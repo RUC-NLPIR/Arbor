@@ -50,6 +50,7 @@ nav:
   - Guides:
       - Configuration: configuration.md
       - Interaction Modes: interaction-modes.md
+      - Arbor Interface Map: arbor-interface.md
       - Web UI & Monitoring: web-ui.md
       - Plugins: plugins.md
       - Skills: skills.md

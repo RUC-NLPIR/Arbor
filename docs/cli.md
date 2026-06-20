@@ -10,6 +10,7 @@ complete reference.
 | `arbor` | With no subcommand, behaves like `arbor run` — starts an interactive session in the current directory. |
 | `arbor run` | Start an AI-powered research session. |
 | `arbor setup` | Interactive wizard to write your provider, model, and API key. |
+| `arbor local` | WSL-native adapter that runs the local skill suite through Claude Code or Codex CLI. |
 | `arbor config` | Inspect and manage stored configuration. |
 | `arbor doctor` | Diagnose your environment (PATH, Python, git, API keys). |
 | `arbor report` | Work with a finished run's report. |
@@ -103,6 +104,41 @@ type `/`; `/help` lists them all.
 | `/resume` | Resume after `/pause`. |
 | `/report` | Show session/report artifact paths. |
 | `/abort` (or `/quit`) | Abort the run. |
+
+## `arbor local`
+
+```bash
+arbor local doctor
+arbor local install --agent both
+arbor local run [TASK] --agent claude --cwd /home/<user>/<target-repo>
+arbor local run [TASK] --agent codex --cwd /home/<user>/<target-repo>
+```
+
+`arbor local` is for WSL-only workflows where Arbor is cloned inside the Linux
+filesystem and the run is delegated to the available `claude` or `codex` CLI.
+It does not use Arbor's provider runtime or `arbor setup` credentials.
+
+The Arbor checkout and target project must be WSL-native paths such as
+`/home/<user>/agent-workspace/Arbor`; mounted Windows paths under `/mnt/c` are
+rejected.
+
+| Subcommand | Action |
+| --- | --- |
+| `doctor` | Check that the current checkout is WSL-native, `skills/` is complete, and `claude` / `codex` are available on PATH. |
+| `install` | Copy every local `skills/arbor-*` directory into WSL user skill directories (`~/.claude/skills`, `~/.codex/skills`). |
+| `run` | Build a local skill-suite prompt and invoke `claude --print` or `codex exec` in the target repo. |
+
+Examples:
+
+```bash
+arbor local doctor
+
+arbor local run --agent claude --cwd ~/agent-workspace/algotune_knn \
+  "try a one-cycle smoke run; do not train, install packages, or use B_test"
+
+arbor local run --agent codex --cwd ~/agent-workspace/algotune_knn \
+  "optimize dev score for 3 cycles; ask before package installs or final test"
+```
 
 ## Other entry points
 

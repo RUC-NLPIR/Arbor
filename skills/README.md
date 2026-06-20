@@ -38,6 +38,25 @@ If you are installing from the current local checkout instead of GitHub, use:
 SKILLS_SRC="<path-to-Arbor>/skills"
 ```
 
+### WSL-native local adapter
+
+On Windows, the recommended local-clone setup is to clone Arbor inside WSL,
+for example under `~/agent-workspace/Arbor`, not under `/mnt/c`. From that WSL
+checkout, `arbor local` can run this suite through the WSL `claude` or `codex`
+CLI without configuring Arbor's native provider runtime:
+
+```bash
+cd ~/agent-workspace/Arbor
+arbor local doctor
+arbor local install --agent both
+arbor local run --agent claude --cwd ~/agent-workspace/<target_repo> \
+  "try a one-cycle smoke run; do not train, install packages, or use B_test"
+```
+
+`arbor local` rejects mounted Windows paths under `/mnt/c` so the Arbor clone,
+target repository, agent CLI, and generated `.arbor/` artifacts all stay in the
+WSL filesystem.
+
 ### Install into Codex
 
 ```bash

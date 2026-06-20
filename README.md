@@ -111,6 +111,7 @@ This repository includes two ways to use Arbor:
 | --- | --- | --- | --- |
 | Native CLI runtime | Python package and `arbor` command | Real Arbor research runs, long experiments, dashboard, checkpoints, executor tools, merge/test discipline, plugins, reports | Recommended. This path is more complete, more reliable, and gives the best Arbor behavior. |
 | Agent Skill Suite | [`skills/`](skills/README.md) | Codex or Claude Code environments where you want Arbor-style behavior without running the native Arbor runtime | Useful integration layer and fallback, but less complete than the CLI runtime. |
+| WSL local CLI adapter | `arbor local` | WSL users who want Arbor behavior through only the locally installed Claude Code or Codex CLIs, with no Arbor provider/API setup | Clone Arbor inside WSL and run this from the Linux filesystem, not `/mnt/c`. |
 
 If you can run the CLI, use the CLI. The native `arbor` runtime contains the full
 implementation: intake, Research Contract, live dashboard, EventBus,
@@ -124,6 +125,38 @@ you would in Arbor. The skill suite performs Arbor-style clarification first
 when target, metric, data, permissions, budget, or run mode are unclear, then
 loads the orchestrator and phase skills. This is separate from the internal
 runtime skills stored under `src/skills/`.
+
+### WSL-local Claude Code / Codex adapter
+
+If you want a local-clone workflow that only uses the Claude Code and Codex
+CLIs, keep both Arbor and the target project inside WSL:
+
+```bash
+mkdir -p ~/agent-workspace
+git clone https://github.com/RUC-NLPIR/Arbor.git ~/agent-workspace/Arbor
+cd ~/agent-workspace/Arbor
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+arbor local doctor
+```
+
+`arbor local` refuses to run from `/mnt/c` or other mounted Windows paths. It
+uses the local `skills/` directory from this checkout and launches the selected
+WSL agent CLI:
+
+```bash
+arbor local run --agent claude --cwd ~/agent-workspace/my-benchmark \
+  "try a one-cycle smoke run; do not train, install packages, or use B_test"
+
+arbor local run --agent codex --cwd ~/agent-workspace/my-benchmark \
+  "optimize dev score for 3 cycles; ask before package installs or final test"
+```
+
+To install the skill suite into the WSL user-level agent skill directories:
+
+```bash
+arbor local install --agent both
+```
 
 ---
 

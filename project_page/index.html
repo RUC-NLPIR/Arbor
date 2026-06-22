@@ -3,24 +3,85 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Arbor | Hypothesis-Tree Refinement for Autonomous Research</title>
+    <title>Arbor — Autonomous Research Agent via Hypothesis-Tree Refinement</title>
     <meta
       name="description"
-      content="Arbor is a general framework for autonomous research via persistent hypothesis-tree refinement."
+      content="Arbor is an autonomous research agent and general optimization framework. It grows a persistent hypothesis tree to turn long-horizon objectives into a cumulative search — proposing hypotheses, editing code, running real experiments, and keeping only the gains that hold on held-out data."
     />
-    <link rel="icon" href="assets/images/arbor-mark.png" />
+    <meta
+      name="keywords"
+      content="Arbor, autonomous research agent, AI research agent, hypothesis tree, hypothesis-tree refinement, LLM agent, automated machine learning, AI optimization framework, agentic research, RUC-NLPIR, Claude Code, Codex"
+    />
+    <meta name="author" content="Renmin University of China · Microsoft Research" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <link rel="canonical" href="https://RUC-NLPIR.github.io/Arbor/" />
+
+    <!-- Open Graph -->
     <meta property="og:title" content="Arbor — Toward Generalist Autonomous Research via Hypothesis-Tree Refinement" />
-    <meta property="og:description" content="A persistent hypothesis tree turns long-horizon AI research into a cumulative process." />
+    <meta property="og:description" content="An autonomous research agent that grows a persistent hypothesis tree, turning long-horizon AI research into a cumulative process." />
     <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://RUC-NLPIR.github.io/Arbor/" />
+    <meta property="og:site_name" content="Arbor" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:image" content="https://RUC-NLPIR.github.io/Arbor/assets/images/fig-overview.png" />
+    <meta property="og:image:alt" content="Arbor hypothesis-tree refinement overview" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Arbor — Toward Generalist Autonomous Research via Hypothesis-Tree Refinement" />
+    <meta name="twitter:description" content="An autonomous research agent that grows a persistent hypothesis tree, turning long-horizon AI research into a cumulative process." />
+    <meta name="twitter:image" content="https://RUC-NLPIR.github.io/Arbor/assets/images/fig-overview.png" />
+
+    <link rel="icon" href="assets/images/arbor-mark.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
+
+    <!-- Structured data: helps search engines understand the project -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Arbor",
+        "alternateName": "Arbor: Toward Generalist Autonomous Research via Hypothesis-Tree Refinement",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Linux, macOS",
+        "description": "Arbor is an autonomous research agent and general optimization framework. It grows a persistent hypothesis tree to turn long-horizon objectives into a cumulative search — proposing hypotheses, editing code, running real experiments, and keeping only the gains that hold on held-out data.",
+        "url": "https://RUC-NLPIR.github.io/Arbor/",
+        "codeRepository": "https://github.com/RUC-NLPIR/Arbor",
+        "license": "https://www.apache.org/licenses/LICENSE-2.0",
+        "author": {
+          "@type": "Organization",
+          "name": "Renmin University of China · Microsoft Research"
+        },
+        "keywords": "autonomous research agent, hypothesis tree, AI optimization framework, LLM agent, agentic research"
+      }
+    </script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- Static fallback for crawlers and no-JS clients; replaced by the React app on load. -->
+      <main>
+        <h1>Arbor — Toward Generalist Autonomous Research via Hypothesis-Tree Refinement</h1>
+        <p>
+          Arbor is an autonomous research agent that turns a long-horizon objective into a
+          cumulative search. Give it a benchmark and a goal; it proposes hypotheses, edits
+          code, runs real experiments, learns from the results, and keeps the improvements
+          that hold up on held-out data. Instead of one-shot attempts that forget what
+          failed, Arbor grows a hypothesis tree: every idea becomes a branch — pruned if it
+          fails, harvested if it works — and insights propagate back so later ideas start
+          smarter.
+        </p>
+        <ul>
+          <li><a href="https://github.com/RUC-NLPIR/Arbor">Code on GitHub</a></li>
+          <li><a href="https://arxiv.org/abs/2606.11926">Paper on arXiv</a></li>
+          <li><a href="https://RUC-NLPIR.github.io/Arbor/docs/">Documentation</a></li>
+        </ul>
+      </main>
+    </div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

@@ -1,416 +1,87 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>arbor · run monitor</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arbor</title>
+<link rel="icon" type="image/png" href="data:image/png;base64,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">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --bg:#0b0e14; --bg2:#0d1117; --panel:#161b22; --panel2:#1b212b;
-    --border:#2a313c; --border2:#30363d; --fg:#e3e9f0; --dim:#8b949e; --dim2:#6e7681;
-    --cyan:#39c5cf; --green:#3fb950; --yellow:#d29922; --magenta:#bc8cff;
-    --red:#f85149; --blue:#58a6ff;
-    --grad:linear-gradient(95deg,#39c5cf 0%,#58a6ff 45%,#bc8cff 100%);
-    --shadow:0 1px 0 rgba(255,255,255,.02) inset, 0 8px 24px -12px rgba(0,0,0,.7);
-    --radius:14px;
-    --fz:clamp(13px, 0.40vw + 11px, 17px);
-    --ui:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
-  }
-  * { box-sizing:border-box; }
-  html,body { height:100%; }
-  body {
-    margin:0; color:var(--fg);
-    font-family:var(--ui); font-size:var(--fz); line-height:1.5;
-    background:
-      radial-gradient(1200px 600px at 80% -10%, rgba(88,166,255,.08), transparent 60%),
-      radial-gradient(1000px 500px at -10% 0%, rgba(188,140,255,.07), transparent 55%),
-      var(--bg);
-    -webkit-font-smoothing:antialiased;
-  }
-  .mono { font-family:var(--mono); font-feature-settings:"tnum" 1; }
-  .shell { max-width:1640px; margin:0 auto; padding:clamp(14px,1.4vw,28px); }
-
-  /* ── sticky top bar ── */
-  header {
-    position:sticky; top:0; z-index:20;
-    display:grid; grid-template-columns:auto minmax(0,1fr);
-    grid-template-areas:"brand meta" "brand kpis";
-    align-items:center; gap:14px 22px;
-    padding:clamp(12px,1vw,18px) clamp(16px,1.3vw,24px);
-    background:linear-gradient(180deg,rgba(27,33,43,.96),rgba(22,27,34,.96));
-    backdrop-filter:blur(8px);
-    border:1px solid var(--border2); border-radius:var(--radius);
-    box-shadow:var(--shadow);
-  }
-  .brand { grid-area:brand; display:flex; align-items:center; gap:11px; margin-right:6px; align-self:center; }
-  .brand .logo {
-    height:clamp(104px,7vw,122px); width:auto; display:block;
-    transform:translateY(11%);
-    filter:drop-shadow(0 1px 3px rgba(0,0,0,.45));
-  }
-  @media (min-width:1280px) {
-    header { grid-template-columns:auto auto minmax(0,1fr); grid-template-areas:"brand meta kpis"; }
-  }
-  @media (max-width:760px) {
-    header { grid-template-columns:1fr; grid-template-areas:"brand" "meta" "kpis"; }
-    .brand { justify-content:center; margin-right:0; }
-  }
-
-  /* ── tab bar (centered segmented control) ── */
-  .tabs { display:flex; gap:4px; width:fit-content; max-width:100%;
-    margin:clamp(12px,1.1vw,18px) auto 0;
-    padding:5px; background:rgba(22,27,34,.7); border:1px solid var(--border2);
-    border-radius:12px; box-shadow:var(--shadow); }
-  .tab { appearance:none; cursor:pointer; font-family:var(--ui); font-size:.86em;
-    font-weight:600; color:var(--dim); background:transparent; border:1px solid transparent;
-    padding:7px 18px; border-radius:8px; display:flex; align-items:center; gap:7px;
-    white-space:nowrap; transition:background .14s, color .14s, box-shadow .14s; }
-  .tab:hover { color:var(--fg); background:var(--bg2); }
-  .tab.active { color:var(--fg); background:linear-gradient(180deg,#232c3a,#1a2230);
-    border-color:var(--border2);
-    box-shadow:0 1px 0 rgba(255,255,255,.05) inset, 0 2px 8px -4px rgba(0,0,0,.6); }
-  .tab .tabcount { font-family:var(--mono); font-size:.82em; color:var(--dim2);
-    background:var(--bg2); border-radius:999px; padding:0 7px; min-width:18px; text-align:center; }
-  .tab .tabcount:empty { display:none; }   /* no count yet → no empty bubble, label stays centered */
-  .tab.active .tabcount { color:var(--cyan); }
-
-  /* ── views ── */
-  .view { display:none; }
-  .view.active { display:grid; }
-  .runpill { grid-area:meta; display:flex; align-items:center; gap:8px; min-width:0; }
-  .runname { font-weight:650; color:var(--fg); font-size:1.02em; max-width:34ch;
-             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .state {
-    display:inline-flex; align-items:center; gap:7px;
-    padding:4px 11px; border-radius:999px; font-size:.74em; font-weight:700;
-    text-transform:uppercase; letter-spacing:.06em;
-    border:1px solid var(--border2); color:var(--dim); background:var(--bg2);
-  }
-  .state #dot { width:8px; height:8px; border-radius:50%; background:var(--dim2); }
-  .state.live { color:var(--green); border-color:rgba(63,185,80,.4); background:rgba(63,185,80,.1); }
-  .state.live #dot { background:var(--green); animation:pulse 1.8s ease-out infinite; }
-  .state.done { color:var(--blue); border-color:rgba(88,166,255,.4); background:rgba(88,166,255,.1); }
-  .state.done #dot { background:var(--blue); }
-  @keyframes pulse {
-    0%{ box-shadow:0 0 0 0 rgba(63,185,80,.5); }
-    70%{ box-shadow:0 0 0 7px rgba(63,185,80,0); }
-    100%{ box-shadow:0 0 0 0 rgba(63,185,80,0); }
-  }
-  .modelchip { font-family:var(--mono); font-size:.78em; color:var(--dim);
-    padding:3px 9px; border:1px solid var(--border); border-radius:8px; background:var(--bg2); }
-
-  /* ── KPI chips ── */
-  .kpis { grid-area:kpis; display:flex; flex-wrap:wrap; align-items:stretch; gap:9px; min-width:0; margin-left:0; }
-  @media (min-width:1280px) { .kpis { justify-content:flex-end; margin-left:auto; } }
-  .kpi {
-    display:flex; flex-direction:column; justify-content:center; gap:2px;
-    padding:7px 13px; min-width:88px;
-    background:var(--bg2); border:1px solid var(--border); border-radius:10px;
-  }
-  .kpi .lab {
-    font-size:.64em; line-height:1.2; min-height:1.2em;
-    text-transform:uppercase; letter-spacing:.08em; color:var(--dim2); white-space:nowrap;
-  }
-  .kpi .val { font-family:var(--mono); font-weight:650; font-size:1.04em; line-height:1.2; color:var(--fg); }
-  .kpi .val.good{ color:var(--green); } .kpi .val.mid{ color:var(--cyan); }
-  .kpi .val.warn{ color:var(--yellow); } .kpi .val.accent{ color:var(--magenta); }
-  .kpi .val.up{ color:var(--green); } .kpi .val.down{ color:var(--red); }
-
-  /* ── grid ── */
-  .view { grid-template-columns:repeat(auto-fit,minmax(380px,1fr));
-         gap:clamp(12px,1.1vw,20px); margin-top:clamp(12px,1.1vw,20px); }
-  .panel {
-    background:linear-gradient(180deg,var(--panel),var(--panel2));
-    border:1px solid var(--border2); border-radius:var(--radius);
-    box-shadow:var(--shadow); padding:clamp(13px,.95vw,18px) clamp(15px,1.05vw,20px);
-    min-width:0;
-  }
-  .panel.wide { grid-column:1/-1; }
-  @media (max-width:840px){ .view{ grid-template-columns:1fr; } }
-
-  h2 { display:flex; align-items:center; gap:9px;
-       margin:0 0 13px; font-size:.72em; font-weight:700;
-       text-transform:uppercase; letter-spacing:.1em; color:var(--dim); }
-  h2::before { content:""; width:3px; height:13px; border-radius:3px; background:var(--grad); }
-  h2 .h2note { margin-left:auto; color:var(--dim2); font-weight:600; letter-spacing:0; text-transform:none; font-size:1em; }
-
-  /* ── score chart ── */
-  .chartwrap { position:relative; width:100%; }
-  svg.chart { display:block; width:100%; height:330px; }
-  .chart .grid line { stroke:var(--border); stroke-width:1; opacity:.5; }
-  .chart .axis text { fill:var(--dim2); font-family:var(--mono); font-size:10px; }
-  .chart .baseline { stroke:var(--yellow); stroke-width:1.5; stroke-dasharray:5 4; opacity:.85; }
-  .chart .baselab { fill:var(--yellow); font-family:var(--mono); font-size:10px; opacity:.9; }
-  .chart .frontier { fill:none; stroke:var(--green); stroke-width:2.4; stroke-linejoin:round; stroke-linecap:round; }
-  .chart .cursor { stroke:var(--dim); stroke-width:1; stroke-dasharray:3 3; opacity:.6; }
-  .tip {
-    position:absolute; pointer-events:none; z-index:5; display:none;
-    background:rgba(13,17,23,.96); border:1px solid var(--border2); border-radius:9px;
-    padding:7px 10px; font-size:.82em; box-shadow:var(--shadow); max-width:280px;
-    transform:translate(-50%,-115%);
-  }
-  .tip .t-sc { font-family:var(--mono); font-weight:700; }
-  .tip .t-hy { color:var(--dim); margin-top:2px; white-space:normal; }
-  .tip .t-meta { color:var(--dim2); font-family:var(--mono); font-size:.85em; margin-top:2px; }
-
-  /* ── leaderboard ── */
-  table.lb { width:100%; border-collapse:collapse; font-size:.92em; }
-  table.lb th { text-align:left; color:var(--dim2); font-weight:600; font-size:.78em;
-    text-transform:uppercase; letter-spacing:.05em; padding:0 8px 7px; }
-  table.lb td { padding:6px 8px; border-top:1px solid var(--border); vertical-align:middle; }
-  table.lb .rk { color:var(--dim2); font-family:var(--mono); width:1.6em; }
-  table.lb .nid { font-family:var(--mono); color:var(--dim); font-size:.86em; }
-  table.lb .hy { color:var(--fg); max-width:1px; width:99%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  table.lb .scwrap { display:flex; align-items:center; gap:8px; justify-content:flex-end; }
-  table.lb .scbar { height:6px; border-radius:3px; background:var(--green); opacity:.55; min-width:2px; }
-  table.lb .sc { font-family:var(--mono); font-weight:700; }
-
-  .badge {
-    display:inline-flex; align-items:center; padding:2px 8px; border-radius:999px;
-    font-size:.7em; font-weight:650; font-family:var(--mono); text-transform:uppercase;
-    letter-spacing:.04em; border:1px solid transparent; white-space:nowrap;
-  }
-  .s-proposed,.s-queued{ color:var(--yellow); background:rgba(210,153,34,.12); border-color:rgba(210,153,34,.3); }
-  .s-running { color:var(--magenta); background:rgba(188,140,255,.12); border-color:rgba(188,140,255,.3); }
-  .s-done    { color:var(--green); background:rgba(63,185,80,.12); border-color:rgba(63,185,80,.3); }
-  .s-merged  { color:var(--green); background:rgba(63,185,80,.2); border-color:rgba(63,185,80,.5); font-weight:800; }
-  .s-pruned  { color:var(--dim2); background:rgba(110,118,129,.1); border-color:var(--border); }
-  .s-failed  { color:var(--red); background:rgba(248,81,73,.12); border-color:rgba(248,81,73,.3); }
-
-  /* ── idea tree ── */
-  .node { display:flex; align-items:center; gap:9px; padding:7px 10px; margin:5px 0;
-    border-radius:10px; background:var(--bg2); border:1px solid var(--border); overflow:hidden; }
-  .node .nid { font-family:var(--mono); color:var(--dim); font-size:.82em; flex:0 0 auto; }
-  .node .score { font-family:var(--mono); font-weight:700; flex:0 0 auto; min-width:58px; text-align:right; }
-  .node .hyp { color:var(--fg); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1 1 auto; }
-  .node .meta { color:var(--dim2); font-family:var(--mono); font-size:.84em; flex:0 0 auto; }
-  .tguide { color:var(--dim2); font-family:var(--mono); flex:0 0 auto; white-space:pre; }
-
-  /* ── idea tree (SVG card graph, top-down) ── */
-  .treewrap { position:relative; width:100%; max-height:78vh; overflow:auto; padding:4px; }
-  svg#treesvg { display:block; }
-  svg#treesvg .edge { fill:none; stroke:var(--border2); stroke-width:1.6; }
-  svg#treesvg .tnode { cursor:default; }
-  svg#treesvg .tnode .card { fill:#11161d; stroke-width:1.4; transition:fill .12s; }
-  svg#treesvg .tnode:hover .card { fill:#1a212c; }
-  svg#treesvg .tnode .nid { font-family:var(--mono); font-size:13.5px; font-weight:700; }
-  svg#treesvg .tnode .st  { font-family:var(--ui); font-size:10px; fill:var(--dim2);
-    text-transform:uppercase; letter-spacing:.05em; font-weight:600; }
-  svg#treesvg .tnode .sc  { font-family:var(--mono); font-size:12.5px; font-weight:700; }
-  svg#treesvg .tnode .hyline { font-family:var(--ui); font-size:11.5px; fill:#c4cdd9; }
-  svg#treesvg .tnode .ft  { font-family:var(--mono); font-size:10px; fill:var(--dim2); }
-  svg#treesvg .tnode .insight { font-family:var(--ui); font-size:11px; fill:var(--magenta); }
-  svg#treesvg .tnode .prune { font-family:var(--ui); font-size:11px; fill:var(--red); opacity:.85; }
-  /* root (task) card */
-  svg#treesvg .tnode .rootcard { fill:#0f1620; stroke-width:1.6; }
-  svg#treesvg .tnode .rlabel { font-family:var(--ui); font-size:9.5px; fill:var(--cyan);
-    text-transform:uppercase; letter-spacing:.12em; font-weight:700; }
-  svg#treesvg .tnode .rtitle { font-family:var(--ui); font-size:14px; font-weight:700; fill:var(--fg); }
-  svg#treesvg .tnode .rtask { font-family:var(--ui); font-size:11.5px; fill:#aeb8c4; }
-  /* tree tooltip: fixed so the scrollable tree container can't clip it */
-  #treetip { position:fixed; transform:translate(14px,16px); max-width:440px; white-space:normal; z-index:30; }
-  #treetip .t-hy { white-space:normal; }
-  .treewrap .tip { z-index:9; }
-
-  /* ── usage ── */
-  .usage { display:flex; gap:18px; align-items:center; flex-wrap:wrap; }
-  .donut { flex:0 0 auto; position:relative; width:108px; height:108px; }
-  .donut .center { position:absolute; inset:0; display:flex; flex-direction:column;
-    align-items:center; justify-content:center; }
-  .donut .center b { font-family:var(--mono); font-size:1.3em; font-weight:700; }
-  .donut .center span { font-size:.62em; text-transform:uppercase; letter-spacing:.08em; color:var(--dim2); }
-  .ubars { flex:1 1 180px; min-width:160px; display:flex; flex-direction:column; gap:11px; }
-  .ubar .urow { display:flex; justify-content:space-between; font-size:.82em; margin-bottom:3px; }
-  .ubar .urow .ul { color:var(--dim); } .ubar .urow .uv { font-family:var(--mono); color:var(--fg); }
-  .ubar .track { height:7px; border-radius:4px; background:var(--bg2); border:1px solid var(--border); overflow:hidden; }
-  .ubar .fill { height:100%; border-radius:4px; }
-
-  /* ── feed ── */
-  .feed { max-height:62vh; overflow-y:auto; padding-right:6px; display:flex; flex-direction:column; gap:1px; }
-  .feed.feed-tall { max-height:76vh; }
-  .feed .line { padding:4px 8px; border-radius:7px; font-family:var(--mono);
-    font-size:.9em; line-height:1.4; word-break:break-word; }
-  .feed .line:hover { background:var(--bg2); }
-  .agent { color:var(--cyan); font-weight:650; } .think { color:var(--dim); }
-  .tool  { color:var(--magenta); font-weight:650; } .feed b { color:var(--fg); font-weight:650; }
-  .empty { color:var(--dim2); font-style:italic; padding:10px 2px; }
-  .feed::-webkit-scrollbar{ width:9px; } .feed::-webkit-scrollbar-thumb{ background:var(--border2); border-radius:6px; }
-  .feed::-webkit-scrollbar-track{ background:transparent; }
-
-  /* phase pipeline */
-  .pipe { display:flex; flex-wrap:wrap; gap:6px; }
-  .pipe .stg { font-family:var(--mono); font-size:.74em; color:var(--dim2); padding:2px 7px;
-    border-radius:7px; border:1px solid transparent; }
-  .pipe .stg.on { color:var(--magenta); background:rgba(188,140,255,.12); border-color:rgba(188,140,255,.3); }
-
-  /* run counters grid */
-  .counters { display:grid; grid-template-columns:repeat(auto-fit,minmax(96px,1fr)); gap:10px; }
-  .counters .cnt { background:var(--bg2); border:1px solid var(--border); border-radius:10px; padding:11px 13px; }
-  .counters .cnt .cv { font-family:var(--mono); font-weight:700; font-size:1.4em; }
-  .counters .cnt .cl { font-size:.66em; text-transform:uppercase; letter-spacing:.08em; color:var(--dim2); margin-top:2px; }
-
-  /* ── review gate banner ── */
-  .gatebar { margin-top:14px; padding:14px 18px; border-radius:var(--radius);
-    border:1px solid rgba(210,153,34,.5);
-    background:linear-gradient(180deg,rgba(210,153,34,.13),rgba(210,153,34,.04));
-    box-shadow:var(--shadow); }
-  .gatebar .gh { display:flex; align-items:center; gap:9px; font-weight:700; color:var(--yellow);
-    text-transform:uppercase; letter-spacing:.06em; font-size:.76em; }
-  .gatebar .gp { margin:9px 0 12px; color:var(--fg); white-space:pre-wrap; }
-  .gatebar .grow { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-
-  /* ── chat (Ask tab) ── */
-  .chat { display:flex; flex-direction:column; gap:8px; max-height:60vh; overflow-y:auto; padding-right:6px; }
-  .chat .msg { padding:8px 11px; border-radius:11px; max-width:88%; line-height:1.5;
-    white-space:pre-wrap; word-break:break-word; }
-  .chat .msg.you { align-self:flex-end; background:rgba(188,140,255,.14); border:1px solid rgba(188,140,255,.3); }
-  .chat .msg.companion { align-self:flex-start; background:var(--bg2); border:1px solid var(--border); }
-  .chat .who { font-size:.66em; text-transform:uppercase; letter-spacing:.06em; color:var(--dim2); margin-bottom:3px; }
-  .chat .msg.you .who { color:var(--magenta); } .chat .msg.companion .who { color:var(--blue); }
-  .chat .busy { align-self:flex-start; color:var(--dim); font-style:italic; padding:2px 4px; }
-  .chat::-webkit-scrollbar{ width:9px; } .chat::-webkit-scrollbar-thumb{ background:var(--border2); border-radius:6px; }
-
-  /* ── input bar + buttons ── */
-  .askbar { display:flex; gap:8px; margin-top:12px; align-items:center; }
-  .field, .askbar input[type=text] { background:var(--bg2); border:1px solid var(--border2); color:var(--fg);
-    border-radius:9px; padding:9px 12px; font-family:var(--ui); font-size:.95em; outline:none; flex:1 1 auto; min-width:120px; }
-  .field:focus, .askbar input[type=text]:focus { border-color:var(--cyan); }
-  .askbar select { background:var(--bg2); border:1px solid var(--border2); color:var(--fg);
-    border-radius:9px; padding:9px 8px; font-size:.84em; cursor:pointer; }
-  .btn { appearance:none; cursor:pointer; border:1px solid var(--border2); border-radius:9px; padding:9px 16px;
-    font-family:var(--ui); font-size:.86em; font-weight:650; color:var(--fg);
-    background:linear-gradient(180deg,#222b38,#1a2230); transition:filter .12s; white-space:nowrap; }
-  .btn:hover { filter:brightness(1.18); }
-  .btn.primary { border-color:rgba(57,197,207,.55); background:linear-gradient(180deg,#0e7490,#0891b2); color:#fff; }
-  .btn.warn { border-color:rgba(248,81,73,.45); color:var(--red); }
-  .btn:disabled { opacity:.45; cursor:not-allowed; filter:none; }
-  .askhint { margin-top:7px; color:var(--dim2); font-size:.8em; }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; }
+  ::-webkit-scrollbar{ width:9px; height:9px; }
+  ::-webkit-scrollbar-thumb{ background:#1f2a26; border-radius:8px; }
+  ::-webkit-scrollbar-track{ background:transparent; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+  @keyframes pulse{ 0%,100%{ opacity:1; transform:scale(1);} 50%{ opacity:.35; transform:scale(.78);} }
+  @keyframes glow{ 0%,100%{ box-shadow:0 0 0 0 var(--soft);} 50%{ box-shadow:0 0 14px 1px var(--soft);} }
+  @keyframes fadeUp{ from{ opacity:0; transform:translateY(6px);} to{ opacity:1; transform:none;} }
+  body{ font-family:'IBM Plex Sans',-apple-system,sans-serif; -webkit-font-smoothing:antialiased; }
+  button{ font-family:inherit; }
+  .hl:hover{ background:var(--card2) !important; }
+  .hb:hover{ color:var(--tx) !important; border-color:var(--line2) !important; }
+  .ha:hover{ color:var(--accent) !important; }
+  .hpop:hover{ background:var(--card2) !important; }
+  .hsug:hover{ border-color:var(--accent) !important; color:var(--accent) !important; }
 </style>
 </head>
 <body>
-<div class="shell">
-  <header>
-    <div class="brand"><img class="logo" alt="arbor" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAiQAAADICAYAAADY6vqgAAAAAXNSR0IArs4c6QAAAHhlWElmTU0AKgAAAAgABAEaAAUAAAABAAAAPgEbAAUAAAABAAAARgEoAAMAAAABAAIAAIdpAAQAAAABAAAATgAAAAAAAAEsAAAAAQAAASwAAAABAAOgAQADAAAAAQABAACgAgAEAAAAAQAAAiSgAwAEAAAAAQAAAMgAAAAAl5LmvQAAAAlwSFlzAAAuIwAALiMBeKU/dgAAQABJREFUeAHtnQmcFMW9x+c+9ua+lhvkCiqKt0bwBhFNonhFzWFEk2g0UfNeNHn7culL8jS3wUTRJBqDxLwoQUQNYBBRQUVZ5F6WXZa9576v96tlZ+3pne6Z2Z1rl19/PrPbXee/vt1d9e+qf1VpNDxIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIgARIoMAEtAXO/7jLPhaLCealfr9/hMFgGB2NRkdptdoheqOxUhONGnFdAn9dNKrzGAwaP8J3dP9awuFwW0uLtX3yZK3/uAPHApMACZAACQxqAlRIcnh7hfLhcDiqTCbTTCgfp0LPONlg0M1AluPxGwZFpCzd7JFWTKPR2jWaWAuUlgO43BkKRbdbrab3Nm7cWL9w4cJwumkxHAmQAAmQAAkUGwEqJFm+I1AU9C5XYKrFolug0+kuxu80ZDEeyocuy1mJ5ISe4o5GNbtiscimQCC8vrTU8i7ycuYgLyZJAiRAAiRAAiRQzASgFOi8Xu/4YDB4ezgcfSUSiTqEppDvAz0nYfx2hUKhn3i9wdNXrVql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fIYnARIgARIgARIoAgJo0Msww+ZWGL1ugSJSFwqF18LtzExFS6aQID07hofuyTQthicBEiABEiABEjhOCUAJ0ba1xcr7uitwMoUEadqg7Nx9nCJlsUmABEiABI5zAobjvPx9Kr5Wq40hoqtPkRmJBEiABEiABEigFwFdLxc65JxAWc5zYAYkQAIkQAIkMLAIUCEp0P3SyvIVw0B6fVb2zZOlzEsSIAESIAESKH4CVEgKdI/EmI/0EMNAMGqNSt14TgIkQAIkQALHCwEqJIW50z70iGySZI3LmB3XUjeJN09JgARIgARIgARIIAcEHA7H0FAo8l1M930LK6K9gHVBFuQgGyZJAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiRAAiQwIAj8P/d274DWD2anAAAAAElFTkSuQmCC"></div>
-    <div class="runpill">
-      <span class="state" id="state"><span id="dot"></span><span id="statetxt">connecting</span></span>
-      <b class="runname" id="run">—</b>
-      <span class="modelchip mono" id="model">—</span>
-    </div>
-    <div class="kpis">
-      <div class="kpi hero"><span class="lab">best</span><span class="val good mono" id="best">—</span></div>
-      <div class="kpi"><span class="lab" id="dlab">vs base</span><span class="val mono" id="delta">—</span></div>
-      <div class="kpi"><span class="lab">branches</span><span class="val mono" id="branches">0/0</span></div>
-      <div class="kpi"><span class="lab">runtime</span><span class="val mono" id="elapsed">0s</span></div>
-      <div class="kpi"><span class="lab">tokens</span><span class="val mono" id="tokens">0</span></div>
-      <div class="kpi"><span class="lab">cache</span><span class="val mid mono" id="cachek">0%</span></div>
-    </div>
-  </header>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="ic-network" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="4.5" r="2.2"/><circle cx="5.5" cy="19" r="2.2"/><circle cx="18.5" cy="19" r="2.2"/><circle cx="12" cy="12" r="1.4"/><path d="M12 6.7v3.9"/><path d="M11 13.2 6.8 17"/><path d="m13 13.2 4.2 3.8"/></symbol>
+  <symbol id="ic-home" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9.5 9-7 9 7V20a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></symbol>
+  <symbol id="ic-lightbulb" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.1 14c.2-1 .7-1.7 1.4-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.8 1.2 1.5 1.4 2.5"/></symbol>
+  <symbol id="ic-git-branch" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+  <symbol id="ic-list" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3.5" y1="6" x2="3.51" y2="6"/><line x1="3.5" y1="12" x2="3.51" y2="12"/><line x1="3.5" y1="18" x2="3.51" y2="18"/></symbol>
+  <symbol id="ic-cpu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M19 9h3M19 14h3M2 9h3M2 14h3"/></symbol>
+  <symbol id="ic-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-2.82 1.17V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 2.82 1.17l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="ic-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="ic-target" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.6"/></symbol>
+  <symbol id="ic-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></symbol>
+  <symbol id="ic-timer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="10" y1="2" x2="14" y2="2"/><line x1="12" y1="14" x2="15" y2="11"/><circle cx="12" cy="14" r="8"/></symbol>
+  <symbol id="ic-scale" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M7 21h10"/><path d="M3 7h4c2 0 4-1 5-1.5 1 .5 3 1.5 5 1.5h4"/><path d="m5 7-3 7c.9.66 2 1 3 1s2.1-.34 3-1z"/><path d="m19 7-3 7c.9.66 2 1 3 1s2.1-.34 3-1z"/></symbol>
+  <symbol id="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="ic-check-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.1V12a10 10 0 1 1-5.9-9.1"/><path d="m9 11 3 3L22 4"/></symbol>
+  <symbol id="ic-loader" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.2-8.6"/></symbol>
+  <symbol id="ic-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></symbol>
+  <symbol id="ic-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/></symbol>
+  <symbol id="ic-flask" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v6.5L4.7 18a2 2 0 0 0 1.7 3h11.2a2 2 0 0 0 1.7-3L14 9.5V3"/><path d="M7 15h10"/></symbol>
+  <symbol id="ic-star" viewBox="0 0 24 24"><polygon fill="currentColor" stroke="none" points="12 2.5 15 9 22 9.7 16.8 14.3 18.4 21.2 12 17.6 5.6 21.2 7.2 14.3 2 9.7 9 9"/></symbol>
+  <symbol id="ic-github" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.9a3.4 3.4 0 0 0-.9-2.6c3.1-.3 6.4-1.5 6.4-7A5.4 5.4 0 0 0 20 4.8 5.1 5.1 0 0 0 19.9 1S18.7.7 16 2.5a13.4 13.4 0 0 0-7 0C6.3.7 5.1 1 5.1 1A5.1 5.1 0 0 0 5 4.8a5.4 5.4 0 0 0-1.5 3.8c0 5.4 3.3 6.6 6.4 7a3.4 3.4 0 0 0-.9 2.6V22"/></symbol>
+  <symbol id="ic-chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></symbol>
+  <symbol id="ic-arrow-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+  <symbol id="ic-grid" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></symbol>
+  <symbol id="ic-arrow-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><polyline points="5 12 12 5 19 12"/></symbol>
+  <symbol id="ic-radical" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h2.5l3 8 4-16H21"/></symbol>
+  <symbol id="ic-repeat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></symbol>
+  <symbol id="ic-layers" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></symbol>
+  <symbol id="ic-gauge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+  <symbol id="ic-zap" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="ic-pause" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></symbol>
+  <symbol id="ic-play" viewBox="0 0 24 24"><polygon fill="currentColor" stroke="none" points="6 4 20 12 6 20"/></symbol>
+  <symbol id="ic-stop" viewBox="0 0 24 24"><rect fill="currentColor" stroke="none" x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="ic-sparkles" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v5M12 16v5M3 12h5M16 12h5"/><path d="m6.3 6.3 3 3M14.7 14.7l3 3M17.7 6.3l-3 3M9.3 14.7l-3 3"/></symbol>
+  <symbol id="ic-chevrons-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="11 17 6 12 11 7"/><polyline points="18 17 13 12 18 7"/></symbol>
+  <symbol id="ic-chevrons-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></symbol>
+  <symbol id="ic-palette" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.3-.3-.4-.5-.8-.5-1.2 0-1 .8-1.8 1.8-1.8H17a5 5 0 0 0 5-5c0-4.97-4.5-9-10-9z"/><circle cx="7.5" cy="10.5" r="1.2"/><circle cx="12" cy="7.5" r="1.2"/><circle cx="16.5" cy="10.5" r="1.2"/></symbol>
+  <symbol id="ic-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="ic-trending-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="15 7 21 7 21 13"/></symbol>
+  <symbol id="ic-activity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+</defs></svg>
 
-  <div id="gatebar" class="gatebar" style="display:none"></div>
-
-  <nav class="tabs" id="tabs">
-    <button class="tab active" data-view="overview">Overview</button>
-    <button class="tab" data-view="ideas">Ideas<span class="tabcount" id="tc-ideas"></span></button>
-    <button class="tab" data-view="ask">Ask</button>
-    <button class="tab" data-view="usage">System</button>
-    <button class="tab" data-view="activity">Activity</button>
-  </nav>
-
-  <!-- ── Overview ── -->
-  <main class="view active" data-view="overview">
-    <section class="panel wide">
-      <h2>score over time <span class="h2note" id="chartnote"></span></h2>
-      <div class="chartwrap">
-        <svg class="chart" id="chart"></svg>
-        <div class="tip" id="tip"></div>
-      </div>
-      <div class="pipe" id="pipe" style="margin-top:12px"></div>
-    </section>
-    <section class="panel wide">
-      <h2>idea leaderboard <span class="h2note" id="lbnote"></span></h2>
-      <div id="lb"><div class="empty">no scored ideas yet…</div></div>
-    </section>
-  </main>
-
-  <!-- ── Ideas ── -->
-  <main class="view" data-view="ideas">
-    <section class="panel wide">
-      <h2>idea tree <span class="h2note" id="treenote"></span></h2>
-      <div class="treewrap" id="treewrap">
-        <svg id="treesvg"></svg>
-        <div class="tip" id="treetip"></div>
-        <div class="empty" id="treeempty">no ideas yet…</div>
-      </div>
-    </section>
-  </main>
-
-  <!-- ── Ask ── -->
-  <main class="view" data-view="ask">
-    <section class="panel wide">
-      <h2>ask the run <span class="h2note" id="asknote"></span></h2>
-      <div id="chat" class="chat"><div class="empty">ask a question about the run — answered by a read-only companion that never touches the run.</div></div>
-      <div class="askbar">
-        <select id="askmode" title="Ask = read-only companion · Steer = inject into the research agent">
-          <option value="ask">Ask companion</option>
-          <option value="steer">Steer agent</option>
-        </select>
-        <input id="askinput" type="text" placeholder="type a question, Enter to send" autocomplete="off" />
-        <button id="asksend" class="btn primary">Send</button>
-      </div>
-      <div class="askhint" id="askhint"></div>
-    </section>
-  </main>
-
-  <!-- ── System ── -->
-  <main class="view" data-view="usage">
-    <section class="panel">
-      <h2>cache</h2>
-      <div class="usage">
-        <div class="donut">
-          <svg viewBox="0 0 36 36" width="120" height="120" id="donut"></svg>
-          <div class="center"><b id="cached">0%</b><span>cache hit</span></div>
-        </div>
-        <div class="ubars" id="ubars"></div>
-      </div>
-    </section>
-    <section class="panel">
-      <h2>run counters</h2>
-      <div id="counters" class="counters"><div class="empty">—</div></div>
-    </section>
-  </main>
-
-  <!-- ── Activity ── -->
-  <main class="view" data-view="activity">
-    <section class="panel wide">
-      <h2>reasoning &amp; activity <span class="h2note">· live</span></h2>
-      <div id="feed" class="feed feed-tall"><div class="empty">waiting for events…</div></div>
-    </section>
-  </main>
-</div>
+<div id="app" style="padding:12px; height:100vh; box-sizing:border-box;"></div>
 
 <script>
-const $ = (id) => document.getElementById(id);
-function fmtDur(s){ if(s==null) return "—"; s=Math.round(s); if(s<60) return s+"s";
-  const m=Math.floor(s/60), r=s%60; if(m<60) return m+"m"+String(r).padStart(2,"0")+"s";
-  const h=Math.floor(m/60); return h+"h"+String(m%60).padStart(2,"0")+"m"; }
-function fmtScore(x){ return (x==null)? "—" : Number(x).toFixed(4); }
-function fmtTokens(n){ n=n||0; return n>=1e6 ? (n/1e6).toFixed(1)+"M" : n>=1000 ? (n/1000).toFixed(1)+"k" : ""+n; }
-function esc(t){ const d=document.createElement("div"); d.textContent=t==null?"":String(t); return d.innerHTML; }
-function scoreClass(x){ if(x==null) return "s-pruned"; x=Number(x);
-  if(x>=0.8) return "s-done"; if(x>=0.5) return "s-running"; if(x>=0.2) return "s-proposed"; return "s-failed"; }
-const SVGNS = "http://www.w3.org/2000/svg";
-
-let LAST = null;                 // last snapshot state
-let SERIES = [];                 // [{t, best}] best-so-far over elapsed time
-let CHART = null;                // {dots, plot geometry} for hover
-// Concrete hex (NOT css var()) for anything injected into SVG presentation
-// attributes — var() is unreliable in fill/stroke attributes across browsers.
-const C = { green:"#3fb950", cyan:"#39c5cf", magenta:"#bc8cff", yellow:"#d29922",
-  red:"#f85149", blue:"#58a6ff", dim2:"#6e7681", border:"#2a313c", bg:"#0b0e14" };
-const MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
-const STATUS_COLOR = { merged:C.green, done:C.cyan, running:C.magenta,
-  proposed:C.yellow, queued:C.yellow, failed:C.red, pruned:C.dim2 };
+"use strict";
+/* ───────────────────────── live data layer ─────────────────────────
+ * Reused contract from the previous WebUI: an SSE /events stream pushes
+ * {kind:"snapshot",state} and {kind:"event",type,data} frames; a token-gated
+ * POST /input carries ask/steer/gate back into the run. This file is a 1:1
+ * port of the Arbor Dashboard design (design-ref), driven by that live data.
+ */
+const TOKEN = new URLSearchParams(location.search).get("t") || "";
+let INTERACTIVE = false;
 
 function normalizeState(raw){
   const s = (raw && typeof raw === "object") ? raw : {};
@@ -418,33 +89,16 @@ function normalizeState(raw){
   const cache = (s.cache && typeof s.cache === "object") ? s.cache : {};
   const counters = (s.counters && typeof s.counters === "object") ? s.counters : {};
   return {
-    run_name: s.run_name || "run",
-    task: s.task || "",
-    cwd: s.cwd || "",
-    model: s.model || "—",
-    phase: s.phase || "connecting",
-    cycle_num: s.cycle_num || 0,
-    total_cycles: s.total_cycles ?? 0,
-    branch_budget_used: s.branch_budget_used || 0,
-    elapsed_seconds: s.elapsed_seconds || 0,
-    best_score: s.best_score ?? null,
-    baseline_score: s.baseline_score ?? null,
+    run_name: s.run_name || "run", task: s.task || "", cwd: s.cwd || "", model: s.model || "—",
+    phase: s.phase || "connecting", cycle_num: s.cycle_num || 0, total_cycles: s.total_cycles ?? 0,
+    branch_budget_used: s.branch_budget_used || 0, elapsed_seconds: s.elapsed_seconds || 0,
+    best_score: s.best_score ?? null, baseline_score: s.baseline_score ?? null,
     metric_direction: s.metric_direction || "maximize",
     best_score_history: Array.isArray(s.best_score_history) ? s.best_score_history : [],
     tokens: { input: tokens.input || 0, output: tokens.output || 0 },
-    cache: {
-      read: cache.read || 0,
-      creation: cache.creation || 0,
-      uncached: cache.uncached || 0,
-      hit_rate: cache.hit_rate || 0,
-    },
-    counters: {
-      proposed: counters.proposed || 0,
-      done: counters.done || 0,
-      pruned: counters.pruned || 0,
-      merged: counters.merged || 0,
-      running: counters.running || 0,
-    },
+    cache: { read: cache.read||0, creation: cache.creation||0, uncached: cache.uncached||0, hit_rate: cache.hit_rate||0 },
+    counters: { proposed: counters.proposed||0, done: counters.done||0, pruned: counters.pruned||0,
+      merged: counters.merged||0, running: counters.running||0 },
     tree: Array.isArray(s.tree) ? s.tree : [],
     thinking: Array.isArray(s.thinking) ? s.thinking : [],
     agents: (s.agents && typeof s.agents === "object") ? s.agents : {},
@@ -453,583 +107,1005 @@ function normalizeState(raw){
       ? { turns: Array.isArray(s.companion.turns) ? s.companion.turns : [], busy: !!s.companion.busy }
       : { turns: [], busy: false },
     gate: (s.gate && typeof s.gate === "object") ? s.gate : null,
-    paused: !!s.paused,
-    interactive: !!s.interactive,
+    paused: !!s.paused, interactive: !!s.interactive,
   };
 }
 
-/* ── top bar + KPIs ───────────────────────────────────────────── */
-function renderTop(s){
-  $("run").textContent = s.run_name || s.task || "run";
-  $("model").textContent = s.model || "—";
-  const idle = s.idle_seconds;
-  const finished = (s.phase==="done" || s.phase==="complete");
-  const st = $("state"); const stt = $("statetxt");
-  st.className = "state " + (finished ? "done" : "live");
-  stt.textContent = finished ? "done" : "running";
+/* ───────────────────────── UI state ───────────────────────── */
+const ST = {
+  screen:'home', collapsed:false, theme:'midnight', themeMenuOpen:false,
+  live:true,                 // client-side "apply live updates" toggle
+  ideaFilter:'All', hoverFilter:null,
+  selIdea:null, selNode:null, hoverNode:null, hoverImpr:null, hoverBranch:null,
+  askInput:'', askMode:'ask',  // 'ask' = read-only companion · 'steer' = inject into the agent
+};
+let SNAP = normalizeState({});
+let ACTIVITY = [];          // event-derived activity feed (newest first)
+let CONNECTED = false;
 
-  $("best").textContent = fmtScore(s.best_score);
-  // delta vs baseline
-  const dl = $("delta");
-  if (s.best_score!=null && s.baseline_score!=null){
-    const d = s.best_score - s.baseline_score;
-    const up = s.metric_direction==="minimize" ? d<0 : d>0;
-    dl.textContent = (d>=0?"+":"") + d.toFixed(4);
-    dl.className = "val mono " + (Math.abs(d)<1e-9 ? "" : (up?"up":"down"));
-    $("dlab").textContent = "vs base " + fmtScore(s.baseline_score);
-  } else { dl.textContent="—"; dl.className="val mono"; $("dlab").textContent="vs base"; }
+/* ───────────────────────── helpers ───────────────────────── */
+const esc = (t)=>{ const d=document.createElement("div"); d.textContent=t==null?"":String(t); return d.innerHTML; };
+const escA = (t)=>esc(t).replace(/"/g,'&quot;');   // attribute-safe (esc() leaves quotes)
+const ic  = (name,size,style)=>`<svg width="${size}" height="${size}"${style?` style="${style}"`:''}><use href="#ic-${name}"></use></svg>`;
+function fmtScore(x){ return (x==null)?"—":Number(x).toFixed(4); }
+function fmtTok(v){ v=v||0; return v>=1000 ? Math.round(v/1000)+'k' : ''+v; }
+function fmtRun(t){ t=Math.max(0,Math.round(t||0)); const h=Math.floor(t/3600), m=Math.floor((t%3600)/60), s=t%60;
+  if(h>0) return h+'h '+String(m).padStart(2,'0')+'m'; return m>0 ? m+'m '+String(s).padStart(2,'0')+'s' : s+'s'; }
+function fmtAgo(t){ t=Math.max(0,Math.round(t||0)); if(t<60) return t+'s ago'; const m=Math.floor(t/60); if(m<60) return m+'m ago'; const h=Math.floor(m/60); return h<24? h+'h ago' : Math.floor(h/24)+'d ago'; }
+function clockFromElapsed(ago){ const d=new Date(Date.now()-Math.max(0,ago||0)*1000); return d.toTimeString().slice(0,8); }
+function imprPct(score){ const b=SNAP.baseline_score; if(score==null||b==null||b===0) return null;
+  const raw = SNAP.metric_direction==='minimize' ? (b-score)/Math.abs(b) : (score-b)/Math.abs(b); return raw*100; }
+function imprStr(score){ const p=imprPct(score); return p==null?'—':(p>=0?'+':'')+p.toFixed(2)+'%'; }
 
-  $("branches").textContent = (s.branch_budget_used||0) + "/" + (s.total_cycles ?? "?");
-  $("elapsed").textContent = fmtDur(s.elapsed_seconds);
-  $("tokens").textContent = fmtTokens(s.tokens.input) + " / " + fmtTokens(s.tokens.output);
-  const hr = Math.round((s.cache.hit_rate||0)*100);
-  $("cachek").textContent = hr + "%";
+function softFor(c){ return ({
+  'var(--accent)':'var(--soft)','var(--accent2)':'rgba(52,214,196,0.13)','var(--blue)':'rgba(91,168,245,0.14)',
+  'var(--purple)':'rgba(168,139,245,0.15)','var(--amber)':'rgba(242,184,75,0.14)','var(--neg)':'rgba(240,114,110,0.14)',
+  'var(--tx3)':'rgba(255,255,255,0.05)'})[c] || 'rgba(255,255,255,0.05)'; }
+function bdFor(c){ return ({
+  'var(--accent)':'var(--aline)','var(--accent2)':'rgba(52,214,196,0.4)','var(--blue)':'rgba(91,168,245,0.4)',
+  'var(--purple)':'rgba(168,139,245,0.42)','var(--amber)':'rgba(242,184,75,0.4)','var(--neg)':'rgba(240,114,110,0.4)',
+  'var(--tx3)':'rgba(255,255,255,0.12)'})[c] || 'rgba(255,255,255,0.12)'; }
 
-  // phase pipeline
-  const PIPE = ["observe","ideate","select","dispatch","backprop","decide"];
-  $("pipe").innerHTML = PIPE.map(p =>
-    `<span class="stg ${p===s.phase?"on":""}">${p}</span>`).join("");
+/* map a live node status -> design badge {label,color,icon} */
+function statusMeta(status, isBest){
+  if(isBest) return { label:'BEST', color:'var(--accent)', icon:'star' };
+  switch((status||'').toLowerCase()){
+    case 'merged':   return { label:'MERGED',  color:'var(--blue)',   icon:'arrow-up' };
+    case 'done':
+    case 'complete': return { label:'DONE',    color:'var(--purple)', icon:'check-circle' };
+    case 'running':
+    case 'active':   return { label:'TESTING', color:'var(--amber)',  icon:'timer' };
+    case 'pruned':   return { label:'PRUNED',  color:'var(--neg)',    icon:'zap' };
+    case 'failed':   return { label:'FAILED',  color:'var(--neg)',    icon:'x' };
+    case 'needs_retry': return { label:'RETRY', color:'var(--amber)', icon:'repeat' };
+    default:         return { label:'QUEUED',  color:'var(--tx3)',    icon:'lightbulb' };
+  }
+}
+function scoreColorFor(score){ const p=imprPct(score); if(p==null) return 'var(--tx3)'; return p>=0?'var(--accent)':'var(--neg)'; }
+
+/* ───────────────────────── themes ───────────────────────── */
+const THEMES = {
+  midnight:{ label:'Midnight', page:'radial-gradient(130% 130% at 78% -12%, #0c1a14 0%, #03100b 58%)', bg:'#05100b', card:'#0a1812', card2:'#0e2018', line:'#193a2c', line2:'#23503c', tx:'#e6f1ea', tx2:'#84a596', tx3:'#4f7263', pop:'#071611', sidebar:'linear-gradient(180deg,#08160f,#05100b)' },
+  indigo:{ label:'Indigo', page:'radial-gradient(130% 130% at 78% -12%, #141633 0%, #07071a 58%)', bg:'#080a1e', card:'#10132f', card2:'#161a3d', line:'#262c54', line2:'#343c70', tx:'#e9ebfb', tx2:'#9498c9', tx3:'#5c618f', pop:'#0a0c22', sidebar:'linear-gradient(180deg,#0d1029,#080a1e)' },
+  carbon:{ label:'Carbon', page:'radial-gradient(130% 130% at 78% -12%, #1c1c1c 0%, #050505 58%)', bg:'#0b0b0b', card:'#161616', card2:'#1e1e1e', line:'#2c2c2c', line2:'#3a3a3a', tx:'#f0f0f0', tx2:'#9c9c9c', tx3:'#5e5e5e', pop:'#101010', sidebar:'linear-gradient(180deg,#121212,#0b0b0b)' },
+  daylight:{ label:'Daylight', page:'radial-gradient(130% 130% at 78% -12%, #ffffff 0%, #e7ece9 58%)', bg:'#f3f6f4', card:'#ffffff', card2:'#eef2f0', line:'#e0e6e3', line2:'#cdd6d1', tx:'#18201c', tx2:'#566158', tx3:'#88948d', pop:'#ffffff', sidebar:'linear-gradient(180deg,#fafcfb,#eef2f0)' },
+};
+const ACCENT = '#35d6a0';
+function applyTheme(){
+  const t = THEMES[ST.theme] || THEMES.midnight;
+  const r = document.documentElement.style;
+  r.setProperty('--bg',t.bg); r.setProperty('--card',t.card); r.setProperty('--card2',t.card2);
+  r.setProperty('--line',t.line); r.setProperty('--line2',t.line2); r.setProperty('--tx',t.tx);
+  r.setProperty('--tx2',t.tx2); r.setProperty('--tx3',t.tx3); r.setProperty('--pop',t.pop); r.setProperty('--sidebar',t.sidebar);
+  r.setProperty('--accent',ACCENT); r.setProperty('--accent2','#34d6c4'); r.setProperty('--blue','#5ba8f5');
+  r.setProperty('--purple','#a88bf5'); r.setProperty('--amber','#f2b84b'); r.setProperty('--neg','#f0726e');
+  r.setProperty('--soft','rgba(53,214,160,0.12)'); r.setProperty('--aline','rgba(53,214,160,0.34)');
+  r.setProperty('--cardpad','18px'); r.setProperty('--gap','16px');
+  document.getElementById('app').style.background = t.page;
 }
 
-/* ── score-over-time chart ────────────────────────────────────── */
-function pushSeries(s){
-  if (s.best_score==null) return;
-  const t = s.elapsed_seconds||0;
-  const last = SERIES[SERIES.length-1];
-  if (last && last.t===t && last.best===s.best_score) return;
-  SERIES.push({t, best:s.best_score});
-  if (SERIES.length>600) SERIES.splice(0, SERIES.length-600);
-}
-
-function renderChart(s){
-  const svg = $("chart");
-  const W = svg.clientWidth || svg.parentElement.clientWidth || 720;
-  const H = 330;
-  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
-  const ml=48, mr=16, mt=14, mb=26;
-  const pw = W-ml-mr, ph = H-mt-mb;
-
-  const attempts = (s.tree||[]).filter(n => n.score!=null && n.finished_elapsed!=null)
-      .map(n => ({t:n.finished_elapsed, score:n.score, status:n.status, hyp:n.hypothesis, id:n.node_id}));
-  const ys = [];
-  SERIES.forEach(p=>ys.push(p.best));
-  attempts.forEach(a=>ys.push(a.score));
-  if (s.baseline_score!=null) ys.push(s.baseline_score);
-
-  if (!ys.length){
-    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="${C.dim2}" font-family="${MONO}" font-size="12">waiting for first result…</text>`;
-    CHART=null; $("chartnote").textContent=""; return;
+/* ───────────────────────── tree layout (from live parent graph) ───────── */
+function buildTree(){
+  const NW=180, NH=46, COL=240, ROW=64, MX=44, MY=30;
+  const nodes = SNAP.tree.slice();
+  const baseline = { node_id:'ROOT', _root:true, hypothesis:'Baseline', score:SNAP.baseline_score, status:'root' };
+  const byId = {}; nodes.forEach(n=>byId[n.node_id]=n);
+  const children = { ROOT:[] }; nodes.forEach(n=>children[n.node_id]=[]);
+  nodes.forEach(n=>{ const p=(n.parent_id && byId[n.parent_id])?n.parent_id:'ROOT'; (children[p]=children[p]||[]).push(n); });
+  const depth = { ROOT:0 };
+  (function dfs(id){ (children[id]||[]).forEach(c=>{ depth[c.node_id]=(depth[id]||0)+1; dfs(c.node_id); }); })('ROOT');
+  let slot=0; const yslot={};
+  (function assign(id){ const cs=children[id]||[]; if(!cs.length){ yslot[id]=slot++; return; }
+    cs.forEach(c=>assign(c.node_id)); yslot[id] = cs.reduce((a,c)=>a+yslot[c.node_id],0)/cs.length; })('ROOT');
+  const maxDepth = Math.max(0, ...Object.values(depth));
+  const leaves = Math.max(1, slot);
+  const vw = MX*2 + maxDepth*COL + NW;
+  const vh = Math.max(160, MY*2 + (leaves-1)*ROW + NH);
+  const best = bestNodeId();
+  const pos = (id)=>({ cx: MX + (depth[id]||0)*COL + NW/2, cy: MY + (yslot[id]||0)*ROW + NH/2 });
+  function visual(n){
+    const isBest = n.node_id===best; const p = imprPct(n.score); const st = (n.status||'').toLowerCase();
+    // titles stay high-contrast (light) except best (accent) / pruned (red);
+    // the delta value carries the status colour.
+    let tc='var(--tx)', vc='var(--tx2)', bg='var(--card2)', bd='var(--line2)', sh='none';
+    if(isBest){ tc='var(--accent)'; vc='var(--accent)'; bg='rgba(53,214,160,0.12)'; bd='var(--accent)'; sh='0 0 22px -4px var(--accent)'; }
+    else if(st==='pruned'||st==='failed'){ tc='var(--neg)'; vc='var(--neg)'; bg='rgba(240,114,110,0.07)'; bd='rgba(240,114,110,0.30)'; }
+    else if(p!=null && p>=0 && (st==='merged'||st==='done')){ tc='var(--accent)'; vc='var(--accent)'; bg='rgba(53,214,160,0.08)'; bd='rgba(53,214,160,0.32)'; }
+    else if(st==='running'||st==='active'){ tc='var(--tx)'; vc='var(--blue)'; bg='rgba(91,168,245,0.08)'; bd='rgba(91,168,245,0.30)'; }
+    else if(p!=null && p>=0){ tc='var(--accent)'; vc='var(--accent)'; }
+    else if(p!=null && p<0){ tc='var(--tx)'; vc='var(--neg)'; }
+    return { tc, vc, bg, bd, sh, isBest };
   }
-  let ymin=Math.min(...ys), ymax=Math.max(...ys);
-  if (ymax-ymin < 1e-9){ const pad=Math.abs(ymax)*0.1||1; ymin-=pad; ymax+=pad; }
-  else { const pad=(ymax-ymin)*0.08; ymin-=pad; ymax+=pad; }
-  const txs = SERIES.map(p=>p.t).concat(attempts.map(a=>a.t)).concat([s.elapsed_seconds||0]);
-  let xmax = Math.max(...txs, 1);
-
-  const X = t => ml + (xmax<=0?0:(t/xmax))*pw;
-  const Y = v => mt + (1-(v-ymin)/(ymax-ymin))*ph;
-
-  let g = "";
-  // horizontal gridlines + y labels (5 ticks)
-  g += `<g class="grid">`;
-  const NTY=4;
-  for(let i=0;i<=NTY;i++){ const y=mt+ph*i/NTY; g+=`<line x1="${ml}" y1="${y}" x2="${ml+pw}" y2="${y}"/>`; }
-  g += `</g><g class="axis">`;
-  for(let i=0;i<=NTY;i++){ const v=ymax-(ymax-ymin)*i/NTY; const y=mt+ph*i/NTY;
-    g+=`<text x="${ml-6}" y="${y+3}" text-anchor="end">${v.toFixed(v>=1?2:3)}</text>`; }
-  // x time labels (4)
-  const NTX=4;
-  for(let i=0;i<=NTX;i++){ const tt=xmax*i/NTX; const x=ml+pw*i/NTX;
-    g+=`<text x="${x}" y="${H-8}" text-anchor="${i===0?'start':i===NTX?'end':'middle'}">${fmtDur(tt)}</text>`; }
-  g += `</g>`;
-
-  // baseline
-  if (s.baseline_score!=null){
-    const by=Y(s.baseline_score);
-    g+=`<line class="baseline" x1="${ml}" y1="${by}" x2="${ml+pw}" y2="${by}"/>`;
-    g+=`<text class="baselab" x="${ml+pw}" y="${by-4}" text-anchor="end">baseline ${fmtScore(s.baseline_score)}</text>`;
-  }
-
-  // area fill under the best-so-far frontier (subtle), drawn first
-  if (SERIES.length){
-    const pts = SERIES.map(p=>`${X(p.t).toFixed(1)},${Y(p.best).toFixed(1)}`);
-    const line = pts.join(" ");
-    const area = `${ml},${mt+ph} ${line} ${X(SERIES[SERIES.length-1].t).toFixed(1)},${mt+ph}`;
-    g+=`<defs><linearGradient id="farea" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="${C.green}" stop-opacity="0.16"/>
-        <stop offset="100%" stop-color="${C.green}" stop-opacity="0"/></linearGradient></defs>`;
-    g+=`<polygon points="${area}" fill="url(#farea)"/>`;
-    var FRONTIER_PTS = line;     // drawn on top, after the dots
-  }
-
-  // scatter dots — kept light so the frontier line reads as the hero even
-  // when the cloud is dense. merged attempts are emphasised.
-  const dots = [];
-  g += `<g class="dots">`;
-  attempts.forEach(a=>{
-    const cx=X(a.t), cy=Y(a.score), c=STATUS_COLOR[a.status]||C.dim2;
-    dots.push({cx, cy, a});
-    if (a.status==="failed"){
-      g+=`<path d="M${cx-3},${cy-3} L${cx+3},${cy+3} M${cx+3},${cy-3} L${cx-3},${cy+3}" stroke="${c}" stroke-width="1.6" opacity="0.7"/>`;
-    } else if (a.status==="merged"){
-      g+=`<circle cx="${cx}" cy="${cy}" r="4.2" fill="${c}" stroke="${C.bg}" stroke-width="1.4"/>`;
-    } else {
-      g+=`<circle cx="${cx}" cy="${cy}" r="2.7" fill="${c}" fill-opacity="0.55"/>`;
-    }
+  const all = [baseline].concat(nodes);
+  const tnodes = all.map((n)=>{
+    const id=n.node_id; const pp=pos(id);
+    const v = n._root ? { tc:'var(--tx)', vc:'var(--tx2)', bg:'var(--card2)', bd:'var(--line2)', sh:'none', isBest:false } : visual(n);
+    const label = n._root ? 'ref' : (n.branch || id);
+    const valTxt = n._root ? fmtScore(n.score) : imprStr(n.score);
+    return { id, root:!!n._root, name: n._root?'Baseline':(n.hypothesis||id), idLabel:label, val:valTxt,
+      valColor:v.vc, titleColor:v.tc, bg:v.bg, bd:v.bd, shadow:v.sh, isBest:v.isBest,
+      cx:pp.cx, cy:pp.cy, w:NW, h:NH, node:n };
   });
-  g += `</g>`;
-  // frontier line on top of the cloud
-  if (SERIES.length){ g+=`<polyline class="frontier" points="${FRONTIER_PTS}"/>`; }
-  // hover cursor placeholder
-  g += `<line class="cursor" id="cursor" x1="0" y1="${mt}" x2="0" y2="${mt+ph}" style="display:none"/>`;
-
-  svg.innerHTML = g;
-  CHART = {dots, ml, mr, mt, mb, pw, ph, W, H};
-  $("chartnote").textContent = attempts.length + " attempts · best " + fmtScore(s.best_score);
+  const edges=[];
+  function colorOf(n){ const p=imprPct(n.score); const st=(n.status||'').toLowerCase();
+    if(st==='pruned'||st==='failed') return 'var(--neg)'; if(p!=null&&p>=0) return 'var(--accent)'; return 'var(--blue)'; }
+  nodes.forEach(n=>{ const pid=(n.parent_id&&byId[n.parent_id])?n.parent_id:'ROOT';
+    const a=pos(pid), b=pos(n.node_id); const x1=a.cx+NW/2, y1=a.cy, x2=b.cx-NW/2, y2=b.cy, mx=(x1+x2)/2;
+    edges.push({ d:`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`, color:colorOf(n) }); });
+  return { tnodes, edges, vw, vh };
+}
+function bestNodeId(){
+  let best=null, bestv=null;
+  SNAP.tree.forEach(n=>{ if(n.score==null) return; const better = bestv==null ||
+    (SNAP.metric_direction==='minimize' ? n.score<bestv : n.score>bestv);
+    if(better){ bestv=n.score; best=n.node_id; } });
+  return best;
+}
+function bestNode(){ const id=bestNodeId(); return SNAP.tree.find(n=>n.node_id===id) || null; }
+function branchCounts(){
+  let active=0, closed=0;
+  SNAP.tree.forEach(n=>{ const st=(n.status||'').toLowerCase();
+    if(st==='pruned'||st==='failed'||st==='merged'||st==='done'||st==='complete') closed++; else active++; });
+  return { active, closed, total: SNAP.tree.length };
+}
+function runningNode(){ return SNAP.tree.find(n=>(n.status||'').toLowerCase()==='running') || null; }
+/* search confidence: share of scored branches that beat the baseline */
+function confidencePct(){
+  const scored = SNAP.tree.filter(n=>n.score!=null);
+  if(!scored.length) return null;
+  const improved = scored.filter(n=>(imprPct(n.score)||0)>0).length;
+  return Math.round(100*improved/scored.length);
+}
+/* benchmark progress of the running branch: elapsed vs typical node runtime */
+function benchProgress(){
+  const running = Object.values(SNAP.agents).filter(a=>a && a.ok==null);
+  if(!running.length && !runningNode()) return 1;        // nothing in flight → complete
+  const durs = SNAP.tree.map(n=>n.runtime_seconds).filter(v=>v!=null).sort((a,b)=>a-b);
+  const med = durs.length ? durs[Math.floor(durs.length/2)] : 12;
+  let el = 0; running.forEach(a=>{ if(a.elapsed!=null) el=Math.max(el,a.elapsed); });
+  if(el<=0) return 0.15;
+  return Math.max(0.02, Math.min(0.98, el/Math.max(1,med)));
 }
 
-function onChartMove(ev){
-  if (!CHART || !CHART.dots.length){ $("tip").style.display="none"; return; }
-  const svg=$("chart"); const r=svg.getBoundingClientRect();
-  const scale = (svg.viewBox.baseVal.width||CHART.W)/r.width;
-  const mx = (ev.clientX-r.left)*scale;
-  let best=null, bd=1e9;
-  for(const d of CHART.dots){ const dd=Math.abs(d.cx-mx); if(dd<bd){bd=dd; best=d;} }
-  if (!best || bd>40){ $("tip").style.display="none"; const c=$("cursor"); if(c)c.style.display="none"; return; }
-  const cur=$("cursor"); if(cur){ cur.setAttribute("x1",best.cx); cur.setAttribute("x2",best.cx); cur.style.display=""; }
-  const tip=$("tip");
-  tip.innerHTML = `<div><span class="badge s-${best.a.status}">${esc(best.a.status)}</span> `
-    + `<span class="t-sc" style="color:${STATUS_COLOR[best.a.status]||'var(--fg)'}">${fmtScore(best.a.score)}</span></div>`
-    + `<div class="t-hy">${esc(best.a.hyp||"")}</div>`
-    + `<div class="t-meta">${esc(best.a.id)} · ${fmtDur(best.a.t)}</div>`;
-  tip.style.display="block";
-  tip.style.left = (best.cx/scale) + "px";
-  tip.style.top  = (best.cy/scale) + "px";
+/* ───────────────────────── render: shell ───────────────────────── */
+function navDefs(){ return [
+  { key:'home', label:'Home', icon:'home' }, { key:'pipeline', label:'Pipeline', icon:'activity' },
+  { key:'ideas', label:'Ideas', icon:'lightbulb' }, { key:'branches', label:'Branches', icon:'git-branch' },
+  { key:'ask', label:'Ask Arbor', icon:'sparkles' },
+]; }
+
+function renderShell(){
+  const sideW = ST.collapsed ? '74px' : '236px';
+  const sidePad = ST.collapsed ? '22px 12px' : '22px 16px';
+  const exp = !ST.collapsed; const just = ST.collapsed?'center':'flex-start';
+  const app = document.getElementById('app');
+  app.innerHTML = `
+  <div style="display:flex; height:100%; border:1px solid var(--line); border-radius:16px; overflow:hidden; background:var(--bg); box-shadow:0 30px 80px -30px rgba(0,0,0,.8); color:var(--tx);">
+    <aside style="width:${sideW}; min-width:${sideW}; max-width:${sideW}; flex:none; display:flex; flex-direction:column; padding:${sidePad}; border-right:1px solid var(--line); background:var(--sidebar); transition:width .2s ease; overflow:hidden;">
+      <div style="display:flex; align-items:center; gap:11px; padding:4px 4px 18px; justify-content:${just};">
+        <div style="width:38px; height:38px; flex:none; border-radius:11px; display:grid; place-items:center; background:var(--soft); border:1px solid var(--aline);"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAASlklEQVR42u2de7RcdXXHP+fMuTfII4lBSAjvgIkI0ZgWwUcFeS1KIQK6lEeJsIrgKu3CSkGrSJQKPopgrVawgCCIig9ClYIG5aGhrVKIKQSBVMGmDYYQQkhIcu+cc/rH3ptsfpy598zMmTkTV2etWbmZmXvnd/b78d37RAcuu44aHxEQ67/N4L0dgH2B/YDXADOBvYCdgMnABGAIGAY26u8/C6wB/gd4HFgG/CewHFgd/P0EyIFM/63lkdRI+IYSLdXXhoA3AIcCfwTMBnbTz433eIVj2h7AnOD93ykj7gXuBv4DeCGgQ1oHI/rNAJP2VIkfAW8F3gn8sUp5+PASGpX8njzQsKn6PEJffxK4HfiWMsW0r9FvjYj6ZIKMECbtU4GTgfkq9Z5wqX4+0v/njnlxye/L9EnB32oEjFwCXA98HXi634zoBwMajvB7AX+hhN8pIHocSG8r0/M8sF7/zR0xh9U3TGzBqNQx0my/Z8bvgOuALwIr3GezrZUBsZO6nYHzgLOBSfp+05mkrIDom4BHgAeAXwK/Uue6GtigjtdL6JASf0f1Ha8G5gJ/qI58m4AZXjMyZ47XAP8AXA6sc5/ZqhiQOLv6PmABsKsjfMMRwvuh1cCPgX8G7gOeqOg8e6tjP079wOTAvzScJtp5lgMnAA8HQjLQDPC2fj9V58PGIXwKLFIbfEeLcBGnTXmJM0TOtITh7XQl7Hzgje5vZ44RIxrm3gkcGZjRgWWAt5dnAZdpWNh0tjZ1TFgL3AhcrSaGwAzlFUpd7EyiJ+TR6pP+JNAIez6lfivrlSmKqc7RZsC26siuUuKnQcLTUAd6BfA64C+V+HHApLRilc9czhE5rboDOFZzjzvcORL1KT8JNGMg8wCz93sDN6vTM6m3ZMu+5ybg45ql4i6sp5FGQY7QDL7/Hn0eC/w1MA34qQYOUS/Pl1RE/AOBhWpfm07qTQMe1Yu5Lcg8U+p9pAEjfqDPuF9CEVdA/MM0cpnuCJ65csNV6uxu0//H+ns5g/NIg7wgK0jYBkoDjPhHq+RPcA42dbb+/Rrd0MtIogcaEZU4axTkLVknWpN0Qfy3O+Jngb3/L+DdmkQNirlp10+MR/y8IMRt23QlHUQ7Ta02euLHjvj3aXHtqSAh+315GPG313xittaQbgceapcJSZv+ItWM9gea9qeB5P8IOFFLBY3fQ+JbLrGX0mB/994lmvVf3w4T4ja4HmnB67vKhGYB8ecp8eOtzOS0+/iqEn9Er39U84ZrgFnOKlTGAHOgVwIHOaJb1LMYOB7Y3M8Qrgbpz5TAh+jPwy5pG1U6vacd2iZt2P3TgTMct83x/kqLXBtrJn4YNmYVn8X+9k4tyhIWvk6r0gkbQfdFSrQ+zrd6zjuQXmxdYaadMR2nJF5FOQOkSrrZ0SF27yfAg1UywLh6jXr91MXICXAa8FiN0Y7XuLeqeZyMVFTvdcSoopBmZeuVwJeBDwRllGHg11qOicoKY1LC7p8FvM3Zffv3Eo0EzP7VRfx9gX/Sglr4+CZS7XymIiaYxH9IQ/D5wHb63s+AM4Hn2jHFrcrRplavUhs/KUjRFyMNjkZNaAIzLXvoWXYtOIeVoJdo0riuQnNkj92BGUr0JZ1oWzyO6VkAvDLg5ibgz2rG1NhFXq7EH3FlZHvGaqvnAH/bTmjYBqzmv5Eq6pJAMLoqxpn67Kcqlbl6fwO4GKluJjVFPJZj7I6UjzM1g0WPYX1/PtIrTisqsHkgQSNwxF1XQ026LnIXkOtnHwE+V3NhzQg4W883Fl7IXp/ostaYahs9XTWP4jGk/11BNygCLlB1ZwDKyduWtOn2me0GNbsrkv7znIkxJvxMo55BKSv/rwMBlLnGJwdEcFoywGLXqUgpOUSRLRiQM1uz55dIxXWslqYJylL1W1ENfsv3u5PQXMYFaIRT2NJQt8jhX5EG9SAU2cwfbdCAIG4RCjddEfFvAvRdP/1V5s73sk5gXIAWm1/g2L7QAwdGl52rhmak/6hRUFSQZMbAB5Fafb+Fx0LSAzQhvA8BJAx73FISZL1zgdc7pxsjOMlb20mv+8iEGDgHuB+Bukx0WvIj4FNakui33zJfOlGZv5u+/iY980VWVYgDaT/eETpz6fzGXmJjKvAHX9U6jEnWKHCqEn+oBsEx6X+9En9UnylwktfGODA/xwSZXoZgeRhA4ntJG1K/RTBhU1fEZrRaocI7pBLfQLpp+5gvi4M22+uCi3tEo41oQDtcuXO4m1skSXVpZgz8Bvh5cJ4htmBSYz/0cLBTV7uwRS4PqKJ2kjhJiCpmxMiA5lh3BgkhjgEvKUe/JQjzUEfWrflpjAFLqdJERD0cqeoELGw0u7egUGdTQZkvqM0Nvng9MsxGF8mLma7tVMNm6v8f09xiUHvIUYukrZ2iW+aSwGeRqrIJ2yylyQZjwPZIY8M/HgZWddjI8BfwV8C5wJ7BZx4DPgncMGBM8PNke2scHys9lrcBwLJQfq1e60HuvVdpdPSocXQPfdETeuk4s1plulVXITX7PR1EvKk/zwS+pkzIBiTJM+LvhMwuPIxM6yxEQFe3KFPKnrfhhDksY+/uVWrPApV7qEubfzbSzhxxB/bNEmPIRxFURRXOvgqzMwkBG5+KzB+b/5qgedK9Sq+8DaFZVuAbdvUMmBGoDU7d8g5qH9tp8S5zBG/l4HLgY70ehmtjyORCpNew2RUkTTBG1HR8ueRZ7TO/LggUpnkGTA86/zmdlW/N088BdilRPzImzG1TtXsh/U2kx3Cq67JFLTpsR6sJLXve1QUMmOqJs3PwC+vVAXeiAaiUlB2oM9OzWw/DybLnnoq0LuMxzmFWYmaJ8+YOPxUK4w7+hVcGv/gcMgjdTaEs6hD4VKf9f7ZH53iuIFGc6BmwPS+fRt/cgQZkLsQsU742R/YsAn+pIxz10JozHewyGkP6Mz3vePSx9zbzcuzUtp5A24yxIKOTGsjDyHBGNA5izsyUx5XGfZR6AxjvjKC+/y5YKJIXlDtiDU2XtyEwUavX4h5dWAqcH4B78+DZdBc2HVkjM6Nger6XdZomcBTw78hcQ+qk3M+LmUZMQKZ/zmnTxEYFn99EwYIMKqj9WKLxE2Rgoel6of6ZBKn9fsqE1wSjrfRgLs407RLgh0gluOlM4jpkqHC9Q9itR0rzb0MAAWX8VuRM/DYFgc6LF/kCL6+lT1Db1Ul8bpHN1WqKLkDggZZtr0IqrbO1MGUXvztwFzLo8YuKQb+RG6WaBXxFiZk5hsRI6/D9yIKn3TTaibSp3+kWlYkFqLl1ngHPFzDgFQU19k76tg8gXaBJmnxkCJrheY2+bkNadTbJPk1LuMdp1lkFE3xF9gykfTnJ/V2jw2c0EbPpnxWO6OGqm3bD21BjVnsTtKqAAZMriMs9fO85laLHlfiJRj9HqenxKw0mqmk4Rokx1GFY6R3tFK09XVtA/Cf1uz7szuzP3nBS30letGeBaV/pGfB0YP+HCpIzuoTvRU7NI7cvaD2yLGNRAAbbRqONd7qpnFYXGFtY55zriItcjkA6U6c5TbC61EKtVN7uNCELzt7t7op9Cs68wjPgtwUDyjMqhqLkjrh5ELa+oCbn1oAJMTLw8F43gzVeZGNlhClujmGREqHpyi2bkSGLE5BtWY0eTPDb39q/wIz91tu+3xQ4lwPob/90RInxDWTQbdSd7zqNVD4xxj63PNDg2zW/mOWYb+HlUgRif3+LNTZVhuPDwGsD07gGgba/KDVP6AV7aZ/TRzRE5g53MgKFGQpGoj6OAMTSAk2YzJYddL7HMSvYA2Fgrjcp8ZMezjiYqXm1q43hKs3rgCh2QNcVwS/OVbua9qlAlrkk6GRk4NnH7KPIfqHzXJRi/mSOMsGXELJgJdkarXT+uZq8Xg+S29neXACftIGORuwO8lBQHtjFaUHcR5iJJUOnqzlquL5CCnxaVdovgzprjMQoQZDdB2silfQJZmPXcmSBVvyUgl2c/1aAKj6ihhKx3xP6PqSZ4cdNE/UFNoJ0BILm9psPm+7aPoUM8D3ucoq8D3WmVMP5QwKU9KgmewCZd7r3FEAx5gUMoc+OeYPWlKKgWTRPY/mZbFmH40PQRE3qMcBHgoUi9HFD8KEaznvzs0yDnihkwIOaHPhW4RyNhvIaOlUmxbfo2Xz0M4ygon+sF5g7O2ux/RtbxPb91ORTCkBZdzhhelG1G+qY7nYhm0Ub82uEptv5ri8AjZ3koovYnXeBhrMrexTblzU/U902Rj/It9Cb2hAd/R0XDtp7pyJN9rSGdqER7m4vNc4s5i6rbiBD2Re7C05rau4b3XYIqqyPavgbFaGj0YxxVbBCcrpKW14DbCRz811rg8pswxE/Ucn/kutoZTW1Ni35Oqcgub0pWGD7kn5AokWy7wZ93RxZ5ZiM0arr9WOzZrVFxb4EGR68uI9RzljSn2smP8PR0EofN4T+KC5Q968E9fEMaZK8u0bwVFFHyczPMxquRm1ktZHLjKOK58GGELBZ7jQiAv5Fo59GKwakbrfCnc6GmhZ8EukR1KUFrUrdlyH9hUZJs+MXdacVmlb7/vcGW7OMxp8rOycMcGnQRcoQ4NT5AwAh9CZzDbIppWxmG7umzzxk1cGUCiYoTfonI3spvPTHSJdvcVFgELeQqns0xvaNiQwZ95wVOpIa93veoiaozJIMu4bTEdTGrcD39ecTu0RkmPRf4rp+/m8taFVRiMeo4n04uA1IjjRJrnHJWlST9Nv3fr/kOYz4f4AM9E1xSO1pSM/hgA6ZYLnGIVroCxfYLtTaT+EwSjxGL/d+Ve9GsCHxLVoabtZ4FyaLKh4s2aM1h/un+v9R1xEb6SLhNMHcAWl15kGovAkBJLQENsTjINY+4jJKvx33Y1pnGa2BCbnrqa4s0bPwDZcpBabAtGNXOoe4XKlhZxZk5ZdqEbAliiIep0GyBoFoRO41u6Ab9Ev77Q9yhyoYHQc2k7g5hA8hCwazYAomdWi+dh5DrkdxiqOD5SZLkNL5mNFZPI6jS5DG+JUuyTFuTlFHNqkmWHle8kZxMxGQ2KfdDYQazndMQBpS17YRTSVK/KOAzzuJz52JsxWfY6LE45LYnnPV3ibBuuIDgO+5xsggjBn5OP9MBA3xdodxihHQ1VoEFnMbsoL/qZIgNBPENwDfDiAwpgXnqwaMu1UsLtnVGdH0ep0zR/7+ATc70xTXfHvEFOnmfVuDiElK/AlK9NOQgfRZqh3HtrHKxq75tZrZTnTXbPilm4C/Lwsoi9uAGT6uUYQHKNmXHK81pKSmRM1L/Ykawb1LTUCmxL8Lwf/cqMRepX4kLplHDOm17q+VgmnOf1hE+HMEbVG6Ehu3kfgkGnd/ICh62c/vUHWe3CeEs5++T1XSr1RBmK5Sb2NGnwAOZ8uS2ZyXjtJmJR3uQepPdgni/QRBlhxvqOeyBcG4zQ5Voup1qZMIr5pHInjOWQEqmh51zFIljCHfznavTUDgH4dr3kLQlsxLZs/Wxz1BJX/ngmTraaT5srKNmlRHXS7j9keR+d+hAk2YrXWP44K7FVWNt9kHgXx8FuljzFSpb+i5blSJvSvAnbYb46d6vd9DYOZZQPy1SvxlnaxeSDrcl9lA8Dl5gNMxc7Cjhq+fRdDGoxXeszd2W8wXu3OZ1D+vZvLaoFTQCYx9OgLkmhfkQabdzyjxO4bSx11gPBtIo+aioPHt7w12gRLpzYGmVIm7abpG/WIE/3Nt0NVrt7SQatT3CyV+MwAVJwi28zBkuqZjCH3cJdC2oeXXM9whm4GkHIgAoz6PNKqbFZuixE27HKqmoBNts7+3I9Ib/2Zwa67cEf8BZHf20m7nF+IK1vcmCHj2cJWKMEIyu3uuJifnuegkqkADNmr0cWEQFnaKwLiaLZD4PHCqCXIX7kP0WruGN8YVRSOJllwPUtufBA2JyDVCLgsqh92urzxdSyLDXeB/7HyTVZCaBSg7Gzw8iS2zY+mg3MzTnPBTmg98kC13UkqDBeApAtnYq4saUupmB25WjRrp0sFHGkWtcybMJmyWIvNklwXTkwwKAwimYK5QZ7gouH2hR0BPqKAhc0VFxDBt2qgmcoMSfgOCLT0YWTCVVH2/hKRHiOAEQVsfpQ76QjdxgzJmeYeT8bnb3f9ghXdjNQH6lkY2eyMohic6DGdrYUCI68yRFuB3lBEHImjny7tA2vmGzOaK19yYJjwREL5nGxiTPqDaGpocfaGDezb2e0mfR2ZHPRpd6hsDQtUuwnUO6qNvsMakhrtYV9UBG2QG1hIF9foxFIy3Dv8/A/p3r4BNyJaSyL32wFYoRFutBmQI6Gmp/vxDBDgWsZXfOPT/AIXkFNwN4oc7AAAAAElFTkSuQmCC" width="22" height="22" alt="Arbor" style="display:block;"></div>
+        ${exp?`<span style="font-size:21px; font-weight:600; letter-spacing:-.02em; white-space:nowrap;">Arbor</span>
+        <button data-act="toggle-sidebar" title="Collapse sidebar" style="all:unset; cursor:pointer; margin-left:auto; width:30px; height:30px; flex:none; border-radius:8px; display:grid; place-items:center; color:var(--tx3);" class="hb">${ic('chevrons-left',17)}</button>`:''}
+      </div>
+      ${ST.collapsed?`<button data-act="toggle-sidebar" title="Expand sidebar" style="all:unset; cursor:pointer; width:38px; height:32px; margin:0 auto 12px; border-radius:8px; display:grid; place-items:center; color:var(--tx3); border:1px solid var(--line);" class="hb">${ic('chevrons-right',17)}</button>`:''}
+      <nav style="display:flex; flex-direction:column; gap:3px;">
+        ${navDefs().map(d=>{ const a=ST.screen===d.key; return `
+        <button data-act="nav:${d.key}" title="${d.label}" class="hb" style="all:unset; cursor:pointer; display:flex; align-items:center; gap:13px; padding:11px 13px; border-radius:10px; font-size:14.5px; font-weight:500; background:${a?'var(--soft)':'transparent'}; color:${a?'var(--accent)':'var(--tx2)'}; border:1px solid ${a?'var(--aline)':'transparent'}; justify-content:${just}; transition:background .15s, color .15s;">
+          ${ic(d.icon,18,'opacity:.95; flex:none;')}${exp?`<span style="white-space:nowrap;">${d.label}</span>`:''}
+        </button>`; }).join('')}
+      </nav>
+      <div style="margin-top:auto; display:flex; flex-direction:column; gap:11px;">
+        <div style="padding:13px 14px; border-radius:12px; background:var(--card); border:1px solid var(--line);">
+          <div style="display:flex; align-items:center; gap:9px; justify-content:${just};">
+            <span style="width:8px; height:8px; flex:none; border-radius:50%; background:var(--accent); box-shadow:0 0 9px var(--accent); animation:pulse 1.8s ease-in-out infinite;"></span>
+            ${exp?`<span id="sideTask" style="font-family:'IBM Plex Mono',monospace; font-size:13px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(SNAP.run_name)}</span>`:''}
+          </div>
+          ${exp?`<div style="font-size:11.5px; color:var(--tx3); margin-top:5px; padding-left:17px;">Active Task</div>`:''}
+        </div>
+        <a href="https://github.com/RUC-NLPIR/Arbor" target="_blank" rel="noopener" title="View Repository" class="hb" style="display:flex; align-items:center; gap:10px; padding:11px 14px; border-radius:11px; background:transparent; border:1px solid var(--line); color:var(--tx2); text-decoration:none; font-size:13.5px; font-weight:500; justify-content:${just};">
+          ${ic('github',17,'flex:none;')}${exp?`<span style="white-space:nowrap;">View Repository</span>`:''}
+        </a>
+      </div>
+    </aside>
+    <main style="flex:1; display:flex; flex-direction:column; min-width:0;">
+      <header style="flex:none; display:flex; align-items:center; justify-content:flex-end; gap:12px; padding:16px 28px; border-bottom:1px solid var(--line);">${topbarHTML()}</header>
+      <div id="gatebar" style="display:none;"></div>
+      <div style="flex:1; overflow-y:auto; overflow-x:auto;">
+        <div style="min-width:960px; padding:26px 28px 40px;" id="content"></div>
+      </div>
+    </main>
+  </div>
+  <div id="overlay"></div>`;
+  renderContent();
+  renderOverlay();
+  _gateKey=null; renderGate();
 }
 
-/* ── leaderboard ──────────────────────────────────────────────── */
-function renderLeaderboard(s){
-  const scored = (s.tree||[]).filter(n=>n.score!=null);
-  const lb=$("lb");
-  if(!scored.length){ lb.innerHTML='<div class="empty">no scored ideas yet…</div>'; $("lbnote").textContent=""; return; }
-  const minimize = s.metric_direction==="minimize";
-  scored.sort((a,b)=> minimize ? a.score-b.score : b.score-a.score);
-  const top = scored.slice(0,12);
-  const vmax=Math.max(...scored.map(n=>Math.abs(n.score)),1e-9);
-  lb.innerHTML = `<table class="lb"><thead><tr>
-      <th></th><th></th><th>idea</th><th style="text-align:right">score</th></tr></thead><tbody>`
-    + top.map((n,i)=>{
-      const w = Math.max(2, Math.round(Math.abs(n.score)/vmax*90));
-      const col = STATUS_COLOR[n.status]||"var(--green)";
-      return `<tr>
-        <td class="rk">${i+1}</td>
-        <td><span class="badge s-${esc(n.status)}">${esc(n.status)}</span></td>
-        <td class="hy"><span class="nid">${esc(n.node_id)}</span> ${esc(n.hypothesis)}</td>
-        <td><div class="scwrap"><span class="scbar" style="width:${w}px;background:${col}"></span>
-            <span class="sc" style="color:${col}">${fmtScore(n.score)}</span></div></td></tr>`;
-    }).join("") + `</tbody></table>`;
-  $("lbnote").textContent = scored.length + " scored";
+/* Review-gate banner: a run-level interrupt shown above all views. Rebuilt only
+ * when the gate changes (so the edit field survives heartbeats). */
+let _gateKey=null;
+function renderGate(){
+  const bar=document.getElementById('gatebar'); if(!bar) return;
+  const g=SNAP.gate;
+  if(!g){ bar.style.display='none'; bar.innerHTML=''; _gateKey=null; return; }
+  const key=`${g.node_id}|${g.prompt}|${(g.options||[]).join(',')}|${INTERACTIVE?1:0}`;
+  bar.style.display='block';
+  if(key===_gateKey) return;        // unchanged → don't clobber the edit field
+  _gateKey=key;
+  const opts=(g.options||[]).filter(o=>!String(o).startsWith('<'));
+  const col=o=> o==='approve'?'var(--accent)' : (o==='reject'||o==='skip')?'var(--neg)' : 'var(--blue)';
+  const btns=opts.map(o=>{ const c=col(o); return `<button data-act="gate:${esc(o)}" style="all:unset; cursor:pointer; padding:8px 16px; border-radius:8px; font-size:12.5px; font-weight:600; font-family:'IBM Plex Mono',monospace; color:${c}; background:${softFor(c)}; border:1px solid ${bdFor(c)};">${esc(o)}</button>`; }).join('');
+  const controls = INTERACTIVE
+    ? `<div style="display:flex; flex-wrap:wrap; align-items:center; gap:8px;">${btns}
+        <input id="gate-edit-input" placeholder="revise / add feedback…" style="background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; color:var(--tx); font-family:'IBM Plex Sans',sans-serif; font-size:13px; outline:none; min-width:200px;" />
+        <button data-act="gate-edit" class="hb" style="all:unset; cursor:pointer; padding:8px 14px; border-radius:8px; font-size:12.5px; font-weight:600; color:var(--tx2); border:1px solid var(--line);">Submit edit</button></div>`
+    : `<span style="font-size:12px; color:var(--tx3);">read-only — answer from the terminal, or relaunch with input enabled</span>`;
+  bar.innerHTML = `<div style="margin:14px 28px 0; padding:14px 18px; border-radius:12px; background:var(--soft); border:1px solid var(--aline); display:flex; flex-wrap:wrap; align-items:center; gap:12px 16px;">
+      <div style="display:flex; align-items:center; gap:10px; flex:1; min-width:220px;">
+        <span style="width:32px; height:32px; flex:none; border-radius:9px; display:grid; place-items:center; background:var(--card); border:1px solid var(--aline); color:var(--amber);">${ic('pause',16)}</span>
+        <div style="min-width:0;">
+          <div style="font-size:11px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--amber);">Awaiting your decision · ${esc(g.kind||'review')}${g.node_id?(' · '+esc(g.node_id)):''}</div>
+          <div style="font-size:13.5px; color:var(--tx); margin-top:3px;">${esc(g.prompt||'')}</div>
+        </div>
+      </div>${controls}
+    </div>`;
+  const gi=document.getElementById('gate-edit-input');
+  if(gi) gi.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); const t=gi.value.trim(); if(t){ postInput({type:'gate', node_id:g.node_id||'', value:'edit '+t}); gi.value=''; } } });
 }
 
-/* ── idea tree (indented by parent depth) ─────────────────────── */
-function depthOf(n, byId, seen){
-  let d=0, cur=n; seen=seen||new Set();
-  while(cur && cur.parent_id!=null && byId[cur.parent_id] && !seen.has(cur.node_id)){
-    seen.add(cur.node_id); cur=byId[cur.parent_id]; d++; if(d>12) break;
-  }
-  return d;
+function topbarHTML(){
+  const live = ST.live;
+  const liveBd = live?'var(--aline)':'var(--line)', liveBg=live?'var(--soft)':'var(--card)', liveColor=live?'var(--accent)':'var(--tx2)';
+  return `
+    <button data-act="toggle-live" title="Toggle live updates" style="all:unset; cursor:pointer; display:flex; align-items:center; gap:8px; padding:8px 14px; border-radius:9px; border:1px solid ${liveBd}; background:${liveBg}; color:${liveColor}; font-size:12.5px; font-weight:600; letter-spacing:.02em;">
+      ${ic(live?'pause':'play',13)}<span>${live?'Live':'Paused'}</span>
+    </button>
+    <div style="display:flex; align-items:center; gap:9px; padding:8px 13px; border-radius:9px; border:1px solid var(--line); background:var(--card); font-family:'IBM Plex Mono',monospace; font-size:13px; color:var(--tx);">
+      <span>${esc(SNAP.run_name)}</span>${ic('chevron-down',15,'color:var(--tx3);')}
+    </div>
+    <div style="position:relative;">
+      <button data-act="toggle-theme" title="Theme" class="hb" style="all:unset; cursor:pointer; width:38px; height:38px; border-radius:9px; border:1px solid var(--line); background:var(--card); display:grid; place-items:center; color:var(--tx2);">${ic('palette',17)}</button>
+      ${ST.themeMenuOpen?`
+      <div data-act="toggle-theme" style="position:fixed; inset:0; z-index:40;"></div>
+      <div style="position:absolute; right:0; top:46px; z-index:50; width:190px; background:var(--pop); border:1px solid var(--line2); border-radius:11px; padding:6px; box-shadow:0 18px 40px rgba(0,0,0,.45);">
+        <div style="font-size:10px; font-weight:600; letter-spacing:.1em; color:var(--tx3); text-transform:uppercase; padding:6px 9px 7px;">Theme</div>
+        ${Object.keys(THEMES).map(k=>{ const t=THEMES[k]; const a=ST.theme===k; return `
+          <button data-act="theme:${k}" class="hpop" style="all:unset; cursor:pointer; display:flex; align-items:center; gap:10px; width:100%; box-sizing:border-box; padding:8px 9px; border-radius:8px; background:${a?'var(--soft)':'transparent'}; color:var(--tx); font-size:13px;">
+            <span style="display:flex; border-radius:5px; overflow:hidden; border:1px solid var(--line2); flex:none;"><span style="width:13px; height:18px; background:${t.bg};"></span><span style="width:13px; height:18px; background:${t.card2};"></span></span>
+            <span style="flex:1;">${t.label}</span>${a?ic('check',15,'color:var(--accent);'):''}
+          </button>`; }).join('')}
+      </div>`:''}
+    </div>`;
 }
-function renderTree(s){
-  const svg=$("treesvg"), empty=$("treeempty"), note=$("treenote");
-  const nodes=s.tree||[];
-  const task=(s.task||"").trim();
-  note.textContent = nodes.length ? `${nodes.length} node(s)` : "";
-  if(!nodes.length && !task){ empty.style.display="block"; svg.innerHTML=""; svg.removeAttribute("width"); TREE_NODES=[]; return; }
-  empty.style.display="none";
+function updateTopbar(){ const h=document.querySelector('#app header'); if(h) h.innerHTML = topbarHTML(); }
 
-  // Synthetic ROOT showing the task instruction; the real depth-0 ideas hang
-  // off it so the whole exploration reads as one tree growing from the goal.
-  const ROOT="__task__";
-  const byId={}; nodes.forEach(n=>byId[n.node_id]=n);
-  const kids={}; const realRoots=[];
-  nodes.forEach(n=>{
-    const p = (n.parent_id!=null && byId[n.parent_id] && n.parent_id!==n.node_id) ? n.parent_id : null;
-    if(p){ (kids[p]=kids[p]||[]).push(n.node_id); } else { realRoots.push(n.node_id); }
+/* ───────────────────────── content router ───────────────────────── */
+function renderContent(){
+  const c = document.getElementById('content'); if(!c) return;
+  const v = ST.screen;
+  if(v==='home') c.innerHTML = viewHome();
+  else if(v==='pipeline') c.innerHTML = viewPipeline();
+  else if(v==='ideas') c.innerHTML = viewIdeas();
+  else if(v==='branches') c.innerHTML = viewBranches();
+  else if(v==='ask'){ c.innerHTML = viewAsk(); wireAsk(); }
+}
+function emptyRow(t){ return `<div style="padding:24px 8px; font-size:13px; color:var(--tx3);">${t}</div>`; }
+
+/* ════════════════════════ HOME ════════════════════════ */
+function statCard(label, value, sub, valColor, grad, valId){
+  return `<div style="min-width:0; padding:var(--cardpad); border-radius:13px; background:${grad?'linear-gradient(160deg,var(--card2),var(--card))':'var(--card)'}; border:1px solid var(--line);">
+    <div style="font-size:12.5px; color:var(--tx2); font-weight:500;">${label}</div>
+    <div ${valId?`id="${valId}" `:''}style="font-family:'IBM Plex Mono',monospace; font-size:28px; font-weight:600; white-space:nowrap;${valColor?`color:${valColor};`:''} margin-top:6px; letter-spacing:-.02em;">${value}</div>
+    <div style="font-size:11.5px; color:var(--tx3); margin-top:3px;">${sub}</div></div>`;
+}
+function viewHome(){
+  const bc = branchCounts();
+  const best = SNAP.best_score;
+  const baseStr = SNAP.baseline_score!=null ? Number(SNAP.baseline_score).toFixed(4) : '—';
+  const finished = (SNAP.phase==='done'||SNAP.phase==='complete');
+  return `
+  <div>
+    <div style="display:flex; flex-direction:column; gap:var(--gap); margin-bottom:var(--gap);">
+      <div style="padding-top:2px;">
+        <div style="font-size:12px; font-weight:600; letter-spacing:.14em; color:var(--tx3); text-transform:uppercase;">Active Objective</div>
+        <h1 style="margin:8px 0 0; font-size:30px; font-weight:700; letter-spacing:-.025em; line-height:1.1;">${esc(SNAP.task || SNAP.run_name)}</h1>
+        <p style="margin:10px 0 0; font-size:14.5px; color:var(--tx2); max-width:560px; line-height:1.5;">Autonomously improving performance through iterative tree search over candidate optimizations.</p>
+        <div style="display:flex; align-items:center; gap:10px; margin-top:14px; font-size:13px;">
+          <span style="width:9px; height:9px; border-radius:50%; background:${finished?'var(--blue)':'var(--accent)'}; box-shadow:0 0 10px ${finished?'var(--blue)':'var(--accent)'}; ${finished?'':'animation:pulse 1.8s ease-in-out infinite;'}"></span>
+          <span style="font-weight:600; color:${finished?'var(--blue)':'var(--accent)'}; letter-spacing:.04em;">${finished?'DONE':(CONNECTED?'RUNNING':'CONNECTING')}</span>
+          <span style="color:var(--tx3);">•</span>
+          <span id="hp-started" style="color:var(--tx2); font-family:'IBM Plex Mono',monospace;">Started ${fmtAgo(SNAP.elapsed_seconds)}</span>
+        </div>
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; align-items:stretch;">
+        ${statCard('Improvement', imprStr(best), 'vs baseline '+baseStr, 'var(--accent)', true)}
+        ${statCard('Best Score', fmtScore(best), 'baseline '+baseStr, 'var(--accent2)', false)}
+        ${statCard('Branches', String(bc.total), `active ${bc.active} · closed ${bc.closed}`, null, false)}
+        ${statCard('Runtime', fmtRun(SNAP.elapsed_seconds), 'total elapsed', null, false, 'st-runtime')}
+        ${statCard('Tokens', fmtTok(SNAP.tokens.input)+' / '+fmtTok(SNAP.tokens.output), 'in / out', 'var(--amber)', false, 'st-tokens')}
+        ${statCard('Cache', cacheHitStr(), fmtTok(SNAP.cache.read)+' read', 'var(--blue)', false, 'st-cache')}
+      </div>
+    </div>
+
+    <div id="home-charts" style="display:grid; grid-template-columns:1.4fr 1fr; gap:var(--gap); margin-bottom:var(--gap);">${chartsInnerHTML()}</div>
+
+    <div style="display:grid; grid-template-columns:280px minmax(0,1fr); gap:var(--gap); margin-bottom:var(--gap);">
+      <section style="padding:var(--cardpad); border-radius:14px; background:var(--card); border:1px solid var(--line); display:flex; flex-direction:column;">
+        <div style="font-size:11.5px; font-weight:600; letter-spacing:.14em; color:var(--tx3); text-transform:uppercase; margin-bottom:14px;">Pipeline</div>
+        <div style="flex:1; display:flex; flex-direction:column; justify-content:space-between; gap:4px;">
+          ${pipelineSteps().map(step=>`
+            <div style="padding:9px 10px; border-radius:9px; background:${step.rowBg}; border-left:2px solid ${step.accentBar};">
+              <div style="display:flex; align-items:center; gap:12px;">
+                ${ic(step.icon,18,`color:${step.iconColor}; flex:none;`)}
+                <span style="flex:1; font-size:14px; font-weight:500; color:${step.labelColor};">${step.label}</span>
+                <span style="font-size:11.5px; font-family:'IBM Plex Mono',monospace; color:${step.statusColor};">${step.statusLabel}</span>
+                <span style="width:18px; display:grid; place-items:center; color:${step.statusColor};">${ic(step.statusIcon,15,step.spinStyle)}</span>
+              </div>
+              ${step.isRunning?`<div style="margin-top:6px; padding-left:30px; font-size:11.5px; color:var(--tx2); line-height:1.45;">${step.detail}</div>`:''}
+            </div>`).join('')}
+        </div>
+      </section>
+      <div style="display:flex; flex-direction:column; gap:var(--gap); min-width:0;">
+        <section style="padding:var(--cardpad); border-radius:14px; background:var(--card); border:1px solid var(--line); display:flex; flex-direction:column;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+            <span style="font-size:11.5px; font-weight:600; letter-spacing:.14em; color:var(--tx3); text-transform:uppercase;">Search Tree (Branches)</span>
+            <button data-act="nav:branches" class="hb" style="all:unset; cursor:pointer; font-size:12px; color:var(--tx2); padding:6px 12px; border-radius:8px; border:1px solid var(--line);">View All Branches</button>
+          </div>
+          ${treeLegend()}
+          ${treeStage(660)}
+        </section>
+        ${currentHypothesis()}
+      </div>
+    </div>
+
+    <div style="display:grid; grid-template-columns:minmax(0,1fr) 360px; gap:var(--gap);">
+      <section style="padding:var(--cardpad); border-radius:14px; background:var(--card); border:1px solid var(--line);">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+          <span style="font-size:11.5px; font-weight:600; letter-spacing:.14em; color:var(--tx3); text-transform:uppercase;">Top Candidate Ideas</span>
+          <button data-act="nav:ideas" class="hb" style="all:unset; cursor:pointer; font-size:12px; color:var(--tx2); padding:6px 12px; border-radius:8px; border:1px solid var(--line);">View All Ideas</button>
+        </div>
+        <div>${topIdeas().map((idea)=>`
+          <div data-act="idea:${escA(idea.id)}" class="hl" style="display:flex; align-items:center; gap:16px; padding:15px 8px; border-bottom:1px solid var(--line); cursor:pointer; border-radius:8px; transition:background .12s;">
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:14px; color:var(--tx3); width:14px; text-align:center;">${idea.rank}</span>
+            <span style="flex:none; padding:4px 9px; border-radius:6px; font-size:10.5px; font-weight:700; letter-spacing:.06em; color:${idea.color}; background:${idea.soft}; border:1px solid ${idea.bd};">${idea.status}</span>
+            <span style="flex:none; width:36px; height:36px; border-radius:9px; display:grid; place-items:center; color:${idea.color}; background:${idea.soft};">${ic(idea.icon,18)}</span>
+            <div style="flex:1; min-width:0;"><div style="font-size:14.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(idea.title)}</div>
+            <div style="font-size:12.5px; color:var(--tx2); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(idea.desc)}</div></div>
+            <div style="flex:none; text-align:right; width:96px;"><div style="font-size:11px; color:var(--tx3);">Expected Impact</div><div style="font-family:'IBM Plex Mono',monospace; font-size:13.5px; font-weight:500; margin-top:2px;">${idea.impact}</div></div>
+            <div style="flex:none; text-align:right; width:96px;"><div style="font-size:11px; color:var(--tx3);">Score</div><div style="font-family:'IBM Plex Mono',monospace; font-size:14px; font-weight:600; margin-top:2px; color:${idea.scoreColor};">${idea.score}</div></div>
+            ${ic('chevron-down',17,'color:var(--tx3); flex:none;')}
+          </div>`).join('') || emptyRow('no ideas yet…')}</div>
+        <button data-act="nav:ideas" class="ha" style="all:unset; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; width:100%; padding:14px 0 4px; font-size:13px; color:var(--tx2);"><span>View all ideas</span>${ic('arrow-right',15)}</button>
+      </section>
+      <section style="padding:var(--cardpad); border-radius:14px; background:var(--card); border:1px solid var(--line); display:flex; flex-direction:column;">
+        <div style="font-size:11.5px; font-weight:600; letter-spacing:.14em; color:var(--tx3); text-transform:uppercase; margin-bottom:6px;">Recent Activity</div>
+        <div id="home-activity" style="flex:1;">${activityRowsHTML()}</div>
+      </section>
+    </div>
+  </div>`;
+}
+
+/* ── charts (sparklines) ── */
+function chartsInnerHTML(){
+  const bc = branchCounts(); const best = SNAP.best_score; const ch = homeCharts();
+  return `<section style="padding:var(--cardpad); border-radius:14px; background:var(--card); border:1px solid var(--line);">
+      <div style="display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:14px;">
+        <div><div style="font-size:11.5px; font-weight:600; letter-spacing:.14em; color:var(--tx3); text-transform:uppercase;">Improvement Trajectory</div>
+        <div style="font-size:12px; color:var(--tx2); margin-top:5px;">% gain vs baseline across ${bc.total} cycles</div></div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:22px; font-weight:600; color:var(--accent); letter-spacing:-.02em;">${imprStr(best)}</div>
+      </div>${ch.impr}
+    </section>
+    <section style="padding:var(--cardpad); border-radius:14px; background:var(--card); border:1px solid var(--line);">
+      <div style="display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:14px;">
+        <div><div style="font-size:11.5px; font-weight:600; letter-spacing:.14em; color:var(--tx3); text-transform:uppercase;">Branch Growth</div>
+        <div style="font-size:12px; color:var(--tx2); margin-top:5px;">tree expansion over time</div></div>
+        <div style="display:flex; gap:16px; font-family:'IBM Plex Mono',monospace; font-size:13px;">
+          <span style="color:var(--purple);">active ${bc.active}</span><span style="color:var(--tx3);">closed ${bc.closed}</span></div>
+      </div>${ch.branch}
+    </section>`;
+}
+function homeCharts(){
+  const base = SNAP.baseline_score, elapsed = SNAP.elapsed_seconds, cyc = SNAP.cycle_num || 0;
+  const cycleAt = (frac)=> Math.max(1, Math.round(frac*(cyc||1)) || 1);
+  const tsAt = (frac)=> clockFromElapsed(elapsed*(1-frac));   // wall-clock for a point along the run
+  let hist = SNAP.best_score_history.map(imprPct).filter(v=>v!=null);
+  if(hist.length===0 && SNAP.best_score!=null){ const p=imprPct(SNAP.best_score); if(p!=null) hist=[p]; }
+  if(hist.length===1) hist=[hist[0],hist[0]];
+  if(hist.length===0) hist=[0,0];
+  const imprTips = hist.map((v,i)=>{ const frac=hist.length>1?i/(hist.length-1):1;
+    const score = base!=null ? (SNAP.metric_direction==='minimize'? base*(1-v/100) : base*(1+v/100)) : null;
+    return { cycle:'Cycle '+cycleAt(frac), big:(v>=0?'+':'')+v.toFixed(2)+'%',
+      score: score!=null?('score '+score.toFixed(4)):'', vs: base!=null?('vs baseline '+Number(base).toFixed(4)):'', ts: tsAt(frac) }; });
+  const impr = sparkSVG(hist, 'var(--accent)', 'cg-impr', ST.hoverImpr, 'hoverImpr', true, imprTips);
+  const fin = SNAP.tree.map(n=>n.finished_elapsed).filter(v=>v!=null).sort((a,b)=>a-b);
+  let barr;
+  if(fin.length>=2) barr = fin.map((_,i)=>i+1);
+  else { const total=Math.max(1, SNAP.tree.length); barr=[]; const n=Math.min(9,Math.max(2,total)); for(let i=0;i<n;i++) barr.push(Math.round(1+(i/(n-1))*(total-1))); }
+  const brTips = barr.map((v,i)=>{ const frac=barr.length>1?i/(barr.length-1):1;
+    return { cycle:'Cycle '+cycleAt(frac), big:v+(v===1?' branch':' branches'), score:'', vs:'active + closed in tree', ts: tsAt(frac) }; });
+  const branch = sparkSVG(barr, 'var(--purple)', 'cg-br', ST.hoverBranch, 'hoverBranch', false, brTips);
+  return { impr, branch };
+}
+function sparkSVG(arr, color, gid, hoverIdx, hoverKey, withProj, tips){
+  const h=38, W=100, ACT = withProj?84:100;
+  const max=Math.max(...arr), min=Math.min(...arr), rng=(max-min)||1;
+  const xOf=i=>(i/(arr.length-1))*ACT, yOf=v=>(h-3-((v-min)/rng)*(h-8));
+  const pts=arr.map((v,i)=>xOf(i).toFixed(1)+','+yOf(v).toFixed(1));
+  const lastX=xOf(arr.length-1), lastY=yOf(arr[arr.length-1]);
+  let proj='';
+  if(withProj){ const projX=98, projY=lastY; proj=`<path d="M${lastX.toFixed(1)},${lastY.toFixed(1)} L${projX},${projY.toFixed(1)}" fill="none" stroke="${color}" stroke-width="1.6" stroke-dasharray="3 2.4" vector-effect="non-scaling-stroke" stroke-linecap="round" opacity="0.85"></path>`; }
+  const ring=(a)=>a?`0 0 0 4px var(--soft)`:`0 0 0 2px var(--card)`;
+  const dots = arr.map((v,i)=>{ const a=hoverIdx===i; return `<div data-hover="${hoverKey}:${i}" style="position:absolute; left:${xOf(i).toFixed(2)}%; top:${((yOf(v)/h)*100).toFixed(2)}%; width:22px; height:22px; transform:translate(-50%,-50%); cursor:pointer; display:grid; place-items:center;"><span style="width:${a?'9px':'5px'}; height:${a?'9px':'5px'}; border-radius:50%; background:${color}; box-shadow:${ring(a)};"></span></div>`; }).join('');
+  let tip='';
+  if(hoverIdx!=null && arr[hoverIdx]!=null && tips && tips[hoverIdx]){ const T=tips[hoverIdx];
+    const align = hoverIdx > arr.length*0.6 ? '-100%' : hoverIdx < arr.length*0.4 ? '0' : '-50%';
+    tip=`<div style="position:absolute; left:${xOf(hoverIdx).toFixed(2)}%; top:${((yOf(arr[hoverIdx])/h)*100).toFixed(2)}%; transform:translate(${align},calc(-100% - 14px)); pointer-events:none; background:var(--pop); border:1px solid var(--line2); border-radius:9px; padding:9px 12px; white-space:nowrap; box-shadow:0 10px 24px rgba(0,0,0,.55); z-index:5; min-width:132px;">
+      <div style="font-size:10.5px; color:var(--tx3); font-family:'IBM Plex Mono',monospace; letter-spacing:.04em;">${esc(T.cycle)}</div>
+      <div style="font-size:17px; font-weight:600; color:${color}; font-family:'IBM Plex Mono',monospace; margin-top:2px;">${esc(T.big)}</div>
+      ${T.score?`<div style="font-size:11px; color:var(--tx2); font-family:'IBM Plex Mono',monospace; margin-top:4px;">${esc(T.score)}</div>`:''}
+      ${T.vs?`<div style="font-size:10.5px; color:var(--tx3); margin-top:1px;">${esc(T.vs)}</div>`:''}
+      <div style="display:flex; align-items:center; gap:5px; font-size:10.5px; color:var(--tx3); font-family:'IBM Plex Mono',monospace; margin-top:7px; padding-top:6px; border-top:1px solid var(--line);">${ic('clock',11)}${esc(T.ts)}</div>
+    </div>`; }
+  return `<div data-hoverleave="${hoverKey}" style="position:relative; height:140px;">
+    <svg viewBox="0 0 ${W} 38" preserveAspectRatio="none" style="position:absolute; inset:0; width:100%; height:100%; display:block;">
+      <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity=".24"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>
+      <polygon points="0,${h} ${pts.join(' ')} ${lastX.toFixed(1)},${h}" fill="url(#${gid})"></polygon>
+      <polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="1.8" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"></polyline>
+      ${proj}
+    </svg>${dots}${tip}</div>`;
+}
+
+/* ── pipeline steps (shared Home + Pipeline) ── */
+const CYCLE_STEPS = ['observe','ideate','select','dispatch','benchmark','backprop','decide'];
+const STEP_LABEL = { observe:'Observe', ideate:'Ideate', select:'Select', dispatch:'Dispatch', benchmark:'Benchmark', backprop:'Backprop', decide:'Decide' };
+const STEP_ICON  = { observe:'eye', ideate:'lightbulb', select:'target', dispatch:'send', benchmark:'timer', backprop:'git-branch', decide:'scale' };
+const STEP_DETAIL= { observe:'Re-grounding on baseline metrics and the Idea Tree frontier…', ideate:'Drafting candidate optimizations from the active diagnosis…', select:'Ranking generated ideas by expected impact…', dispatch:'Sending the top candidates to the executor pool…', benchmark:'Timing the dispatched branch against the held-out test split…', backprop:'Propagating the measured insight to ancestor hypotheses…', decide:'Comparing the result against the current best branch…' };
+function activePhaseIndex(){
+  const p=(SNAP.phase||'').toLowerCase();
+  const m=[['observ',0],['ideat',1],['select',2],['dispatch',3],['execut',3],['run',3],['bench',4],['eval',4],['backprop',5],['decid',6],['merg',6]];
+  for(const [k,i] of m){ if(p.includes(k)) return i; }
+  if(Object.keys(SNAP.agents).length) return 4;
+  return -1;
+}
+function pipelineSteps(){
+  const phase = activePhaseIndex();
+  return CYCLE_STEPS.map((k,i)=>{
+    const st = phase<0 ? 'pending' : (i<phase?'done':(i===phase?'running':'pending'));
+    const statusColor = st==='done'?'var(--accent)':st==='running'?'var(--amber)':'var(--tx3)';
+    return { key:k, label:STEP_LABEL[k], icon:STEP_ICON[k], detail:STEP_DETAIL[k], isRunning:st==='running',
+      statusLabel: st==='done'?'Done':st==='running'?'Running':'Pending',
+      statusIcon: st==='done'?'check':st==='running'?'loader':'circle', statusColor,
+      iconColor: st==='pending'?'var(--tx3)':'var(--tx)', labelColor: st==='pending'?'var(--tx2)':'var(--tx)',
+      rowBg: st==='running'?'var(--soft)':'transparent', accentBar: st==='running'?'var(--accent)':'transparent',
+      spinStyle: st==='running'?'animation:spin 1.1s linear infinite;':'',
+      dotSoft: softFor(statusColor), dotBorder: bdFor(statusColor),
+      lineText: st==='running'?STEP_DETAIL[k]:(st==='done'?STEP_LABEL[k]+' complete':'Queued'),
+      lineColor: st==='running'?'var(--tx2)':'var(--tx3)', st };
   });
-  kids[ROOT]=realRoots.slice();
+}
 
-  // ── tidy layout (top → down): depth = row, in-order leaf slot = column ──
-  const pos={}, seen=new Set(); let leaf=0, maxDepth=0;
-  const dfs=(id,depth)=>{
-    if(seen.has(id)) return; seen.add(id);
-    maxDepth=Math.max(maxDepth,depth);
-    const cs=kids[id]||[];
-    if(!cs.length){ pos[id]={depth, slot:leaf++}; return; }
-    cs.forEach(c=>dfs(c,depth+1));
-    const xs=cs.map(c=>pos[c].slot);
-    pos[id]={depth, slot:(Math.min(...xs)+Math.max(...xs))/2};
-  };
-  dfs(ROOT,0);
-  nodes.forEach(n=>{ if(!(n.node_id in pos)) pos[n.node_id]={depth:1, slot:leaf++}; });
+/* ── tree stage (shared Home + Branches) ── */
+function treeLegend(){ return `<div style="display:flex; flex-wrap:wrap; gap:9px 16px; margin:2px 0 10px; font-size:11px; color:var(--tx2); font-family:'IBM Plex Mono',monospace;">
+  <span style="display:inline-flex; align-items:center; gap:6px;"><span style="width:16px; height:3px; border-radius:2px; background:var(--accent);"></span>Improvement</span>
+  <span style="display:inline-flex; align-items:center; gap:6px;"><span style="width:16px; height:3px; border-radius:2px; background:var(--blue);"></span>Active branch</span>
+  <span style="display:inline-flex; align-items:center; gap:6px;"><span style="width:16px; height:3px; border-radius:2px; background:var(--neg);"></span>Regression · pruned</span>
+  <span style="display:inline-flex; align-items:center; gap:5px;">${ic('star',12,'color:var(--accent);')}Current best</span></div>`; }
+function treeNodesHTML(t){
+  return t.tnodes.map((n,i)=>`
+    <div data-act="node:${n.root?'':i}" ${n.root?'':`data-hover="hoverNode:${i}"`} style="position:absolute; left:${(n.cx-n.w/2)}px; top:${n.cy}px; width:${n.w}px; height:${n.h}px; transform:translateY(-50%); box-sizing:border-box; border-radius:10px; padding:0 13px; display:flex; flex-direction:column; justify-content:center; background:${n.bg}; border:1px solid ${n.bd}; box-shadow:${n.shadow}; cursor:${n.root?'default':'pointer'};">
+      <div style="display:flex; align-items:center; gap:6px;"><span style="font-size:12.5px; font-weight:600; color:${n.titleColor}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(n.name)}</span>${n.isBest?`<span style="margin-left:auto; flex:none; display:inline-flex; align-items:center; gap:3px; font-size:10.5px; font-weight:600; color:var(--accent);">${ic('star',11)}Best</span>`:''}</div>
+      <div style="display:flex; align-items:center; gap:6px; margin-top:2px; font-family:'IBM Plex Mono',monospace; font-size:11.5px;"><span style="color:var(--tx3);">${esc(n.idLabel)}</span><span style="color:${n.valColor}; font-weight:600;">${n.val}</span></div>
+    </div>`).join('');
+}
+let _treeScale = 1;
+function treeInnerHTML(t, scale){
+  return `<div style="position:absolute; top:0; left:0; width:${t.vw}px; height:${t.vh}px; transform:scale(${scale}); transform-origin:top left;">
+      <svg width="${t.vw}" height="${t.vh}" viewBox="0 0 ${t.vw} ${t.vh}" style="position:absolute; top:0; left:0;">
+        ${t.edges.map(e=>`<path d="${e.d}" fill="none" stroke="${e.color}" stroke-width="2.2" stroke-linecap="round" opacity="0.8"></path>`).join('')}
+      </svg>${treeNodesHTML(t)}${nodePopup(t, scale)}</div>`;
+}
+function treeStageWrap(t, scale, extra){
+  _treeScale = scale;       // remembered so hover can re-render just this stage
+  const stageH = Math.round(t.vh*scale)+8;
+  return `<div id="tree-stage" data-hoverleave="hoverNode" style="position:relative; width:100%; height:${stageH}px; ${extra||''}overflow:hidden;">${treeInnerHTML(t, scale)}</div>`;
+}
+function treeStage(nominalW){
+  const t = buildTree();
+  const scale = Math.max(0.5, Math.min(1.6, nominalW / t.vw));
+  return treeStageWrap(t, scale, 'flex:none; ');
+}
+function nodePopup(t, scale){
+  const i = ST.hoverNode; if(i==null || !t.tnodes[i] || t.tnodes[i].root) return '';
+  const n = t.tnodes[i]; const nd = n.node;
+  const below = n.cy < t.vh*0.34;
+  const hx = n.cx < t.vw*0.42 ? '0' : n.cx > t.vw*0.62 ? '-100%' : '-50%';
+  const meta = statusMeta(nd.status, n.isBest);
+  const diag = nd.insight || nd.pruned_reason || 'No diagnosis recorded.';
+  return `<div style="position:absolute; left:${n.cx}px; top:${(below?n.cy+23:n.cy-23)}px; transform:scale(${(1/scale).toFixed(4)}); transform-origin:top left; z-index:30; pointer-events:none;">
+    <div style="transform:${below?`translate(${hx}, 12px)`:`translate(${hx}, calc(-100% - 12px))`}; width:300px; background:var(--pop); border:1px solid var(--line2); border-radius:11px; padding:13px 15px; box-shadow:0 18px 44px rgba(0,0,0,.62);">
+      <div style="display:flex; align-items:center; gap:8px;"><span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--tx3);">${esc(n.idLabel)}</span><span style="flex:1; font-size:14.5px; font-weight:600; color:var(--tx);">${esc(n.name)}</span><span style="flex:none; padding:3px 8px; border-radius:6px; font-size:9.5px; font-weight:700; letter-spacing:.06em; color:${meta.color}; background:${softFor(meta.color)}; border:1px solid ${bdFor(meta.color)};">${meta.label}</span></div>
+      <div style="font-family:'IBM Plex Mono',monospace; font-size:14px; font-weight:600; color:${n.valColor}; margin-top:7px;">score ${fmtScore(nd.score)}   ·   ${n.val}</div>
+      <div style="margin-top:11px;"><div style="font-size:10px; font-weight:600; letter-spacing:.06em; color:var(--tx3); text-transform:uppercase;">Diagnosis</div><div style="font-size:12.5px; color:var(--tx2); line-height:1.5; margin-top:3px;">${esc(diag)}</div></div>
+    </div></div>`;
+}
 
-  // geometry: idea cards + a wider/taller root card, centred over its column
-  const CW=222, CH=98, RW=400, RH=112, xGap=30, yGap=54, mX=20, mY=18;
-  const xStep=CW+xGap, yStep=CH+yGap;
-  const colCenter = slot => mX + slot*xStep + CW/2;   // center x of a column slot
-  const rowTop    = depth => mY + depth*yStep;
-  const box = id => {
-    const p=pos[id]; const cx=colCenter(p.slot);
-    const w = id===ROOT?RW:CW, h = id===ROOT?RH:CH;
-    return {x: Math.max(mX, cx - w/2), y: rowTop(p.depth), w, h, cx, cy: rowTop(p.depth)};
-  };
-  const boxes={}; boxes[ROOT]=box(ROOT); nodes.forEach(n=>{ boxes[n.node_id]=box(n.node_id); });
-  // Centre the task card over the WHOLE idea span (not just its direct children)
-  // so the root always sits in the visual middle at the top.
-  if(nodes.length){
-    let minL=Infinity, maxR=-Infinity;
-    nodes.forEach(n=>{ const b=boxes[n.node_id]; minL=Math.min(minL,b.x); maxR=Math.max(maxR,b.x+b.w); });
-    const c=(minL+maxR)/2; const rb=boxes[ROOT];
-    rb.x=Math.max(mX, c-RW/2); rb.cx=rb.x+RW/2;
+function currentHypothesis(){
+  const running = runningNode();
+  const node = running || bestNode();
+  const bn = bestNode();
+  const title = node ? (node.hypothesis||node.node_id) : 'No active hypothesis yet';
+  const diag = node ? (node.insight || node.pruned_reason || 'Diagnosis will appear once the node reports.') : 'Waiting for the coordinator to draft a hypothesis.';
+  const benching = !!running;
+  const conf = confidencePct();
+  const confStr = conf!=null ? conf+'%' : '—';
+  const prog = Math.round(benchProgress()*100);
+  // chip: "B1 · Hoist append + cache²"
+  const chip = bn ? ((bn.branch||bn.node_id) + (bn.hypothesis ? ' · '+bn.hypothesis : '')) : '—';
+  // expected impact for the in-flight node: its provisional Δ, else evaluating
+  const impact = node ? (node.score!=null ? imprStr(node.score) : (benching?'evaluating…':'pending')) : '—';
+  // projection "if it wins": never regresses below the standing best — it's the
+  // better of the running branch's provisional score and the current trunk best.
+  const curBest = SNAP.best_score;
+  let projScore = curBest;
+  if(running && running.score!=null){
+    projScore = (curBest==null) ? running.score
+      : (SNAP.metric_direction==='minimize' ? Math.min(running.score, curBest) : Math.max(running.score, curBest));
   }
-  let width=0, height=0;
-  Object.values(boxes).forEach(b=>{ width=Math.max(width,b.x+b.w); height=Math.max(height,b.y+b.h); });
-  width+=mX; height+=mY;
+  const projImpr = imprStr(projScore);
+  return `<section style="padding:var(--cardpad); border-radius:14px; background:var(--card); border:1px solid var(--line);">
+    <div style="display:flex; align-items:center; gap:9px; margin-bottom:14px;">
+      ${ic('flask',16,'color:var(--accent2);')}
+      <span style="font-size:11.5px; font-weight:600; letter-spacing:.14em; color:var(--tx3); text-transform:uppercase;">Current Hypothesis</span>
+      <button data-act="nav:branches" title="View in search tree" class="hb" style="all:unset; cursor:pointer; margin-left:auto; display:inline-flex; align-items:center; gap:6px; max-width:340px; padding:4px 10px; border-radius:7px; background:var(--soft); border:1px solid var(--accent); font-family:'IBM Plex Mono',monospace; font-size:11px; font-weight:600; color:var(--accent); white-space:nowrap; overflow:hidden;">${ic('git-branch',12,'flex:none;')}<span style="overflow:hidden; text-overflow:ellipsis;">${esc(chip)}</span></button>
+    </div>
+    <div style="display:flex; gap:24px; align-items:stretch; flex-wrap:wrap;">
+      <div style="flex:1.5; min-width:240px;">
+        <h3 style="margin:0; font-size:18px; font-weight:600; line-height:1.28; letter-spacing:-.01em;">${esc(title)}</h3>
+        <div style="margin-top:12px;"><div style="font-size:11px; font-weight:600; color:var(--tx3); letter-spacing:.04em; text-transform:uppercase;">Diagnosis</div>
+        <p style="margin:6px 0 0; font-size:13.5px; color:var(--tx2); line-height:1.5;">${esc(diag)}</p></div>
+        <div style="margin-top:14px; display:flex; gap:26px; align-items:flex-start;">
+          <div style="flex:none;"><div style="font-size:11px; font-weight:600; color:var(--tx3); letter-spacing:.04em; text-transform:uppercase;">Expected Impact</div>
+          <div style="margin-top:5px; font-family:'IBM Plex Mono',monospace; font-size:16px; font-weight:600; color:${node&&node.score!=null?scoreColorFor(node.score):'var(--accent)'};">${impact}</div></div>
+          <div style="flex:1; min-width:130px;">
+            <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--tx2); margin-bottom:7px;"><span>Confidence</span><span style="font-family:'IBM Plex Mono',monospace; color:var(--tx);">${confStr}</span></div>
+            <div style="height:7px; border-radius:6px; background:var(--line2); overflow:hidden;"><div style="height:100%; width:${conf!=null?conf:0}%; border-radius:6px; background:linear-gradient(90deg,var(--accent2),var(--accent)); transition:width .6s ease;"></div></div>
+            <div style="margin-top:12px; display:flex; align-items:center; gap:9px;">
+              <span style="display:inline-flex; align-items:center; gap:7px; padding:6px 12px; border-radius:8px; background:var(--soft); border:1px solid var(--aline); color:var(--accent); font-size:11.5px; font-weight:600; letter-spacing:.04em;">${ic('loader',13, benching?'animation:spin 1.1s linear infinite;':'')}${benching?'BENCHMARKING':'IDLE'}</span>
+              <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--tx3);">${benching?prog+'% complete':'awaiting dispatch'}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="flex:1; min-width:250px; padding:14px 15px; border-radius:10px; background:var(--soft); border:1px solid var(--aline);">
+        <div style="display:flex; align-items:center; gap:6px;">${ic('trending-up',13,'color:var(--accent);')}<span style="font-size:11px; font-weight:700; letter-spacing:.05em; color:var(--accent); text-transform:uppercase;">Projection · if it wins</span></div>
+        <div style="display:flex; align-items:baseline; gap:8px; margin-top:9px;">
+          <span style="font-family:'IBM Plex Mono',monospace; font-size:24px; font-weight:600; color:var(--accent); letter-spacing:-.02em;">${projImpr}</span>
+          <span style="font-size:12px; color:var(--tx2);">improvement vs baseline</span></div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:var(--tx3); margin-top:3px;">projected best ${fmtScore(projScore)} · trunk best ${fmtScore(SNAP.best_score)}</div>
+        <div style="display:flex; align-items:center; justify-content:space-between; font-size:10.5px; color:var(--tx2); margin:12px 0 5px;"><span>Live estimate</span><span style="font-family:'IBM Plex Mono',monospace; color:var(--accent);">${prog}%</span></div>
+        <div style="height:5px; border-radius:5px; background:var(--line2); overflow:hidden;"><div style="height:100%; width:${prog}%; border-radius:5px; background:linear-gradient(90deg,var(--accent2),var(--accent)); transition:width .8s linear;"></div></div>
+      </div>
+    </div>
+  </section>`;
+}
 
-  // edges: parent bottom-center → child top-center, drawn first
-  let edges="";
-  const edge=(pb,cb)=>{ const y1=pb.y+pb.h, y2=cb.y, my=(y1+y2)/2;
-    edges+=`<path class="edge" d="M ${pb.cx} ${y1} C ${pb.cx} ${my} ${cb.cx} ${my} ${cb.cx} ${y2}"/>`; };
-  realRoots.forEach(r=>edge(boxes[ROOT], boxes[r]));
-  nodes.forEach(n=>{ const p=byId[n.parent_id];
-    if(p && boxes[p.node_id] && n.parent_id!==n.node_id) edge(boxes[p.node_id], boxes[n.node_id]); });
-
-  // ── root card ──
-  const rb=boxes[ROOT];
-  const rTask = wrapText(task||"(no task set)", 56, 3);
-  let rootSvg = `<g class="tnode" data-i="-1">`
-    + `<rect class="rootcard" x="${rb.x}" y="${rb.y}" width="${RW}" height="${RH}" rx="12" stroke="${C.cyan}"/>`
-    + `<rect x="${rb.x}" y="${rb.y}" width="4" height="${RH}" fill="${C.cyan}" rx="2"/>`
-    + `<text class="rlabel" x="${rb.x+16}" y="${rb.y+20}">task</text>`
-    + `<text class="rtitle" x="${rb.x+16}" y="${rb.y+40}">${esc(trunc(s.run_name||"run",44))}</text>`
-    + rTask.map((ln,j)=>`<text class="rtask" x="${rb.x+16}" y="${rb.y+60+j*16}">${esc(ln)}</text>`).join("")
-    + `</g>`;
-  ROOT_INFO = {run_name:s.run_name, task:task};
-
-  // ── idea cards (richer: status, score, hypothesis, insight / prune reason / runtime) ──
-  TREE_NODES = nodes.map((n,i)=>{
-    const col = STATUS_COLOR[n.status] || C.dim2;
-    const b=boxes[n.node_id], x=b.x, y=b.y;
-    const hy = wrapText(n.hypothesis||"(no description)", 32, 2)
-      .map((ln,j)=>`<text class="hyline" x="${x+14}" y="${y+44+j*15}">${esc(ln)}</text>`).join("");
-    const score = (n.score!=null)
-      ? `<text class="sc" x="${x+CW-12}" y="${y+23}" text-anchor="end" fill="${scoreHex(n.score)}">${fmtScore(n.score)}</text>`
-      : "";
-    // contextual 4th line: insight > prune reason > runtime/branch
-    let ctx="";
-    if(n.insight) ctx=`<text class="insight" x="${x+14}" y="${y+CH-12}">💡 ${esc(trunc(n.insight,40))}</text>`;
-    else if(n.status==="pruned" && n.pruned_reason) ctx=`<text class="prune" x="${x+14}" y="${y+CH-12}">✗ ${esc(trunc(n.pruned_reason,40))}</text>`;
-    else {
-      const foot=[];
-      if(n.runtime_seconds!=null) foot.push((n.status==="running"?"⏱ ":"")+fmtDur(n.runtime_seconds));
-      if(n.branch) foot.push("⌥ "+n.branch);
-      if(foot.length) ctx=`<text class="ft" x="${x+14}" y="${y+CH-12}">${esc(foot.join("   "))}</text>`;
-    }
-    return {i,x,y,col,n,
-      svg:`<g class="tnode" data-i="${i}">`
-        + `<rect class="card" x="${x}" y="${y}" width="${CW}" height="${CH}" rx="11" stroke="${col}"/>`
-        + `<rect x="${x}" y="${y}" width="4" height="${CH}" fill="${col}" rx="2"/>`
-        + `<text class="nid" x="${x+14}" y="${y+23}" fill="${col}">${esc(n.node_id)}`
-        + `<tspan class="st" dx="8">${esc(n.status)}</tspan></text>`
-        + score + hy + ctx
-        + `</g>`};
+/* ── ideas data ── */
+function ideaList(){
+  const ranked = SNAP.tree.slice().sort((a,b)=>{
+    const sa=a.score==null?-Infinity:Math.abs(imprPct(a.score)||0), sb=b.score==null?-Infinity:Math.abs(imprPct(b.score)||0);
+    return sb-sa; });
+  const bestId = bestNodeId();
+  return ranked.map((n,i)=>{
+    const meta = statusMeta(n.status, false);
+    const isAccepted = n.node_id===bestId;
+    const m = isAccepted ? { label:'ACCEPTED', color:'var(--accent)', icon:'grid' } : meta;
+    return { id:n.node_id, rank:i+1, status:m.label, color:m.color, soft:softFor(m.color), bd:bdFor(m.color), icon:m.icon,
+      title:n.hypothesis||n.node_id, desc:(n.insight||n.pruned_reason||'').slice(0,90) || '—',
+      impact: n.score!=null?'—':'pending', score: n.score!=null?imprStr(n.score):((n.status||'').toLowerCase()==='running'?'running':'queued'),
+      scoreColor: scoreColorFor(n.score), branch:n.branch||n.node_id, node:n,
+      approach: n.insight || 'No path recorded yet.', result: n.pruned_reason || (n.score!=null?('Benchmarked at '+imprStr(n.score)+'.'):'In progress.') };
   });
-
-  svg.setAttribute("width", width);
-  svg.setAttribute("height", height);
-  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-  svg.innerHTML = `<g class="edges">${edges}</g>` + rootSvg + TREE_NODES.map(t=>t.svg).join("");
+}
+function topIdeas(){ return ideaList().slice(0,4); }
+function activityRowsHTML(){
+  return recentActivity().map(a=>`
+    <div style="display:flex; gap:13px; padding:13px 2px; border-bottom:1px solid var(--line);">
+      <span style="flex:none; width:30px; height:30px; border-radius:50%; display:grid; place-items:center; color:${a.color}; background:${softFor(a.color)};">${ic(a.icon,15)}</span>
+      <div style="flex:1; min-width:0;"><div style="font-size:13.5px; font-weight:500;">${esc(a.title)}</div><div style="font-size:12px; color:var(--tx2); margin-top:2px;">${esc(a.sub)}</div></div>
+      <span style="flex:none; font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:var(--tx3);">${esc(a.time)}</span>
+    </div>`).join('') || emptyRow('waiting for events…');
+}
+function updateActivityFeed(){ const box=document.getElementById('home-activity'); if(box) box.innerHTML=activityRowsHTML(); }
+function recentActivity(){
+  if(ACTIVITY.length) return ACTIVITY.slice(0,6);
+  const fin = SNAP.tree.filter(n=>n.finished_elapsed!=null).sort((a,b)=>b.finished_elapsed-a.finished_elapsed);
+  return fin.slice(0,6).map(n=>{ const meta=statusMeta(n.status, n.node_id===bestNodeId());
+    return { icon:meta.icon, color:meta.color, title:(meta.label.charAt(0)+meta.label.slice(1).toLowerCase())+' '+(n.branch||n.node_id),
+      sub:(n.score!=null?('score '+fmtScore(n.score)+' · '+imprStr(n.score)):(n.hypothesis||'').slice(0,48)),
+      time:fmtAgo(SNAP.elapsed_seconds-(n.finished_elapsed||0)) }; });
 }
 
-function wrapText(s, maxChars, maxLines){
-  const words=String(s).replace(/\s+/g," ").trim().split(" ");
-  const lines=[]; let cur="";
-  for(const w of words){
-    const cand = cur ? cur+" "+w : w;
-    if(cand.length>maxChars && cur){ lines.push(cur); cur=w; if(lines.length>=maxLines) break; }
-    else cur=cand;
-  }
-  if(cur && lines.length<maxLines) lines.push(cur);
-  if(lines.length>=maxLines){
-    let last=lines[maxLines-1]||"";
-    // if there was overflow, mark with ellipsis
-    const used=lines.slice(0,maxLines).join(" ").length;
-    if(used < String(s).replace(/\s+/g," ").trim().length){
-      last=last.length>maxChars-1 ? last.slice(0,maxChars-1)+"…" : last+"…";
-    }
-    lines[maxLines-1]=last;
-  }
-  return lines.slice(0,maxLines);
+/* ════════════════════════ PIPELINE ════════════════════════ */
+function viewPipeline(){
+  const phase = activePhaseIndex();
+  const cycleProgress = phase<0?0:Math.round(((phase+0.5)/7)*100);
+  const stepLabel = (phase<0?0:phase+1)+' / 7';
+  const steps = pipelineSteps();
+  const running = steps.find(s=>s.isRunning);
+  const modelResp = SNAP.thinking.length ? SNAP.thinking.slice(-14).map(t=>t.text).join('') : 'Waiting for the model to stream its reasoning for the current step…';
+  return `<div>
+    <div style="margin-bottom:18px;"><h1 style="margin:0; font-size:26px; font-weight:700; letter-spacing:-.02em;">Pipeline</h1><p style="margin:7px 0 0; font-size:14px; color:var(--tx2);">Live view of the arbor cycle — current task detail, progress, and the model's response.</p></div>
+    <div style="display:flex; align-items:center; gap:24px; flex-wrap:wrap; padding:14px 20px; border-radius:13px; background:var(--card); border:1px solid var(--line); margin-bottom:var(--gap);">
+      ${pipeStat('Cycle', (SNAP.cycle_num||0)+(SNAP.total_cycles?(' / '+SNAP.total_cycles):''))}
+      <div style="width:1px; align-self:stretch; background:var(--line);"></div>
+      ${pipeStat('Step', stepLabel)}
+      <div style="width:1px; align-self:stretch; background:var(--line);"></div>
+      ${pipeStat('Elapsed', fmtRun(SNAP.elapsed_seconds), null, 'pl-elapsed')}
+      <div style="width:1px; align-self:stretch; background:var(--line);"></div>
+      ${pipeStat('Tokens', fmtTok(SNAP.tokens.input)+' / '+fmtTok(SNAP.tokens.output), 'var(--amber)', 'pl-tokens')}
+      <div style="width:1px; align-self:stretch; background:var(--line);"></div>
+      ${pipeStat('Cache', cacheHitStr(), 'var(--blue)', 'pl-cache')}
+      <div style="flex:1; min-width:160px;">
+        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--tx3); margin-bottom:6px;"><span>Cycle progress</span><span style="font-family:'IBM Plex Mono',monospace;">${cycleProgress}%</span></div>
+        <div style="height:6px; border-radius:5px; background:var(--line2); overflow:hidden;"><div style="height:100%; width:${cycleProgress}%; border-radius:5px; background:linear-gradient(90deg,var(--accent2),var(--accent)); transition:width .6s linear;"></div></div>
+      </div>
+    </div>
+    <div style="display:grid; grid-template-columns:minmax(0,1.2fr) minmax(0,1fr); gap:var(--gap); align-items:start;">
+      <section style="padding:var(--cardpad) 22px; border-radius:14px; background:var(--card); border:1px solid var(--line);">
+        <div style="font-size:11.5px; font-weight:600; letter-spacing:.14em; color:var(--tx3); text-transform:uppercase; margin-bottom:8px;">Arbor Cycle</div>
+        <div style="position:relative;">
+          <div style="position:absolute; left:14px; top:24px; bottom:24px; width:2px; background:var(--line2);"></div>
+          ${steps.map(step=>`
+            <div style="position:relative; display:flex; gap:15px; padding:11px 0;">
+              <div style="z-index:1; flex:none; width:30px; display:flex; justify-content:center;">
+                <span style="width:30px; height:30px; border-radius:50%; display:grid; place-items:center; background:${step.dotSoft}; border:1px solid ${step.dotBorder}; color:${step.statusColor};">${ic(step.statusIcon,15,step.spinStyle)}</span>
+              </div>
+              <div style="flex:1; min-width:0; padding-top:3px;">
+                <div style="display:flex; align-items:center; gap:10px;">
+                  ${ic(step.icon,15,`color:${step.iconColor}; flex:none;`)}
+                  <span style="font-size:14.5px; font-weight:600; color:${step.labelColor};">${step.label}</span>
+                  <span style="margin-left:auto; font-size:11px; font-family:'IBM Plex Mono',monospace; color:${step.statusColor};">${step.statusLabel}</span>
+                </div>
+                <div style="font-size:12.5px; color:${step.lineColor}; margin-top:5px; line-height:1.45;">${step.lineText}</div>
+              </div>
+            </div>`).join('')}
+        </div>
+      </section>
+      <section style="padding:var(--cardpad); border-radius:14px; background:var(--card); border:1px solid var(--line);">
+        <div style="display:flex; align-items:center; gap:9px; margin-bottom:13px;">
+          <span style="width:8px; height:8px; border-radius:50%; background:var(--accent); box-shadow:0 0 9px var(--accent); animation:pulse 1.6s ease-in-out infinite;"></span>
+          <span style="font-size:11.5px; font-weight:600; letter-spacing:.14em; color:var(--tx3); text-transform:uppercase;">Model Response</span>
+          <span style="margin-left:auto; display:inline-flex; align-items:center; gap:6px; font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:var(--accent);">${ic('loader',12,'animation:spin 1.1s linear infinite;')}${running?running.label:'Idle'}</span>
+        </div>
+        <div style="background:var(--pop); border:1px solid var(--line); border-radius:10px; padding:15px 16px; font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:var(--tx2); line-height:1.65; white-space:pre-wrap; min-height:210px; max-height:360px; overflow-y:auto;">${esc(modelResp)}<span style="display:inline-block; width:7px; height:14px; background:var(--accent); margin-left:3px; vertical-align:text-bottom; animation:pulse 1s steps(2,start) infinite;"></span></div>
+        <div style="display:flex; justify-content:space-between; margin-top:12px; font-size:11.5px; color:var(--tx3); font-family:'IBM Plex Mono',monospace;"><span>${fmtTok(SNAP.tokens.input)} / ${fmtTok(SNAP.tokens.output)} tokens</span><span>${cycleProgress}% complete</span></div>
+      </section>
+    </div>
+  </div>`;
+}
+function pipeStat(label, val, color, id){ return `<div><div style="font-size:11px; color:var(--tx3);">${label}</div><div ${id?`id="${id}" `:''}style="font-family:'IBM Plex Mono',monospace; font-size:18px; font-weight:600; margin-top:2px;${color?`color:${color};`:''}">${val}</div></div>`; }
+
+/* ════════════════════════ IDEAS ════════════════════════ */
+function viewIdeas(){
+  const all = ideaList();
+  const counts = {}; all.forEach(i=>counts[i.status]=(counts[i.status]||0)+1);
+  const order = ['ACCEPTED','MERGED','DONE','TESTING','RETRY','QUEUED','PRUNED','FAILED'];
+  const filters = [{key:'All', color:'var(--tx)', n:all.length}].concat(order.filter(s=>counts[s]).map(s=>({key:s, color:(all.find(i=>i.status===s)||{}).color, n:counts[s]})));
+  const filtered = ST.ideaFilter==='All' ? all : all.filter(i=>i.status===ST.ideaFilter);
+  return `<div>
+    <div style="margin-bottom:22px;"><h1 style="margin:0; font-size:26px; font-weight:700; letter-spacing:-.02em;">Ideas</h1><p style="margin:7px 0 0; font-size:14px; color:var(--tx2);">Candidate optimizations generated and evaluated across the search tree.</p></div>
+    <div data-hoverleave="hoverFilter" style="display:flex; gap:10px; margin-bottom:18px; flex-wrap:wrap;">
+      ${filters.map(f=>{ const a=ST.ideaFilter===f.key; const hov=ST.hoverFilter===f.key && !a;
+        const isAll=f.key==='All'; const nice=isAll?'All':f.key.charAt(0)+f.key.slice(1).toLowerCase();
+        let col,bg,bd;
+        if(a||hov){ col=isAll?'var(--tx)':f.color; bg=isAll?'var(--card2)':softFor(f.color); bd=isAll?'var(--line2)':bdFor(f.color); }
+        else { col='var(--tx2)'; bg='transparent'; bd='var(--line)'; }
+        return `<button data-act="filter:${f.key}" data-hover="hoverFilter:${f.key}" style="all:unset; cursor:pointer; padding:7px 14px; border-radius:8px; font-size:12.5px; font-weight:500; color:${col}; background:${bg}; border:1px solid ${bd}; transition:background .15s, color .15s, border-color .15s;">${nice} · ${f.n}</button>`; }).join('')}
+    </div>
+    <section style="border-radius:14px; background:var(--card); border:1px solid var(--line); overflow:hidden;">
+      <div style="display:grid; grid-template-columns:44px 110px 1fr 120px 120px; gap:16px; padding:13px 20px; border-bottom:1px solid var(--line); font-size:11px; font-weight:600; letter-spacing:.06em; color:var(--tx3); text-transform:uppercase;">
+        <span>#</span><span>Status</span><span>Idea</span><span style="text-align:right;">Expected Impact</span><span style="text-align:right;">Score</span></div>
+      ${filtered.map(idea=>`
+        <div data-act="idea:${escA(idea.id)}" class="hl" style="display:grid; grid-template-columns:44px 110px 1fr 120px 120px; gap:16px; align-items:center; padding:16px 20px; border-bottom:1px solid var(--line); cursor:pointer; transition:background .12s;">
+          <span style="font-family:'IBM Plex Mono',monospace; font-size:14px; color:var(--tx3);">${idea.rank}</span>
+          <span style="justify-self:start; padding:4px 9px; border-radius:6px; font-size:10.5px; font-weight:700; letter-spacing:.06em; color:${idea.color}; background:${idea.soft}; border:1px solid ${idea.bd};">${idea.status}</span>
+          <div style="display:flex; align-items:center; gap:14px; min-width:0;">
+            <span style="flex:none; width:36px; height:36px; border-radius:9px; display:grid; place-items:center; color:${idea.color}; background:${idea.soft};">${ic(idea.icon,18)}</span>
+            <div style="min-width:0;"><div style="font-size:14.5px; font-weight:600;">${esc(idea.title)}</div><div style="font-size:12.5px; color:var(--tx2); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(idea.desc)}</div></div>
+          </div>
+          <span style="text-align:right; font-family:'IBM Plex Mono',monospace; font-size:13.5px; color:var(--tx2);">${idea.impact}</span>
+          <span style="text-align:right; font-family:'IBM Plex Mono',monospace; font-size:14px; font-weight:600; color:${idea.scoreColor};">${idea.score}</span>
+        </div>`).join('') || emptyRow('no ideas match this filter…')}
+    </section>
+  </div>`;
 }
 
-function trunc(s, n){ s=String(s).replace(/\s+/g," ").trim(); return s.length>n ? s.slice(0,n-1)+"…" : s; }
-function scoreHex(x){ if(x==null) return C.dim2; x=Number(x);
-  return x>=0.8?C.green : x>=0.5?C.cyan : x>=0.2?C.yellow : C.red; }
-
-let TREE_NODES = [];
-let ROOT_INFO = null;
-function placeTip(ev){
-  const tip=$("treetip");
-  // Fixed positioning → viewport coords; flip left/up near the right/bottom edge.
-  const vw=window.innerWidth, vh=window.innerHeight;
-  let tx=14, ty=16;
-  const w=Math.min(440, tip.offsetWidth||440), h=tip.offsetHeight||120;
-  if(ev.clientX + 14 + w > vw) tx = -(w+14);
-  if(ev.clientY + 16 + h > vh) ty = -(h+16);
-  tip.style.transform = `translate(${tx}px,${ty}px)`;
-  tip.style.left = ev.clientX + "px";
-  tip.style.top  = ev.clientY + "px";
-  tip.style.display = "block";
-}
-function showTreeTip(t, ev){
-  const tip=$("treetip"); const n=t.n;
-  const meta=[];
-  if(n.parent_id) meta.push("parent "+n.parent_id);
-  if(n.branch) meta.push("⌥ "+n.branch);
-  if(n.runtime_seconds!=null) meta.push(fmtDur(n.runtime_seconds));
-  tip.innerHTML = `<div><span class="t-sc" style="color:${t.col}">${esc(n.node_id)}`
-    + (n.score!=null?` · ${fmtScore(n.score)}`:"")+`</span> <span style="color:${t.col}">${esc(n.status)}</span></div>`
-    + `<div class="t-hy">${esc(n.hypothesis||"(no description)")}</div>`
-    + (n.insight?`<div class="t-hy" style="color:var(--magenta)">💡 ${esc(n.insight)}</div>`:"")
-    + (n.status==="pruned"&&n.pruned_reason?`<div class="t-hy" style="color:var(--red)">✗ ${esc(n.pruned_reason)}</div>`:"")
-    + (meta.length?`<div class="t-meta">${esc(meta.join("  ·  "))}</div>`:"");
-  placeTip(ev);
-}
-function showRootTip(ev){
-  const tip=$("treetip"); const ri=ROOT_INFO||{};
-  tip.innerHTML = `<div><span class="t-sc" style="color:var(--cyan)">task</span> ${esc(ri.run_name||"run")}</div>`
-    + `<div class="t-hy">${esc(ri.task||"(no task set)")}</div>`;
-  placeTip(ev);
-}
-$("treesvg").addEventListener("mousemove", (ev)=>{
-  const g=ev.target.closest && ev.target.closest("g.tnode");
-  if(g){
-    const i=+g.dataset.i;
-    if(i===-1){ showRootTip(ev); return; }
-    const t=TREE_NODES[i]; if(t){ showTreeTip(t, ev); return; }
-  }
-  $("treetip").style.display="none";
-});
-$("treesvg").addEventListener("mouseleave", ()=>{ $("treetip").style.display="none"; });
-
-/* ── usage: cache donut + token bars ──────────────────────────── */
-function renderUsage(s){
-  const hr = Math.max(0, Math.min(1, s.cache.hit_rate||0));
-  const pct = Math.round(hr*100);
-  $("cached").textContent = pct + "%";
-  const col = hr>=0.7?C.green:hr>=0.3?C.cyan:C.yellow;
-  const dash = (hr*100).toFixed(1);
-  $("donut").innerHTML =
-    `<path d="M18 2.5 a 15.5 15.5 0 1 1 0 31 a 15.5 15.5 0 1 1 0 -31"
-        fill="none" stroke="${C.border}" stroke-width="3.4"/>
-     <path d="M18 2.5 a 15.5 15.5 0 1 1 0 31 a 15.5 15.5 0 1 1 0 -31"
-        fill="none" stroke="${col}" stroke-width="3.4" stroke-linecap="round"
-        stroke-dasharray="${dash} 100"/>`;
-
-  const ti=s.tokens.input||0, to=s.tokens.output||0, tot=ti+to||1;
-  const rd=s.cache.read||0, cr=s.cache.creation||0, un=s.cache.uncached||0;
-  const rate = s.elapsed_seconds>1 ? Math.round((ti+to)/s.elapsed_seconds) : 0;
-  function bar(lab, val, sub, w, col){
-    return `<div class="ubar"><div class="urow"><span class="ul">${lab}</span>
-      <span class="uv">${val}${sub?` <span style="color:var(--dim2)">${sub}</span>`:``}</span></div>
-      <div class="track"><div class="fill" style="width:${w}%;background:${col}"></div></div></div>`;
-  }
-  $("ubars").innerHTML =
-    bar("input tokens", fmtTokens(ti), `${rate}/s`, Math.round(ti/tot*100), "var(--cyan)")
-    + bar("output tokens", fmtTokens(to), "", Math.round(to/tot*100), "var(--blue)")
-    + bar("cache reads", fmtTokens(rd), "", Math.round(rd/(rd+cr+un||1)*100), "var(--green)");
-}
-
-/* ── snapshot + events ────────────────────────────────────────── */
-function renderCounters(s){
-  const c = s.counters||{};
-  const items = [
-    ["proposed", c.proposed, "var(--yellow)"],
-    ["running", c.running, "var(--magenta)"],
-    ["kept", c.done, "var(--green)"],
-    ["merged", c.merged, "var(--green)"],
-    ["pruned", c.pruned, "var(--dim2)"],
+/* ════════════════════════ BRANCHES ════════════════════════ */
+function viewBranches(){
+  const bc = branchCounts();
+  const counts = {merged:0,pruned:0}; SNAP.tree.forEach(n=>{ const st=(n.status||'').toLowerCase(); if(st==='merged')counts.merged++; if(st==='pruned'||st==='failed')counts.pruned++; });
+  const t = buildTree();
+  const stats = [
+    { label:'Best improvement', value:imprStr(SNAP.best_score), color:'var(--accent)' },
+    { label:'Active', value:String(bc.active), color:'var(--tx)' },
+    { label:'Merged', value:String(counts.merged), color:'var(--blue)' },
+    { label:'Pruned', value:String(counts.pruned), color:'var(--neg)' },
+    { label:'Total nodes', value:String(bc.total), color:'var(--tx)' },
+    { label:'Metric', value:SNAP.metric_direction==='minimize'?'minimize':'maximize', color:'var(--tx)' },
   ];
-  $("counters").innerHTML = items.map(([l,v,col])=>
-    `<div class="cnt"><div class="cv" style="color:${col}">${v||0}</div><div class="cl">${l}</div></div>`).join("");
+  const bestId = bestNodeId();
+  const byId={}; SNAP.tree.forEach(n=>byId[n.node_id]=n);
+  const rows = SNAP.tree.map(n=>{ const meta=statusMeta(n.status, n.node_id===bestId); const p=imprPct(n.score);
+    const parent = n.parent_id&&byId[n.parent_id] ? (byId[n.parent_id].hypothesis||n.parent_id) : 'Baseline';
+    return { id:n.node_id, label:n.branch||n.node_id, name:n.hypothesis||n.node_id, parent, delta:imprStr(n.score),
+      deltaColor:scoreColorFor(n.score), score:fmtScore(n.score), statusLabel:meta.label, color:meta.color, soft:softFor(meta.color), bd:bdFor(meta.color),
+      idColor:n.node_id===bestId?'var(--accent)':'var(--tx)', barW:(p!=null&&p>0?Math.min(100,p):3)+'%', barColor:(p!=null&&p>=0)?'var(--accent)':'var(--neg)' }; });
+  const scale = Math.max(0.5, Math.min(1.6, 880 / t.vw));
+  return `<div>
+    <div style="margin-bottom:18px;"><h1 style="margin:0; font-size:26px; font-weight:700; letter-spacing:-.02em;">Branches</h1><p style="margin:7px 0 0; font-size:14px; color:var(--tx2);">The hypothesis tree. Each node is a benchmarked candidate; insights backpropagate to ancestors.</p></div>
+    <div style="display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; margin-bottom:var(--gap);">
+      ${stats.map(st=>`<div style="padding:14px 16px; border-radius:12px; background:var(--card); border:1px solid var(--line);"><div style="font-size:11.5px; color:var(--tx2);">${st.label}</div><div style="font-family:'IBM Plex Mono',monospace; font-size:20px; font-weight:600; margin-top:5px; color:${st.color};">${st.value}</div></div>`).join('')}
+    </div>
+    <section style="padding:24px; border-radius:14px; background:var(--card); border:1px solid var(--line); margin-bottom:var(--gap);">
+      ${treeLegend()}
+      ${treeStageWrap(t, scale)}
+    </section>
+    <section style="border-radius:14px; background:var(--card); border:1px solid var(--line); overflow:hidden;">
+      <div style="display:grid; grid-template-columns:64px 1.4fr 0.9fr 150px 96px 96px; gap:16px; padding:13px 20px; border-bottom:1px solid var(--line); font-size:11px; font-weight:600; letter-spacing:.06em; color:var(--tx3); text-transform:uppercase;"><span>Branch</span><span>Hypothesis</span><span>Parent</span><span>vs Baseline</span><span style="text-align:right;">Score</span><span style="text-align:right;">Status</span></div>
+      ${rows.map(b=>`
+        <div data-act="idea:${escA(b.id)}" class="hl" style="display:grid; grid-template-columns:64px 1.4fr 0.9fr 150px 96px 96px; gap:16px; align-items:center; padding:15px 20px; border-bottom:1px solid var(--line); cursor:pointer; transition:background .12s;">
+          <span style="font-family:'IBM Plex Mono',monospace; font-size:14px; font-weight:600; color:${b.idColor};">${esc(b.label)}</span>
+          <span style="font-size:13.5px; font-weight:600; color:var(--tx); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(b.name)}</span>
+          <span style="font-size:13px; color:var(--tx2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(b.parent)}</span>
+          <div style="display:flex; align-items:center; gap:9px;"><div style="flex:1; height:6px; border-radius:5px; background:var(--line2); overflow:hidden;"><div style="height:100%; width:${b.barW}; border-radius:5px; background:${b.barColor};"></div></div><span style="flex:none; font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:${b.deltaColor};">${b.delta}</span></div>
+          <span style="text-align:right; font-family:'IBM Plex Mono',monospace; font-size:13.5px;">${b.score}</span>
+          <span style="justify-self:end; padding:4px 10px; border-radius:6px; font-size:10.5px; font-weight:700; letter-spacing:.06em; color:${b.color}; background:${b.soft}; border:1px solid ${b.bd};">${b.statusLabel}</span>
+        </div>`).join('') || emptyRow('no branches yet…')}
+    </section>
+  </div>`;
 }
 
-function renderSnapshot(s){
-  s = normalizeState(s);
-  LAST = s;
-  pushSeries(s);
-  renderTop(s);
-  if (curView==="overview") renderChart(s);
-  renderLeaderboard(s);
-  renderTree(s);
-  renderUsage(s);
-  renderCounters(s);
-  $("tc-ideas").textContent = (s.tree||[]).length || "";
-  INTERACTIVE = !!s.interactive;
-  renderCompanion(s);
-  renderGate(s);
-  updateInteractiveUI();
+/* ════════════════════════ ASK ARBOR ════════════════════════ */
+const _askSugs = ['Why is the current best branch winning?','What hypothesis should we explore next?','Why was the last branch pruned?','Suggest a concrete new direction to reorient the search.'];
+function viewAsk(){
+  const turns = SNAP.companion.turns;
+  const busy = SNAP.companion.busy;
+  const empty = turns.length===0;
+  const steer = ST.askMode==='steer';
+  const ph = !INTERACTIVE ? 'Read-only — relaunch with input enabled to ask from the browser'
+    : (steer ? 'Send guidance to the research agent (it acts on this)…' : 'Ask about a hypothesis, a score, or what to try next…');
+  const modeBtn = (m,lbl,title)=>{ const a=ST.askMode===m; return `<button data-act="askmode:${m}" title="${title}" style="all:unset; cursor:pointer; padding:6px 14px; border-radius:7px; font-size:12px; font-weight:600; font-family:'IBM Plex Mono',monospace; background:${a?'var(--soft)':'transparent'}; color:${a?'var(--accent)':'var(--tx2)'}; border:1px solid ${a?'var(--aline)':'var(--line)'};">${lbl}</button>`; };
+  return `<div style="display:flex; flex-direction:column; height:calc(100vh - 162px); max-width:840px; margin:0 auto;">
+    <div style="margin-bottom:16px; flex:none; display:flex; align-items:flex-start; gap:16px;">
+      <div style="flex:1; min-width:0;">
+        <h1 style="margin:0; font-size:26px; font-weight:700; letter-spacing:-.02em; display:flex; align-items:center; gap:10px;">${ic('sparkles',22,'color:var(--accent);')}Ask Arbor</h1>
+        <p style="margin:7px 0 0; font-size:14px; color:var(--tx2);">${steer?'Steer the run — inject guidance the research agent will act on.':'Query the run for context, the rationale behind a choice, or to reorient the search.'}</p>
+      </div>
+      <div style="flex:none; display:flex; gap:6px; padding:4px; border-radius:10px; background:var(--pop); border:1px solid var(--line);">
+        ${modeBtn('ask','Ask','Read-only — answered by a companion that never touches the run')}
+        ${modeBtn('steer','Steer','Inject a message into the research agent')}
+      </div>
+    </div>
+    <div id="askMsgs" style="flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:14px; padding:4px 2px;">${askMessagesHTML(turns, busy, empty)}</div>
+    <div id="askStatus" style="flex:none; height:16px; margin-top:8px; font-size:12px; color:var(--accent); font-family:'IBM Plex Mono',monospace;"></div>
+    <div style="flex:none; margin-top:4px; display:flex; gap:10px; align-items:center; background:var(--card); border:1px solid ${steer?'var(--aline)':'var(--line)'}; border-radius:13px; padding:7px 7px 7px 16px;">
+      <input id="askInput" ${INTERACTIVE?'':'disabled'} placeholder="${ph}" style="flex:1; background:transparent; border:none; outline:none; color:var(--tx); font-family:'IBM Plex Sans',sans-serif; font-size:14px;" />
+      <button data-act="ask-send" title="${steer?'Steer':'Send'}" style="all:unset; cursor:pointer; flex:none; width:38px; height:38px; border-radius:9px; display:grid; place-items:center; background:var(--accent); color:#05140d; ${INTERACTIVE?'':'opacity:.5; cursor:not-allowed;'}">${ic('send',18)}</button>
+    </div>
+  </div>`;
+}
+function askMessagesHTML(turns, busy, empty){
+  if(empty && !busy){
+    return `<div style="margin:auto; text-align:center; max-width:520px; padding:20px 0;">
+      <div style="width:52px; height:52px; margin:0 auto; border-radius:14px; display:grid; place-items:center; background:var(--soft); border:1px solid var(--aline); color:var(--accent);">${ic('sparkles',26)}</div>
+      <div style="font-size:17px; font-weight:600; margin-top:16px;">Ask about this run</div>
+      <div style="font-size:13.5px; color:var(--tx2); margin-top:6px; line-height:1.5;">Arbor has full context on the objective, hypotheses, and benchmark scores. Ask why a branch won, what to try next, or to rethink the strategy.</div>
+      <div style="display:flex; flex-wrap:wrap; justify-content:center; gap:9px; margin-top:18px;">
+        ${_askSugs.map((q,i)=>`<button data-act="ask-sug:${i}" class="hsug" style="all:unset; cursor:${INTERACTIVE?'pointer':'not-allowed'}; padding:9px 14px; border-radius:9px; font-size:12.5px; color:var(--tx); background:var(--card2); border:1px solid var(--line2); ${INTERACTIVE?'':'opacity:.6;'}">${esc(q)}</button>`).join('')}
+      </div></div>`;
+  }
+  const msgs = turns.map(([role,text])=>{ const user=role==='you'||role==='user';
+    return `<div style="display:flex; justify-content:${user?'flex-end':'flex-start'};"><div style="max-width:80%; padding:12px 15px; border-radius:13px; background:${user?'var(--soft)':'var(--card2)'}; border:1px solid ${user?'var(--aline)':'var(--line)'}; font-size:14px; line-height:1.55; color:var(--tx); white-space:pre-wrap;">${esc(text)}</div></div>`; }).join('');
+  const load = busy?`<div style="display:flex; justify-content:flex-start;"><div style="padding:14px 17px; border-radius:13px; background:var(--card2); border:1px solid var(--line); display:flex; gap:5px; align-items:center;"><span style="width:7px; height:7px; border-radius:50%; background:var(--accent); animation:pulse 1.1s ease-in-out infinite;"></span><span style="width:7px; height:7px; border-radius:50%; background:var(--accent); animation:pulse 1.1s ease-in-out infinite .2s;"></span><span style="width:7px; height:7px; border-radius:50%; background:var(--accent); animation:pulse 1.1s ease-in-out infinite .4s;"></span></div></div>`:'';
+  return msgs+load;
+}
+function wireAsk(){
+  const inp = document.getElementById('askInput'); if(!inp) return;
+  inp.value = ST.askInput;
+  inp.addEventListener('input', ()=>{ ST.askInput = inp.value; });
+  inp.addEventListener('keydown', (e)=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); askSend(); } });
+  if(INTERACTIVE){ inp.focus(); const n=inp.value.length; try{ inp.setSelectionRange(n,n); }catch(e){} }
+  const box=document.getElementById('askMsgs'); if(box) box.scrollTop = box.scrollHeight;
+}
+function updateAsk(){
+  const box = document.getElementById('askMsgs'); if(!box) return;
+  const turns=SNAP.companion.turns, busy=SNAP.companion.busy, empty=turns.length===0;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+  box.innerHTML = askMessagesHTML(turns, busy, empty);
+  if(atBottom) box.scrollTop = box.scrollHeight;
+}
+function askSend(modeOverride){
+  if(!INTERACTIVE) return;
+  const text=(ST.askInput||'').trim(); if(!text) return;
+  const mode = (modeOverride || ST.askMode)==='steer' ? 'steer' : 'ask';
+  postInput({type:mode, payload:text});
+  ST.askInput=''; const inp=document.getElementById('askInput'); if(inp) inp.value='';
+  if(mode==='steer'){ const st=document.getElementById('askStatus'); if(st){ st.textContent='Sent to the research agent ✓';
+    setTimeout(()=>{ const s2=document.getElementById('askStatus'); if(s2) s2.textContent=''; }, 3000); } }
 }
 
-/* ── interaction: ask / steer / gate (token-gated POST) ───────────── */
-const TOKEN = new URLSearchParams(location.search).get("t") || "";
-let INTERACTIVE = false;
+/* ════════════════════════ MODALS / OVERLAY ════════════════════════ */
+function renderOverlay(){
+  const o=document.getElementById('overlay'); if(!o) return;
+  let html='';
+  if(ST.selIdea!=null){ const idea = ideaList().find(i=>i.id===ST.selIdea); if(idea) html=ideaModalHTML(idea); else ST.selIdea=null; }
+  else if(ST.selNode!=null){ const n=SNAP.tree.find(x=>x.node_id===ST.selNode); if(n) html=nodeModalHTML(n); else ST.selNode=null; }
+  o.innerHTML=html;
+}
+function ideaModalHTML(idea){
+  return `<div data-act="close-idea" style="position:fixed; inset:0; z-index:100; background:rgba(0,0,0,.58); display:flex; align-items:center; justify-content:center; padding:32px; animation:fadeUp .18s ease;">
+    <div data-stop style="width:580px; max-width:100%; max-height:86vh; overflow-y:auto; background:var(--card); border:1px solid var(--line2); border-radius:16px; padding:26px 28px; box-shadow:0 40px 90px -20px rgba(0,0,0,.7);">
+      <div style="display:flex; align-items:flex-start; gap:15px;">
+        <span style="flex:none; width:46px; height:46px; border-radius:12px; display:grid; place-items:center; color:${idea.color}; background:${idea.soft};">${ic(idea.icon,23)}</span>
+        <div style="flex:1; min-width:0;">
+          <div style="display:flex; align-items:center; gap:9px; flex-wrap:wrap;"><span style="padding:4px 9px; border-radius:6px; font-size:10.5px; font-weight:700; letter-spacing:.06em; color:${idea.color}; background:${idea.soft}; border:1px solid ${idea.bd};">${idea.status}</span><span style="font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:var(--tx3);">branch ${esc(idea.branch)}</span></div>
+          <h2 style="margin:9px 0 0; font-size:20px; font-weight:700; letter-spacing:-.01em; line-height:1.25;">${esc(idea.title)}</h2>
+        </div>
+        <button data-act="close-idea" title="Close" class="hb" style="all:unset; cursor:pointer; flex:none; width:32px; height:32px; border-radius:8px; display:grid; place-items:center; color:var(--tx3); border:1px solid var(--line);">${ic('x',15)}</button>
+      </div>
+      <div style="display:flex; gap:26px; margin-top:18px; padding:14px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line);">
+        <div><div style="font-size:11px; color:var(--tx3);">Expected Impact</div><div style="font-family:'IBM Plex Mono',monospace; font-size:15px; font-weight:600; margin-top:3px;">${idea.impact}</div></div>
+        <div><div style="font-size:11px; color:var(--tx3);">Score</div><div style="font-family:'IBM Plex Mono',monospace; font-size:15px; font-weight:600; margin-top:3px; color:${idea.scoreColor};">${idea.score}</div></div>
+      </div>
+      <div style="margin-top:18px;"><div style="display:flex; align-items:center; gap:7px; font-size:11px; font-weight:600; letter-spacing:.08em; color:var(--tx3); text-transform:uppercase;">${ic('git-branch',13,'color:var(--accent2);')}Path chosen</div><p style="margin:8px 0 0; font-size:14px; color:var(--tx2); line-height:1.6;">${esc(idea.approach)}</p></div>
+      <div style="margin-top:18px;"><div style="display:flex; align-items:center; gap:7px; font-size:11px; font-weight:600; letter-spacing:.08em; color:var(--tx3); text-transform:uppercase;">${ic('gauge',13,'color:var(--accent);')}Result</div><p style="margin:8px 0 0; font-size:14px; color:var(--tx2); line-height:1.6;">${esc(idea.result)}</p></div>
+    </div></div>`;
+}
+function nodeModalHTML(n){
+  const bestId=bestNodeId(); const meta=statusMeta(n.status, n.node_id===bestId);
+  const byId={}; SNAP.tree.forEach(x=>byId[x.node_id]=x);
+  const parent = n.parent_id&&byId[n.parent_id]?(byId[n.parent_id].hypothesis||n.parent_id):'Baseline';
+  return `<div data-act="close-node" style="position:fixed; inset:0; z-index:100; background:rgba(0,0,0,.58); display:flex; align-items:center; justify-content:center; padding:32px; animation:fadeUp .18s ease;">
+    <div data-stop style="width:580px; max-width:100%; max-height:86vh; overflow-y:auto; background:var(--card); border:1px solid var(--line2); border-radius:16px; padding:26px 28px; box-shadow:0 40px 90px -20px rgba(0,0,0,.7);">
+      <div style="display:flex; align-items:flex-start; gap:15px;">
+        <span style="flex:none; width:46px; height:46px; border-radius:12px; display:grid; place-items:center; color:${meta.color}; background:${softFor(meta.color)};">${ic('git-branch',22)}</span>
+        <div style="flex:1; min-width:0;">
+          <div style="display:flex; align-items:center; gap:9px; flex-wrap:wrap;"><span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--tx3);">${esc(n.branch||n.node_id)}</span><span style="padding:4px 9px; border-radius:6px; font-size:10.5px; font-weight:700; letter-spacing:.06em; color:${meta.color}; background:${softFor(meta.color)}; border:1px solid ${bdFor(meta.color)};">${meta.label}</span><span style="font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:var(--tx3);">parent ${esc(parent)}</span></div>
+          <h2 style="margin:9px 0 0; font-size:20px; font-weight:700; letter-spacing:-.01em; line-height:1.25;">${esc(n.hypothesis||n.node_id)}</h2>
+        </div>
+        <button data-act="close-node" title="Close" class="hb" style="all:unset; cursor:pointer; flex:none; width:32px; height:32px; border-radius:8px; display:grid; place-items:center; color:var(--tx3); border:1px solid var(--line);">${ic('x',15)}</button>
+      </div>
+      <div style="margin-top:18px; padding:14px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line); font-family:'IBM Plex Mono',monospace; font-size:15px; font-weight:600; color:${scoreColorFor(n.score)};">score ${fmtScore(n.score)}   ·   ${imprStr(n.score)}</div>
+      <div style="margin-top:18px;"><div style="display:flex; align-items:center; gap:7px; font-size:11px; font-weight:600; letter-spacing:.08em; color:var(--tx3); text-transform:uppercase;">${ic('flask',13,'color:var(--accent2);')}Diagnosis</div><p style="margin:8px 0 0; font-size:14px; color:var(--tx2); line-height:1.6;">${esc(n.insight||n.pruned_reason||'No diagnosis recorded for this node.')}</p></div>
+      <div style="margin-top:18px;"><div style="display:flex; align-items:center; gap:7px; font-size:11px; font-weight:600; letter-spacing:.08em; color:var(--tx3); text-transform:uppercase;">${ic('sparkles',13,'color:var(--accent);')}Details</div><p style="margin:8px 0 0; font-size:14px; color:var(--tx2); line-height:1.6;">${esc(n.hypothesis||'')}${n.runtime_seconds!=null?(' · ran '+fmtRun(n.runtime_seconds)):''}</p></div>
+    </div></div>`;
+}
 
+/* ───────────────────────── interactions ───────────────────────── */
 async function postInput(body){
   if(!INTERACTIVE || !TOKEN) return false;
-  try{
-    const r = await fetch("/input", {
-      method:"POST",
-      headers:{"Content-Type":"application/json","X-Arbor-Token":TOKEN},
-      body:JSON.stringify(body),
-    });
-    return r.ok;
-  }catch(e){ return false; }
+  try{ const r=await fetch('/input',{ method:'POST', headers:{'Content-Type':'application/json','X-Arbor-Token':TOKEN}, body:JSON.stringify(body) }); return r.ok; }
+  catch(e){ return false; }
 }
+function setScreen(k){ if(ST.screen===k) return; ST.screen=k; ST.hoverNode=null; ST.hoverImpr=null; ST.hoverBranch=null; ST.hoverFilter=null; renderShell(); }
 
-function renderCompanion(s){
-  const chat=$("chat"); const c=(s.companion)||{turns:[],busy:false};
-  const turns=c.turns||[];
-  if(!turns.length && !c.busy){
-    chat.innerHTML='<div class="empty">ask a question about the run — answered by a read-only companion that never touches the run.</div>';
-    $("asknote").textContent=""; return;
-  }
-  const atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
-  let html = turns.map(([role,text])=>{
-    const who = role==="you" ? "you" : "companion";
-    return `<div class="msg ${who}"><div class="who">${who}</div>${esc(text)}</div>`;
-  }).join("");
-  if(c.busy) html += '<div class="busy">companion thinking…</div>';
-  chat.innerHTML = html;
-  $("asknote").textContent = c.busy ? "· thinking…" : "";
-  if(atBottom) chat.scrollTop = chat.scrollHeight;
-}
-
-let gateKey = null;
-function renderGate(s){
-  const bar=$("gatebar"); const g=s.gate;
-  if(!g){ bar.style.display="none"; bar.innerHTML=""; gateKey=null; return; }
-  // Rebuild only when the gate (or interactivity) changes — otherwise the 1.5s
-  // heartbeat would wipe whatever the user is typing in the edit field.
-  const key = `${g.node_id}|${g.prompt}|${(g.options||[]).join(",")}|${INTERACTIVE?1:0}`;
-  if(key===gateKey){ bar.style.display="block"; return; }
-  gateKey = key;
-  const opts=(g.options||[]).filter(o=>!o.startsWith("<"));
-  const btns = opts.map(o=>{
-    const cls = o==="approve" ? "btn primary" : (o==="skip"||o==="reject") ? "btn warn" : "btn";
-    return `<button class="${cls}" data-gate-value="${esc(o)}">${esc(o)}</button>`;
-  }).join("");
-  const editable = INTERACTIVE;
-  bar.innerHTML = `
-    <div class="gh">⏸ awaiting your decision · ${esc(g.kind||"review")}${g.node_id?` · node ${esc(g.node_id)}`:""}</div>
-    <div class="gp">${esc(g.prompt||"")}</div>
-    <div class="grow">
-      ${editable?btns:""}
-      ${editable?`<input id="gateedit" class="field" type="text" placeholder="revise the hypothesis / feedback…" autocomplete="off" style="flex:1 1 240px"/>
-      <button class="btn" id="gatesubmit">Submit edit</button>`
-      :`<span class="askhint">read-only — answer from the terminal (launch with input enabled to act here)</span>`}
-    </div>`;
-  bar.style.display="block";
-}
-
-function updateInteractiveUI(){
-  const dis = !INTERACTIVE;
-  $("askinput").disabled = dis; $("asksend").disabled = dis; $("askmode").disabled = dis;
-  $("askhint").textContent = dis
-    ? "read-only — relaunch with the dashboard input enabled to ask/steer from the browser."
-    : "Ask = read-only companion (won't touch the run) · Steer = inject a message into the research agent.";
-}
-
-function sendAsk(){
-  const inp=$("askinput"); const text=inp.value.trim(); if(!text) return;
-  const mode=$("askmode").value==="steer" ? "steer" : "ask";
-  postInput({type:mode, payload:text});
-  inp.value="";
-}
-
-$("asksend").addEventListener("click", sendAsk);
-$("askinput").addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ e.preventDefault(); sendAsk(); } });
-$("gatebar").addEventListener("click", (e)=>{
-  const b=e.target.closest("[data-gate-value]");
-  if(b){ postInput({type:"gate", node_id:(LAST&&LAST.gate&&LAST.gate.node_id)||"", value:b.dataset.gateValue}); return; }
-  if(e.target.id==="gatesubmit"){
-    const t=($("gateedit").value||"").trim(); if(!t) return;
-    postInput({type:"gate", node_id:(LAST&&LAST.gate&&LAST.gate.node_id)||"", value:"edit "+t});
-    $("gateedit").value="";
+document.addEventListener('click', (e)=>{
+  const t = e.target.closest('[data-act]'); if(!t) return;
+  // Honor data-stop: a click inside a protected region (e.g. a modal card) must
+  // not fire an action that lives on an ancestor (e.g. the backdrop's close-*).
+  const stop = e.target.closest('[data-stop]'); if(stop && t.contains(stop)) return;
+  const raw = t.dataset.act; const ci = raw.indexOf(':');
+  const act = ci<0?raw:raw.slice(0,ci); const arg = ci<0?'':raw.slice(ci+1);
+  switch(act){
+    case 'nav': setScreen(arg); break;
+    case 'toggle-sidebar': ST.collapsed=!ST.collapsed; renderShell(); break;
+    case 'toggle-live': ST.live=!ST.live; _lastSig=null; updateTopbar(); break;
+    case 'toggle-theme': ST.themeMenuOpen=!ST.themeMenuOpen; updateTopbar(); break;
+    case 'theme': ST.theme=arg; ST.themeMenuOpen=false; applyTheme(); renderShell(); break;
+    case 'idea': ST.selIdea=arg; renderOverlay(); break;
+    case 'close-idea': ST.selIdea=null; renderOverlay(); break;
+    case 'node': if(arg!==''){ const t2=buildTree(); const nd=t2.tnodes[+arg]; if(nd&&!nd.root){ ST.selNode=nd.id; renderOverlay(); } } break;
+    case 'close-node': ST.selNode=null; renderOverlay(); break;
+    case 'filter': ST.ideaFilter=arg; renderContent(); break;
+    case 'askmode': ST.askMode=arg; renderContent(); break;
+    case 'ask-send': askSend(); break;
+    case 'ask-sug': if(INTERACTIVE){ ST.askInput=_askSugs[+arg]||''; askSend('ask'); } break;
+    case 'gate': postInput({type:'gate', node_id:(SNAP.gate&&SNAP.gate.node_id)||'', value:arg}); break;
+    case 'gate-edit': { const gi=document.getElementById('gate-edit-input'); const t=(gi&&gi.value||'').trim(); if(t){ postInput({type:'gate', node_id:(SNAP.gate&&SNAP.gate.node_id)||'', value:'edit '+t}); if(gi) gi.value=''; } break; }
   }
 });
+// Re-render only the region a hover affects, so chart/tree hovers don't rebuild
+// the whole view (which restarts the pulse/spin CSS animations and re-runs layout).
+function rerenderHover(k){
+  if(ST.screen==='ask') return;
+  if(k==='hoverImpr' || k==='hoverBranch'){ const el=document.getElementById('home-charts'); if(el){ el.innerHTML=chartsInnerHTML(); return; } }
+  if(k==='hoverNode'){ const el=document.getElementById('tree-stage'); if(el){ el.innerHTML=treeInnerHTML(buildTree(), _treeScale); return; } }
+  renderContent();
+}
+document.addEventListener('mouseover', (e)=>{
+  const t=e.target.closest('[data-hover]');
+  if(t){ const raw=t.dataset.hover; const ci=raw.indexOf(':'); const k=raw.slice(0,ci); const rv=raw.slice(ci+1);
+    const v = (k==='hoverFilter') ? rv : (+rv);
+    if(ST[k]===v) return; ST[k]=v; rerenderHover(k); return; }
+  // moved onto the tree stage but not onto a node → dismiss the node popup
+  const stage=e.target.closest('[data-hoverleave="hoverNode"]');
+  if(stage && ST.hoverNode!=null){ ST.hoverNode=null; rerenderHover('hoverNode'); }
+});
+document.addEventListener('mouseout', (e)=>{
+  const t=e.target.closest('[data-hoverleave]'); if(!t) return;
+  const rel=e.relatedTarget; if(rel && t.contains(rel)) return;
+  const k=t.dataset.hoverleave; if(ST[k]==null) return; ST[k]=null;
+  rerenderHover(k);
+});
 
-let feedCount = 0;
-function pushFeed(html){
-  const feed=$("feed");
-  if(feedCount===0) feed.innerHTML="";
-  const div=document.createElement("div"); div.className="line"; div.innerHTML=html;
-  feed.appendChild(div); feedCount++;
-  while(feed.childNodes.length>300) feed.removeChild(feed.firstChild);
-  feed.scrollTop = feed.scrollHeight;
+/* ───────────────────────── SSE wiring ─────────────────────────
+ * A snapshot arrives on every heartbeat (~1.5s) even when nothing changed.
+ * Rebuilding the whole view each time replays CSS entrance animations and
+ * looks like the page is "reloading". So: update the cheap ticking values in
+ * place every beat, but only rebuild the content when a structural signature
+ * actually changes. */
+let _lastSig = null;
+function renderSignature(){
+  // high-frequency cosmetic fields (elapsed, tokens, agent timers) are excluded —
+  // they update via tickers(). Streaming thinking only matters on the Pipeline view.
+  const liveText = ST.screen==='pipeline' ? (SNAP.thinking.length+':'+((SNAP.thinking.slice(-1)[0]||{}).text||'')) : '';
+  return JSON.stringify([
+    SNAP.run_name, SNAP.task, SNAP.model, SNAP.phase, SNAP.cycle_num, SNAP.total_cycles,
+    SNAP.branch_budget_used, SNAP.best_score, SNAP.baseline_score, SNAP.metric_direction,
+    SNAP.counters, SNAP.paused, SNAP.interactive,
+    SNAP.best_score_history.length, SNAP.best_score_history[SNAP.best_score_history.length-1]||0,
+    SNAP.tree.map(n=>[n.node_id,n.status,n.score,n.parent_id,n.branch,(n.insight||'').length,(n.pruned_reason||'').length]),
+    SNAP.companion.turns.length, SNAP.companion.busy,
+    SNAP.gate?[SNAP.gate.node_id,SNAP.gate.prompt]:0,
+    Object.keys(SNAP.agents).sort(), liveText,
+  ]);
+}
+function cacheHitStr(){ return Math.round((SNAP.cache.hit_rate||0)*100)+'%'; }
+function tickers(){
+  const set=(id,txt)=>{ const e=document.getElementById(id); if(e) e.textContent=txt; };
+  const tok = fmtTok(SNAP.tokens.input)+' / '+fmtTok(SNAP.tokens.output);
+  set('st-runtime', fmtRun(SNAP.elapsed_seconds)); set('st-tokens', tok); set('st-cache', cacheHitStr());
+  set('hp-started', 'Started '+fmtAgo(SNAP.elapsed_seconds));
+  set('pl-elapsed', fmtRun(SNAP.elapsed_seconds)); set('pl-tokens', tok); set('pl-cache', cacheHitStr());
+}
+function onSnapshot(state){
+  if(!ST.live) return;                 // paused: freeze UI updates
+  SNAP = normalizeState(state);
+  INTERACTIVE = SNAP.interactive;
+  CONNECTED = true;
+  updateTopbar();
+  const sideTask = document.getElementById('sideTask'); if(sideTask) sideTask.textContent = SNAP.run_name;
+  renderGate();                                    // run-level interrupt, visible on every screen
+  if(ST.screen==='ask'){ updateAsk(); return; }
+  tickers();                                       // cheap per-beat refresh
+  const sig = renderSignature();
+  if(sig===_lastSig) return;                       // nothing structural changed → no rebuild
+  _lastSig = sig;
+  renderContent();
+  if(ST.selNode!=null || ST.selIdea!=null) renderOverlay();
 }
 function onEvent(type, d){
-  if(type==="llm.thinking_delta"){
-    pushFeed(`<span class="agent">${esc(d.agent||"coordinator")}</span> <span class="think">${esc(d.text)}</span>`);
-  } else if(type==="tool.start"){
-    pushFeed(`<span class="tool">▸ ${esc(d.agent||"coordinator")}</span> <b>${esc(d.name)}</b> <span class="think">${esc(d.args_preview||"")}</span>`);
-  } else if(type==="tool.end"){
-    const m=d.ok?'<span class="s-done">✓</span>':'<span class="s-failed">✗</span>';
-    pushFeed(`${m} <span class="tool">${esc(d.agent||"coordinator")}</span> <b>${esc(d.name)}</b> <span class="think">${fmtDur(d.duration)}</span>`);
-  } else if(type==="idea.proposed"){
-    pushFeed(`<span class="s-proposed">◌ idea ${esc(d.node_id)}</span> <span class="hyp">${esc(d.hypothesis)}</span>`);
-  } else if(type==="idea.completed"){
-    pushFeed(`<span class="s-done">✓ ${esc(d.node_id)}</span> scored <b>${fmtScore(d.score)}</b>`);
-  } else if(type==="idea.merged"){
-    pushFeed(`<span class="s-merged">↻ merged ${esc(d.node_id)}</span>`);
-  } else if(type==="idea.pruned"){
-    pushFeed(`<span class="s-pruned">✗ pruned ${esc(d.node_id)}</span> <span class="think">${esc(d.reason||"")}</span>`);
-  }
+  d=d||{};
+  let item=null;
+  if(type==='idea.proposed') item={ icon:'lightbulb', color:'var(--amber)', title:'New idea '+(d.node_id||''), sub:(d.hypothesis||'').slice(0,60) };
+  else if(type==='idea.completed') item={ icon:'gauge', color:'var(--accent)', title:'Benchmarked '+(d.node_id||''), sub:'scored '+fmtScore(d.score) };
+  else if(type==='idea.merged') item={ icon:'check-circle', color:'var(--accent)', title:'Merged '+(d.node_id||''), sub:'promoted to the trunk' };
+  else if(type==='idea.pruned') item={ icon:'zap', color:'var(--neg)', title:'Pruned '+(d.node_id||''), sub:(d.reason||'').slice(0,60) };
+  else if(type==='tool.start') item={ icon:'send', color:'var(--blue)', title:(d.agent||'agent')+' · '+(d.name||'tool'), sub:(d.args_preview||'').slice(0,60) };
+  if(item){ item.time=new Date().toTimeString().slice(0,8); ACTIVITY.unshift(item); ACTIVITY=ACTIVITY.slice(0,30);
+    if(ST.live && ST.screen==='home') updateActivityFeed(); }   // surgical: only the feed, no full rebuild
 }
-
 function connect(){
-  const es = new EventSource("/events");
-  es.onmessage = (e) => {
-    let f; try { f = JSON.parse(e.data); } catch { return; }
-    if (f.kind === "snapshot") renderSnapshot(f.state);
-    else if (f.kind === "event") onEvent(f.type, f.data);
-  };
-  es.onerror = () => {
-    const st=$("state"); st.className="state"; $("statetxt").textContent="disconnected";
-  };
+  const es=new EventSource('/events');
+  es.onmessage=(e)=>{ let f; try{ f=JSON.parse(e.data); }catch{ return; }
+    if(f.kind==='snapshot') onSnapshot(f.state);
+    else if(f.kind==='event') onEvent(f.type, f.data); };
+  es.onerror=()=>{ CONNECTED=false; updateTopbar(); };
 }
 
-$("chart").addEventListener("mousemove", onChartMove);
-$("chart").addEventListener("mouseleave", ()=>{ $("tip").style.display="none";
-  const c=$("cursor"); if(c)c.style.display="none"; });
-if (window.ResizeObserver){
-  new ResizeObserver(()=>{ if(LAST && curView==="overview") renderChart(LAST); }).observe($("chart"));
-}
-window.addEventListener("resize", ()=>{ if(LAST && curView==="overview") renderChart(LAST); });
-
-/* ── tab navigation ── */
-let curView = "overview";
-function showView(name){
-  curView = name;
-  document.querySelectorAll(".tab").forEach(b=> b.classList.toggle("active", b.dataset.view===name));
-  document.querySelectorAll(".view").forEach(v=> v.classList.toggle("active", v.dataset.view===name));
-  // chart panels have zero width while hidden → re-render once visible
-  if (name==="overview" && LAST) renderChart(LAST);
-}
-$("tabs").addEventListener("click", (e)=>{
-  const btn = e.target.closest(".tab"); if(!btn) return;
-  showView(btn.dataset.view);
-});
-
+/* ───────────────────────── boot ───────────────────────── */
+applyTheme();
+renderShell();
 connect();
 </script>
 </body>

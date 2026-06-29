@@ -476,6 +476,10 @@ class CoordinatorConfig(ProxyModel):
     export_trajectory: bool = True
     # Capture per-call token-level traces (tokens.jsonl) for SFT/RL. Heavy; off.
     token_trace: bool = False
+    # Distill run insights into a reusable skill in ~/.arbor/skills (line 2). Off.
+    distill_skills: bool = False
+    # Use the LLM to abstract distilled lessons into transferable principles. Off.
+    distill_abstract: bool = False
 
     # ── Plugin (runtime object; not serialized) ──────────────────────
     plugin: Any = PydField(default=None, exclude=True, repr=False)

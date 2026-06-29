@@ -1154,6 +1154,16 @@ class CoordinatorOrchestrator:
             except Exception as e:  # pylint: disable=broad-exception-caught
                 _print_status(f"Warning: failed to write trajectory: {e}")
 
+        # Self-evolution line 2: distill insights into a reusable cross-run skill.
+        if getattr(self.config, "distill_skills", False):
+            try:
+                from ..distill import distill_to_session
+                prov = self.provider if getattr(self.config, "distill_abstract", False) else None
+                p = distill_to_session(self.config.workspace_dir, provider=prov)
+                _print_status(f"Distilled experience: {p}" if p else "Distill: nothing to learn")
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                _print_status(f"Warning: failed to distill skill: {e}")
+
     # ------------------------------------------------------------------
     # Final report
     # ------------------------------------------------------------------

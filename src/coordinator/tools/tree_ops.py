@@ -331,6 +331,22 @@ class TreeUpdateNodeTool(Tool):
 
         self._tree.update_node(node_id, **updates)
 
+        # Live experience capture (self-evolution): log lessons as the research
+        # advances, not only at finalize. Best-effort — never break a tool call.
+        if updates.get("insight") or updates.get("status"):
+            try:
+                from ...experience import append_experience
+                # Use the node's current insight (it may have been set by a prior
+                # update), not just this call's fields, so notes aren't empty.
+                node = self._tree.get_node(node_id)
+                enriched = dict(updates)
+                if not enriched.get("insight") and node is not None and getattr(node, "insight", ""):
+                    enriched["insight"] = node.insight
+                append_experience(getattr(self._tree, "json_path", None),
+                                   node_id=node_id, updates=enriched)
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
         parts = [f"Updated {node_id}:"]
         for k, v in updates.items():
             parts.append(f"  {k} = {v}")

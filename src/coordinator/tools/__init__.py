@@ -19,6 +19,7 @@ from .git_ops import GitMergeBranchTool
 from .search_ctx import SearchIdeaContextTool, SearchIdeaContextParallelTool, SearchStatusTool
 from .research_ctx import ResearchSearchTool
 from .ask_user import AskUserTool
+from .record_finding import RecordFindingTool
 from ..convergence import ConvergenceDetector, ConvergenceConfig
 
 if TYPE_CHECKING:
@@ -85,6 +86,7 @@ def get_coordinator_tools(
         FileReadTool(cwd=cwd, workspace_dir=wdir),
         GrepTool(cwd=cwd, workspace_dir=wdir),
         GlobTool(cwd=cwd, workspace_dir=wdir),
+        RecordFindingTool(cwd=cwd, workspace_dir=wdir),
     ]
     if skill_registry is not None:
         # Skills (read-only reference docs loaded on demand)

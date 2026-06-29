@@ -3,6 +3,28 @@
 from __future__ import annotations
 
 
+def _prior_experience_block(starting_cwd: str) -> str:
+    """If past runs here left experience, tell intake to offer it and ask the user."""
+    try:
+        from ...recall import list_experiences
+        exps = list_experiences(starting_cwd)
+    except Exception:  # pylint: disable=broad-exception-caught
+        exps = []
+    if not exps:
+        return ""
+    lines = [f"  - {name}: {desc}" for name, desc in exps]
+    return (
+        "## Prior experience available\n"
+        "This project has experience from past runs:\n"
+        + "\n".join(lines) + "\n"
+        "If the user's goal is similar, briefly offer to reuse the relevant one "
+        "and ask whether to apply it (default yes). Don't push it if unrelated.\n"
+        "When launching with the user's agreement, set apply_experience=true and "
+        "list the relevant session names in experience_sessions (you judge relevance).\n"
+        "\n"
+    )
+
+
 def build_system_prompt(*, starting_cwd: str) -> str:
     """Build the planning-agent system prompt.
 
@@ -101,6 +123,7 @@ def build_system_prompt(*, starting_cwd: str) -> str:
         "## Target directory\n"
         f"The user launched you from: {starting_cwd}\n"
         "\n"
+        + _prior_experience_block(starting_cwd) +
         "Treat that path as the default target. In the common case the user "
         "is already inside their project — just go with it and start talking "
         "about the goal. Quietly check it looks like a project (one Glob is "

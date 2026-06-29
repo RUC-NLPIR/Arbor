@@ -129,6 +129,17 @@ class LaunchExperimentTool(Tool):
                 "items": {"type": "string"},
                 "description": "Optional bullet notes (constraints, edge cases) to attach to the plan.",
             },
+            "apply_experience": {
+                "type": "boolean",
+                "description": "Set true when the user agreed to reuse prior experience; "
+                               "matched lessons are composed into the instruction.",
+            },
+            "experience_sessions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Session names (from 'Prior experience available') you judged "
+                               "relevant to this goal. You select; keyword match is only a fallback.",
+            },
         },
         "required": ["cwd", "instruction"],
     }
@@ -165,7 +176,9 @@ class LaunchExperimentTool(Tool):
 
         plan = LaunchPlan(
             cwd=str(resolved.resolve()),
-            instruction=instruction,
+            instruction=_with_experience(str(resolved.resolve()), instruction,
+                                         kwargs.get("apply_experience"),
+                                         kwargs.get("experience_sessions")),
             rationale=(kwargs.get("rationale") or "").strip(),
             suggested_max_cycles=_safe_int(kwargs.get("suggested_max_cycles")),
             suggested_max_turns=_safe_int(kwargs.get("suggested_max_turns")),
@@ -188,3 +201,23 @@ def _safe_int(v: Any) -> int | None:
         return int(v) if v is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _with_experience(cwd: str, instruction: str, apply: Any, sessions: Any = None) -> str:
+    """Prepend composed prior experience to the instruction when the user opted in.
+
+    Prefers the sessions the intake agent (an LLM) selected as relevant; falls back
+    to keyword topic matching only if it named none.
+    """
+    if not apply:
+        return instruction
+    try:
+        from ...recall import compose_for_topic, compose_from_sessions
+        block = ""
+        if isinstance(sessions, list) and sessions:
+            block = compose_from_sessions(cwd, [str(s) for s in sessions])
+        if not block:
+            block = compose_for_topic(cwd, instruction)
+    except Exception:  # pylint: disable=broad-exception-caught
+        block = ""
+    return f"{block}\n\n---\n{instruction}" if block else instruction

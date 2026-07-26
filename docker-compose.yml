@@ -1,0 +1,65 @@
+# Arbor — security-hardened container. Default mode: MCP (stdio).
+# Select modes with ARBOR_MODE (see docker/.env.example). MCP/doctor/version/...
+# are one-shots (`docker compose run --rm arbor`); `web` is long-running (`up`).
+services:
+  arbor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ARBOR_UID: ${ARBOR_UID:-1000}
+        ARBOR_GID: ${ARBOR_GID:-1000}
+    image: arbor:hardened
+    # Run as the build-time user (matches host uid so the workspace mount is
+    # writable). Override via .env if your host uid differs.
+    user: "${ARBOR_UID:-1000}:${ARBOR_GID:-1000}"
+
+    # MCP is stdio — stdin must be attachable: `docker compose run --rm arbor`.
+    stdin_open: true
+    tty: true
+
+    environment:
+      ARBOR_MODE: ${ARBOR_MODE:-mcp}
+      ARBOR_PROVIDER: ${ARBOR_PROVIDER:-}
+      ARBOR_MODEL: ${ARBOR_MODEL:-}
+      ARBOR_BASE_URL: ${ARBOR_BASE_URL:-}
+      ARBOR_API_KEY: ${ARBOR_API_KEY:-}
+      ARBOR_CWD: ${ARBOR_CWD:-/workspace}
+      ARBOR_SESSION: ${ARBOR_SESSION:-}
+      WEB_PORT: ${WEB_PORT:-8765}
+      # git identity for `arbor run` worktree commits (non-interactive).
+      GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME:-Arbor}
+      GIT_AUTHOR_EMAIL: ${GIT_AUTHOR_EMAIL:-arbor@localhost}
+      GIT_COMMITTER_NAME: ${GIT_COMMITTER_NAME:-Arbor}
+      GIT_COMMITTER_EMAIL: ${GIT_COMMITTER_EMAIL:-arbor@localhost}
+
+    volumes:
+      # Project dir — the only persistent, host-backed mount.
+      - ${ARBOR_WORKSPACE:-./workspace}:/workspace
+
+    # ── security hardening ────────────────────────────────────────────────
+    read_only: true               # rootfs immutable; only the mounts below are writable
+    tmpfs:
+      # Ephemeral in-RAM home: config + caches. The API key written by
+      # `arbor config init` lives in RAM and never reaches disk. uid/gid must
+      # match the runtime user or the dir is root-owned and unwritable.
+      - /home/arbor:uid=${ARBOR_UID:-1000},gid=${ARBOR_GID:-1000},mode=0700,size=64m
+      - /tmp:mode=1777,size=128m
+    security_opt:
+      - no-new-privileges:true    # blocks setuid escalation
+    cap_drop:
+      - ALL                       # no Linux capabilities
+    networks:
+      - arbor-net
+    ports:
+      # Used only in ARBOR_MODE=web; a no-op otherwise (nothing listens).
+      - "${WEB_PORT:-8765}:${WEB_PORT:-8765}"
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+
+networks:
+  arbor-net:
+    driver: bridge

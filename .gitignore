@@ -39,3 +39,6 @@ research_sessions/
 # Project page build output
 project_page/node_modules/
 project_page/dist/
+
+# Docker local config (docker-compose.yml .env)
+.env

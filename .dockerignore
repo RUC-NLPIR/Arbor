@@ -1,0 +1,29 @@
+# Keep the image build context lean. `pip install` needs pyproject.toml + src/;
+# docker/entrypoint.sh is COPYed separately. Everything else is excluded.
+.git
+.github
+.venv
+venv
+env
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+dist
+build
+*.egg-info
+tests
+docs
+arbor-zoo
+node_modules
+.env
+.env.*
+.DS_Store
+*.md
+!docker/README.md
+# Test fixtures/script — not needed in the image (kept out of the build context).
+docker/test_mcp.py
+docker/test-bench

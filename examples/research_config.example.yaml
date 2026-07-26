@@ -24,6 +24,11 @@ llm:
   #                                    # or paste the key here / pass --api-key
   # base_url:                          # set for proxies / vLLM / Ollama
   reasoning_effort: high               # low | medium | high | none
+  # logprobs: false                    # opt-in sampled-token logprobs for
+  #                                    # token-faithful trajectory traces. Off
+  #                                    # by default — Gemini/Ollama reject the
+  #                                    # field with HTTP 400; enable only where
+  #                                    # supported (OpenAI, vLLM, DeepSeek).
 
   # meta_model:                        # optional: a different model for the
   #                                    # orchestrator than for executors

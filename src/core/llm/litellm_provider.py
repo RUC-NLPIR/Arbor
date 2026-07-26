@@ -38,6 +38,7 @@ class LiteLLMProvider(OpenAICompatProvider):
         max_retries: int = 3,
         timeout: float = 300.0,
         reasoning_effort: str | None = "high",
+        logprobs: bool = False,
     ):
         import litellm
 
@@ -53,6 +54,7 @@ class LiteLLMProvider(OpenAICompatProvider):
         self.timeout = timeout
         self.max_retries = max_retries
         self.reasoning_effort = reasoning_effort
+        self.logprobs = logprobs
         # No AsyncOpenAI client — litellm.acompletion is the transport.
         try:
             self._enc = tiktoken.encoding_for_model(model)

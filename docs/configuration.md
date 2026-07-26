@@ -292,6 +292,7 @@ See [Plugins](plugins.md) and [Skills](skills.md).
 | `executor_max_turns` | Hard cap on a single experiment's reasoning turns — a runaway/cost safety valve. Override with `--max-turns`. |
 | `reasoning_effort` | How hard the model thinks per step (`low`/`medium`/`high`, where the provider supports it). |
 | `meta_model` | Optional cheaper/faster model for meta-level steps (distilling insight, drafting the report) while `model` drives the main loop. |
+| `logprobs` | Opt-in sampled-token logprobs for token-faithful trajectory traces. Off by default — some OpenAI-compatible endpoints (Gemini, Ollama) reject the field with HTTP 400 instead of ignoring it. Enable only where supported (OpenAI, vLLM, DeepSeek). Override with `--logprobs`/`--no-logprobs`. |
 
 ### Budgets and timeouts
 

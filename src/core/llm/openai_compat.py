@@ -80,10 +80,12 @@ class OpenAICompatProvider(LLMProvider):
         base_url: str | None = None,
         max_retries: int = 3,
         timeout: float = 300.0,
+        logprobs: bool = False,
     ):
         self.model = model
         self.base_url = base_url
         self.timeout = timeout
+        self.logprobs = logprobs
         self._client = AsyncOpenAI(
             api_key=api_key or os.environ.get("OPENAI_API_KEY", "dummy"),
             base_url=base_url,
@@ -123,10 +125,13 @@ class OpenAICompatProvider(LLMProvider):
             "model": self.model,
             "messages": oai_messages,
             "max_tokens": max_tokens,
-            # Token-faithful traces: ask for sampled-token logprobs. Endpoints that
-            # don't support it ignore these; we read back None and degrade cleanly.
-            "logprobs": True,
         }
+        # Token-faithful traces: ask for sampled-token logprobs when enabled. Opt-in
+        # — some OpenAI-compatible endpoints (Gemini, Ollama) reject the field with
+        # HTTP 400 instead of ignoring it. _extract_logprobs degrades to None when
+        # the endpoint returns none.
+        if self.logprobs:
+            params["logprobs"] = True
         if oai_tools:
             params["tools"] = oai_tools
             params["tool_choice"] = "auto"

@@ -253,6 +253,7 @@ arbor run --max-cycles 20 --mode review --no-webui
 | `executor_max_turns` | 单个实验推理轮次的硬上限——一个失控/成本安全阀。用 `--max-turns` 覆盖。 |
 | `reasoning_effort` | 模型每步的思考投入程度（`low`/`medium`/`high`，在 provider 支持处）。 |
 | `meta_model` | 可选的、更便宜/更快的模型，用于元层级步骤（提炼洞见、起草报告），而 `model` 驱动主循环。 |
+| `logprobs` | 可选的采样 token logprobs，用于 token 忠实的轨迹记录。默认关闭——部分 OpenAI 兼容端点（Gemini、Ollama）会以 HTTP 400 拒绝该字段而非忽略它。仅在支持的端点（OpenAI、vLLM、DeepSeek）上启用。可用 `--logprobs`/`--no-logprobs` 覆盖。 |
 
 ### 预算与超时 { #budgets-and-timeouts }
 

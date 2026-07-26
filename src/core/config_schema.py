@@ -151,6 +151,10 @@ class LLMConfig(BaseModel):
     parallel_tool_calls: bool | None = True
     thinking_budget_tokens: int | None = None
     max_tokens: int = 16384
+    # Opt-in: request sampled-token logprobs for token-faithful trajectory traces.
+    # Off by default — some OpenAI-compatible endpoints (Gemini, Ollama) reject the
+    # field with HTTP 400 instead of ignoring it; enable only where supported.
+    logprobs: bool = False
     llm_timeout: float = 300.0
     llm_provider_retries: int = 3
     llm_retry_attempts: int = 5

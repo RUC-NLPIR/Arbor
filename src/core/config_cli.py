@@ -55,6 +55,7 @@ LLM_FLAGS: tuple[CLIField, ...] = (
     CLIField("--parallel-tool-calls", "parallel_tool_calls", None, "Allow GPT Responses models to request multiple tools in one turn", bool_optional=True),
     CLIField("--thinking-budget-tokens", "thinking_budget_tokens", int, "Claude extended-thinking token budget override"),
     CLIField("--max-tokens", "max_tokens", int, "Max output tokens per LLM call (default: 16384)"),
+    CLIField("--logprobs", "logprobs", None, "Request sampled-token logprobs for trajectory traces (default: off; Gemini/Ollama reject it)", bool_optional=True),
     CLIField("--llm-timeout", "llm_timeout", float, "HTTP timeout per LLM API call (default: 300)"),
     CLIField("--llm-provider-retries", "llm_provider_retries", int, "Native SDK retries per LLM API call (default: 3)"),
     CLIField("--llm-retry-attempts", "llm_retry_attempts", int, "Agent-level retry attempts for transient LLM errors (default: 5)"),

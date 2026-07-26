@@ -151,6 +151,7 @@ def create_provider(config: AgentConfig) -> LLMProvider:
             base_url=config.base_url,
             max_retries=config.llm_provider_retries,
             timeout=config.llm_timeout,
+            logprobs=config.logprobs,
         )
     # backend == "litellm": unified transport for the chat-completions family
     # (DeepSeek/Qwen/Gemini/OpenAI-compatible proxies). Reasoning chain is
@@ -164,4 +165,5 @@ def create_provider(config: AgentConfig) -> LLMProvider:
         max_retries=config.llm_provider_retries,
         timeout=config.llm_timeout,
         reasoning_effort=config.reasoning_effort,
+        logprobs=config.logprobs,
     )

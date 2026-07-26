@@ -454,18 +454,6 @@ src/                 # `arbor` 包
 
 ------
 
-## 🙏 致谢
-
-Arbor 构建在优秀的开源项目
-[claw-code](https://github.com/ultraworkers/claw-code) 之上。
-
-claw-code 是 Claude Code 的开源 Rust 复现，为 Arbor CLI 提供了 REPL 框架、
-工具调用基础设施和跨平台编译能力。非常感谢 ultraworkers 团队的出色工作。
-
-🔗 claw-code: https://github.com/ultraworkers/claw-code
-
-------
-
 ## 📚 引用
 
 ```bibtex

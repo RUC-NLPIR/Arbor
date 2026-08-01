@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "documents": [
+    {
+      "id": "aros-implementation-baseline",
+      "title": "AROS Implementation Baseline",
+      "path": "docs/architecture/aros-implementation-baseline.md",
+      "status": "current",
+      "authority": "implementation_baseline",
+      "agent_visibility": "default"
+    },
+    {
+      "id": "aros-design-book-v1-0-zh",
+      "title": "AR OS Agent-Principal Design Book v1.0 (ZH)",
+      "path": "AR_OS_AGENT_PRINCIPAL_DESIGN_BOOK_v1_0_zh.md",
+      "status": "current",
+      "authority": "target_specification",
+      "agent_visibility": "on_demand"
+    },
+    {
+      "id": "legacy-arbor-baseline-dataflow",
+      "title": "Legacy Arbor Baseline Dataflow Evidence",
+      "path": "docs/analysis/legacy-arbor-baseline-dataflow.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
+    }
+  ]
+}

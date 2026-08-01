@@ -9,14 +9,17 @@ import signal
 import socket
 import subprocess
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .isolation import IsolationError, IsolationLimits, build_isolated_linux
 from .store import (
     atomic_write_json,
     create_json,
     environment_sha256 as _environment_sha256,
     final_identity as _final_identity,
+    json_sha256 as _json_sha256,
     manifest_sha256 as _manifest_sha256,
     process_start_token as _process_start_token,
     read_json,
@@ -80,6 +83,7 @@ def _finish(
     stop_request: dict[str, Any] | None = None,
     signal_sequence: list[str] | None = None,
     error: str | None = None,
+    actual_environment_sha256: str | None = None,
 ) -> None:
     run_id = str(manifest["run_id"])
     finished_at = _utc_now()
@@ -99,7 +103,9 @@ def _finish(
             "duration_seconds": duration_seconds,
             "resource_usage": {"wall_seconds": duration_seconds},
             "host": socket.gethostname(),
-            "actual_environment_sha256": _environment_sha256(),
+            "actual_environment_sha256": (
+                actual_environment_sha256 or _environment_sha256()
+            ),
             "launch_receipt_sha256": launch_receipt_sha256,
             "stdout": _file_receipt(
                 stdout_path, f".aros/runs/{run_id}/stdout.log"
@@ -210,7 +216,36 @@ def run(workspace: str, run_id: str) -> int:
         )
         return 0
 
+    popen_options: dict[str, Any] = {}
+    actual_environment_sha256 = _environment_sha256()
     try:
+        profile = manifest.get("security_profile")
+        if profile == "isolated-linux":
+            raw_limits = manifest.get("isolation_limits")
+            if not isinstance(raw_limits, dict):
+                raise ValueError("isolated manifest is missing isolation_limits")
+            limits = IsolationLimits(**raw_limits)
+            launch = build_isolated_linux(
+                root,
+                manifest.get("writable_paths", []),
+                limits=limits,
+            )
+            frozen_policy = {
+                "writable_paths": list(launch.writable_paths),
+                "network_policy": launch.network_policy,
+                "process_policy": launch.process_policy,
+                "environment_policy": launch.environment_policy,
+                "isolation_limits": asdict(launch.limits),
+            }
+            if any(manifest.get(key) != value for key, value in frozen_policy.items()):
+                raise ValueError("isolated launch policy differs from frozen manifest")
+            popen_options = {
+                "env": launch.env,
+                "preexec_fn": launch.preexec_fn,
+            }
+            actual_environment_sha256 = _json_sha256(launch.env)
+        elif profile != "trusted-local":
+            raise ValueError("manifest has an unsupported security profile")
         with stdout_path.open("ab", buffering=0) as stdout, stderr_path.open(
             "ab", buffering=0
         ) as stderr:
@@ -220,8 +255,15 @@ def run(workspace: str, run_id: str) -> int:
                 stdout=stdout,
                 stderr=stderr,
                 start_new_session=True,
+                **popen_options,
             )
-    except (OSError, ValueError) as error:
+    except (
+        IsolationError,
+        OSError,
+        subprocess.SubprocessError,
+        TypeError,
+        ValueError,
+    ) as error:
         _finish(
             root=root,
             runtime=runtime,
@@ -329,6 +371,7 @@ def run(workspace: str, run_id: str) -> int:
         stderr_path=stderr_path,
         stop_request=stop_request,
         signal_sequence=final_signal_sequence,
+        actual_environment_sha256=actual_environment_sha256,
     )
     return 0 if state in {"completed", "cancelled", "timed_out"} else 1
 

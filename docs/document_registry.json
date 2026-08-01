@@ -40,6 +40,14 @@
       "status": "current",
       "authority": "informative",
       "agent_visibility": "on_demand"
+    },
+    {
+      "id": "aros-m3-isolated-linux-smoke",
+      "title": "AROS M3 Isolated Linux Smoke Evidence",
+      "path": "docs/analysis/aros-m3-isolated-linux-smoke.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
     }
   ]
 }

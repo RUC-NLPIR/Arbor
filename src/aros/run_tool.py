@@ -15,9 +15,10 @@ class RunTool(Tool):
     name = "Run"
     description = (
         "Control durable background experiments. Use action='start' with an exact "
-        "argv array and idempotency_key; status/list inspect process state; tail "
-        "returns raw stdout or stderr; stop requires a reason. Process completion "
-        "is operational evidence, not a scientific verdict."
+        "argv array and idempotency_key. Runs default to isolated-linux; select "
+        "trusted-local explicitly. status/list inspect process state; tail returns "
+        "raw stdout or stderr; stop requires a reason. Process completion is "
+        "operational evidence, not a scientific verdict."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
@@ -47,6 +48,17 @@ class RunTool(Tool):
             "label": {
                 "type": "string",
                 "description": "Optional short run label.",
+            },
+            "security_profile": {
+                "type": "string",
+                "enum": ["isolated-linux", "trusted-local"],
+                "default": "isolated-linux",
+                "description": "Run isolation profile (default: isolated-linux).",
+            },
+            "writable_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Workspace-relative paths writable by the run.",
             },
             "run_id": {
                 "type": "string",
@@ -92,6 +104,11 @@ class RunTool(Tool):
                 idempotency_key=kwargs.get("idempotency_key"),
                 actor="principal",
                 label=kwargs.get("label"),
+                security_profile=kwargs.get(
+                    "security_profile",
+                    "isolated-linux",
+                ),
+                writable_paths=kwargs.get("writable_paths", []),
             )
             result = service.start(str(manifest["run_id"]), actor="principal")
         elif action == "status":

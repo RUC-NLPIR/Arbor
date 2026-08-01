@@ -18,9 +18,11 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .isolation import IsolationError, isolated_linux_policy, probe_isolated_linux
 from .store import (
     atomic_write_json,
     create_json,
@@ -69,6 +71,8 @@ class RunService:
         idempotency_key: str,
         actor: str,
         label: str | None = None,
+        security_profile: str = "isolated-linux",
+        writable_paths: list[str] | None = None,
     ) -> dict[str, object]:
         """Freeze a launch manifest without starting a process."""
         normalized_argv = _validate_argv(argv)
@@ -77,13 +81,39 @@ class RunService:
         key = _validate_text(idempotency_key, "idempotency_key")
         run_actor = _validate_text(actor, "actor")
         run_label = _normalize_label(label)
+        profile = _validate_security_profile(security_profile)
+        if profile == "isolated-linux":
+            try:
+                policy = isolated_linux_policy(self.root, writable_paths or [])
+            except IsolationError as error:
+                raise RunError(f"invalid isolated-linux policy: {error}") from error
+            normalized_writable_paths = list(policy.writable_paths)
+            network_policy = policy.network_policy
+            process_policy = policy.process_policy
+            environment_policy = policy.environment_policy
+            isolation_limits: dict[str, int] | None = asdict(policy.limits)
+        else:
+            if writable_paths:
+                raise RunError(
+                    "trusted-local is unrestricted; writable_paths require isolated-linux"
+                )
+            normalized_writable_paths = []
+            network_policy = "host"
+            process_policy = "host"
+            environment_policy = {"kind": "inherit"}
+            isolation_limits = None
         environment_ref, environment_sha256 = _environment_fingerprint()
         requested = {
             "argv": normalized_argv,
             "cwd": normalized_cwd,
             "timeout_seconds": timeout,
             "idempotency_key": key,
-            "security_profile": "trusted-local",
+            "security_profile": profile,
+            "writable_paths": normalized_writable_paths,
+            "network_policy": network_policy,
+            "process_policy": process_policy,
+            "environment_policy": environment_policy,
+            "isolation_limits": isolation_limits,
             "environment_ref": environment_ref,
             "environment_sha256": environment_sha256,
             "actor": run_actor,
@@ -186,12 +216,19 @@ class RunService:
         status = self.status(run_id)
         if status["state"] != "prepared":
             return status
-        tmux = shutil.which("tmux")
-        if tmux is None:
-            raise RunError("tmux is required for durable local runs")
         self._validate_manifest_against_status(manifest, status)
         self._require_clean_git_for_start(manifest)
         self._normalize_cwd(str(manifest["cwd"]))
+        if manifest.get("security_profile") == "isolated-linux":
+            try:
+                probe_isolated_linux()
+            except IsolationError as error:
+                raise RunError(f"isolated-linux is unavailable: {error}") from error
+        elif manifest.get("security_profile") != "trusted-local":
+            raise RunError("run manifest has an unsupported security profile")
+        tmux = shutil.which("tmux")
+        if tmux is None:
+            raise RunError("tmux is required for durable local runs")
         launch_actor = _validate_text(actor or str(manifest["actor"]), "actor")
         launched_at = _utc_now()
         session_name = f"aros-{run_id.lower()}"
@@ -854,6 +891,11 @@ def _request_sha256(manifest: dict[str, object]) -> str:
                 "timeout_seconds",
                 "idempotency_key",
                 "security_profile",
+                "writable_paths",
+                "network_policy",
+                "process_policy",
+                "environment_policy",
+                "isolation_limits",
                 "environment_ref",
                 "environment_sha256",
                 "actor",
@@ -874,6 +916,12 @@ def _validate_argv(argv: list[str]) -> list[str]:
 def _validate_timeout(value: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise RunError("timeout_seconds must be a positive number")
+    return value
+
+
+def _validate_security_profile(value: str) -> str:
+    if value not in {"isolated-linux", "trusted-local"}:
+        raise RunError("security_profile must be isolated-linux or trusted-local")
     return value
 
 

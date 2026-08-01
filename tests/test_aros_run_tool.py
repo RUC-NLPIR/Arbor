@@ -32,6 +32,8 @@ class FakeRunService:
         idempotency_key: str,
         actor: str,
         label: str | None = None,
+        security_profile: str,
+        writable_paths: list[str],
     ) -> dict[str, Any]:
         self.calls.append(
             (
@@ -42,6 +44,8 @@ class FakeRunService:
                 idempotency_key,
                 actor,
                 label,
+                security_profile,
+                writable_paths,
             )
         )
         return {"run_id": "RUN-test", "state": "prepared"}
@@ -100,6 +104,13 @@ def test_run_tool_exposes_one_action_based_system_call(tmp_path: Path) -> None:
         "tail",
         "stop",
     ]
+    assert tool.input_schema["properties"]["security_profile"] == {
+        "type": "string",
+        "enum": ["isolated-linux", "trusted-local"],
+        "default": "isolated-linux",
+        "description": "Run isolation profile (default: isolated-linux).",
+    }
+    assert tool.input_schema["properties"]["writable_paths"]["type"] == "array"
 
 
 def test_start_prepares_then_starts_as_principal(tmp_path: Path) -> None:
@@ -126,10 +137,39 @@ def test_start_prepares_then_starts_as_principal(tmp_path: Path) -> None:
             "demo-1",
             "principal",
             "demo run",
+            "isolated-linux",
+            [],
         ),
         ("start", "RUN-test", "principal"),
     ]
     assert json.loads(output) == {"run_id": "RUN-test", "state": "running"}
+
+
+def test_start_explicitly_forwards_trusted_local_and_writable_paths(
+    tmp_path: Path,
+) -> None:
+    tool = RunTool(cwd=str(tmp_path))
+
+    _execute(
+        tool,
+        action="start",
+        argv=["python", "train.py"],
+        idempotency_key="trusted-1",
+        security_profile="trusted-local",
+        writable_paths=["artifacts", "checkpoints", "artifacts"],
+    )
+
+    assert FakeRunService.instances[0].calls[0] == (
+        "prepare",
+        ["python", "train.py"],
+        ".",
+        3600,
+        "trusted-1",
+        "principal",
+        None,
+        "trusted-local",
+        ["artifacts", "checkpoints", "artifacts"],
+    )
 
 
 def test_status_and_list_return_json(tmp_path: Path) -> None:

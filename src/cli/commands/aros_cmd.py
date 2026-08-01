@@ -144,6 +144,16 @@ def run_start_command(
         "--idempotency-key",
         help="Stable key preventing duplicate process launch.",
     ),
+    security_profile: str = typer.Option(
+        "isolated-linux",
+        "--security-profile",
+        help="Run isolation profile; trusted-local must be selected explicitly.",
+    ),
+    writable_paths: list[str] | None = typer.Option(
+        None,
+        "--writable-path",
+        help="Workspace-relative writable path; repeat for multiple paths.",
+    ),
     actor: str = typer.Option("human", "--actor", help="Launch authority."),
     label: str | None = typer.Option(None, "--label", help="Optional display label."),
 ) -> None:
@@ -157,6 +167,8 @@ def run_start_command(
             idempotency_key=idempotency_key,
             actor=actor,
             label=label,
+            security_profile=security_profile,
+            writable_paths=writable_paths or [],
         )
         run_id = manifest.get("run_id")
         if not isinstance(run_id, str) or not run_id:

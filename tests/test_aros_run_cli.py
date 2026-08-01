@@ -31,6 +31,8 @@ class FakeRunService:
         idempotency_key: str,
         actor: str,
         label: str | None = None,
+        security_profile: str,
+        writable_paths: list[str],
     ) -> dict[str, Any]:
         self.calls.append(
             (
@@ -41,6 +43,8 @@ class FakeRunService:
                 idempotency_key,
                 actor,
                 label,
+                security_profile,
+                writable_paths,
             )
         )
         return {"run_id": "RUN-test", "state": "prepared"}
@@ -105,6 +109,12 @@ def test_run_start_prepares_then_starts_exact_argv(
             "principal",
             "--label",
             "demo run",
+            "--security-profile",
+            "trusted-local",
+            "--writable-path",
+            "artifacts",
+            "--writable-path",
+            "checkpoints",
             "--",
             "python",
             "-m",
@@ -126,10 +136,46 @@ def test_run_start_prepares_then_starts_exact_argv(
             "demo-1",
             "principal",
             "demo run",
+            "trusted-local",
+            ["artifacts", "checkpoints"],
         ),
         ("start", "RUN-test"),
     ]
     assert json.loads(result.output) == {"run_id": "RUN-test", "state": "running"}
+
+
+def test_run_start_defaults_to_isolated_linux_without_writable_paths(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    _install_fake(monkeypatch)
+
+    result = runner.invoke(
+        aros_cmd.aros_app,
+        [
+            "run",
+            "start",
+            "--cwd",
+            str(tmp_path),
+            "--idempotency-key",
+            "isolated-default",
+            "--",
+            "python",
+            "train.py",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert FakeRunService.instances[0].calls[0] == (
+        "prepare",
+        ["python", "train.py"],
+        ".",
+        3600,
+        "isolated-default",
+        "human",
+        None,
+        "isolated-linux",
+        [],
+    )
 
 
 def test_run_start_requires_command(tmp_path: Path, monkeypatch) -> None:

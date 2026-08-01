@@ -17,6 +17,12 @@ from pathlib import Path
 
 import pytest
 
+from arbor.aros.isolation import (
+    ENVIRONMENT_POLICY,
+    NETWORK_POLICY,
+    IsolationError,
+    probe_isolated_linux,
+)
 from arbor.aros.runs import RunError, RunService
 from arbor.aros.store import atomic_write_json
 
@@ -56,6 +62,7 @@ def _prepare(
         idempotency_key=key,
         actor="test-principal",
         label="durable-test",
+        security_profile="trusted-local",
     )
     return service, manifest
 
@@ -109,6 +116,9 @@ def test_prepare_freezes_a_versioned_manifest_and_runtime_status(tmp_path: Path)
     assert manifest["timeout_seconds"] == 10
     assert manifest["idempotency_key"] == "test-run-key"
     assert manifest["security_profile"] == "trusted-local"
+    assert manifest["writable_paths"] == []
+    assert manifest["network_policy"] == "host"
+    assert manifest["environment_policy"] == {"kind": "inherit"}
     assert manifest["environment_ref"]["kind"] == "allowlist-fingerprint-v1"
     assert "environment" not in manifest
     assert manifest["actor"] == "test-principal"
@@ -142,6 +152,37 @@ def test_prepare_freezes_a_versioned_manifest_and_runtime_status(tmp_path: Path)
     assert not (tmp_path / "runs" / run_id / "stdout.log").exists()
 
 
+def test_prepare_defaults_to_isolated_linux_and_freezes_capability_policy(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    (tmp_path / "scratch").mkdir()
+    (tmp_path / "scratch" / ".keep").write_text("", encoding="utf-8")
+    _git(tmp_path, "add", "scratch/.keep")
+    _git(tmp_path, "commit", "-qm", "add isolated output directory")
+    service = RunService(tmp_path)
+
+    manifest = service.prepare(
+        ["/usr/bin/python3", "-c", "print('isolated')"],
+        idempotency_key="isolated-default",
+        actor="principal",
+        writable_paths=["scratch"],
+    )
+
+    assert manifest["security_profile"] == "isolated-linux"
+    assert manifest["writable_paths"] == ["scratch"]
+    assert manifest["network_policy"] == NETWORK_POLICY
+    assert manifest["environment_policy"]["kind"] == ENVIRONMENT_POLICY
+
+    with pytest.raises(RunError, match="idempotency key.*different manifest"):
+        service.prepare(
+            ["/usr/bin/python3", "-c", "print('isolated')"],
+            idempotency_key="isolated-default",
+            actor="principal",
+            security_profile="trusted-local",
+        )
+
+
 def test_prepare_requires_clean_git_and_contained_real_cwd(tmp_path: Path) -> None:
     _init_clean_repo(tmp_path)
     (tmp_path / "dirty.txt").write_text("not checkpointed", encoding="utf-8")
@@ -152,6 +193,7 @@ def test_prepare_requires_clean_git_and_contained_real_cwd(tmp_path: Path) -> No
             ["true"],
             idempotency_key="dirty",
             actor="principal",
+            security_profile="trusted-local",
         )
     assert not (tmp_path / "runs").exists()
 
@@ -165,6 +207,7 @@ def test_prepare_requires_clean_git_and_contained_real_cwd(tmp_path: Path) -> No
             cwd="escape",
             idempotency_key="escape",
             actor="principal",
+            security_profile="trusted-local",
         )
 
 
@@ -179,6 +222,7 @@ def test_prepare_idempotency_is_locked_and_never_creates_a_second_run(
             [sys.executable, "-c", "print('once')"],
             idempotency_key="one-logical-launch",
             actor="principal",
+            security_profile="trusted-local",
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -192,6 +236,7 @@ def test_prepare_idempotency_is_locked_and_never_creates_a_second_run(
             [sys.executable, "-c", "print('different')"],
             idempotency_key="one-logical-launch",
             actor="principal",
+            security_profile="trusted-local",
         )
     assert list((tmp_path / "runs").glob("*/manifest.json")) == manifests
 
@@ -204,6 +249,7 @@ def test_prepare_allows_other_valid_uncheckpointed_run_artifacts(tmp_path: Path)
         [sys.executable, "-c", "print('second')"],
         idempotency_key="second",
         actor="principal",
+        security_profile="trusted-local",
     )
 
     assert first["run_id"] != second["run_id"]
@@ -223,6 +269,7 @@ def test_environment_fingerprint_does_not_derive_from_unlisted_secrets(
         [sys.executable, "-c", "print('second')"],
         idempotency_key="second-environment",
         actor="test-principal",
+        security_profile="trusted-local",
     )
 
     assert first["environment_sha256"] == second["environment_sha256"]
@@ -241,6 +288,92 @@ def test_start_fails_closed_when_tmux_is_missing(tmp_path: Path, monkeypatch) ->
     assert service.status(run_id, reconcile=False)["state"] == "prepared"
     assert list((tmp_path / ".aros" / "receipts").glob("*.json")) == []
     assert list((tmp_path / ".aros" / "events").glob("*.json")) == []
+
+
+def test_isolated_start_probe_failure_precedes_launch_receipt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service = RunService(tmp_path)
+    manifest = service.prepare(
+        ["/usr/bin/python3", "-c", "print('must not launch')"],
+        idempotency_key="isolation-unavailable",
+        actor="principal",
+    )
+    run_id = str(manifest["run_id"])
+
+    def unavailable() -> None:
+        raise IsolationError("test kernel capability is unavailable")
+
+    monkeypatch.setattr("arbor.aros.runs.shutil.which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr("arbor.aros.runs.probe_isolated_linux", unavailable)
+
+    with pytest.raises(RunError, match="isolated-linux.*unavailable"):
+        service.start(run_id)
+
+    assert service.status(run_id, reconcile=False)["state"] == "prepared"
+    assert list((tmp_path / ".aros" / "receipts").glob("*.json")) == []
+    assert list((tmp_path / ".aros" / "events").glob("*.json")) == []
+
+
+def test_real_isolated_tmux_run_enforces_manifest_capabilities(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _require_tmux()
+    try:
+        probe_isolated_linux()
+    except IsolationError as error:
+        pytest.skip(f"isolated-linux is unavailable: {error}")
+    _init_clean_repo(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / ".keep").write_text("", encoding="utf-8")
+    _git(tmp_path, "add", "scratch/.keep")
+    _git(tmp_path, "commit", "-qm", "add isolated output directory")
+    outside = tmp_path.parent / f"{tmp_path.name}-secret.txt"
+    outside.write_text("host secret", encoding="utf-8")
+    monkeypatch.setenv("AROS_SECRET_SENTINEL", "must-not-cross-boundary")
+    code = r"""
+import json, os, pathlib, socket, sys
+root = pathlib.Path.cwd()
+def attempt(operation):
+    try:
+        return {"ok": True, "value": operation()}
+    except OSError as error:
+        return {"ok": False, "errno": error.errno}
+print(json.dumps({
+    "outside_read": attempt(lambda: pathlib.Path(sys.argv[1]).read_text()),
+    "root_write": attempt(lambda: (root / "forbidden.txt").write_text("bad")),
+    "scratch_write": attempt(lambda: (root / "scratch" / "result.txt").write_text("ok")),
+    "network": attempt(socket.socket),
+    "secret": os.environ.get("AROS_SECRET_SENTINEL"),
+    "profile": os.environ.get("AROS_SECURITY_PROFILE"),
+}))
+"""
+    service = RunService(tmp_path)
+    manifest = service.prepare(
+        ["/usr/bin/python3", "-c", code, str(outside)],
+        idempotency_key="real-isolated-run",
+        actor="principal",
+        writable_paths=["scratch"],
+    )
+    run_id = str(manifest["run_id"])
+
+    service.start(run_id)
+    status = _wait_for_state(service, run_id)
+    observed = json.loads(service.tail(run_id))
+
+    assert status["state"] == "completed"
+    assert observed["outside_read"]["ok"] is False
+    assert observed["root_write"]["ok"] is False
+    assert observed["scratch_write"]["ok"] is True
+    assert observed["network"]["ok"] is False
+    assert observed["secret"] is None
+    assert observed["profile"] == "isolated-linux"
+    assert (scratch / "result.txt").read_text(encoding="utf-8") == "ok"
+    assert not (tmp_path / "forbidden.txt").exists()
 
 
 def test_start_rejects_manifest_tamper_and_unrelated_dirty_work(tmp_path: Path) -> None:
@@ -334,6 +467,7 @@ def test_real_tmux_run_survives_client_and_writes_final_receipts(tmp_path: Path)
         [sys.executable, "-c", "print('later')"],
         idempotency_key="later-run",
         actor="test-principal",
+        security_profile="trusted-local",
     )
     assert later["run_id"] != run_id
 
@@ -652,6 +786,11 @@ def test_reconcile_prefers_existing_final_receipt_over_stale_status(tmp_path: Pa
 
     assert status["state"] == "completed"
     assert status["exit_code"] == 0
+    completion_event = (
+        tmp_path / ".aros" / "events" / f"EVT-{run_id}-completed.json"
+    )
+    assert completion_event.is_file()
+    assert json.loads(completion_event.read_text(encoding="utf-8"))["kind"] == "run_completed"
 
 
 def test_list_fails_closed_on_unreadable_run_status(tmp_path: Path) -> None:

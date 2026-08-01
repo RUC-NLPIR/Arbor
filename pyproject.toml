@@ -73,6 +73,7 @@ fallback_version = "0.1.0"
 package-dir = { "arbor" = "src", "arbor.skills_suite" = "skills" }
 packages = [
     "arbor",
+    "arbor.aros",
     "arbor.cli",
     "arbor.cli.commands",
     "arbor.cli.intake",

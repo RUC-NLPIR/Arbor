@@ -64,6 +64,9 @@ class AgentConfig(ProxyModel):
 
     # ── Persistence — keep agent state out of the target codebase ────
     workspace_dir: str | None = None
+    # Exact runtime directory override for clients with their own state root.
+    # Legacy Arbor callers leave this unset and continue using ``.arbor``.
+    runtime_dir: str | None = None
 
     # ── Runtime-only handles (never serialized) ──────────────────────
     # Event attribution: which tree node / agent these emissions belong to.
@@ -99,9 +102,12 @@ class AgentConfig(ProxyModel):
 
     @property
     def agent_dir(self) -> Path:
-        """Directory for agent artifacts (.arbor/)."""
+        """Directory for agent runtime artifacts (legacy default: ``.arbor``)."""
         from .._app import CONFIG_DIR_NAME
-        if self.workspace_dir:
+
+        if self.runtime_dir:
+            d = Path(self.runtime_dir)
+        elif self.workspace_dir:
             d = Path(self.workspace_dir) / CONFIG_DIR_NAME
         else:
             d = self.cwd_path / CONFIG_DIR_NAME

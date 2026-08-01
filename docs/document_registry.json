@@ -24,6 +24,14 @@
       "status": "current",
       "authority": "informative",
       "agent_visibility": "on_demand"
+    },
+    {
+      "id": "aros-m1-native-principal-smoke",
+      "title": "AROS M1 Native Principal Smoke Evidence",
+      "path": "docs/analysis/aros-m1-native-principal-smoke.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
     }
   ]
 }

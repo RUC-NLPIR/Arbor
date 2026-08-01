@@ -131,6 +131,10 @@ class FileEditTool(Tool):
         if not os.path.isabs(file_path):
             file_path = os.path.join(self.cwd, file_path)
 
+        file_path, blocked = self.authorize_path(file_path)
+        if blocked:
+            return f"BLOCKED: {blocked}"
+
         if old_string == new_string:
             return "Error: old_string and new_string are identical. No change needed."
 

@@ -51,6 +51,10 @@ class FileWriteTool(Tool):
         if not os.path.isabs(file_path):
             file_path = os.path.join(self.cwd, file_path)
 
+        file_path, blocked = self.authorize_path(file_path)
+        if blocked:
+            return f"BLOCKED: {blocked}"
+
         # Create parent directories
         parent = os.path.dirname(file_path)
         if parent:

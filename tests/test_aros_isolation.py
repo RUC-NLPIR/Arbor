@@ -235,6 +235,14 @@ def test_environment_uses_fixed_path_and_only_real_writable_home(tmp_path: Path)
     assert with_writes.env["HOME"] == with_writes.env["TMPDIR"] == str(scratch)
     assert with_writes.env["PYTHONDONTWRITEBYTECODE"] == "1"
 
+    empty_environment = build_isolated_linux(
+        tmp_path,
+        [],
+        source_environment={},
+    )
+    assert empty_environment.env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+    assert "LANG" not in empty_environment.env
+
 
 def test_kernel_resource_limits_are_applied(tmp_path: Path) -> None:
     limits = IsolationLimits(
@@ -319,6 +327,11 @@ def test_capability_probe_failure_is_fail_closed(tmp_path: Path, monkeypatch) ->
     policy = isolated_linux_policy(tmp_path, [])
     assert policy.profile == "isolated-linux"
     with pytest.raises(IsolationError, match="Landlock"):
+        build_isolated_linux(tmp_path, [])
+
+    monkeypatch.undo()
+    monkeypatch.setattr(isolation, "_probe_landlock_abi", lambda: 5)
+    with pytest.raises(IsolationError, match="exactly Landlock ABI 4"):
         build_isolated_linux(tmp_path, [])
 
     monkeypatch.undo()

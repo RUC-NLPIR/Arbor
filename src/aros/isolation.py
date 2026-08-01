@@ -235,8 +235,10 @@ def probe_isolated_linux() -> IsolationProbe:
     if platform.system() != "Linux" or platform.machine() not in {"x86_64", "aarch64"}:
         raise IsolationError("isolated-linux requires Linux on x86_64 or aarch64")
     abi = _probe_landlock_abi()
-    if abi < 4:
-        raise IsolationError("isolated-linux requires Landlock ABI 4 or newer")
+    if abi != 4:
+        raise IsolationError(
+            f"isolated-linux supports exactly Landlock ABI 4; host reports ABI {abi}"
+        )
     library = _find_seccomp_library()
     if library is None:
         raise IsolationError("isolated-linux requires libseccomp")
@@ -260,7 +262,7 @@ def build_isolated_linux(
     environment = _isolated_environment(
         workspace,
         policy.writable_paths,
-        source_environment or os.environ,
+        source_environment if source_environment is not None else os.environ,
     )
     rules = _filesystem_rules(workspace, policy.writable_paths)
     seccomp = _load_seccomp_library(probe.seccomp_library)
@@ -513,8 +515,10 @@ def _drop_capabilities(cap_last: int) -> None:
     if _LIBC.capset(ctypes.byref(header), ctypes.byref(data)) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
-    _LIBC.prctl(_PR_SET_KEEPCAPS, 0, 0, 0, 0)
-    _LIBC.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
+    for option in (_PR_SET_KEEPCAPS, _PR_SET_DUMPABLE):
+        if _LIBC.prctl(option, 0, 0, 0, 0) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
 
 
 def _set_no_new_privileges() -> None:

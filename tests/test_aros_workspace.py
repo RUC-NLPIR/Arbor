@@ -142,8 +142,111 @@ def test_status_workspace_reports_explicit_views_without_reading_their_meaning(
         "mission": {"path": "AROS.md", "exists": True},
         "now": {"path": "memory/NOW.md", "exists": True},
         "frontier": {"path": "questions/FRONTIER.md", "exists": True},
-        "active_runs": {"path": "runs/ACTIVE.md", "exists": False},
     }
+    assert status["runs"] == {
+        "total": 0,
+        "counts": {},
+        "items": [],
+        "truncated": False,
+        "operational_error": None,
+    }
+
+
+def test_status_and_boot_discover_bounded_operational_run_facts(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from arbor.aros import runs as runs_module
+
+    _init_git(tmp_path)
+    init_workspace(tmp_path, "Mission")
+
+    run_statuses = [
+        {
+            "run_id": f"RUN-completed-{index:02d}",
+            "state": "completed",
+            "updated_at": f"2026-08-01T00:{index:02d}:00Z",
+            "exit_code": 0,
+            "final_ref": f"runs/RUN-completed-{index:02d}/final.json",
+            "unbounded_detail": "X" * 10_000,
+        }
+        for index in range(24)
+    ]
+    run_statuses.extend(
+        [
+            {
+                "run_id": "RUN-lost-important",
+                "state": "lost",
+                "updated_at": "2026-08-01T01:00:00Z",
+                "reason": "process_absent_without_final_receipt",
+            },
+            {
+                "run_id": "RUN-running-important",
+                "state": "running",
+                "updated_at": "2026-08-01T02:00:00Z",
+                "process_pid": 1234,
+            },
+        ]
+    )
+
+    class FakeRunService:
+        def __init__(self, root: Path) -> None:
+            assert root == tmp_path.resolve()
+
+        def list(self) -> list[dict[str, object]]:
+            return run_statuses
+
+    monkeypatch.setattr(runs_module, "RunService", FakeRunService)
+
+    status = status_workspace(tmp_path)
+    summary = status["runs"]
+    assert summary["total"] == 26
+    assert summary["counts"] == {"completed": 24, "lost": 1, "running": 1}
+    assert summary["truncated"] is True
+    assert len(summary["items"]) == 20
+    assert {item["run_id"] for item in summary["items"]} >= {
+        "RUN-lost-important",
+        "RUN-running-important",
+    }
+    assert all("unbounded_detail" not in item for item in summary["items"])
+
+    boot = boot_workspace(tmp_path)
+    assert "## Operational runs" in boot
+    assert "RUN-running-important" in boot
+    assert "RUN-lost-important" in boot
+    assert "completed=24" in boot
+    assert "additional runs omitted" in boot
+
+
+def test_run_discovery_reports_operational_error_without_inventing_lost_state(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from arbor.aros import runs as runs_module
+
+    _init_git(tmp_path)
+    init_workspace(tmp_path, "Mission")
+
+    class BrokenRunService:
+        def __init__(self, root: Path) -> None:
+            assert root == tmp_path.resolve()
+
+        def list(self) -> list[dict[str, object]]:
+            raise runs_module.RunError("receipt store is unreadable")
+
+    monkeypatch.setattr(runs_module, "RunService", BrokenRunService)
+
+    status = status_workspace(tmp_path)
+    assert status["runs"] == {
+        "total": None,
+        "counts": {},
+        "items": [],
+        "truncated": False,
+        "operational_error": "receipt store is unreadable",
+    }
+
+    boot = boot_workspace(tmp_path)
+    assert "## Operational runs" in boot
+    assert "Operational error: receipt store is unreadable" in boot
+    assert "state: lost" not in boot
 
 
 def test_status_workspace_reports_git_dirty_state_and_worktrees(tmp_path: Path) -> None:
@@ -189,7 +292,7 @@ def test_boot_workspace_uses_only_durable_allowlisted_views_and_git(tmp_path: Pa
     )
     (tmp_path / "runs").mkdir()
     (tmp_path / "runs" / "ACTIVE.md").write_text(
-        "# Active Runs\n\nrun-001 is running.\n",
+        "FORBIDDEN_ACTIVE_MD_SENTINEL",
         encoding="utf-8",
     )
     (tmp_path / ".arbor" / "sessions").mkdir(parents=True)
@@ -206,9 +309,9 @@ def test_boot_workspace_uses_only_durable_allowlisted_views_and_git(tmp_path: Pa
     assert "Find the causal mechanism." in boot
     assert "The strongest counterevidence is C." in boot
     assert "Is mediator M load-bearing?" in boot
-    assert "run-001 is running." in boot
     assert "## Git and workspace status" in boot
     assert "Branch:" in boot
+    assert "FORBIDDEN_ACTIVE_MD_SENTINEL" not in boot
     assert "FORBIDDEN_TRANSCRIPT_SENTINEL" not in boot
     assert "FORBIDDEN_PROVIDER_SENTINEL" not in boot
     assert "IdeaTree" not in boot

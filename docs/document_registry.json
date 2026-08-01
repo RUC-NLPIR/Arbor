@@ -32,6 +32,14 @@
       "status": "current",
       "authority": "informative",
       "agent_visibility": "on_demand"
+    },
+    {
+      "id": "aros-m2-durable-run-smoke",
+      "title": "AROS M2 Durable Run Smoke Evidence",
+      "path": "docs/analysis/aros-m2-durable-run-smoke.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
     }
   ]
 }

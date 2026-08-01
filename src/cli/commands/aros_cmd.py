@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import typer
+from typer.core import TyperCommand
 
 from ...aros.principal import build_principal_agent, run_principal
+from ...aros.runs import RunService
 from ...aros.workspace import (
     DEFAULT_BOOT_MAX_CHARS,
     boot_workspace,
@@ -25,6 +27,12 @@ aros_app = typer.Typer(
     help="Operate the native Agent-principal research workspace.",
     no_args_is_help=True,
 )
+run_app = typer.Typer(
+    name="run",
+    help="Manage durable background experiments.",
+    no_args_is_help=True,
+)
+aros_app.add_typer(run_app, name="run")
 
 
 def _root(cwd: Path) -> Path:
@@ -38,6 +46,15 @@ def _print_json(value: Any) -> None:
 def _fail(exc: Exception) -> None:
     typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
     raise typer.Exit(code=2) from exc
+
+
+class _RequireCommandSeparator(TyperCommand):
+    """Keep experiment argv separate from Arbor's own CLI options."""
+
+    def parse_args(self, ctx: Any, args: list[str]) -> list[str]:
+        if "--help" not in args and "-h" not in args and "--" not in args:
+            ctx.fail("experiment command argv must follow --")
+        return super().parse_args(ctx, args)
 
 
 @aros_app.command("init")
@@ -101,6 +118,131 @@ def status_command(
     missing = status.get("missing")
     if missing:
         typer.echo("missing: " + ", ".join(str(item) for item in missing))
+
+
+@run_app.command("start", cls=_RequireCommandSeparator)
+def run_start_command(
+    command: list[str] = typer.Argument(
+        ...,
+        metavar="-- COMMAND [ARGS]...",
+        help="Exact command argv. Place it after -- so options are not parsed by Arbor.",
+    ),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+    run_cwd: str = typer.Option(
+        ".",
+        "--run-cwd",
+        help="Command working directory, relative to the workspace root.",
+    ),
+    timeout_seconds: int = typer.Option(
+        3600,
+        "--timeout-seconds",
+        min=1,
+        help="Hard run timeout in seconds.",
+    ),
+    idempotency_key: str = typer.Option(
+        ...,
+        "--idempotency-key",
+        help="Stable key preventing duplicate process launch.",
+    ),
+    actor: str = typer.Option("human", "--actor", help="Launch authority."),
+    label: str | None = typer.Option(None, "--label", help="Optional display label."),
+) -> None:
+    """Prepare and launch one durable run."""
+    try:
+        service = RunService(_root(cwd))
+        manifest = service.prepare(
+            list(command),
+            cwd=run_cwd,
+            timeout_seconds=timeout_seconds,
+            idempotency_key=idempotency_key,
+            actor=actor,
+            label=label,
+        )
+        run_id = manifest.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise RuntimeError("prepared run manifest has no run_id")
+        status = service.start(run_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(status)
+
+
+@run_app.command("status")
+def run_status_command(
+    run_id: str = typer.Argument(..., help="Stable run identifier."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Reconcile and inspect one durable run."""
+    try:
+        status = RunService(_root(cwd)).status(run_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(status)
+
+
+@run_app.command("list")
+def run_list_command(
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """List durable runs after reconciling their process state."""
+    try:
+        runs = RunService(_root(cwd)).list()
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(runs)
+
+
+@run_app.command("tail")
+def run_tail_command(
+    run_id: str = typer.Argument(..., help="Stable run identifier."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+    stream: str = typer.Option(
+        "stdout",
+        "--stream",
+        help="Log stream: stdout or stderr.",
+    ),
+    max_bytes: int = typer.Option(
+        65_536,
+        "--max-bytes",
+        min=1,
+        help="Maximum number of trailing bytes to print.",
+    ),
+) -> None:
+    """Print the current tail of a run log without JSON escaping it."""
+    try:
+        output = RunService(_root(cwd)).tail(
+            run_id,
+            stream=stream,
+            max_bytes=max_bytes,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    typer.echo(output, nl=False)
+
+
+@run_app.command("stop")
+def run_stop_command(
+    run_id: str = typer.Argument(..., help="Stable run identifier."),
+    reason: str = typer.Option(..., "--reason", help="Required audit reason."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+    actor: str = typer.Option("human", "--actor", help="Stop authority."),
+    signal_name: str = typer.Option(
+        "TERM",
+        "--signal",
+        help="Signal name recorded and sent by the run service.",
+    ),
+) -> None:
+    """Stop a durable run and record an attributed receipt."""
+    try:
+        receipt = RunService(_root(cwd)).stop(
+            run_id,
+            actor=actor,
+            reason=reason,
+            signal_name=signal_name,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(receipt)
 
 
 @aros_app.command("start")

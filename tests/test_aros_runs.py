@@ -1,0 +1,732 @@
+"""Durable AROS run lifecycle tests.
+
+These tests exercise the filesystem/process contract directly.  tmux tests are
+real integration tests when tmux is available; deterministic state-machine
+tests do not require it.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+from arbor.aros.runs import RunError, RunService
+from arbor.aros.store import atomic_write_json
+
+
+def _git(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _init_clean_repo(root: Path) -> str:
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "config", "user.email", "aros@example.invalid")
+    _git(root, "config", "user.name", "AROS test")
+    (root / "README.md").write_text("# test workspace\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-qm", "initial state")
+    return _git(root, "rev-parse", "HEAD")
+
+
+def _prepare(
+    root: Path,
+    *,
+    argv: list[str] | None = None,
+    key: str = "test-run-key",
+    timeout: float = 10,
+) -> tuple[RunService, dict[str, object]]:
+    service = RunService(root)
+    manifest = service.prepare(
+        argv or [sys.executable, "-c", "print('measured output', flush=True)"],
+        cwd=".",
+        timeout_seconds=timeout,
+        idempotency_key=key,
+        actor="test-principal",
+        label="durable-test",
+    )
+    return service, manifest
+
+
+def _wait_for_state(
+    service: RunService,
+    run_id: str,
+    terminal: set[str] | None = None,
+    *,
+    timeout: float = 10,
+) -> dict[str, object]:
+    wanted = terminal or {
+        "completed",
+        "failed_process",
+        "timed_out",
+        "cancelled",
+        "lost",
+    }
+    deadline = time.monotonic() + timeout
+    latest: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        latest = service.status(run_id)
+        if latest["state"] in wanted:
+            return latest
+        time.sleep(0.05)
+    pytest.fail(f"run {run_id} did not reach {wanted}; latest status: {latest}")
+
+
+def _require_tmux() -> None:
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux is unavailable")
+
+
+def test_prepare_freezes_a_versioned_manifest_and_runtime_status(tmp_path: Path) -> None:
+    head = _init_clean_repo(tmp_path)
+
+    service, manifest = _prepare(tmp_path)
+
+    run_id = str(manifest["run_id"])
+    manifest_path = tmp_path / "runs" / run_id / "manifest.json"
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    assert manifest_path.is_file()
+    assert status_path.is_file()
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
+    assert manifest["schema_version"] == 1
+    assert run_id.startswith("RUN-")
+    assert manifest["base_commit"] == head
+    assert manifest["repository_ref"] == "."
+    assert manifest["argv"][0] == sys.executable
+    assert manifest["cwd"] == "."
+    assert manifest["timeout_seconds"] == 10
+    assert manifest["idempotency_key"] == "test-run-key"
+    assert manifest["security_profile"] == "trusted-local"
+    assert manifest["environment_ref"]["kind"] == "allowlist-fingerprint-v1"
+    assert "environment" not in manifest
+    assert manifest["actor"] == "test-principal"
+    assert manifest["created_at"].endswith("Z")
+    assert len(str(manifest["environment_sha256"])) == 64
+    assert len(str(manifest["manifest_sha256"])) == 64
+    assert manifest["question_refs"] == []
+    assert manifest["experiment_ref"] is None
+    assert manifest["prediction_ref"] is None
+    assert manifest["evaluator_ref"] is None
+    assert manifest["evaluator_version"] is None
+    assert manifest["seed"] is None
+    assert manifest["dataset_ref"] is None
+    assert manifest["resource_request"] == {}
+    assert manifest["budget"] == {}
+    assert manifest["output_paths"] == [
+        f".aros/runs/{run_id}/stdout.log",
+        f".aros/runs/{run_id}/stderr.log",
+        f"runs/{run_id}/final.json",
+    ]
+    assert manifest["success_exit_codes"] == [0]
+    assert manifest["candidate_commit"] is None
+    assert service.status(run_id, reconcile=False) == {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": "prepared",
+        "manifest_sha256": manifest["manifest_sha256"],
+        "updated_at": manifest["created_at"],
+    }
+    assert not (tmp_path / "runs" / run_id / "status.json").exists()
+    assert not (tmp_path / "runs" / run_id / "stdout.log").exists()
+
+
+def test_prepare_requires_clean_git_and_contained_real_cwd(tmp_path: Path) -> None:
+    _init_clean_repo(tmp_path)
+    (tmp_path / "dirty.txt").write_text("not checkpointed", encoding="utf-8")
+    service = RunService(tmp_path)
+
+    with pytest.raises(RunError, match="clean Git"):
+        service.prepare(
+            ["true"],
+            idempotency_key="dirty",
+            actor="principal",
+        )
+    assert not (tmp_path / "runs").exists()
+
+    (tmp_path / "dirty.txt").unlink()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (tmp_path / "escape").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RunError, match="cwd.*workspace"):
+        service.prepare(
+            ["true"],
+            cwd="escape",
+            idempotency_key="escape",
+            actor="principal",
+        )
+
+
+def test_prepare_idempotency_is_locked_and_never_creates_a_second_run(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service = RunService(tmp_path)
+
+    def prepare_once() -> dict[str, object]:
+        return service.prepare(
+            [sys.executable, "-c", "print('once')"],
+            idempotency_key="one-logical-launch",
+            actor="principal",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(lambda _: prepare_once(), range(2)))
+
+    assert first == second
+    manifests = list((tmp_path / "runs").glob("*/manifest.json"))
+    assert len(manifests) == 1
+    with pytest.raises(RunError, match="idempotency key.*already belongs"):
+        service.prepare(
+            [sys.executable, "-c", "print('different')"],
+            idempotency_key="one-logical-launch",
+            actor="principal",
+        )
+    assert list((tmp_path / "runs").glob("*/manifest.json")) == manifests
+
+
+def test_prepare_allows_other_valid_uncheckpointed_run_artifacts(tmp_path: Path) -> None:
+    _init_clean_repo(tmp_path)
+    service, first = _prepare(tmp_path, key="first")
+
+    second = service.prepare(
+        [sys.executable, "-c", "print('second')"],
+        idempotency_key="second",
+        actor="principal",
+    )
+
+    assert first["run_id"] != second["run_id"]
+    assert len(list((tmp_path / "runs").glob("*/manifest.json"))) == 2
+
+
+def test_environment_fingerprint_does_not_derive_from_unlisted_secrets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    monkeypatch.setenv("AROS_SECRET_SENTINEL", "first-secret-value")
+    service, first = _prepare(tmp_path, key="first-environment")
+    monkeypatch.setenv("AROS_SECRET_SENTINEL", "different-secret-value")
+
+    second = service.prepare(
+        [sys.executable, "-c", "print('second')"],
+        idempotency_key="second-environment",
+        actor="test-principal",
+    )
+
+    assert first["environment_sha256"] == second["environment_sha256"]
+    assert "AROS_SECRET_SENTINEL" not in first["environment_ref"]["keys"]
+
+
+def test_start_fails_closed_when_tmux_is_missing(tmp_path: Path, monkeypatch) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path)
+    run_id = str(manifest["run_id"])
+    monkeypatch.setattr("arbor.aros.runs.shutil.which", lambda _name: None)
+
+    with pytest.raises(RunError, match="tmux.*required"):
+        service.start(run_id)
+
+    assert service.status(run_id, reconcile=False)["state"] == "prepared"
+    assert list((tmp_path / ".aros" / "receipts").glob("*.json")) == []
+    assert list((tmp_path / ".aros" / "events").glob("*.json")) == []
+
+
+def test_start_rejects_manifest_tamper_and_unrelated_dirty_work(tmp_path: Path) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path)
+    run_id = str(manifest["run_id"])
+    manifest_path = tmp_path / "runs" / run_id / "manifest.json"
+    tampered = dict(manifest)
+    tampered["timeout_seconds"] = 999
+    manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    with pytest.raises(RunError, match="manifest hash"):
+        service.start(run_id)
+    with pytest.raises(RunError, match="manifest hash"):
+        service.status(run_id)
+    with pytest.raises(RunError, match="manifest hash"):
+        service.list()
+
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "unrelated.txt").write_text("dirty", encoding="utf-8")
+    with pytest.raises(RunError, match="clean Git"):
+        service.start(run_id)
+
+
+def test_real_tmux_run_survives_client_and_writes_final_receipts(tmp_path: Path) -> None:
+    _require_tmux()
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            "import time; print('begin', flush=True); time.sleep(.25); print('end', flush=True)",
+        ],
+    )
+    run_id = str(manifest["run_id"])
+
+    launched = service.start(run_id)
+    del launched
+    del service  # no in-memory Principal/service state is needed for completion
+    recovered = RunService(tmp_path)
+    status = _wait_for_state(recovered, run_id)
+
+    assert status["state"] == "completed"
+    final_path = tmp_path / "runs" / run_id / "final.json"
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    assert final["state"] == "completed"
+    assert final["exit_code"] == 0
+    for field in (
+        "base_commit",
+        "argv",
+        "cwd",
+        "timeout_seconds",
+        "idempotency_key",
+        "security_profile",
+        "manifest_sha256",
+        "actor",
+        "started_at",
+        "finished_at",
+    ):
+        assert final[field] == manifest[field] if field in manifest else final[field]
+    assert final["stdout"]["sha256"]
+    assert final["stdout"]["bytes"] > 0
+    assert final["finalized_at"] == final["finished_at"]
+    assert final["resource_usage"]["wall_seconds"] == final["duration_seconds"]
+    assert "begin\nend\n" == recovered.tail(run_id, stream="stdout")
+    assert (tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json").is_file()
+    launch_receipt = json.loads(
+        (tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert launch_receipt["host"]
+    assert launch_receipt["runner_version"] == 1
+    assert launch_receipt["runner_invocation"][1:3] == ["-m", "arbor.aros.runner"]
+    assert len(launch_receipt["receipt_sha256"]) == 64
+    assert final["launch_receipt_sha256"] == launch_receipt["receipt_sha256"]
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / ".aros" / "events").glob("*.json")
+    ]
+    assert {event["kind"] for event in events} == {
+        "run_launch_requested",
+        "run_completed",
+    }
+    assert all(event["source_ref"] == f"runs/{run_id}" for event in events)
+    later = recovered.prepare(
+        [sys.executable, "-c", "print('later')"],
+        idempotency_key="later-run",
+        actor="test-principal",
+    )
+    assert later["run_id"] != run_id
+
+
+def test_concurrent_start_reattaches_without_a_second_tmux_launch(tmp_path: Path) -> None:
+    _require_tmux()
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "import time; time.sleep(.3)"],
+        key="concurrent-start",
+    )
+    run_id = str(manifest["run_id"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(pool.map(lambda _: service.start(run_id), range(2)))
+
+    _wait_for_state(service, run_id)
+    assert {status["run_id"] for status in statuses} == {run_id}
+    assert len(
+        list((tmp_path / ".aros" / "receipts").glob(f"{run_id}-prelaunch.json"))
+    ) == 1
+    launch_events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / ".aros" / "events").glob("*.json")
+        if "launch-requested" in path.name
+    ]
+    assert len(launch_events) == 1
+
+
+def test_timeout_is_a_process_state_with_automatic_final(tmp_path: Path) -> None:
+    _require_tmux()
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+        timeout=0.2,
+    )
+    run_id = str(manifest["run_id"])
+
+    service.start(run_id)
+    status = _wait_for_state(service, run_id)
+    final = json.loads(
+        (tmp_path / "runs" / run_id / "final.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert status["state"] == "timed_out"
+    assert final["state"] == "timed_out"
+    assert final["timeout_seconds"] == 0.2
+    assert "scientific" not in json.dumps(final).lower()
+
+
+def test_nonzero_exit_is_failed_process_not_scientific_negative(tmp_path: Path) -> None:
+    _require_tmux()
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "raise SystemExit(7)"],
+        key="nonzero-exit",
+    )
+    run_id = str(manifest["run_id"])
+
+    service.start(run_id)
+    status = _wait_for_state(service, run_id)
+    final = json.loads(
+        (tmp_path / "runs" / run_id / "final.json").read_text(encoding="utf-8")
+    )
+
+    assert status["state"] == "failed_process"
+    assert final["state"] == "failed_process"
+    assert final["exit_code"] == 7
+    assert "scientific" not in json.dumps(final).lower()
+
+
+def test_stop_on_terminal_run_returns_existing_final_without_new_signal(
+    tmp_path: Path,
+) -> None:
+    _require_tmux()
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "print('already done')"],
+        key="terminal-stop",
+    )
+    run_id = str(manifest["run_id"])
+    service.start(run_id)
+    assert _wait_for_state(service, run_id)["state"] == "completed"
+
+    final = service.stop(run_id, actor="human", reason="no-op after completion")
+
+    assert final["state"] == "completed"
+    assert not (tmp_path / ".aros" / "receipts" / f"{run_id}-stop.json").exists()
+
+
+def test_stop_persists_actor_reason_signal_request_and_receipt(tmp_path: Path) -> None:
+    _require_tmux()
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+    run_id = str(manifest["run_id"])
+    service.start(run_id)
+
+    service.stop(
+        run_id,
+        actor="human-owner",
+        reason="safety review",
+        signal_name="TERM",
+    )
+    status = _wait_for_state(service, run_id)
+    request = json.loads(
+        (tmp_path / ".aros" / "runs" / run_id / "stop-request.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    receipt = json.loads(
+        (tmp_path / ".aros" / "receipts" / f"{run_id}-stop.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert status["state"] == "cancelled"
+    assert request["actor"] == receipt["actor"] == "human-owner"
+    assert request["reason"] == receipt["reason"] == "safety review"
+    assert request["signal"] == receipt["signal"] == "TERM"
+    assert receipt["delivered"] is True
+    assert receipt["process_start_token"]
+    assert receipt["signal_sequence"] == ["TERM"]
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / ".aros" / "events").glob("*.json")
+    ]
+    assert any(event["kind"] == "run_stop_requested" for event in events)
+
+
+def test_stop_fails_closed_when_process_identity_token_changed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _require_tmux()
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+        key="identity-stop",
+    )
+    run_id = str(manifest["run_id"])
+    service.start(run_id)
+    from arbor.aros import runs
+
+    original = runs._process_start_token
+    monkeypatch.setattr(runs, "_process_start_token", lambda _pid: "reused-pid")
+    with pytest.raises(RunError, match="process identity"):
+        service.stop(run_id, actor="owner", reason="must not hit reused PID")
+    assert not (tmp_path / ".aros" / "runs" / run_id / "stop-request.json").exists()
+
+    monkeypatch.setattr(runs, "_process_start_token", original)
+    service.stop(run_id, actor="owner", reason="test cleanup")
+    assert _wait_for_state(service, run_id)["state"] == "cancelled"
+
+
+def test_stop_escalates_to_kill_when_child_ignores_term(tmp_path: Path) -> None:
+    _require_tmux()
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            (
+                "import signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print('ready', flush=True); time.sleep(30)"
+            ),
+        ],
+        key="ignore-term",
+    )
+    run_id = str(manifest["run_id"])
+    service.start(run_id)
+    deadline = time.monotonic() + 5
+    while "ready" not in service.tail(run_id) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert "ready" in service.tail(run_id)
+
+    service.stop(run_id, actor="owner", reason="bounded shutdown", signal_name="TERM")
+    assert _wait_for_state(service, run_id, timeout=5)["state"] == "cancelled"
+    final = json.loads(
+        (tmp_path / "runs" / run_id / "final.json").read_text(encoding="utf-8")
+    )
+    assert final["signal_sequence"] == ["TERM", "KILL"]
+
+
+def test_concurrent_identical_stop_requests_share_one_receipt(tmp_path: Path) -> None:
+    _require_tmux()
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+        key="concurrent-stop",
+    )
+    run_id = str(manifest["run_id"])
+    service.start(run_id)
+
+    def stop_once() -> dict[str, object]:
+        return service.stop(run_id, actor="owner", reason="same request")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(lambda _index: stop_once(), range(2)))
+
+    assert first == second
+    assert len(list((tmp_path / ".aros" / "receipts").glob(f"{run_id}-stop.json"))) == 1
+    assert _wait_for_state(service, run_id)["state"] == "cancelled"
+
+
+def test_stop_retries_after_request_was_persisted_before_signal(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key="partial-stop")
+    run_id = str(manifest["run_id"])
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
+    status.update(
+        {
+            "state": "running",
+            "process_pid": 12345,
+            "process_pgid": 12345,
+            "process_start_token": "stable-process",
+            "launch_receipt_sha256": "a" * 64,
+        }
+    )
+    atomic_write_json(runtime / "status.json", status)
+    monkeypatch.setattr(
+        "arbor.aros.runs._process_start_token", lambda _pid: "stable-process"
+    )
+
+    def fail_after_request(**_kwargs: object) -> None:
+        raise RuntimeError("simulated crash after durable stop request")
+
+    monkeypatch.setattr(service, "_write_event", fail_after_request)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        service.stop(run_id, actor="owner", reason="same request")
+    request = json.loads((runtime / "stop-request.json").read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(service, "_write_event", lambda **_kwargs: None)
+    monkeypatch.setattr("arbor.aros.runs.os.killpg", lambda _pgid, _signal: None)
+    receipt = service.stop(run_id, actor="owner", reason="same request")
+
+    assert receipt["delivered"] is True
+    assert receipt["requested_at"] == request["requested_at"]
+
+
+def test_reconcile_absent_process_without_final_is_lost_not_failed(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path)
+    run_id = str(manifest["run_id"])
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    atomic_write_json(
+        runtime / "status.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "running",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "process_pid": 999_999_999,
+            "updated_at": manifest["created_at"],
+        },
+    )
+
+    status = service.reconcile(run_id)
+
+    assert status["state"] == "lost"
+    assert status["reason"] == "process_absent_without_final_receipt"
+    assert not (tmp_path / "runs" / run_id / "final.json").exists()
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / ".aros" / "events").glob("*.json")
+    ]
+    assert any(event["kind"] == "anomaly" for event in events)
+
+
+def test_reconcile_prefers_existing_final_receipt_over_stale_status(tmp_path: Path) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path)
+    run_id = str(manifest["run_id"])
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    final = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": "completed",
+        "manifest_sha256": manifest["manifest_sha256"],
+        "launch_receipt_sha256": "a" * 64,
+        "exit_code": 0,
+        "finished_at": manifest["created_at"],
+    }
+    atomic_write_json(tmp_path / "runs" / run_id / "final.json", final)
+    atomic_write_json(
+        runtime / "status.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "running",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "launch_receipt_sha256": "a" * 64,
+            "process_pid": 999_999_999,
+            "updated_at": manifest["created_at"],
+        },
+    )
+
+    status = service.reconcile(run_id)
+
+    assert status["state"] == "completed"
+    assert status["exit_code"] == 0
+
+
+def test_list_fails_closed_on_unreadable_run_status(tmp_path: Path) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path)
+    run_id = str(manifest["run_id"])
+    (tmp_path / ".aros" / "runs" / run_id / "status.json").write_text(
+        "{broken", encoding="utf-8"
+    )
+
+    with pytest.raises(RunError, match="run status"):
+        service.list()
+
+
+def test_reconcile_restores_missing_completion_event(tmp_path: Path) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path)
+    run_id = str(manifest["run_id"])
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
+    status["state"] = "running"
+    status["launch_receipt_sha256"] = "a" * 64
+    atomic_write_json(runtime / "status.json", status)
+    atomic_write_json(
+        tmp_path / "runs" / run_id / "final.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "completed",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "launch_receipt_sha256": "a" * 64,
+            "exit_code": 0,
+            "finished_at": manifest["created_at"],
+        },
+    )
+
+    assert service.reconcile(run_id)["state"] == "completed"
+    event = tmp_path / ".aros" / "events" / f"EVT-{run_id}-completed.json"
+    assert event.is_file()
+    assert service.reconcile(run_id)["state"] == "completed"
+    assert len(list((tmp_path / ".aros" / "events").glob("*.json"))) == 1
+
+
+def test_reconcile_rejects_final_while_matching_process_is_alive(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path)
+    run_id = str(manifest["run_id"])
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
+    status.update(
+        {
+            "state": "running",
+            "process_pid": 12345,
+            "process_start_token": "same-process",
+            "launch_receipt_sha256": "a" * 64,
+        }
+    )
+    atomic_write_json(runtime / "status.json", status)
+    atomic_write_json(
+        tmp_path / "runs" / run_id / "final.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "completed",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "launch_receipt_sha256": "a" * 64,
+            "exit_code": 0,
+            "finished_at": manifest["created_at"],
+        },
+    )
+    monkeypatch.setattr(
+        "arbor.aros.runs._process_start_token", lambda _pid: "same-process"
+    )
+
+    with pytest.raises(RunError, match="integrity conflict"):
+        service.reconcile(run_id)

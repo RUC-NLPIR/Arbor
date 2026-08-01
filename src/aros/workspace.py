@@ -16,13 +16,25 @@ DEFAULT_BOOT_MAX_CHARS = 12_000
 _MIN_BOOT_MAX_CHARS = 512
 _MAX_CHANGES = 100
 _MAX_WORKTREES = 50
+_MAX_RUNS = 20
 _IGNORE_ENTRIES = ("/.aros/", "/.worktree/")
 _VIEWS = {
     "mission": "AROS.md",
     "now": "memory/NOW.md",
     "frontier": "questions/FRONTIER.md",
-    "active_runs": "runs/ACTIVE.md",
 }
+_ACTIVE_RUN_STATES = {"prepared", "launched", "running"}
+_RUN_SUMMARY_FIELDS = (
+    "run_id",
+    "state",
+    "updated_at",
+    "started_at",
+    "finished_at",
+    "exit_code",
+    "reason",
+    "final_ref",
+    "process_pid",
+)
 
 _NOW_TEMPLATE = """# Current State
 
@@ -101,6 +113,7 @@ def status_workspace(root: str | Path) -> dict[str, object]:
         ),
         "git": git,
         "views": views,
+        "runs": _run_summary(workspace),
     }
 
 
@@ -136,13 +149,10 @@ def boot_workspace(
                 _read_workspace_view(workspace, _VIEWS["frontier"], max_chars),
             )
         )
-    if status["views"]["active_runs"]["exists"]:  # type: ignore[index]
-        sections.append(
-            (
-                "Active runs — runs/ACTIVE.md",
-                _read_workspace_view(workspace, _VIEWS["active_runs"], max_chars),
-            )
-        )
+    runs = status["runs"]
+    assert isinstance(runs, dict)
+    if runs["items"] or runs["operational_error"]:
+        sections.append(("Operational runs", _format_runs(runs)))
     sections.append(("Git and workspace status", _format_status(status)))
 
     return _render_bounded_sections(sections, max_chars)
@@ -231,6 +241,64 @@ def _git_status(root: Path) -> tuple[dict[str, Any], Path | None]:
     }, git_root
 
 
+def _run_summary(root: Path) -> dict[str, object]:
+    """Return a compact run inventory from the deterministic run service."""
+    from .runs import RunService
+
+    try:
+        raw_runs = RunService(root).list()
+        for run in raw_runs:
+            if not isinstance(run.get("run_id"), str) or not run["run_id"]:
+                raise ValueError("run inventory contains an invalid run_id")
+            if not isinstance(run.get("state"), str) or not run["state"]:
+                raise ValueError("run inventory contains an invalid state")
+    except (OSError, RuntimeError, ValueError) as error:
+        return {
+            "total": None,
+            "counts": {},
+            "items": [],
+            "truncated": False,
+            "operational_error": str(error),
+        }
+
+    counts: dict[str, int] = {}
+    for run in raw_runs:
+        state = str(run["state"])
+        counts[state] = counts.get(state, 0) + 1
+
+    indexed = list(enumerate(raw_runs))
+    ordered = sorted(
+        indexed,
+        key=lambda pair: (_run_state_priority(str(pair[1]["state"])), -pair[0]),
+    )
+    items = [_compact_run(run) for _, run in ordered[:_MAX_RUNS]]
+    return {
+        "total": len(raw_runs),
+        "counts": dict(sorted(counts.items())),
+        "items": items,
+        "truncated": len(raw_runs) > _MAX_RUNS,
+        "operational_error": None,
+    }
+
+
+def _run_state_priority(state: str) -> int:
+    if state in _ACTIVE_RUN_STATES:
+        return 0
+    if state == "lost":
+        return 1
+    return 2
+
+
+def _compact_run(run: dict[str, object]) -> dict[str, object]:
+    summary: dict[str, object] = {}
+    for field in _RUN_SUMMARY_FIELDS:
+        value = run.get(field)
+        if value is None:
+            continue
+        summary[field] = _clip(value, 240) if isinstance(value, str) else value
+    return summary
+
+
 def _parse_worktrees(raw: str) -> list[dict[str, object]]:
     worktrees: list[dict[str, object]] = []
     current: dict[str, object] | None = None
@@ -312,6 +380,34 @@ def _format_status(status: dict[str, object]) -> str:
             )
         if git["worktrees_truncated"]:
             lines.append("- [additional worktrees truncated]")
+    return "\n".join(lines)
+
+
+def _format_runs(runs: dict[str, object]) -> str:
+    error = runs["operational_error"]
+    if error:
+        return f"Operational error: {error}"
+
+    counts = runs["counts"]
+    items = runs["items"]
+    assert isinstance(counts, dict)
+    assert isinstance(items, list)
+    count_text = ", ".join(f"{state}={count}" for state, count in counts.items())
+    lines = [f"Total: {runs['total']}", f"States: {count_text or '(none)'}"]
+    for item in items:
+        assert isinstance(item, dict)
+        line = f"- {item['run_id']}: {item['state']}"
+        if item.get("updated_at"):
+            line += f"; updated={item['updated_at']}"
+        if item.get("exit_code") is not None:
+            line += f"; exit_code={item['exit_code']}"
+        if item.get("reason"):
+            line += f"; reason={item['reason']}"
+        if item.get("final_ref"):
+            line += f"; final={item['final_ref']}"
+        lines.append(line)
+    if runs["truncated"]:
+        lines.append("- [additional runs omitted]")
     return "\n".join(lines)
 
 

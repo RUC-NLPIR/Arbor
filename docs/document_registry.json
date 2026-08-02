@@ -64,6 +64,14 @@
       "status": "current",
       "authority": "informative",
       "agent_visibility": "on_demand"
+    },
+    {
+      "id": "aros-wave1-public-entry-smoke",
+      "title": "AROS Wave 1 Public Entry Smoke Evidence",
+      "path": "docs/analysis/aros-wave1-public-entry-smoke.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
     }
   ]
 }

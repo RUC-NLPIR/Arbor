@@ -15,6 +15,7 @@ FROZEN_ROOTS = (
     "src/run.py",
     "src/review.py",
 )
+Change = tuple[str, tuple[str, ...], str, str, str]
 
 
 def _arguments() -> argparse.Namespace:
@@ -24,62 +25,171 @@ def _arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _is_deletion_only(line: str) -> tuple[bool, str]:
-    columns = line.split("\t", 2)
-    if len(columns) != 3 or not columns[2]:
-        raise ValueError(f"malformed git numstat row: {line!r}")
+def _git_bytes(repo: Path, *args: str) -> bytes:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip()).decode(
+            errors="replace"
+        )
+        raise ValueError(detail or f"git {args[0]} exited {result.returncode}")
+    return result.stdout
 
-    additions, deletions, path = columns
-    if additions == "-" and deletions == "-":
-        return False, path
-    if not (
-        additions.isascii()
-        and additions.isdecimal()
-        and deletions.isascii()
-        and deletions.isdecimal()
-    ):
-        raise ValueError(f"malformed git numstat counts: {line!r}")
-    return int(additions) == 0 and int(deletions) > 0, path
+
+def _git(repo: Path, *args: str) -> str:
+    return _git_bytes(repo, *args).decode()
+
+
+def _nul_fields(output: str) -> list[str]:
+    if not output:
+        return []
+    if not output.endswith("\0"):
+        raise ValueError("malformed NUL-delimited Git output")
+    fields = output[:-1].split("\0")
+    if any(not field for field in fields):
+        raise ValueError("empty field in NUL-delimited Git output")
+    return fields
+
+
+def _parse_raw(output: str) -> list[Change]:
+    fields = _nul_fields(output)
+    changes: list[Change] = []
+    position = 0
+    while position < len(fields):
+        header = fields[position]
+        position += 1
+        parts = header.split()
+        if len(parts) != 5 or not parts[0].startswith(":"):
+            raise ValueError(f"malformed Git raw header: {header!r}")
+        old_mode = parts[0][1:]
+        new_mode, old_oid, new_oid, status = parts[1:]
+        if any(
+            len(mode) != 6 or any(character not in "01234567" for character in mode)
+            for mode in (old_mode, new_mode)
+        ):
+            raise ValueError(f"malformed Git mode: {header!r}")
+        if any(
+            not oid or any(character not in "0123456789abcdef" for character in oid)
+            for oid in (old_oid, new_oid)
+        ):
+            raise ValueError(f"malformed Git object ID: {header!r}")
+        kind = status[0]
+        if kind in {"R", "C"}:
+            if not status[1:].isascii() or not status[1:].isdecimal():
+                raise ValueError(f"malformed Git status: {status!r}")
+            path_count = 2
+        elif len(status) == 1 and kind in {"A", "D", "M", "T", "U", "X", "B"}:
+            path_count = 1
+        else:
+            raise ValueError(f"unknown Git status: {status!r}")
+        if position + path_count > len(fields):
+            raise ValueError(f"missing path for Git status: {status!r}")
+        paths = tuple(fields[position : position + path_count])
+        position += path_count
+        changes.append((kind, paths, old_mode, new_mode, old_oid))
+    return changes
+
+
+def _is_frozen(path: str) -> bool:
+    return any(path == root or path.startswith(f"{root}/") for root in FROZEN_ROOTS)
+
+
+def _is_text_deletion_only(repo: Path, change: Change) -> bool:
+    _, paths, old_mode, new_mode, old_oid = change
+    if old_mode != new_mode or old_mode not in {"100644", "100755"}:
+        return False
+    current_path = repo / paths[0]
+    if current_path.is_symlink() or not current_path.is_file():
+        return False
+    before = _git_bytes(repo, "cat-file", "blob", old_oid)
+    after = current_path.read_bytes()
+    if b"\0" in before or b"\0" in after:
+        return False
+    before_lines = before.splitlines(keepends=True)
+    after_lines = after.splitlines(keepends=True)
+    if len(after_lines) >= len(before_lines):
+        return False
+    candidates = iter(before_lines)
+    return all(any(candidate == line for candidate in candidates) for line in after_lines)
+
+
+def _find_violations(
+    repo: Path,
+    changes: list[Change],
+    untracked: list[str],
+) -> list[str]:
+    if any(not _is_frozen(path) for path in untracked):
+        raise ValueError("Git returned an out-of-scope untracked path")
+    violations = list(untracked)
+    for change in changes:
+        kind, paths, _, _, _ = change
+        frozen_paths = [path for path in paths if _is_frozen(path)]
+        if not frozen_paths:
+            continue
+        if kind in {"R", "C"}:
+            violations.extend(paths)
+        elif kind == "D":
+            continue
+        elif kind == "M":
+            path = paths[0]
+            if _is_text_deletion_only(repo, change):
+                continue
+            violations.append(path)
+        else:
+            violations.extend(frozen_paths)
+    return list(dict.fromkeys(violations))
 
 
 def main() -> int:
     args = _arguments()
     try:
-        result = subprocess.run(
-            [
-                "git",
+        repo = args.repo.resolve()
+        top_level_output = _git(repo, "rev-parse", "--show-toplevel")
+        top_level_lines = top_level_output.splitlines()
+        if len(top_level_lines) != 1:
+            raise ValueError("Git returned an invalid top level")
+        top_level = Path(top_level_lines[0]).resolve()
+        if repo != top_level:
+            raise ValueError(
+                f"--repo must resolve exactly to the Git top level: {repo} != {top_level}"
+            )
+
+        changes = _parse_raw(
+            _git(
+                repo,
                 "diff",
-                "--numstat",
+                "--raw",
+                "-z",
+                "--no-abbrev",
+                "--find-renames=1%",
+                "--find-copies=1%",
+                "--find-copies-harder",
+                "-l0",
                 "--end-of-options",
                 args.base,
                 "--",
-                *FROZEN_ROOTS,
-            ],
-            cwd=args.repo,
-            check=False,
-            capture_output=True,
-            text=True,
+            )
         )
-    except (OSError, UnicodeError) as error:
-        print(f"legacy freeze check failed: {error}", file=sys.stderr)
-        return 2
-
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
+        untracked = _nul_fields(
+            _git(
+                repo,
+                "ls-files",
+                "--others",
+                "-z",
+                "--",
+                *FROZEN_ROOTS,
+            )
+        )
+        violations = _find_violations(repo, changes, untracked)
+    except (OSError, RuntimeError, UnicodeError, ValueError) as error:
         print(
-            f"legacy freeze check failed for base {args.base!r}: {detail}",
+            f"legacy freeze check failed for base {args.base!r}: {error}",
             file=sys.stderr,
         )
-        return 2
-
-    violations: list[str] = []
-    try:
-        for line in result.stdout.splitlines():
-            deletion_only, path = _is_deletion_only(line)
-            if not deletion_only:
-                violations.append(path)
-    except ValueError as error:
-        print(f"legacy freeze check failed: {error}", file=sys.stderr)
         return 2
 
     for path in violations:

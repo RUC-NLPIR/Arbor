@@ -82,6 +82,7 @@ packages = [
     "arbor.coordinator.tools",
     "arbor.core",
     "arbor.core.llm",
+    "arbor.core.oauth",
     "arbor.core.tools",
     "arbor.core.tools.web",
     "arbor.events",

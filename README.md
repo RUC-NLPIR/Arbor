@@ -26,7 +26,8 @@
 > bootable workspaces and durable runs; see the [AROS public guide](docs/aros/README.md).
 > `arbor aros` is a temporary forwarding compatibility route. CI freezes feature
 > growth only in the legacy semantic Coordinator/Executor and run/review roots:
-> `src/coordinator`, `src/executor`, `src/run.py`, and `src/review.py`.
+> `src/coordinator`, `src/executor`, `src/run.py`, `src/review.py`, and
+> `src/cli/commands/run.py`.
 > Other `arbor` commands remain legacy implementations until migrated.
 
 <p align="center">

@@ -14,6 +14,16 @@ FROZEN_ROOTS = (
     "src/executor",
     "src/run.py",
     "src/review.py",
+    "src/cli/commands/run.py",
+)
+GROWTH_ROOTS = (
+    "src/aros",
+    "src/core",
+)
+GROWTH_FILES = (
+    "src/cli/aros_app.py",
+    "src/cli/commands/aros_cmd.py",
+    "src/cli/app.py",
 )
 Change = tuple[str, tuple[str, ...], str, str, str]
 
@@ -98,6 +108,53 @@ def _is_frozen(path: str) -> bool:
     return any(path == root or path.startswith(f"{root}/") for root in FROZEN_ROOTS)
 
 
+def _is_source(path: str) -> bool:
+    return path == "src" or path.startswith("src/")
+
+
+def _allows_growth(path: str) -> bool:
+    return path in GROWTH_FILES or any(
+        path == root or path.startswith(f"{root}/")
+        for root in GROWTH_ROOTS
+    )
+
+
+def _current_text_lines(repo: Path, path: str) -> list[bytes] | None:
+    current_path = repo / path
+    if current_path.is_symlink() or not current_path.is_file():
+        return None
+    content = current_path.read_bytes()
+    if b"\0" in content:
+        return None
+    return content.splitlines(keepends=True)
+
+
+def _contains_added_lines(before: list[bytes], after: list[bytes]) -> bool:
+    candidates = iter(before)
+    return not all(any(candidate == line for candidate in candidates) for line in after)
+
+
+def _has_source_additions(repo: Path, change: Change) -> bool:
+    kind, paths, old_mode, new_mode, old_oid = change
+    path = paths[-1]
+    if kind == "D" or not _is_source(path) or _allows_growth(path):
+        return False
+    if new_mode not in {"100644", "100755"}:
+        return False
+    after = _current_text_lines(repo, path)
+    if after is None:
+        return False
+    if kind in {"A", "C"} or old_mode not in {"100644", "100755"}:
+        return bool(after)
+    before_content = _git_bytes(repo, "cat-file", "blob", old_oid)
+    if b"\0" in before_content:
+        return bool(after)
+    return _contains_added_lines(
+        before_content.splitlines(keepends=True),
+        after,
+    )
+
+
 def _is_text_deletion_only(repo: Path, change: Change) -> bool:
     _, paths, old_mode, new_mode, old_oid = change
     if old_mode != new_mode or old_mode not in {"100644", "100755"}:
@@ -122,25 +179,33 @@ def _find_violations(
     changes: list[Change],
     untracked: list[str],
 ) -> list[str]:
-    if any(not _is_frozen(path) for path in untracked):
+    if any(not _is_source(path) for path in untracked):
         raise ValueError("Git returned an out-of-scope untracked path")
-    violations = list(untracked)
+    violations = [
+        path
+        for path in untracked
+        if _is_frozen(path)
+        or (
+            not _allows_growth(path)
+            and bool(_current_text_lines(repo, path))
+        )
+    ]
     for change in changes:
         kind, paths, _, _, _ = change
         frozen_paths = [path for path in paths if _is_frozen(path)]
-        if not frozen_paths:
-            continue
-        if kind in {"R", "C"}:
-            violations.extend(paths)
-        elif kind == "D":
-            continue
-        elif kind == "M":
-            path = paths[0]
-            if _is_text_deletion_only(repo, change):
-                continue
-            violations.append(path)
-        else:
-            violations.extend(frozen_paths)
+        if frozen_paths:
+            if kind in {"R", "C"}:
+                violations.extend(paths)
+            elif kind == "D":
+                pass
+            elif kind == "M":
+                path = paths[0]
+                if not _is_text_deletion_only(repo, change):
+                    violations.append(path)
+            else:
+                violations.extend(frozen_paths)
+        if _has_source_additions(repo, change):
+            violations.append(paths[-1])
     return list(dict.fromkeys(violations))
 
 
@@ -182,7 +247,7 @@ def main() -> int:
                 "--exclude-standard",
                 "-z",
                 "--",
-                *FROZEN_ROOTS,
+                "src",
             )
         )
         violations = _find_violations(repo, changes, untracked)

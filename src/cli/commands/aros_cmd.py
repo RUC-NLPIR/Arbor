@@ -19,7 +19,6 @@ from ...aros.workspace import (
     status_workspace,
 )
 from ...core import AgentConfig, create_provider
-from ..user_config import llm_defaults
 
 
 aros_app = typer.Typer(
@@ -33,6 +32,12 @@ run_app = typer.Typer(
     no_args_is_help=True,
 )
 aros_app.add_typer(run_app, name="run")
+
+
+def llm_defaults() -> dict[str, Any]:
+    from ..user_config import llm_defaults as load_user_llm_defaults
+
+    return load_user_llm_defaults()
 
 
 def _root(cwd: Path) -> Path:
@@ -49,7 +54,7 @@ def _fail(exc: Exception) -> None:
 
 
 class _RequireCommandSeparator(TyperCommand):
-    """Keep experiment argv separate from Arbor's own CLI options."""
+    """Keep experiment argv separate from AROS's own CLI options."""
 
     def parse_args(self, ctx: Any, args: list[str]) -> list[str]:
         if "--help" not in args and "-h" not in args and "--" not in args:
@@ -125,7 +130,7 @@ def run_start_command(
     command: list[str] = typer.Argument(
         ...,
         metavar="-- COMMAND [ARGS]...",
-        help="Exact command argv. Place it after -- so options are not parsed by Arbor.",
+        help="Exact command argv. Place it after -- so options are not parsed by AROS.",
     ),
     cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
     run_cwd: str = typer.Option(

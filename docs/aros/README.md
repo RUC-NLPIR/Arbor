@@ -30,4 +30,4 @@ The exposed command surface for the direct `aros` entry is:
 
 The direct `aros` command is the public AROS entry. `arbor aros` is a temporary forwarding compatibility route.
 
-CI freezes feature growth only in the legacy semantic Coordinator/Executor and run/review roots: `src/coordinator`, `src/executor`, `src/run.py`, and `src/review.py`. Other `arbor` commands remain legacy implementations until migrated.
+CI freezes feature growth only in the legacy semantic Coordinator/Executor and run/review roots: `src/coordinator`, `src/executor`, `src/run.py`, `src/review.py`, and `src/cli/commands/run.py`. Other `arbor` commands remain legacy implementations until migrated.

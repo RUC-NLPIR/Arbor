@@ -130,7 +130,7 @@ def boot_workspace(
     status = status_workspace(workspace)
     if not status["initialized"]:
         raise ValueError(
-            f"workspace is not initialized; run `arbor aros init` at the Git root: {workspace}"
+            f"workspace is not initialized; run `aros init` at the Git root: {workspace}"
         )
     sections: list[tuple[str, str]] = [
         (

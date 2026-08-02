@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -15,13 +17,34 @@ FROZEN_FILES = (
     "src/executor/main.py",
     "src/run.py",
     "src/review.py",
+    "src/cli/commands/run.py",
 )
-FORBIDDEN_IMPORT_COMPONENTS = {
-    "coordinator",
-    "executor",
-    "idea_tree",
-    "orchestrator",
+ALLOWED_INTERNAL_PREFIXES = (
+    "arbor.aros",
+    "arbor.core",
+    "arbor.cli.aros_app",
+    "arbor.cli.commands.aros_cmd",
+    "arbor.cli.user_config",
+)
+BOUNDARY_PATHS = (
+    *sorted((REPO_ROOT / "src" / "aros").rglob("*.py")),
+    REPO_ROOT / "src" / "cli" / "aros_app.py",
+    REPO_ROOT / "src" / "cli" / "commands" / "aros_cmd.py",
+)
+PROJECT_MODULES = {
+    ".".join(
+        (
+            "arbor",
+            *(
+                path.parent.relative_to(REPO_ROOT / "src").parts
+                if path.name == "__init__.py"
+                else path.relative_to(REPO_ROOT / "src").with_suffix("").parts
+            ),
+        )
+    )
+    for path in (REPO_ROOT / "src").rglob("*.py")
 }
+DYNAMIC_IMPORT_CALL = "<dynamic import call>"
 FROZEN_HELPER = """\
 def normalize_legacy(value):
     stripped = value.strip()
@@ -31,6 +54,10 @@ def normalize_legacy(value):
     joined = "_".join(pieces)
     return joined
 """
+PADDED_FROZEN_SOURCE = "".join(
+    f"legacy_step_{number} = {number}\n" for number in range(20)
+)
+PADDING = "".join(f"new_step_{number} = {number}\n" for number in range(30))
 INDEPENDENT_UTILITY = """\
 def summarize_tokens(tokens):
     filtered = [token for token in tokens if token]
@@ -64,33 +91,162 @@ def test_legacy_freeze_bounds_rename_and_copy_detection() -> None:
     assert '"-l0"' not in checker
 
 
-def _import_components(node: ast.Import | ast.ImportFrom) -> set[str]:
-    components: set[str] = set()
-    if isinstance(node, ast.ImportFrom) and node.module:
-        components.update(node.module.split("."))
-    for name in node.names:
-        components.update(name.name.split("."))
-    return components
+def _module_and_package(path: Path) -> tuple[str, str]:
+    relative = path.relative_to(REPO_ROOT / "src")
+    if path.name == "__init__.py":
+        module = ".".join(("arbor", *relative.parent.parts))
+        return module, module
+    module = ".".join(("arbor", *relative.with_suffix("").parts))
+    return module, module.rpartition(".")[0]
 
 
-def test_aros_imports_do_not_reach_legacy_control_paths() -> None:
-    paths = sorted((REPO_ROOT / "src" / "aros").rglob("*.py"))
-    paths.append(REPO_ROOT / "src" / "cli" / "commands" / "aros_cmd.py")
+def _is_project_module(module: str) -> bool:
+    return module in PROJECT_MODULES
+
+
+def _is_allowed_internal(module: str) -> bool:
+    return any(
+        module == allowed
+        or module.startswith(f"{allowed}.")
+        or allowed.startswith(f"{module}.")
+        for allowed in ALLOWED_INTERNAL_PREFIXES
+    )
+
+
+def _resolve_import_from(node: ast.ImportFrom, package: str) -> str:
+    if not node.level:
+        return node.module or ""
+    relative = "." * node.level + (node.module or "")
+    return importlib.util.resolve_name(relative, package)
+
+
+def _static_imports(tree: ast.AST, package: str) -> list[tuple[int, str]]:
+    imports: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend((node.lineno, name.name) for name in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = _resolve_import_from(node, package)
+            if base:
+                imports.append((node.lineno, base))
+            for name in node.names:
+                candidate = f"{base}.{name.name}" if base else name.name
+                if _is_project_module(candidate):
+                    imports.append((node.lineno, candidate))
+    return imports
+
+
+def _dynamic_imports(tree: ast.AST) -> list[tuple[int, str]]:
+    dynamic_names = {"__import__", "import_module"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            dynamic_names.update(
+                name.asname or name.name
+                for name in node.names
+                if name.name in {"__import__", "import_module"}
+            )
+
+    imports: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        is_dynamic = (
+            isinstance(node.func, ast.Name) and node.func.id in dynamic_names
+        ) or (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"__import__", "import_module"}
+        )
+        if is_dynamic:
+            imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
+    return imports
+
+
+def _forbidden_imports(tree: ast.AST, package: str) -> list[tuple[int, str]]:
+    return [
+        (line, module)
+        for line, module in (*_static_imports(tree, package), *_dynamic_imports(tree))
+        if module == DYNAMIC_IMPORT_CALL
+        or (_is_project_module(module) and not _is_allowed_internal(module))
+    ]
+
+
+def test_aros_imports_only_use_the_one_way_internal_boundary() -> None:
     violations: list[str] = []
 
-    for path in paths:
+    for path in BOUNDARY_PATHS:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.Import, ast.ImportFrom)):
-                continue
-            forbidden = _import_components(node) & FORBIDDEN_IMPORT_COMPONENTS
-            if forbidden:
-                relative_path = path.relative_to(REPO_ROOT)
-                violations.append(
-                    f"{relative_path}:{node.lineno}: {', '.join(sorted(forbidden))}"
-                )
+        _, package = _module_and_package(path)
+        for line, module in _forbidden_imports(tree, package):
+            violations.append(f"{path.relative_to(REPO_ROOT)}:{line}: {module}")
 
-    assert not violations, "AROS imports legacy control paths:\n" + "\n".join(violations)
+    assert not violations, "AROS imports cross the one-way boundary:\n" + "\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    (
+        ("from .. import run", {"arbor.run"}),
+        ("from arbor import executor", {"arbor.executor"}),
+        ("import importlib as loader\nloader.import_module('arbor.review')", {DYNAMIC_IMPORT_CALL}),
+        ("import importlib.util\nimportlib.import_module('arbor.review')", {DYNAMIC_IMPORT_CALL}),
+        ("from importlib import import_module as load\nload('arbor.coordinator.main')", {DYNAMIC_IMPORT_CALL}),
+        ("__import__('arbor.mcp.server')", {DYNAMIC_IMPORT_CALL}),
+        ("module = 'arbor.review'\n__import__(module)", {DYNAMIC_IMPORT_CALL}),
+        ("__import__('run', globals(), locals(), (), 2)", {DYNAMIC_IMPORT_CALL}),
+        ("import builtins as b\nb.__import__('arbor.review')", {DYNAMIC_IMPORT_CALL}),
+        ("import importlib\nimportlib.import_module('arbor.aros.runs')", {DYNAMIC_IMPORT_CALL}),
+        ("target = 'arbor.review'\nimport_module(target)", {DYNAMIC_IMPORT_CALL}),
+        ("target = 'arbor.review'\nloader.import_module(target)", {DYNAMIC_IMPORT_CALL}),
+        ("from importlib import import_module as load\ndef later(target):\n    return load(target)", {DYNAMIC_IMPORT_CALL}),
+        ("from ..core import config", set()),
+    ),
+)
+def test_aros_boundary_resolves_relative_imports_and_rejects_dynamic_imports(
+    source: str,
+    expected: set[str],
+) -> None:
+    tree = ast.parse(source)
+
+    assert {module for _, module in _forbidden_imports(tree, "arbor.aros")} == expected
+
+
+def test_direct_aros_import_loads_no_forbidden_project_modules() -> None:
+    script = """
+import importlib
+import importlib.util
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location(
+    "arbor",
+    root / "src" / "__init__.py",
+    submodule_search_locations=[str(root / "src")],
+)
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+sys.modules["arbor"] = module
+spec.loader.exec_module(module)
+importlib.import_module("arbor.cli.aros_app")
+print(json.dumps(sorted(sys.modules)))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(REPO_ROOT)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    loaded = json.loads(result.stdout)
+    forbidden = sorted(
+        module
+        for module in loaded
+        if _is_project_module(module) and not _is_allowed_internal(module)
+    )
+    assert not forbidden, f"direct AROS import loaded forbidden modules: {forbidden}"
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -119,6 +275,12 @@ def legacy_repo(tmp_path: Path) -> tuple[Path, str]:
     (repo / "src" / "coordinator" / "empty").touch()
     (repo / "src" / "coordinator" / "helper.py").write_text(
         FROZEN_HELPER, encoding="utf-8"
+    )
+    (repo / "src" / "coordinator" / "padded_source.py").write_text(
+        PADDED_FROZEN_SOURCE, encoding="utf-8"
+    )
+    (repo / "src" / "legacy.py").write_text(
+        "legacy one\nlegacy two\n", encoding="utf-8"
     )
     (repo / ".gitignore").write_text(
         "src/coordinator/ignored.py\n"
@@ -293,12 +455,87 @@ def test_legacy_freeze_permits_independent_low_similarity_utility(
     legacy_repo: tuple[Path, str], delete_frozen_helper: bool
 ) -> None:
     repo, base = legacy_repo
-    utility_path = repo / "src" / "independent_utility.py"
+    utility_path = repo / "independent_utility.py"
     utility_path.write_text(INDEPENDENT_UTILITY, encoding="utf-8")
     _git(repo, "add", str(utility_path.relative_to(repo)))
     if delete_frozen_helper:
         helper_path = repo / "src" / "coordinator" / "helper.py"
         helper_path.unlink()
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_legacy_freeze_rejects_padded_copy_outside_growth_allowlist(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    destination = repo / "src" / "control_v2.py"
+    destination.write_text(PADDED_FROZEN_SOURCE + PADDING, encoding="utf-8")
+    _git(repo, "add", "src/control_v2.py")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/control_v2.py" in result.stdout + result.stderr
+
+
+def test_legacy_freeze_rejects_growth_in_existing_legacy_source(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    path = repo / "src" / "legacy.py"
+    path.write_text(path.read_text(encoding="utf-8") + "new behavior\n", encoding="utf-8")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/legacy.py" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "src/aros/new_behavior.py",
+        "src/core/new_behavior.py",
+        "src/cli/aros_app.py",
+        "src/cli/commands/aros_cmd.py",
+        "src/cli/app.py",
+    ),
+)
+def test_legacy_freeze_permits_explicit_aros_growth(
+    legacy_repo: tuple[Path, str], relative_path: str
+) -> None:
+    repo, base = legacy_repo
+    path = repo / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("new AROS behavior\n", encoding="utf-8")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_legacy_freeze_file_allowlist_does_not_allow_descendants(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    path = repo / "src" / "cli" / "app.py" / "escape.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("new legacy behavior\n", encoding="utf-8")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/cli/app.py/escape.py" in result.stdout + result.stderr
+
+
+def test_legacy_freeze_permits_pure_deletion_in_non_allowlisted_source(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    (repo / "src" / "legacy.py").write_text("legacy one\n", encoding="utf-8")
 
     result = _run_checker(repo, base)
 

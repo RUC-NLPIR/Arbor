@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
-import errno
 import hashlib
 import math
 import os
@@ -23,8 +21,6 @@ _TASK_ID = re.compile(
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TASK_STAGING_DIRECTORY = ".staging"
-_AT_FDCWD = -100
-_RENAME_NOREPLACE = 1
 _UTC_TIMESTAMP = re.compile(
     r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
     r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{3}Z$"
@@ -84,7 +80,12 @@ class TaskService:
         if supplied != resolved:
             raise TaskError(f"workspace must be the exact Git repository root: {supplied}")
         self.root = resolved
-        self._git_dir = self._require_git_root()
+        (
+            self._git_dir,
+            self._git_dir_identity,
+            self._git_common_dir,
+            self._git_common_dir_identity,
+        ) = self._require_git_root()
         self._require_initialized_workspace()
 
     def create(
@@ -217,6 +218,7 @@ class TaskService:
         publication_lock = self._publication_lock_path()
         _require_plain_file(publication_lock, "task record publication lock")
         with file_lock(publication_lock):
+            self._reconcile_authoritative_briefs()
             return self._status_unlocked(task_id)
 
     def _status_unlocked(self, task_id: str) -> dict[str, object]:
@@ -261,6 +263,7 @@ class TaskService:
         publication_lock = self._publication_lock_path()
         _require_plain_file(publication_lock, "task record publication lock")
         with file_lock(publication_lock):
+            self._reconcile_authoritative_briefs()
             return self._list_unlocked()
 
     def _list_unlocked(self) -> list[dict[str, object]]:
@@ -390,16 +393,74 @@ class TaskService:
         self._validate_inventory()
 
     def _publish_staged_brief(self, staging: Path, target: Path) -> None:
+        staged_brief = staging / "brief.json"
         _require_plain_directory(staging, "versioned task staging path")
-        _require_plain_file(staging / "brief.json", "staged task brief")
+        staging_identity = _plain_directory_identity(
+            staging,
+            "versioned task staging path",
+        )
+        staged_identity = _plain_file_identity(staged_brief, "staged task brief")
         _require_absent(target, "versioned task path")
-        _rename_noreplace(staging, target)
+        _create_plain_directory(target, "versioned task path")
+        published_brief = target / "brief.json"
+        try:
+            os.link(staged_brief, published_brief, follow_symlinks=False)
+        except OSError as error:
+            raise TaskError(f"task brief publication failed: {error}") from error
+        if _plain_file_identity(published_brief, "published task brief") != staged_identity:
+            raise TaskError("published task brief does not bind to staged brief")
+        _fsync_directory(target)
         _fsync_directory(target.parent)
-        _fsync_directory(staging.parent)
-        if _path_exists(staging):
-            raise TaskError(f"task staging path remains after publication: {staging}")
+        self._remove_staging_alias(
+            staging,
+            staging_identity,
+            staged_brief,
+            staged_identity,
+            published_brief,
+        )
         _require_plain_directory(target, "versioned task path")
-        _require_plain_file(target / "brief.json", "published task brief")
+        _require_plain_file(published_brief, "published task brief")
+
+    def _remove_staging_alias(
+        self,
+        staging: Path,
+        staging_identity: tuple[int, int],
+        staged_brief: Path,
+        staged_identity: tuple[int, int],
+        published_brief: Path,
+    ) -> None:
+        if _plain_directory_identity(
+            staging,
+            "versioned task staging path",
+        ) != staging_identity:
+            raise TaskError("task staging directory identity changed after publication")
+        if (
+            _plain_file_identity(staged_brief, "staged task brief") != staged_identity
+            or _plain_file_identity(published_brief, "published task brief")
+            != staged_identity
+        ):
+            raise TaskError("task staging alias identity changed after publication")
+        try:
+            staged_brief.unlink()
+        except OSError as error:
+            raise TaskError(f"unable to remove staged task brief alias: {staged_brief}") from error
+        _fsync_directory(staging)
+        try:
+            has_unexpected_content = any(staging.iterdir())
+        except OSError as error:
+            raise TaskError(f"unable to inspect task staging directory: {staging}") from error
+        if has_unexpected_content:
+            raise TaskError(f"task staging directory contains ambiguous material: {staging}")
+        if _plain_directory_identity(
+            staging,
+            "versioned task staging path",
+        ) != staging_identity:
+            raise TaskError("task staging directory identity changed during cleanup")
+        try:
+            staging.rmdir()
+        except OSError as error:
+            raise TaskError(f"unable to remove empty task staging directory: {staging}") from error
+        _fsync_directory(staging.parent)
 
     def _brief_for_idempotency_key(self, key: str) -> dict[str, object] | None:
         matches = [
@@ -435,7 +496,9 @@ class TaskService:
         _require_plain_directory(self.root / ".aros", "AROS runtime directory")
         return _task_directory_ids(self.root / ".aros" / "tasks", runtime=True)
 
-    def _require_git_root(self) -> Path:
+    def _require_git_root(
+        self,
+    ) -> tuple[Path, tuple[int, int], Path, tuple[int, int]]:
         top = self._git_output("rev-parse", "--show-toplevel")
         if top is None or Path(top).resolve() != self.root:
             raise TaskError(f"workspace must be the Git repository root: {self.root}")
@@ -446,10 +509,44 @@ class TaskService:
         marker_git_dir = self._git_directory_from_marker()
         if git_dir != marker_git_dir:
             raise TaskError(f"invalid Git directory association: {self.root}")
-        pinned = getattr(self, "_git_dir", git_dir)
-        if git_dir != pinned:
+        git_dir_identity = _plain_directory_identity(git_dir, "Git directory")
+        pinned_git_dir = getattr(self, "_git_dir", git_dir)
+        pinned_git_identity = getattr(
+            self,
+            "_git_dir_identity",
+            git_dir_identity,
+        )
+        if git_dir != pinned_git_dir:
             raise TaskError(f"Git directory association changed: {self.root}")
-        return git_dir
+        if git_dir_identity != pinned_git_identity:
+            raise TaskError(f"Git directory identity changed: {self.root}")
+
+        raw_common_dir = self._git_output(
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        )
+        if raw_common_dir is None:
+            raise TaskError(f"unable to resolve common Git directory: {self.root}")
+        common_dir = Path(raw_common_dir)
+        if not common_dir.is_absolute():
+            common_dir = self.root / common_dir
+        common_dir = common_dir.resolve()
+        common_identity = _plain_directory_identity(
+            common_dir,
+            "common Git directory",
+        )
+        pinned_common_dir = getattr(self, "_git_common_dir", common_dir)
+        pinned_common_identity = getattr(
+            self,
+            "_git_common_dir_identity",
+            common_identity,
+        )
+        if common_dir != pinned_common_dir:
+            raise TaskError(f"common Git directory association changed: {self.root}")
+        if common_identity != pinned_common_identity:
+            raise TaskError(f"common Git directory identity changed: {self.root}")
+        return git_dir, git_dir_identity, common_dir, common_identity
 
     def _git_directory_from_marker(self) -> Path:
         marker = self.root / ".git"
@@ -698,39 +795,21 @@ def _task_directory_ids(root: Path, *, runtime: bool) -> set[str]:
         if not _valid_task_id(entry.name):
             raise TaskError(f"unrecognized task entry: {entry}")
         _require_plain_directory(entry, "task record directory")
+        if not runtime:
+            brief_path = entry / "brief.json"
+            if not _path_exists(brief_path):
+                try:
+                    has_content = any(entry.iterdir())
+                except OSError as error:
+                    raise TaskError(f"unable to inspect task record directory: {entry}") from error
+                if has_content:
+                    raise TaskError(
+                        f"ambiguous task record directory without a brief: {entry}"
+                    )
+                continue
+            _require_plain_file(brief_path, "versioned task brief")
         task_ids.add(entry.name)
     return task_ids
-
-
-def _rename_noreplace(source: Path, target: Path) -> None:
-    try:
-        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
-    except (AttributeError, OSError) as error:
-        raise TaskError("atomic no-replace task publication is unavailable") from error
-    renameat2.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    renameat2.restype = ctypes.c_int
-    ctypes.set_errno(0)
-    result = renameat2(
-        _AT_FDCWD,
-        os.fsencode(source),
-        _AT_FDCWD,
-        os.fsencode(target),
-        _RENAME_NOREPLACE,
-    )
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number == errno.EEXIST:
-        raise TaskError(f"versioned task path conflict: path already exists: {target}")
-    raise TaskError(
-        f"atomic no-replace task publication failed: {os.strerror(error_number)}"
-    )
 
 
 def _fsync_directory(path: Path) -> None:
@@ -744,6 +823,26 @@ def _fsync_directory(path: Path) -> None:
         raise TaskError(f"unable to sync task publication directory: {path}") from error
     finally:
         os.close(descriptor)
+
+
+def _plain_directory_identity(path: Path, description: str) -> tuple[int, int]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise TaskError(f"unable to inspect {description}: {path}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise TaskError(f"{description} must be a plain directory: {path}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _plain_file_identity(path: Path, description: str) -> tuple[int, int]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise TaskError(f"unable to inspect {description}: {path}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise TaskError(f"{description} must be a plain file: {path}")
+    return metadata.st_dev, metadata.st_ino
 
 
 def _path_exists(path: Path) -> bool:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -304,6 +305,64 @@ def test_create_rejects_a_git_marker_swap_during_head_capture(
     assert not list((workspace / "tasks").glob("TASK-*"))
 
 
+def test_create_rejects_same_path_git_directory_replacement(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    foreign = tmp_path / "foreign"
+    workspace.mkdir()
+    foreign.mkdir()
+    _init_workspace(workspace)
+    _init_workspace(foreign)
+    (foreign / "foreign.txt").write_text("foreign head\n", encoding="utf-8")
+    _git(foreign, "add", "foreign.txt")
+    _git(foreign, "commit", "-qm", "distinct foreign head")
+    service = TaskService(workspace)
+    (workspace / ".git").rename(workspace / ".git-original")
+    (foreign / ".git").rename(workspace / ".git")
+
+    with pytest.raises(TaskError, match="Git directory identity"):
+        _create(service, key="same-path-git-replacement")
+
+    assert not list((workspace / "tasks").glob("TASK-*"))
+
+
+def test_linked_worktree_rejects_common_git_directory_redirection(
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary"
+    linked = tmp_path / "linked"
+    foreign = tmp_path / "foreign"
+    primary.mkdir()
+    foreign.mkdir()
+    _init_workspace(primary)
+    _init_workspace(foreign)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(primary),
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked-test",
+            str(linked),
+        ],
+        check=True,
+    )
+    (linked / ".aros").mkdir()
+    service = TaskService(linked)
+    git_dir = Path(_git(linked, "rev-parse", "--absolute-git-dir"))
+    (git_dir / "commondir").write_text(
+        f"{(foreign / '.git').resolve()}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskError, match="common Git directory"):
+        service._require_git_root()
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
@@ -482,6 +541,40 @@ def test_precommit_task_staging_is_ignored_and_preserved(
     assert service.list() == [service.status(str(brief["task_id"]))]
 
 
+def test_empty_preauthority_task_container_is_ignored_and_preserved(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    empty = tmp_path / "tasks" / "TASK-20260802-empty-remnant"
+    empty.mkdir(parents=True)
+    service = TaskService(tmp_path)
+
+    assert service.list() == []
+    brief = _create(service, key="after-empty-container")
+
+    assert empty.is_dir()
+    assert list(empty.iterdir()) == []
+    assert service.list() == [service.status(str(brief["task_id"]))]
+
+
+def test_nonempty_preauthority_task_container_fails_closed_and_is_preserved(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    ambiguous = tmp_path / "tasks" / "TASK-20260802-ambiguous-remnant"
+    ambiguous.mkdir(parents=True)
+    marker = ambiguous / "unknown.bin"
+    marker.write_bytes(b"preserve")
+    service = TaskService(tmp_path)
+
+    with pytest.raises(TaskError, match="ambiguous.*without.*brief"):
+        service.list()
+    with pytest.raises(TaskError, match="ambiguous.*without.*brief"):
+        _create(service, key="blocked-by-ambiguous-container")
+
+    assert marker.read_bytes() == b"preserve"
+
+
 def test_different_key_create_recovers_a_published_brief_after_interruption(
     tmp_path: Path,
 ) -> None:
@@ -576,7 +669,7 @@ def test_different_key_publications_serialize_without_inventory_races(
     assert {str(status["task_id"]) for status in observed} <= task_ids
 
 
-def test_publication_syncs_both_rename_parent_directories(
+def test_publication_syncs_target_and_parent_before_staging_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -585,9 +678,117 @@ def test_publication_syncs_both_rename_parent_directories(
     synced: list[Path] = []
     monkeypatch.setattr(tasks_module, "_fsync_directory", synced.append)
 
-    _create(service, key="sync-publication-parents")
+    brief = _create(service, key="sync-publication-parents")
 
-    assert synced == [tmp_path / "tasks", tmp_path / "tasks" / ".staging"]
+    target = tmp_path / "tasks" / str(brief["task_id"])
+    assert synced[:2] == [target, tmp_path / "tasks"]
+    assert tmp_path / "tasks" / ".staging" in synced
+
+
+def test_publication_link_failure_preserves_staging_and_empty_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+
+    def fail_cross_device_link(
+        _source: Path,
+        _target: Path,
+        *,
+        follow_symlinks: bool,
+    ) -> None:
+        assert follow_symlinks is False
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(tasks_module.os, "link", fail_cross_device_link)
+
+    with pytest.raises(TaskError, match="task brief publication"):
+        _create(service, key="link-failure")
+
+    staged = list((tmp_path / "tasks" / ".staging").glob("TASK-*/brief.json"))
+    targets = list((tmp_path / "tasks").glob("TASK-*"))
+    assert len(staged) == 1
+    assert len(targets) == 1
+    assert list(targets[0].iterdir()) == []
+    assert service.list() == []
+
+
+def test_publication_never_clobbers_a_race_created_brief(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    original_link = tasks_module.os.link
+
+    def create_foreign_destination_then_link(
+        source: Path,
+        target: Path,
+        *,
+        follow_symlinks: bool,
+    ) -> None:
+        target.write_text("foreign\n", encoding="utf-8")
+        original_link(source, target, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(
+        tasks_module.os,
+        "link",
+        create_foreign_destination_then_link,
+    )
+
+    with pytest.raises(TaskError, match="task brief publication"):
+        _create(service, key="link-eexist")
+
+    targets = list((tmp_path / "tasks").glob("TASK-*"))
+    assert len(targets) == 1
+    assert (targets[0] / "brief.json").read_text(encoding="utf-8") == "foreign\n"
+    assert list((tmp_path / "tasks" / ".staging").glob("TASK-*/brief.json"))
+
+
+@pytest.mark.parametrize("reader", ("status", "list"))
+def test_immediate_post_link_crash_is_recoverable_and_preserves_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    original_link = tasks_module.os.link
+
+    class InjectedInterruption(RuntimeError):
+        pass
+
+    def interrupt_after_link(
+        source: Path,
+        target: Path,
+        *,
+        follow_symlinks: bool,
+    ) -> None:
+        original_link(source, target, follow_symlinks=follow_symlinks)
+        raise InjectedInterruption
+
+    monkeypatch.setattr(tasks_module.os, "link", interrupt_after_link)
+    with pytest.raises(InjectedInterruption):
+        _create(service, key=f"immediate-link-crash-{reader}")
+    monkeypatch.setattr(tasks_module.os, "link", original_link)
+    targets = list((tmp_path / "tasks").glob("TASK-*"))
+    staged = list((tmp_path / "tasks" / ".staging").glob("TASK-*/brief.json"))
+    assert len(targets) == len(staged) == 1
+    task_id = targets[0].name
+
+    fresh = TaskService(tmp_path)
+    result = fresh.status(task_id) if reader == "status" else fresh.list()
+
+    if reader == "status":
+        assert result["task_id"] == task_id  # type: ignore[index]
+    else:
+        assert [status["task_id"] for status in result] == [task_id]  # type: ignore[union-attr]
+    assert staged[0].is_file()
+
+
+def test_task_publication_has_no_linux_specific_rename_helper() -> None:
+    assert not hasattr(tasks_module, "_rename_noreplace")
 
 
 def test_create_rejects_a_noncommit_head_even_when_it_is_40_hex(
@@ -961,8 +1162,58 @@ def test_task_readback_requires_a_strictly_bound_idempotency_index(
         atomic_write_json(brief_path, brief)
         atomic_write_json(status_path, status)
 
-    with pytest.raises(TaskError, match="idempotency index"):
-        service.status(task_id) if reader == "status" else service.list()
+    if problem == "missing":
+        result = service.status(task_id) if reader == "status" else service.list()
+        if reader == "status":
+            assert result["task_id"] == task_id  # type: ignore[index]
+        else:
+            assert [status["task_id"] for status in result] == [task_id]  # type: ignore[union-attr]
+    else:
+        with pytest.raises(TaskError, match="idempotency index"):
+            service.status(task_id) if reader == "status" else service.list()
+
+
+@pytest.mark.parametrize("reader", ("status", "list"))
+def test_fresh_read_recovers_immediately_after_brief_authority_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    original_publish = TaskService._publish_staged_brief
+
+    class InjectedInterruption(RuntimeError):
+        pass
+
+    def interrupt_after_publication(
+        self: TaskService,
+        staging: Path,
+        target: Path,
+    ) -> None:
+        original_publish(self, staging, target)
+        raise InjectedInterruption
+
+    monkeypatch.setattr(
+        TaskService,
+        "_publish_staged_brief",
+        interrupt_after_publication,
+    )
+    with pytest.raises(InjectedInterruption):
+        _create(service, key=f"crash-before-derived-{reader}")
+    monkeypatch.setattr(TaskService, "_publish_staged_brief", original_publish)
+    task_directories = sorted((tmp_path / "tasks").glob("TASK-*"))
+    assert len(task_directories) == 1
+    task_id = task_directories[0].name
+    assert not (tmp_path / ".aros" / "tasks" / task_id).exists()
+
+    fresh = TaskService(tmp_path)
+    result = fresh.status(task_id) if reader == "status" else fresh.list()
+
+    if reader == "status":
+        assert result["task_id"] == task_id  # type: ignore[index]
+    else:
+        assert [status["task_id"] for status in result] == [task_id]  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize("mutation", ("extra", "key_hash", "brief_hash"))

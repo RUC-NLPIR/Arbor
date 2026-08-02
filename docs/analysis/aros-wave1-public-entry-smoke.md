@@ -460,6 +460,16 @@ mission=Verify direct AROS entry
 The real initialized workspace therefore has `AROS.md`, `AGENTS.md`, durable
 `memory/NOW.md`, `.aros`, and `.worktree`, and it does not create `.arbor`.
 
+## Observed transient
+
+One intermediate full-suite repeat produced `614 passed, 1 failed, 6 skipped`
+in the pre-existing stop-delivery timing test. Preserved artifacts showed that
+TERM was delivered and the run was cancelled before the client recorded
+`delivered=false`. No Wave 1 source or test change was made. The test then
+passed 10/10 isolated reruns, and subsequent fresh full-suite runs passed
+`615 passed, 6 skipped`. This records the observation; it does not claim that
+the timing race was fixed.
+
 ## Limits and prerequisites
 
 - This is offline dependency seeding, not a fully dependency-isolated install.

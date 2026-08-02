@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -33,3 +34,43 @@ def test_direct_entry_reuses_the_single_app() -> None:
     from arbor.cli import aros_app as entry
 
     assert entry.app is aros_app
+
+
+def test_legacy_root_mounts_the_same_aros_app() -> None:
+    from arbor.cli import app as legacy
+
+    registered = {
+        group.name: group.typer_instance
+        for group in legacy.app.registered_groups
+    }
+    assert registered["aros"] is aros_app
+
+
+def test_legacy_main_warns_when_forwarding_aros(
+    monkeypatch,
+    capsys,
+) -> None:
+    from arbor.cli import app as legacy
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(sys, "argv", ["arbor", "aros", "--help"])
+    monkeypatch.setattr(legacy, "app", lambda: calls.append(list(sys.argv)))
+    legacy.main()
+    captured = capsys.readouterr()
+
+    assert calls == [["arbor", "aros", "--help"]]
+    assert "deprecated" in captured.err.lower()
+    assert "use aros" in captured.err.lower()
+
+
+def test_legacy_main_does_not_warn_for_non_aros_commands(
+    monkeypatch,
+    capsys,
+) -> None:
+    from arbor.cli import app as legacy
+
+    monkeypatch.setattr(sys, "argv", ["arbor", "report", "--help"])
+    monkeypatch.setattr(legacy, "app", lambda: None)
+    legacy.main()
+
+    assert capsys.readouterr().err == ""

@@ -85,6 +85,15 @@ _ROOT_FLAGS = {"--help", "-h"}
 _VERSION_FLAGS = {"--version", "-V"}
 
 
+def _warn_aros_forward(argv: list[str]) -> None:
+    if argv and argv[0] == "aros":
+        typer.secho(
+            "warning: arbor aros is deprecated; use aros directly",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+
 def main() -> None:
     """Console-script entry point.
 
@@ -104,6 +113,7 @@ def main() -> None:
             pass
 
     argv = sys.argv[1:]
+    _warn_aros_forward(argv)
     first = argv[0] if argv else None
     if first in _VERSION_FLAGS:
         sys.argv = [sys.argv[0], "version", *argv[1:]]

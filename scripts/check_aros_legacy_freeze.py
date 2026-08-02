@@ -152,7 +152,7 @@ def _violates_source_growth(
     path = paths[-1]
     if kind == "D" or not _is_source(path) or _allows_growth(path):
         return False
-    if kind in {"R", "C"} or new_mode == "120000":
+    if kind in {"A", "R", "C"} or new_mode == "120000":
         return True
     if new_mode not in {"100644", "100755"}:
         return False
@@ -163,7 +163,7 @@ def _violates_source_growth(
     )
     if after is None:
         return False
-    if kind in {"A", "C"} or old_mode not in {"100644", "100755"}:
+    if old_mode not in {"100644", "100755"}:
         return bool(after)
     before_content = _git_bytes(repo, "cat-file", "blob", old_oid)
     if b"\0" in before_content:
@@ -209,14 +209,7 @@ def _find_violations(
     violations = [
         path
         for path in untracked
-        if _is_frozen(path)
-        or (
-            not _allows_growth(path)
-            and (
-                (repo / path).is_symlink()
-                or bool(_text_lines(repo, path))
-            )
-        )
+        if _is_frozen(path) or not _allows_growth(path)
     ]
     for change in changes:
         kind, paths, _, _, _, _ = change

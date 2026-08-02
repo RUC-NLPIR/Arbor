@@ -45,6 +45,13 @@ PROJECT_MODULES = {
     for path in (REPO_ROOT / "src").rglob("*.py")
 }
 DYNAMIC_IMPORT_CALL = "<dynamic import call>"
+DYNAMIC_REFLECTION_NAMES = {
+    "eval",
+    "exec",
+    "__import__",
+    "import_module",
+}
+DYNAMIC_IMPORT_STRINGS = {"__import__", "import_module"}
 FROZEN_HELPER = """\
 def normalize_legacy(value):
     stripped = value.strip()
@@ -152,23 +159,36 @@ def _static_imports(tree: ast.AST, package: str) -> list[tuple[int, str]]:
 
 
 def _dynamic_imports(tree: ast.AST) -> list[tuple[int, str]]:
-    dynamic_names = {"__import__", "import_module"}
+    dynamic_names = set(DYNAMIC_REFLECTION_NAMES)
     imports: list[tuple[int, str]] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
+        if isinstance(node, ast.Import):
             for name in node.names:
-                if name.name in {"__import__", "import_module"}:
+                if name.name == "importlib" or name.name.startswith("importlib."):
+                    dynamic_names.add(name.asname or "importlib")
+                    imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "importlib" or (
+                node.module is not None and node.module.startswith("importlib.")
+            ):
+                imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
+            for name in node.names:
+                if name.name in DYNAMIC_REFLECTION_NAMES:
                     dynamic_names.add(name.asname or name.name)
                     imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
 
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Attribute)
-            and node.attr in {"__import__", "import_module"}
+            and node.attr in DYNAMIC_REFLECTION_NAMES
         ) or (
             isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
             and node.id in dynamic_names
+        ) or (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in DYNAMIC_IMPORT_STRINGS
         ):
             imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
     return imports
@@ -212,8 +232,14 @@ def test_aros_imports_only_use_the_one_way_internal_boundary() -> None:
         ("target = 'arbor.review'\nloader.import_module(target)", {DYNAMIC_IMPORT_CALL}),
         ("from importlib import import_module as load\ndef later(target):\n    return load(target)", {DYNAMIC_IMPORT_CALL}),
         ("import importlib\nload = importlib.import_module\ndef later():\n    return load('arbor.review')", {DYNAMIC_IMPORT_CALL}),
+        ("import importlib\nload = getattr(importlib, 'import_module')", {DYNAMIC_IMPORT_CALL}),
+        ("import importlib", {DYNAMIC_IMPORT_CALL}),
+        ("import importlib.util as util", {DYNAMIC_IMPORT_CALL}),
+        ("from importlib.metadata import version", {DYNAMIC_IMPORT_CALL}),
         ("from importlib import import_module as load", {DYNAMIC_IMPORT_CALL}),
         ("load = __import__", {DYNAMIC_IMPORT_CALL}),
+        ("name = '__import__'", {DYNAMIC_IMPORT_CALL}),
+        ("name = 'import_module'", {DYNAMIC_IMPORT_CALL}),
         ("from ..core import config", set()),
     ),
 )
@@ -224,6 +250,39 @@ def test_aros_boundary_resolves_relative_imports_and_rejects_dynamic_imports(
     tree = ast.parse(source)
 
     assert {module for _, module in _forbidden_imports(tree, "arbor.aros")} == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "eval",
+        "exec",
+        "__import__",
+        "import_module",
+    ),
+)
+def test_aros_boundary_rejects_dynamic_reflection_names(name: str) -> None:
+    tree = ast.parse(f"reflection = {name}")
+
+    assert _forbidden_imports(tree, "arbor.aros")
+
+
+@pytest.mark.parametrize("name", ("vars", "globals", "locals", "getattr"))
+def test_aros_boundary_permits_ordinary_reflection_names(name: str) -> None:
+    tree = ast.parse(f"reflection = {name}")
+
+    assert not _forbidden_imports(tree, "arbor.aros")
+
+
+def test_aros_boundary_permits_harmless_standard_imports() -> None:
+    tree = ast.parse(
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "directory_flag = getattr(os, 'O_DIRECTORY', 0)"
+    )
+
+    assert not _forbidden_imports(tree, "arbor.aros")
 
 
 def test_direct_aros_import_loads_no_forbidden_project_modules() -> None:
@@ -310,6 +369,23 @@ def legacy_repo(tmp_path: Path) -> tuple[Path, str]:
         encoding="utf-8",
     )
     (repo / "README.md").write_text("outside\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "baseline")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    return repo, base
+
+
+@pytest.fixture
+def source_growth_repo(tmp_path: Path) -> tuple[Path, str]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "aros-tests@example.invalid")
+    _git(repo, "config", "user.name", "AROS Tests")
+    _git(repo, "config", "commit.gpgsign", "false")
+    existing = repo / "src" / "existing.py"
+    existing.parent.mkdir()
+    existing.write_text("existing source\n", encoding="utf-8")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "baseline")
     base = _git(repo, "rev-parse", "HEAD").stdout.strip()
@@ -527,6 +603,50 @@ def test_legacy_freeze_rejects_new_source_symlinks(
 
     assert result.returncode == 2
     assert "src/legacy_link.py" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("content", "staged"),
+    (
+        (b"", False),
+        (b"", True),
+        (b"\0legacy binary", False),
+        (b"\0legacy binary", True),
+    ),
+)
+def test_legacy_freeze_rejects_new_empty_and_binary_source_paths(
+    source_growth_repo: tuple[Path, str], content: bytes, staged: bool
+) -> None:
+    repo, base = source_growth_repo
+    path = repo / "src" / "legacy_payload.py"
+    path.write_bytes(content)
+    if staged:
+        _git(repo, "add", "src/legacy_payload.py")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/legacy_payload.py" in result.stdout + result.stderr
+
+
+def test_legacy_freeze_rejects_new_gitlink_under_source(
+    source_growth_repo: tuple[Path, str],
+) -> None:
+    repo, base = source_growth_repo
+    _git(
+        repo,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{base},src/legacy-submodule",
+    )
+    staged = _git(repo, "ls-files", "--stage", "src/legacy-submodule").stdout
+    assert staged.startswith("160000 ")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/legacy-submodule" in result.stdout + result.stderr
 
 
 def test_legacy_freeze_rejects_r100_move_into_non_allowlisted_source(

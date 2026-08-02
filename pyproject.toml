@@ -49,6 +49,7 @@ mcp = [
 
 [project.scripts]
 arbor = "arbor.cli.app:main"
+aros = "arbor.cli.aros_app:main"
 executor = "arbor.executor.main:cli"
 coordinator = "arbor.coordinator.main:cli"
 run-research = "arbor.run:cli"

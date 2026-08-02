@@ -51,7 +51,7 @@ DYNAMIC_REFLECTION_NAMES = {
     "__import__",
     "import_module",
 }
-DYNAMIC_IMPORT_STRINGS = {"__import__", "import_module"}
+DYNAMIC_IMPORT_STRINGS = {"eval", "exec", "__import__", "import_module"}
 FROZEN_HELPER = """\
 def normalize_legacy(value):
     stripped = value.strip()
@@ -240,6 +240,8 @@ def test_aros_imports_only_use_the_one_way_internal_boundary() -> None:
         ("load = __import__", {DYNAMIC_IMPORT_CALL}),
         ("name = '__import__'", {DYNAMIC_IMPORT_CALL}),
         ("name = 'import_module'", {DYNAMIC_IMPORT_CALL}),
+        ("import builtins\ngetattr(builtins, 'exec')", {DYNAMIC_IMPORT_CALL}),
+        ("name = 'eval'", {DYNAMIC_IMPORT_CALL}),
         ("from ..core import config", set()),
     ),
 )
@@ -386,6 +388,7 @@ def source_growth_repo(tmp_path: Path) -> tuple[Path, str]:
     existing = repo / "src" / "existing.py"
     existing.parent.mkdir()
     existing.write_text("existing source\n", encoding="utf-8")
+    (repo / "src" / "existing.bin").write_bytes(b"\0existing binary")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "baseline")
     base = _git(repo, "rev-parse", "HEAD").stdout.strip()
@@ -649,6 +652,60 @@ def test_legacy_freeze_rejects_new_gitlink_under_source(
     assert "src/legacy-submodule" in result.stdout + result.stderr
 
 
+def test_legacy_freeze_rejects_gitlink_type_change_under_source(
+    source_growth_repo: tuple[Path, str],
+) -> None:
+    repo, base = source_growth_repo
+    _git(
+        repo,
+        "update-index",
+        "--cacheinfo",
+        f"160000,{base},src/existing.py",
+    )
+    cached = _git(
+        repo,
+        "diff",
+        "--cached",
+        "--raw",
+        base,
+        "--",
+        "src/existing.py",
+    ).stdout
+    assert " T\tsrc/existing.py" in cached
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/existing.py" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("staged", (False, True))
+def test_legacy_freeze_rejects_tracked_binary_replacement(
+    source_growth_repo: tuple[Path, str], staged: bool
+) -> None:
+    repo, base = source_growth_repo
+    path = repo / "src" / "existing.bin"
+    path.write_bytes(b"\0replacement binary")
+    if staged:
+        _git(repo, "add", "src/existing.bin")
+    cached = ("--cached",) if staged else ()
+    numstat = _git(
+        repo,
+        "diff",
+        *cached,
+        "--numstat",
+        base,
+        "--",
+        "src/existing.bin",
+    ).stdout
+    assert numstat.startswith("-\t-\t")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/existing.bin" in result.stdout + result.stderr
+
+
 def test_legacy_freeze_rejects_r100_move_into_non_allowlisted_source(
     legacy_repo: tuple[Path, str],
 ) -> None:
@@ -788,11 +845,14 @@ def test_legacy_freeze_file_allowlist_does_not_allow_descendants(
     assert "src/cli/app.py/escape.py" in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("staged", (False, True))
 def test_legacy_freeze_permits_pure_deletion_in_non_allowlisted_source(
-    legacy_repo: tuple[Path, str],
+    legacy_repo: tuple[Path, str], staged: bool
 ) -> None:
     repo, base = legacy_repo
     (repo / "src" / "legacy.py").write_text("legacy one\n", encoding="utf-8")
+    if staged:
+        _git(repo, "add", "src/legacy.py")
 
     result = _run_checker(repo, base)
 

@@ -152,7 +152,7 @@ def _violates_source_growth(
     path = paths[-1]
     if kind == "D" or not _is_source(path) or _allows_growth(path):
         return False
-    if kind in {"A", "R", "C"} or new_mode == "120000":
+    if kind in {"A", "R", "C", "T"} or new_mode == "120000":
         return True
     if new_mode not in {"100644", "100755"}:
         return False
@@ -162,12 +162,12 @@ def _violates_source_growth(
         blob_oid=new_oid if staged else None,
     )
     if after is None:
-        return False
+        return kind == "M"
     if old_mode not in {"100644", "100755"}:
         return bool(after)
     before_content = _git_bytes(repo, "cat-file", "blob", old_oid)
     if b"\0" in before_content:
-        return bool(after)
+        return kind == "M" or bool(after)
     return _contains_added_lines(
         before_content.splitlines(keepends=True),
         after,

@@ -4,6 +4,7 @@ import ast
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +65,57 @@ def _configured_package_path(package: str, package_dirs: dict[str, str]) -> Path
     return (REPO_ROOT / package_dirs[prefix]).joinpath(*(part for part in suffix if part))
 
 
+def _canonical_package_path(package: str) -> tuple[Path, Path]:
+    if package == "arbor.skills_suite" or package.startswith("arbor.skills_suite."):
+        root = REPO_ROOT / "skills"
+        suffix = package.split(".")[2:]
+    else:
+        root = REPO_ROOT / "src"
+        suffix = package.split(".")[1:]
+    return root.joinpath(*suffix), root
+
+
+def _plain_path_beneath(path: Path, root: Path) -> bool:
+    try:
+        root_real = root.resolve(strict=True)
+        path_real = path.resolve(strict=True)
+        path_real.relative_to(root_real)
+        relative = path.relative_to(root)
+        current = root
+        if stat.S_ISLNK(current.lstat().st_mode):
+            return False
+        for part in relative.parts:
+            current /= part
+            if stat.S_ISLNK(current.lstat().st_mode):
+                return False
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    return True
+
+
+def _tree_symlinks(root: Path) -> list[Path]:
+    pending = [root]
+    symlinks: list[Path] = []
+    while pending:
+        directory = pending.pop()
+        try:
+            mode = directory.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            symlinks.append(directory)
+            continue
+        if not stat.S_ISDIR(mode):
+            continue
+        for path in directory.iterdir():
+            child_mode = path.lstat().st_mode
+            if stat.S_ISLNK(child_mode):
+                symlinks.append(path)
+            elif stat.S_ISDIR(child_mode):
+                pending.append(path)
+    return sorted(symlinks)
+
+
 def _configured_project_module_paths() -> dict[str, Path]:
     metadata = tomllib.loads(
         (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -79,24 +131,27 @@ def _configured_project_module_paths() -> dict[str, Path]:
         not isinstance(package, str) for package in packages
     ):
         raise ValueError("tool.setuptools.packages must be a list of package names")
+    for directory in package_dirs.values():
+        symlinks = _tree_symlinks(REPO_ROOT / directory)
+        if symlinks:
+            raise ValueError(
+                f"configured package tree contains symlink: "
+                f"{symlinks[0].relative_to(REPO_ROOT)}"
+            )
     for package in packages:
         if package != "arbor" and not package.startswith("arbor."):
             continue
         if any(not part.isidentifier() for part in package.split(".")):
             raise ValueError(f"configured package name is not canonical: {package!r}")
         actual_path = _configured_package_path(package, package_dirs)
-        expected_path = (
-            REPO_ROOT / "skills"
-            if package == "arbor.skills_suite"
-            else (REPO_ROOT / "src").joinpath(*package.split(".")[1:])
-        )
+        expected_path, physical_root = _canonical_package_path(package)
         package_init = actual_path / "__init__.py"
         if (
             actual_path != expected_path
             or not actual_path.is_dir()
-            or actual_path.resolve() != actual_path
+            or not _plain_path_beneath(actual_path, physical_root)
             or not package_init.is_file()
-            or package_init.resolve() != package_init
+            or not _plain_path_beneath(package_init, physical_root)
         ):
             raise ValueError(
                 f"configured package {package!r} must exist at {expected_path}"
@@ -106,6 +161,11 @@ def _configured_project_module_paths() -> dict[str, Path]:
     for package, directory in package_dirs.items():
         package_path = REPO_ROOT / directory
         for path in package_path.rglob("*.py"):
+            if not _plain_path_beneath(path, package_path):
+                raise ValueError(
+                    f"configured module path is not physical: "
+                    f"{path.relative_to(REPO_ROOT)}"
+                )
             relative = path.relative_to(package_path)
             suffix = (
                 relative.parent.parts
@@ -258,7 +318,8 @@ def test_aros_boundary_indexes_nested_modules_in_configured_external_roots(
     (tmp_path / "pyproject.toml").write_text(
         "[tool.setuptools]\n"
         'package-dir = { "arbor" = "src", "arbor.skills_suite" = "skills" }\n'
-        'packages = ["arbor", "arbor.skills_suite"]\n',
+        'packages = ["arbor", "arbor.skills_suite", '
+        '"arbor.skills_suite.legacy"]\n',
         encoding="utf-8",
     )
     source_root = tmp_path / "src"
@@ -269,6 +330,7 @@ def test_aros_boundary_indexes_nested_modules_in_configured_external_roots(
     (package_root / "__init__.py").write_text("", encoding="utf-8")
     nested = package_root / "legacy" / "bridge.py"
     nested.parent.mkdir()
+    (nested.parent / "__init__.py").write_text("", encoding="utf-8")
     nested.write_text("VALUE = 1\n", encoding="utf-8")
     monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
 
@@ -286,6 +348,43 @@ def test_aros_boundary_indexes_nested_modules_in_configured_external_roots(
     assert {
         module for _, module in _forbidden_imports(tree, "arbor.aros")
     } == {"arbor.skills_suite.legacy.bridge"}
+
+
+def test_aros_boundary_rejects_source_directory_symlink_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.setuptools]\n"
+        'package-dir = { "arbor" = "src", "arbor.skills_suite" = "skills" }\n'
+        'packages = ["arbor", "arbor.aros", "arbor.coordinator", '
+        '"arbor.skills_suite"]\n',
+        encoding="utf-8",
+    )
+    for package_root in (
+        tmp_path / "src",
+        tmp_path / "src" / "aros",
+        tmp_path / "src" / "coordinator",
+        tmp_path / "skills",
+    ):
+        package_root.mkdir(parents=True, exist_ok=True)
+        (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "aros" / "entry.py").write_text(
+        "import arbor.aros.link.idea_tree\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "coordinator" / "idea_tree.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "aros" / "link").symlink_to(
+        "../coordinator",
+        target_is_directory=True,
+    )
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    with pytest.raises(ValueError, match=r"src/aros/link"):
+        _configured_project_module_paths()
 
 
 def test_aros_boundary_rejects_package_dir_aliases(
@@ -393,11 +492,24 @@ def _canonical_module_paths(module: str) -> set[Path]:
     return {stem.with_suffix(".py"), stem / "__init__.py"}
 
 
+def _allowed_module_root(module: str) -> Path:
+    if module == "arbor.aros" or module.startswith("arbor.aros."):
+        return REPO_ROOT / "src" / "aros"
+    if module == "arbor.core" or module.startswith("arbor.core."):
+        return REPO_ROOT / "src" / "core"
+    return REPO_ROOT / "src"
+
+
 def _is_allowed_internal(module: str) -> bool:
     if not _is_logically_allowed_internal(module):
         return False
     path = PROJECT_MODULE_PATHS.get(module)
-    if path is None or not path.is_file() or path.resolve() != path:
+    if (
+        path is None
+        or not path.is_file()
+        or not stat.S_ISREG(path.lstat().st_mode)
+        or not _plain_path_beneath(path, _allowed_module_root(module))
+    ):
         return False
     exact_paths = {
         "arbor.cli.aros_app": REPO_ROOT / "src" / "cli" / "aros_app.py",
@@ -1784,6 +1896,34 @@ def test_legacy_freeze_rejects_new_source_symlinks(
     assert "src/legacy_link.py" in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("staged", (False, True))
+@pytest.mark.parametrize(
+    ("relative_path", "target", "target_is_directory"),
+    (
+        ("src/aros/link", "../coordinator", True),
+        ("src/aros/run_link.py", "../run.py", False),
+    ),
+)
+def test_legacy_freeze_rejects_symlinks_inside_allowed_growth_root(
+    legacy_repo: tuple[Path, str],
+    staged: bool,
+    relative_path: str,
+    target: str,
+    target_is_directory: bool,
+) -> None:
+    repo, base = legacy_repo
+    path = repo / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.symlink_to(target, target_is_directory=target_is_directory)
+    if staged:
+        _git(repo, "add", relative_path)
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert relative_path in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     ("content", "staged"),
     (
@@ -2114,6 +2254,34 @@ def test_legacy_freeze_rejects_e4_shim_resurrection_after_deletion(
     _git(repo, "commit", "-qm", "retire shim")
     base = _git(repo, "rev-parse", "HEAD").stdout.strip()
     shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    if staged:
+        _git(repo, "add", "src/cli/app.py")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/cli/app.py" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("staged", (False, True))
+@pytest.mark.parametrize("transition", ("old-to-wrong", "other-to-approved"))
+def test_legacy_freeze_rejects_other_e4_blob_transitions(
+    legacy_repo: tuple[Path, str], staged: bool, transition: str
+) -> None:
+    repo, _ = legacy_repo
+    shim = repo / "src" / "cli" / "app.py"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    approved = (REPO_ROOT / "src" / "cli" / "app.py").read_bytes()
+    if transition == "old-to-wrong":
+        shim.write_bytes(_old_e4_shim_bytes())
+        result_content = approved + b"# wrong result\n"
+    else:
+        shim.write_bytes(b"other existing shim\n")
+        result_content = approved
+    _git(repo, "add", "src/cli/app.py")
+    _git(repo, "commit", "-qm", "add transition base")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    shim.write_bytes(result_content)
     if staged:
         _git(repo, "add", "src/cli/app.py")
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -121,6 +122,30 @@ def _allows_growth(path: str) -> bool:
     )
 
 
+def _source_symlinks(repo: Path) -> list[str]:
+    source_root = repo / "src"
+    pending = [source_root]
+    symlinks: list[str] = []
+    while pending:
+        directory = pending.pop()
+        try:
+            mode = directory.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            symlinks.append(directory.relative_to(repo).as_posix())
+            continue
+        if not stat.S_ISDIR(mode):
+            continue
+        for path in directory.iterdir():
+            child_mode = path.lstat().st_mode
+            if stat.S_ISLNK(child_mode):
+                symlinks.append(path.relative_to(repo).as_posix())
+            elif stat.S_ISDIR(child_mode):
+                pending.append(path)
+    return sorted(symlinks)
+
+
 def _worktree_blob_oid(repo: Path, path: str) -> str:
     return _git(
         repo,
@@ -167,6 +192,8 @@ def _violates_source_growth(
     path = paths[-1]
     if kind == "D" or not _is_source(path):
         return False
+    if new_mode == "120000":
+        return True
     if path == AROS_RETIREMENT_GATE_E4_PATH:
         resulting_oid = new_oid if staged else _worktree_blob_oid(repo, path)
         return not (
@@ -313,11 +340,14 @@ def main() -> int:
                 "src",
             )
         )
-        violations = _find_violations(
-            repo,
-            changes,
-            untracked,
-            staged=False,
+        violations = _source_symlinks(repo)
+        violations.extend(
+            _find_violations(
+                repo,
+                changes,
+                untracked,
+                staged=False,
+            )
         )
         violations.extend(
             _find_violations(

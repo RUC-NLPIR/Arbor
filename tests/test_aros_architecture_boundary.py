@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,14 @@ ALLOWED_INTERNAL_PREFIXES = (
     "arbor.cli.aros_app",
     "arbor.cli.commands.aros_cmd",
     "arbor.cli.user_config",
+    "arbor._app",
+)
+SEMANTIC_LEGACY_PREFIXES = (
+    "arbor.coordinator",  # includes the legacy IdeaTree module
+    "arbor.executor",
+    "arbor.run",
+    "arbor.review",
+    "arbor.cli.commands.run",
 )
 BOUNDARY_PATHS = (
     *sorted((REPO_ROOT / "src" / "aros").rglob("*.py")),
@@ -45,14 +54,11 @@ PROJECT_MODULES = {
     for path in (REPO_ROOT / "src").rglob("*.py")
 }
 DYNAMIC_IMPORT_CALL = "<dynamic import call>"
-DYNAMIC_REFLECTION_NAMES = {
-    "eval",
-    "exec",
-    "__import__",
-    "import_module",
-}
-DYNAMIC_IMPORT_STRINGS = {"eval", "exec", "__import__", "import_module"}
+DYNAMIC_IMPORT_REFERENCES = {"__import__", "import_module"}
+DYNAMIC_EXECUTION_NAMES = {"eval", "exec", "__import__"}
+DYNAMIC_IMPORT_STRINGS = {"__import__", "import_module"}
 BUILTINS_NAMES = {"builtins", "__builtins__"}
+BindingState = tuple[set[str], set[str], set[str], set[str], dict[str, str]]
 FROZEN_HELPER = """\
 def normalize_legacy(value):
     stripped = value.strip()
@@ -159,74 +165,423 @@ def _static_imports(tree: ast.AST, package: str) -> list[tuple[int, str]]:
     return imports
 
 
-def _dynamic_imports(tree: ast.AST) -> list[tuple[int, str]]:
-    dynamic_names = set(DYNAMIC_REFLECTION_NAMES)
-    imports: list[tuple[int, str]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for name in node.names:
-                if name.name == "importlib" or name.name.startswith("importlib."):
-                    dynamic_names.add(name.asname or "importlib")
-                    imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
-                elif name.name == "builtins":
-                    imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
-        elif isinstance(node, ast.ImportFrom):
-            if node.level == 0 and (
-                node.module == "importlib"
-                or (
-                    node.module is not None
-                    and node.module.startswith("importlib.")
-                )
-            ):
-                imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
-            elif node.level == 0 and node.module == "builtins":
-                imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
-            for name in node.names:
-                if name.name in DYNAMIC_REFLECTION_NAMES:
-                    dynamic_names.add(name.asname or name.name)
-                    imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
+def _terminal_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
 
-    for node in ast.walk(tree):
-        builtins_reference = (
-            isinstance(node, ast.Name) and node.id == "__builtins__"
-        ) or (
-            isinstance(node, ast.Attribute) and node.attr == "__builtins__"
+
+def _is_importlib_metadata(module: str) -> bool:
+    return module == "importlib.metadata" or module.startswith("importlib.metadata.")
+
+
+def _literal_string(node: ast.AST, bindings: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    if isinstance(node, ast.NamedExpr):
+        return _literal_string(node.value, bindings)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _literal_string(node.left, bindings)
+        right = _literal_string(node.right, bindings)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+class _DynamicImportVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.violations: list[tuple[int, str]] = []
+        self.dynamic_import_names = set(DYNAMIC_IMPORT_REFERENCES)
+        self.execution_names = set(DYNAMIC_EXECUTION_NAMES)
+        self.builtins_names = set(BUILTINS_NAMES)
+        self.importlib_names = {"importlib"}
+        self.string_bindings: dict[str, str] = {}
+        self.class_outer_state: BindingState | None = None
+
+    def _mark(self, node: ast.AST) -> None:
+        self.violations.append((node.lineno, DYNAMIC_IMPORT_CALL))
+
+    def _snapshot(self) -> BindingState:
+        return (
+            set(self.dynamic_import_names),
+            set(self.execution_names),
+            set(self.builtins_names),
+            set(self.importlib_names),
+            dict(self.string_bindings),
         )
-        builtins_getattr = (
-            isinstance(node, ast.Call)
-            and bool(node.args)
-            and (
-                (isinstance(node.func, ast.Name) and node.func.id == "getattr")
-                or (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "getattr"
-                )
-            )
-            and (
-                (
-                    isinstance(node.args[0], ast.Name)
-                    and node.args[0].id in BUILTINS_NAMES
-                )
-                or (
-                    isinstance(node.args[0], ast.Attribute)
-                    and node.args[0].attr in BUILTINS_NAMES
-                )
-            )
-        )
-        if builtins_reference or builtins_getattr or (
-            isinstance(node, ast.Attribute)
-            and node.attr in DYNAMIC_REFLECTION_NAMES
-        ) or (
-            isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Load)
-            and node.id in dynamic_names
-        ) or (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and node.value in DYNAMIC_IMPORT_STRINGS
+
+    def _restore(self, state: BindingState) -> None:
+        (
+            dynamic_import_names,
+            execution_names,
+            builtins_names,
+            importlib_names,
+            string_bindings,
+        ) = state
+        self.dynamic_import_names = set(dynamic_import_names)
+        self.execution_names = set(execution_names)
+        self.builtins_names = set(builtins_names)
+        self.importlib_names = set(importlib_names)
+        self.string_bindings = dict(string_bindings)
+
+    def _restore_name(self, name: str, state: BindingState) -> None:
+        for names in (
+            self.dynamic_import_names,
+            self.execution_names,
+            self.builtins_names,
+            self.importlib_names,
         ):
-            imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
-    return imports
+            names.discard(name)
+        self.string_bindings.pop(name, None)
+        for current, previous in zip(
+            (
+                self.dynamic_import_names,
+                self.execution_names,
+                self.builtins_names,
+                self.importlib_names,
+            ),
+            state[:4],
+        ):
+            if name in previous:
+                current.add(name)
+        if name in state[4]:
+            self.string_bindings[name] = state[4][name]
+
+    def _clear_binding(self, name: str) -> None:
+        for names in (
+            self.dynamic_import_names,
+            self.execution_names,
+            self.builtins_names,
+            self.importlib_names,
+        ):
+            names.discard(name)
+        self.string_bindings.pop(name, None)
+        if name in DYNAMIC_IMPORT_REFERENCES:
+            self.dynamic_import_names.add(name)
+        if name in BUILTINS_NAMES:
+            self.builtins_names.add(name)
+        if name == "importlib":
+            self.importlib_names.add(name)
+
+    def _bind(self, name: str, value: ast.AST) -> None:
+        source_name = _terminal_name(value)
+        literal = _literal_string(value, self.string_bindings)
+        is_dynamic_import = source_name in self.dynamic_import_names
+        is_execution = isinstance(value, ast.Name) and value.id in self.execution_names
+        if isinstance(value, ast.Attribute):
+            is_execution = (
+                value.attr in DYNAMIC_EXECUTION_NAMES
+                and _terminal_name(value.value) in self.builtins_names
+            )
+        is_builtins = source_name in self.builtins_names
+        is_importlib = source_name in self.importlib_names
+        self._clear_binding(name)
+        if literal is not None:
+            self.string_bindings[name] = literal
+        if is_dynamic_import:
+            self.dynamic_import_names.add(name)
+        if is_execution:
+            self.execution_names.add(name)
+        if is_builtins:
+            self.builtins_names.add(name)
+        if is_importlib:
+            self.importlib_names.add(name)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for imported in node.names:
+            bound = imported.asname or imported.name.split(".", 1)[0]
+            self._clear_binding(bound)
+            if imported.name == "importlib":
+                self.importlib_names.add(bound)
+                self._mark(node)
+            elif imported.name.startswith("importlib."):
+                if not _is_importlib_metadata(imported.name):
+                    self._mark(node)
+                if imported.asname is None:
+                    self.importlib_names.add("importlib")
+            elif imported.name == "builtins":
+                self.builtins_names.add(bound)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for imported in node.names:
+            bound = imported.asname or imported.name
+            self._clear_binding(bound)
+            if node.level == 0 and node.module == "importlib":
+                if imported.name == "import_module":
+                    self.dynamic_import_names.add(bound)
+                    self._mark(node)
+                elif imported.name != "metadata":
+                    self._mark(node)
+            elif (
+                node.level == 0
+                and node.module is not None
+                and node.module.startswith("importlib.")
+                and not _is_importlib_metadata(node.module)
+            ):
+                self._mark(node)
+            elif node.level == 0 and node.module == "builtins":
+                if imported.name in DYNAMIC_IMPORT_REFERENCES:
+                    self.dynamic_import_names.add(bound)
+                if imported.name in DYNAMIC_EXECUTION_NAMES:
+                    self.execution_names.add(bound)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self._bind_target(target, node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+            if isinstance(node.target, ast.Name):
+                self._bind(node.target.id, node.value)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            self._bind(node.target.id, node.value)
+
+    def _clear_target(self, target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            self._clear_binding(target.id)
+        elif isinstance(target, (ast.List, ast.Tuple)):
+            for item in target.elts:
+                self._clear_target(item)
+
+    def _target_names(self, target: ast.AST) -> list[str]:
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return [name for item in target.elts for name in self._target_names(item)]
+        return []
+
+    def _bind_target(self, target: ast.AST, value: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            self._bind(target.id, value)
+        elif (
+            isinstance(target, (ast.List, ast.Tuple))
+            and isinstance(value, (ast.List, ast.Tuple))
+            and len(target.elts) == len(value.elts)
+        ):
+            for target_item, value_item in zip(target.elts, value.elts):
+                self._bind_target(target_item, value_item)
+        else:
+            self._clear_target(target)
+
+    def visit_For(self, node: ast.For) -> None:
+        saved = self._snapshot()
+        self.visit(node.iter)
+        self._clear_target(node.target)
+        for statement in node.body:
+            self.visit(statement)
+        for name in self._target_names(node.target):
+            self._restore_name(name, saved)
+        for statement in node.orelse:
+            self.visit(statement)
+
+    visit_AsyncFor = visit_For
+
+    def visit_With(self, node: ast.With) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._clear_target(item.optional_vars)
+        for statement in node.body:
+            self.visit(statement)
+
+    visit_AsyncWith = visit_With
+
+    def _visit_comprehension(
+        self,
+        generators: list[ast.comprehension],
+        expressions: list[ast.expr],
+    ) -> None:
+        saved = self._snapshot()
+        for generator in generators:
+            self.visit(generator.iter)
+            if isinstance(generator.iter, (ast.List, ast.Tuple)) and len(generator.iter.elts) == 1:
+                self._bind_target(generator.target, generator.iter.elts[0])
+            else:
+                self._clear_target(generator.target)
+            for condition in generator.ifs:
+                self.visit(condition)
+        for expression in expressions:
+            self.visit(expression)
+        self._restore(saved)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    visit_SetComp = visit_ListComp
+    visit_GeneratorExp = visit_ListComp
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node.generators, [node.key, node.value])
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is not None:
+            self.visit(node.type)
+        saved = self._snapshot()
+        if node.name is not None:
+            self._clear_binding(node.name)
+        for statement in node.body:
+            self.visit(statement)
+        if node.name is not None:
+            self._restore_name(node.name, saved)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        attribute = (
+            _literal_string(node.args[1], self.string_bindings)
+            if len(node.args) >= 2
+            else None
+        )
+        namespace = _terminal_name(node.args[0]) if node.args else None
+        protected_getattr = _terminal_name(node.func) == "getattr" and (
+            (namespace in self.builtins_names and attribute in {"eval", "exec", "__import__"})
+            or (namespace in self.importlib_names and attribute == "import_module")
+        )
+        direct_execution = (
+            isinstance(node.func, ast.Name) and node.func.id in self.execution_names
+        )
+        if protected_getattr or direct_execution:
+            self._mark(node)
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and node.id in self.dynamic_import_names:
+            self._mark(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in self.dynamic_import_names:
+            self._mark(node)
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str) and node.value in DYNAMIC_IMPORT_STRINGS:
+            self._mark(node)
+
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        if _literal_string(node, {}) in DYNAMIC_IMPORT_STRINGS:
+            self._mark(node)
+        self.generic_visit(node)
+
+    def _visit_scoped(
+        self,
+        body: list[ast.stmt],
+        parameters: list[str],
+        *,
+        base_state: BindingState | None = None,
+    ) -> None:
+        saved = self._snapshot()
+        if base_state is not None:
+            self._restore(base_state)
+        for parameter in parameters:
+            self._clear_binding(parameter)
+        for statement in body:
+            self.visit(statement)
+        self._restore(saved)
+
+    def _visit_scoped_expression(
+        self,
+        expression: ast.expr,
+        parameters: list[str],
+        *,
+        base_state: BindingState | None = None,
+    ) -> None:
+        saved = self._snapshot()
+        if base_state is not None:
+            self._restore(base_state)
+        for parameter in parameters:
+            self._clear_binding(parameter)
+        self.visit(expression)
+        self._restore(saved)
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+        arguments = [
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        ]
+        if node.args.vararg is not None:
+            arguments.append(node.args.vararg)
+        if node.args.kwarg is not None:
+            arguments.append(node.args.kwarg)
+        for argument in arguments:
+            if argument.annotation is not None:
+                self.visit(argument.annotation)
+        if node.returns is not None:
+            self.visit(node.returns)
+        parameters = [argument.arg for argument in arguments]
+        is_method = self.class_outer_state is not None
+        body_base = self.class_outer_state or self._snapshot()
+        class_outer_state = self.class_outer_state
+        self.class_outer_state = None
+        self._visit_scoped(
+            node.body,
+            parameters if is_method else [*parameters, node.name],
+            base_state=body_base,
+        )
+        self.class_outer_state = class_outer_state
+        self._clear_binding(node.name)
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+        parameters = [
+            argument.arg
+            for argument in (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            )
+        ]
+        if node.args.vararg is not None:
+            parameters.append(node.args.vararg.arg)
+        if node.args.kwarg is not None:
+            parameters.append(node.args.kwarg.arg)
+        body_base = self.class_outer_state or self._snapshot()
+        class_outer_state = self.class_outer_state
+        self.class_outer_state = None
+        self._visit_scoped_expression(
+            node.body,
+            parameters,
+            base_state=body_base,
+        )
+        self.class_outer_state = class_outer_state
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        method_outer_state = self.class_outer_state or self._snapshot()
+        class_outer_state = self.class_outer_state
+        self.class_outer_state = method_outer_state
+        self._visit_scoped(node.body, [])
+        self.class_outer_state = class_outer_state
+        self._clear_binding(node.name)
+
+
+def _dynamic_imports(tree: ast.AST) -> list[tuple[int, str]]:
+    visitor = _DynamicImportVisitor()
+    visitor.visit(tree)
+    return visitor.violations
 
 
 def _forbidden_imports(tree: ast.AST, package: str) -> list[tuple[int, str]]:
@@ -271,19 +626,50 @@ def test_aros_imports_only_use_the_one_way_internal_boundary() -> None:
         ("import importlib\nload = getattr(importlib, 'import_module')", {DYNAMIC_IMPORT_CALL}),
         ("import importlib", {DYNAMIC_IMPORT_CALL}),
         ("import importlib.util as util", {DYNAMIC_IMPORT_CALL}),
-        ("from importlib.metadata import version", {DYNAMIC_IMPORT_CALL}),
+        ("from importlib.metadata import version", set()),
+        ("import importlib.metadata", set()),
+        ("import importlib.metadata_loader", {DYNAMIC_IMPORT_CALL}),
+        ("from importlib import metadata", set()),
+        ("from importlib import util", {DYNAMIC_IMPORT_CALL}),
         ("from importlib import import_module as load", {DYNAMIC_IMPORT_CALL}),
         ("load = __import__", {DYNAMIC_IMPORT_CALL}),
         ("name = '__import__'", {DYNAMIC_IMPORT_CALL}),
         ("name = 'import_module'", {DYNAMIC_IMPORT_CALL}),
         ("import builtins\ngetattr(builtins, 'exec')", {DYNAMIC_IMPORT_CALL}),
-        ("name = 'eval'", {DYNAMIC_IMPORT_CALL}),
-        ("import builtins", {DYNAMIC_IMPORT_CALL}),
-        ("from builtins import open", {DYNAMIC_IMPORT_CALL}),
+        ("name = 'eval'", set()),
+        ("model.eval()", set()),
+        ("runner = model.eval\nrunner()", set()),
+        ("eval(source)", {DYNAMIC_IMPORT_CALL}),
+        ("exec(source)", {DYNAMIC_IMPORT_CALL}),
+        ("import builtins", set()),
+        ("from builtins import open", set()),
         ("def load(builtins):\n    return getattr(builtins, '__im' + 'port__')", {DYNAMIC_IMPORT_CALL}),
-        ("reference = __builtins__", {DYNAMIC_IMPORT_CALL}),
-        ("reference = runtime.__builtins__", {DYNAMIC_IMPORT_CALL}),
-        ("getattr(runtime.builtins, attribute)", {DYNAMIC_IMPORT_CALL}),
+        ("reference = __builtins__", set()),
+        ("reference = runtime.__builtins__", set()),
+        ("getattr(runtime.builtins, attribute)", set()),
+        ("getattr(builtins, 'open')", set()),
+        ("name: str = 'ev' + 'al'\ngetattr(builtins, name)", {DYNAMIC_IMPORT_CALL}),
+        ("getattr(builtins, (name := 'eval'))", {DYNAMIC_IMPORT_CALL}),
+        ("b: object = builtins\ngetattr(b, 'eval')", {DYNAMIC_IMPORT_CALL}),
+        ("name = 'eval'\ngetattr(builtins, name)\nname = 'open'", {DYNAMIC_IMPORT_CALL}),
+        ("name = 'open'\ngetattr(builtins, name)\nname = 'eval'", set()),
+        ("name = 'open'\ndef nested():\n    name = 'eval'\ngetattr(builtins, name)", set()),
+        ("def annotated(value: exec(source)) -> eval(source):\n    pass", {DYNAMIC_IMPORT_CALL}),
+        ("class C(metaclass=eval(source)):\n    pass", {DYNAMIC_IMPORT_CALL}),
+        ("lambda eval: eval(source)", set()),
+        ("def eval(source):\n    return source\neval(source)", set()),
+        ("class C:\n    eval = lambda value: value\n    def method(self):\n        return eval(source)", {DYNAMIC_IMPORT_CALL}),
+        ("class C:\n    def eval(self, source):\n        return eval(source)", {DYNAMIC_IMPORT_CALL}),
+        ("class C:\n    def eval(self, source):\n        return self.eval(source)", set()),
+        ("for eval in functions:\n    eval(source)", set()),
+        ("try:\n    operation()\nexcept Exception as eval:\n    eval(source)", set()),
+        ("[eval(source) for eval in callbacks]", set()),
+        ("(eval(source) for eval in callbacks)", set()),
+        ("with callback() as eval:\n    eval(source)", set()),
+        ("eval, other = callbacks\neval(source)", set()),
+        ("for eval in []:\n    pass\neval(source)", {DYNAMIC_IMPORT_CALL}),
+        ("[getattr(builtins, name) for name in ('eval',)]", {DYNAMIC_IMPORT_CALL}),
+        ("b, = (builtins,)\ngetattr(b, 'eval')", {DYNAMIC_IMPORT_CALL}),
         ("from .builtins import helper", set()),
         ("from .importlib import helper", set()),
         ("from ..core import config", set()),
@@ -298,22 +684,17 @@ def test_aros_boundary_resolves_relative_imports_and_rejects_dynamic_imports(
     assert {module for _, module in _forbidden_imports(tree, "arbor.aros")} == expected
 
 
-@pytest.mark.parametrize(
-    "name",
-    (
-        "eval",
-        "exec",
-        "__import__",
-        "import_module",
-    ),
-)
-def test_aros_boundary_rejects_dynamic_reflection_names(name: str) -> None:
+@pytest.mark.parametrize("name", ("__import__", "import_module"))
+def test_aros_boundary_rejects_dynamic_import_references(name: str) -> None:
     tree = ast.parse(f"reflection = {name}")
 
     assert _forbidden_imports(tree, "arbor.aros")
 
 
-@pytest.mark.parametrize("name", ("vars", "globals", "locals", "getattr"))
+@pytest.mark.parametrize(
+    "name",
+    ("vars", "globals", "locals", "getattr", "eval", "exec"),
+)
 def test_aros_boundary_permits_ordinary_reflection_names(name: str) -> None:
     tree = ast.parse(f"reflection = {name}")
 
@@ -345,6 +726,10 @@ def test_aros_boundary_gate_is_documented_as_architecture_discipline() -> None:
 
     assert "architecture discipline" in documentation
     assert "not a sandbox" in documentation
+
+
+def test_config_substrate_is_in_the_canonical_allowlist() -> None:
+    assert {"arbor._app", "arbor.cli.user_config"} <= set(ALLOWED_INTERNAL_PREFIXES)
 
 
 def test_direct_aros_import_loads_no_forbidden_project_modules() -> None:
@@ -384,6 +769,55 @@ print(json.dumps(sorted(sys.modules)))
         if _is_project_module(module) and not _is_allowed_internal(module)
     )
     assert not forbidden, f"direct AROS import loaded forbidden modules: {forbidden}"
+
+
+def test_start_config_path_loads_config_helpers_but_not_semantic_legacy(
+    tmp_path: Path,
+) -> None:
+    script = """
+import importlib
+import importlib.util
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location(
+    "arbor",
+    root / "src" / "__init__.py",
+    submodule_search_locations=[str(root / "src")],
+)
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+sys.modules["arbor"] = module
+spec.loader.exec_module(module)
+commands = importlib.import_module("arbor.cli.commands.aros_cmd")
+commands.llm_defaults()
+print(json.dumps(sorted(sys.modules)))
+"""
+    environment = dict(os.environ)
+    environment["HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(REPO_ROOT)],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    loaded = json.loads(result.stdout)
+    assert {"arbor._app", "arbor.cli.user_config"} <= set(loaded)
+    forbidden = sorted(
+        module
+        for module in loaded
+        if any(
+            module == prefix or module.startswith(f"{prefix}.")
+            for prefix in SEMANTIC_LEGACY_PREFIXES
+        )
+    )
+    assert not forbidden, f"start config path loaded semantic legacy: {forbidden}"
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -739,6 +1173,43 @@ def test_legacy_freeze_rejects_gitlink_type_change_under_source(
     assert "src/existing.py" in result.stdout + result.stderr
 
 
+def test_legacy_freeze_rejects_gitlink_update_under_source(
+    source_growth_repo: tuple[Path, str],
+) -> None:
+    repo, original_base = source_growth_repo
+    _git(
+        repo,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{original_base},src/existing-submodule",
+    )
+    _git(repo, "commit", "-qm", "add gitlink")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(
+        repo,
+        "update-index",
+        "--cacheinfo",
+        f"160000,{base},src/existing-submodule",
+    )
+    cached = _git(
+        repo,
+        "diff",
+        "--cached",
+        "--raw",
+        base,
+        "--",
+        "src/existing-submodule",
+    ).stdout
+    assert cached.startswith(":160000 160000 ")
+    assert " M\tsrc/existing-submodule" in cached
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/existing-submodule" in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("staged", (False, True))
 def test_legacy_freeze_rejects_tracked_binary_replacement(
     source_growth_repo: tuple[Path, str], staged: bool
@@ -913,6 +1384,27 @@ def test_legacy_freeze_permits_pure_deletion_in_non_allowlisted_source(
     (repo / "src" / "legacy.py").write_text("legacy one\n", encoding="utf-8")
     if staged:
         _git(repo, "add", "src/legacy.py")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_legacy_freeze_permits_crlf_text_deletion(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, _ = legacy_repo
+    (repo / ".gitattributes").write_text(
+        "src/legacy.py text eol=crlf\n", encoding="utf-8"
+    )
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-qm", "declare CRLF checkout")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    path = repo / "src" / "legacy.py"
+    path.write_bytes(b"legacy one\r\n")
+    assert b"\r\n" in path.read_bytes()
+    numstat = _git(repo, "diff", "--numstat", base, "--", "src/legacy.py").stdout
+    assert numstat.startswith("0\t1\t")
 
     result = _run_checker(repo, base)
 

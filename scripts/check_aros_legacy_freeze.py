@@ -129,7 +129,15 @@ def _text_lines(
         current_path = repo / path
         if current_path.is_symlink() or not current_path.is_file():
             return None
-        content = current_path.read_bytes()
+        normalized_oid = _git(
+            repo,
+            "hash-object",
+            "-w",
+            f"--path={path}",
+            "--",
+            path,
+        ).strip()
+        content = _git_bytes(repo, "cat-file", "blob", normalized_oid)
     else:
         content = _git_bytes(repo, "cat-file", "blob", blob_oid)
     if b"\0" in content:
@@ -152,7 +160,7 @@ def _violates_source_growth(
     path = paths[-1]
     if kind == "D" or not _is_source(path) or _allows_growth(path):
         return False
-    if kind in {"A", "R", "C", "T"} or new_mode == "120000":
+    if kind in {"A", "R", "C", "T"} or new_mode in {"120000", "160000"}:
         return True
     if new_mode not in {"100644", "100755"}:
         return False

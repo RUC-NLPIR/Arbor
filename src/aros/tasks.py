@@ -15,7 +15,7 @@ from .store import create_json, file_lock, json_sha256, read_json, utc_now
 
 
 _TASK_ID = re.compile(
-    r"^TASK-\d{8}-[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$"
+    r"^TASK-[0-9]{8}-[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$"
 )
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -126,7 +126,7 @@ class TaskService:
                     raise TaskError(
                         "idempotency key already belongs to a different task request"
                     )
-                self._recover_prepared_records(brief, index_path, key_digest)
+                self._recover_prepared_records(brief)
                 return brief
 
             existing = self._brief_for_idempotency_key(key)
@@ -135,7 +135,7 @@ class TaskService:
                     raise TaskError(
                         "idempotency key already belongs to a different task request"
                     )
-                self._recover_prepared_records(existing, index_path, key_digest)
+                self._recover_prepared_records(existing)
                 return existing
 
             base_commit = self._git_output("rev-parse", "--verify", "HEAD^{commit}")
@@ -177,6 +177,14 @@ class TaskService:
     def status(self, task_id: str) -> dict[str, object]:
         """Return prepared runtime state bound to its immutable brief."""
         brief = self._load_brief(task_id)
+        self._load_bound_idempotency_index(brief)
+        return self._load_prepared_status(brief)
+
+    def _load_prepared_status(
+        self,
+        brief: dict[str, object],
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
         _require_plain_directory(self.root / ".aros", "AROS runtime directory")
         _require_plain_directory(
             self.root / ".aros" / "tasks", "runtime tasks directory"
@@ -274,21 +282,42 @@ class TaskService:
         ):
             raise TaskError("invalid task idempotency index binding")
 
+    def _load_bound_idempotency_index(
+        self,
+        brief: dict[str, object],
+    ) -> dict[str, object]:
+        key = str(brief["idempotency_key"])
+        key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        _require_plain_directory(self.root / ".aros", "AROS runtime directory")
+        _require_plain_directory(
+            self.root / ".aros" / "tasks", "runtime tasks directory"
+        )
+        _require_plain_directory(
+            self.root / ".aros" / "tasks" / "idempotency",
+            "task idempotency directory",
+        )
+        index = self._load_idempotency_index(
+            self._idempotency_index_path(key),
+            key_digest,
+        )
+        self._validate_index_binding(index, brief)
+        return index
+
     def _recover_prepared_records(
         self,
         brief: dict[str, object],
-        index_path: Path,
-        key_digest: str,
     ) -> None:
         task_id = str(brief["task_id"])
+        key = str(brief["idempotency_key"])
+        key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         status_path = self.root / ".aros" / "tasks" / task_id / "status.json"
+        index_path = self._idempotency_index_path(key)
         if not _path_exists(status_path):
             create_json(status_path, _prepared_status(brief))
-        self.status(task_id)
         if not _path_exists(index_path):
             create_json(index_path, _idempotency_index(brief, key_digest))
-        index = self._load_idempotency_index(index_path, key_digest)
-        self._validate_index_binding(index, brief)
+        self._load_prepared_status(brief)
+        self._load_bound_idempotency_index(brief)
 
     def _brief_for_idempotency_key(self, key: str) -> dict[str, object] | None:
         matches = [
@@ -463,7 +492,11 @@ def _validate_string_list(value: object, field: str) -> list[str]:
 def _validate_timeout(value: object) -> int | float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise TaskError("timeout_seconds must be a positive number")
-    if not math.isfinite(value):
+    try:
+        finite = math.isfinite(value)
+    except OverflowError as error:
+        raise TaskError("timeout_seconds must be finite") from error
+    if not finite:
         raise TaskError("timeout_seconds must be finite")
     return value
 
@@ -477,6 +510,10 @@ def _validate_hash(value: object, field: str) -> str:
 def _validate_timestamp(value: object, field: str) -> str:
     if not isinstance(value, str) or _UTC_TIMESTAMP.fullmatch(value) is None:
         raise TaskError(f"{field} must be a UTC timestamp")
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError as error:
+        raise TaskError(f"{field} must be a UTC timestamp") from error
     return value
 
 

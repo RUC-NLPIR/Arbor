@@ -269,6 +269,20 @@ def test_create_rejects_invalid_request_fields_without_writing_records(
     assert not (tmp_path / ".aros" / "tasks").exists()
 
 
+def test_create_rejects_an_oversized_integer_timeout_as_a_task_error(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    request = _request()
+    request["timeout_seconds"] = 10**10_000
+
+    with pytest.raises(TaskError, match="finite"):
+        service.create("bounded objective", **request)  # type: ignore[arg-type]
+
+    assert not (tmp_path / "tasks").exists()
+
+
 def test_create_is_idempotent_for_the_same_request_and_rejects_a_change(
     tmp_path: Path,
 ) -> None:
@@ -559,6 +573,16 @@ def test_status_rejects_a_noncanonical_task_id_before_path_access(
         service.status("TASK-20260802-trailing-")
 
 
+def test_status_rejects_non_ascii_task_id_date_digits_before_path_access(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+
+    with pytest.raises(TaskError, match="invalid task ID"):
+        service.status("TASK-２０２６０８０２-child")
+
+
 def test_status_rejects_a_noncanonical_brief_timestamp(
     tmp_path: Path,
 ) -> None:
@@ -575,6 +599,35 @@ def test_status_rejects_a_noncanonical_brief_timestamp(
     status["updated_at"] = "Z"
     atomic_write_json(brief_path, brief)
     atomic_write_json(status_path, status)
+
+    with pytest.raises(TaskError, match="created_at.*UTC timestamp"):
+        service.status(task_id)
+
+
+def test_status_rejects_a_calendar_invalid_brief_timestamp(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    key = "calendar-invalid-timestamp"
+    brief = _create(service, key=key)
+    task_id = str(brief["task_id"])
+    brief_path = tmp_path / "tasks" / task_id / "brief.json"
+    status_path = tmp_path / ".aros" / "tasks" / task_id / "status.json"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    index_path = tmp_path / ".aros" / "tasks" / "idempotency" / f"{digest}.json"
+    invalid_timestamp = "2026-02-31T12:00:00.000Z"
+    brief["created_at"] = invalid_timestamp
+    _rehash_brief(brief)
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["brief_sha256"] = brief["brief_sha256"]
+    status["updated_at"] = invalid_timestamp
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["brief_sha256"] = brief["brief_sha256"]
+    index["created_at"] = invalid_timestamp
+    atomic_write_json(brief_path, brief)
+    atomic_write_json(status_path, status)
+    atomic_write_json(index_path, index)
 
     with pytest.raises(TaskError, match="created_at.*UTC timestamp"):
         service.status(task_id)
@@ -604,6 +657,40 @@ def test_idempotency_index_is_strict_and_contains_no_plaintext_key(
     assert index["brief_sha256"] == brief["brief_sha256"]
     assert key not in index_path.name
     assert key not in json.dumps(index, sort_keys=True)
+
+
+@pytest.mark.parametrize("reader", ("status", "list"))
+@pytest.mark.parametrize("problem", ("missing", "tampered", "conflicting"))
+def test_task_readback_requires_a_strictly_bound_idempotency_index(
+    tmp_path: Path,
+    reader: str,
+    problem: str,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    key = "readback-index-authority"
+    brief = _create(service, key=key)
+    task_id = str(brief["task_id"])
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    index_path = tmp_path / ".aros" / "tasks" / "idempotency" / f"{digest}.json"
+    if problem == "missing":
+        index_path.unlink()
+    elif problem == "tampered":
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        index["unexpected"] = True
+        atomic_write_json(index_path, index)
+    else:
+        brief_path = tmp_path / "tasks" / task_id / "brief.json"
+        status_path = tmp_path / ".aros" / "tasks" / task_id / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        brief["base_commit"] = "0" * 40
+        _rehash_brief(brief)
+        status["brief_sha256"] = brief["brief_sha256"]
+        atomic_write_json(brief_path, brief)
+        atomic_write_json(status_path, status)
+
+    with pytest.raises(TaskError, match="idempotency index"):
+        service.status(task_id) if reader == "status" else service.list()
 
 
 @pytest.mark.parametrize("mutation", ("extra", "key_hash", "brief_hash"))

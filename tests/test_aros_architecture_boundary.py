@@ -52,6 +52,7 @@ DYNAMIC_REFLECTION_NAMES = {
     "import_module",
 }
 DYNAMIC_IMPORT_STRINGS = {"eval", "exec", "__import__", "import_module"}
+BUILTINS_NAMES = {"builtins", "__builtins__"}
 FROZEN_HELPER = """\
 def normalize_legacy(value):
     stripped = value.strip()
@@ -167,10 +168,18 @@ def _dynamic_imports(tree: ast.AST) -> list[tuple[int, str]]:
                 if name.name == "importlib" or name.name.startswith("importlib."):
                     dynamic_names.add(name.asname or "importlib")
                     imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
+                elif name.name == "builtins":
+                    imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
         elif isinstance(node, ast.ImportFrom):
-            if node.module == "importlib" or (
-                node.module is not None and node.module.startswith("importlib.")
+            if node.level == 0 and (
+                node.module == "importlib"
+                or (
+                    node.module is not None
+                    and node.module.startswith("importlib.")
+                )
             ):
+                imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
+            elif node.level == 0 and node.module == "builtins":
                 imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
             for name in node.names:
                 if name.name in DYNAMIC_REFLECTION_NAMES:
@@ -178,7 +187,33 @@ def _dynamic_imports(tree: ast.AST) -> list[tuple[int, str]]:
                     imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
 
     for node in ast.walk(tree):
-        if (
+        builtins_reference = (
+            isinstance(node, ast.Name) and node.id == "__builtins__"
+        ) or (
+            isinstance(node, ast.Attribute) and node.attr == "__builtins__"
+        )
+        builtins_getattr = (
+            isinstance(node, ast.Call)
+            and bool(node.args)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "getattr")
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "getattr"
+                )
+            )
+            and (
+                (
+                    isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in BUILTINS_NAMES
+                )
+                or (
+                    isinstance(node.args[0], ast.Attribute)
+                    and node.args[0].attr in BUILTINS_NAMES
+                )
+            )
+        )
+        if builtins_reference or builtins_getattr or (
             isinstance(node, ast.Attribute)
             and node.attr in DYNAMIC_REFLECTION_NAMES
         ) or (
@@ -204,6 +239,7 @@ def _forbidden_imports(tree: ast.AST, package: str) -> list[tuple[int, str]]:
 
 
 def test_aros_imports_only_use_the_one_way_internal_boundary() -> None:
+    """Enforce reviewable architecture discipline; this is not a sandbox."""
     violations: list[str] = []
 
     for path in BOUNDARY_PATHS:
@@ -242,6 +278,14 @@ def test_aros_imports_only_use_the_one_way_internal_boundary() -> None:
         ("name = 'import_module'", {DYNAMIC_IMPORT_CALL}),
         ("import builtins\ngetattr(builtins, 'exec')", {DYNAMIC_IMPORT_CALL}),
         ("name = 'eval'", {DYNAMIC_IMPORT_CALL}),
+        ("import builtins", {DYNAMIC_IMPORT_CALL}),
+        ("from builtins import open", {DYNAMIC_IMPORT_CALL}),
+        ("def load(builtins):\n    return getattr(builtins, '__im' + 'port__')", {DYNAMIC_IMPORT_CALL}),
+        ("reference = __builtins__", {DYNAMIC_IMPORT_CALL}),
+        ("reference = runtime.__builtins__", {DYNAMIC_IMPORT_CALL}),
+        ("getattr(runtime.builtins, attribute)", {DYNAMIC_IMPORT_CALL}),
+        ("from .builtins import helper", set()),
+        ("from .importlib import helper", set()),
         ("from ..core import config", set()),
     ),
 )
@@ -285,6 +329,22 @@ def test_aros_boundary_permits_harmless_standard_imports() -> None:
     )
 
     assert not _forbidden_imports(tree, "arbor.aros")
+
+
+def test_aros_boundary_permits_normal_getattr() -> None:
+    tree = ast.parse(
+        "directory_flag = getattr(os, 'O_DIRECTORY', 0)\n"
+        "value = getattr(subject, attribute, None)"
+    )
+
+    assert not _forbidden_imports(tree, "arbor.aros")
+
+
+def test_aros_boundary_gate_is_documented_as_architecture_discipline() -> None:
+    documentation = test_aros_imports_only_use_the_one_way_internal_boundary.__doc__ or ""
+
+    assert "architecture discipline" in documentation
+    assert "not a sandbox" in documentation
 
 
 def test_direct_aros_import_loads_no_forbidden_project_modules() -> None:

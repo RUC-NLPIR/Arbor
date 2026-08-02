@@ -8,11 +8,14 @@ import math
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from typing import Callable
 
 import pytest
 
+import arbor.aros.tasks as tasks_module
 from arbor.aros.store import atomic_write_json, json_sha256
 from arbor.aros.tasks import TaskError, TaskService
 from arbor.aros.workspace import init_workspace
@@ -216,6 +219,91 @@ def test_service_requires_exact_git_root_and_initialized_aros_workspace(
         TaskService(alias)
 
 
+def test_git_probes_ignore_foreign_ambient_repository_and_config_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    foreign = tmp_path / "foreign"
+    workspace.mkdir()
+    foreign.mkdir()
+    workspace_head = _init_workspace(workspace)
+    _init_workspace(foreign)
+    (foreign / "foreign.txt").write_text("foreign head\n", encoding="utf-8")
+    _git(foreign, "add", "foreign.txt")
+    _git(foreign, "commit", "-qm", "distinct foreign head")
+    assert _git(foreign, "rev-parse", "HEAD") != workspace_head
+    monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(foreign))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.worktree")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(foreign))
+
+    service = TaskService(workspace)
+    brief = _create(service, key="ambient-git-overrides")
+
+    assert brief["base_commit"] == workspace_head
+
+
+def test_create_rejects_a_changed_git_directory_association(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    foreign = tmp_path / "foreign"
+    workspace.mkdir()
+    foreign.mkdir()
+    _init_workspace(workspace)
+    _init_workspace(foreign)
+    service = TaskService(workspace)
+    (workspace / ".git").rename(workspace / ".git-original")
+    (workspace / ".git").write_text(
+        f"gitdir: {(foreign / '.git').resolve()}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskError, match="Git directory association"):
+        _create(service, key="changed-git-association")
+
+
+def test_create_rejects_a_git_marker_swap_during_head_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    foreign = tmp_path / "foreign"
+    workspace.mkdir()
+    foreign.mkdir()
+    _init_workspace(workspace)
+    _init_workspace(foreign)
+    (foreign / "foreign.txt").write_text("foreign head\n", encoding="utf-8")
+    _git(foreign, "add", "foreign.txt")
+    _git(foreign, "commit", "-qm", "distinct foreign head")
+    service = TaskService(workspace)
+    original_git_output = service._git_output
+    swapped = False
+
+    def swap_marker_before_head(
+        *args: str,
+        **kwargs: object,
+    ) -> str | None:
+        nonlocal swapped
+        if args == ("rev-parse", "--verify", "HEAD^{commit}") and not swapped:
+            swapped = True
+            (workspace / ".git").rename(workspace / ".git-original")
+            (workspace / ".git").write_text(
+                f"gitdir: {(foreign / '.git').resolve()}\n",
+                encoding="utf-8",
+            )
+        return original_git_output(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_git_output", swap_marker_before_head)
+
+    with pytest.raises(TaskError, match="Git directory association"):
+        _create(service, key="git-marker-swap")
+
+    assert not list((workspace / "tasks").glob("TASK-*"))
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
@@ -283,6 +371,41 @@ def test_create_rejects_an_oversized_integer_timeout_as_a_task_error(
     assert not (tmp_path / "tasks").exists()
 
 
+@pytest.mark.parametrize(
+    "field",
+    (
+        "objective",
+        "actor",
+        "idempotency_key",
+        "adapter_argv",
+        "deliverables",
+        "acceptance",
+    ),
+)
+def test_create_rejects_lone_surrogates_in_external_strings(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    surrogate = "\ud800"
+    objective = "bounded objective"
+    request = _request()
+    if field == "objective":
+        objective = surrogate
+    elif field in {"actor", "idempotency_key"}:
+        request[field] = surrogate
+    elif field == "adapter_argv":
+        request[field] = ["adapter", surrogate]
+    else:
+        request[field] = [surrogate]
+
+    with pytest.raises(TaskError, match="UTF-8"):
+        service.create(objective, **request)  # type: ignore[arg-type]
+
+    assert not (tmp_path / "tasks").exists()
+
+
 def test_create_is_idempotent_for_the_same_request_and_rejects_a_change(
     tmp_path: Path,
 ) -> None:
@@ -302,7 +425,10 @@ def test_create_is_idempotent_for_the_same_request_and_rejects_a_change(
     assert len(list((tmp_path / "tasks").glob("TASK-*/brief.json"))) == 1
 
 
-@pytest.mark.parametrize("missing", ("status", "index", "both"))
+@pytest.mark.parametrize(
+    "missing",
+    ("status", "index", "both", "runtime", "runtime_and_index"),
+)
 def test_create_recovers_missing_prepared_records_from_the_immutable_brief(
     tmp_path: Path,
     missing: str,
@@ -312,12 +438,15 @@ def test_create_recovers_missing_prepared_records_from_the_immutable_brief(
     key = "recover-partial-create"
     brief = _create(service, key=key)
     task_id = str(brief["task_id"])
-    status_path = tmp_path / ".aros" / "tasks" / task_id / "status.json"
+    runtime_path = tmp_path / ".aros" / "tasks" / task_id
+    status_path = runtime_path / "status.json"
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
     index_path = tmp_path / ".aros" / "tasks" / "idempotency" / f"{digest}.json"
-    if missing in {"status", "both"}:
+    if missing in {"status", "both", "runtime", "runtime_and_index"}:
         status_path.unlink()
-    if missing in {"index", "both"}:
+    if missing in {"runtime", "runtime_and_index"}:
+        runtime_path.rmdir()
+    if missing in {"index", "both", "runtime_and_index"}:
         index_path.unlink()
 
     replayed = _create(service, key=key)
@@ -334,6 +463,131 @@ def test_create_recovers_missing_prepared_records_from_the_immutable_brief(
     assert index["idempotency_key_sha256"] == digest
     assert index["request_sha256"] == brief["request_sha256"]
     assert index["brief_sha256"] == brief["brief_sha256"]
+
+
+def test_precommit_task_staging_is_ignored_and_preserved(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    interrupted = tmp_path / "tasks" / ".staging" / "interrupted-publication"
+    interrupted.mkdir(parents=True)
+    marker = interrupted / "brief.json"
+    marker.write_text("ambiguous staged material\n", encoding="utf-8")
+    service = TaskService(tmp_path)
+
+    assert service.list() == []
+    brief = _create(service, key="after-interruption")
+
+    assert marker.read_text(encoding="utf-8") == "ambiguous staged material\n"
+    assert service.list() == [service.status(str(brief["task_id"]))]
+
+
+def test_different_key_create_recovers_a_published_brief_after_interruption(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    first = _create(service, key="interrupted-first", objective="first task")
+    first_id = str(first["task_id"])
+    runtime_path = tmp_path / ".aros" / "tasks" / first_id
+    (runtime_path / "status.json").unlink()
+    runtime_path.rmdir()
+    first_digest = hashlib.sha256(b"interrupted-first").hexdigest()
+    (
+        tmp_path / ".aros" / "tasks" / "idempotency" / f"{first_digest}.json"
+    ).unlink()
+
+    second = _create(service, key="after-interruption", objective="second task")
+
+    assert service.status(first_id)["brief_sha256"] == first["brief_sha256"]
+    assert {status["task_id"] for status in service.list()} == {
+        first["task_id"],
+        second["task_id"],
+    }
+
+
+def test_different_key_publications_serialize_without_inventory_races(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    publication_reached = Event()
+    release_publication = Event()
+    second_started = Event()
+    reader_started = Event()
+    original_create_directory = tasks_module._create_plain_directory
+
+    def pause_legacy_visible_directory(path: Path, description: str) -> None:
+        original_create_directory(path, description)
+        if description == "versioned task path" and not publication_reached.is_set():
+            publication_reached.set()
+            assert release_publication.wait(timeout=5)
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_create_plain_directory",
+        pause_legacy_visible_directory,
+    )
+    original_publish = getattr(TaskService, "_publish_staged_brief", None)
+    if original_publish is not None:
+
+        def pause_atomic_publication(
+            self: TaskService,
+            staging: Path,
+            target: Path,
+        ) -> None:
+            original_publish(self, staging, target)
+            if not publication_reached.is_set():
+                publication_reached.set()
+                assert release_publication.wait(timeout=5)
+
+        monkeypatch.setattr(TaskService, "_publish_staged_brief", pause_atomic_publication)
+
+    def create_second() -> dict[str, object]:
+        second_started.set()
+        return _create(service, key="publication-two", objective="second task")
+
+    def read_inventory() -> list[dict[str, object]]:
+        reader_started.set()
+        return service.list()
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first_future = pool.submit(
+            _create,
+            service,
+            key="publication-one",
+            objective="first task",
+        )
+        assert publication_reached.wait(timeout=5)
+        second_future = pool.submit(create_second)
+        reader_future = pool.submit(read_inventory)
+        assert second_started.wait(timeout=5)
+        assert reader_started.wait(timeout=5)
+        release_publication.set()
+        first = first_future.result(timeout=5)
+        second = second_future.result(timeout=5)
+        observed = reader_future.result(timeout=5)
+
+    final = service.list()
+    task_ids = {str(first["task_id"]), str(second["task_id"])}
+    assert len(task_ids) == 2
+    assert {str(status["task_id"]) for status in final} == task_ids
+    assert {str(status["task_id"]) for status in observed} <= task_ids
+
+
+def test_publication_syncs_both_rename_parent_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    synced: list[Path] = []
+    monkeypatch.setattr(tasks_module, "_fsync_directory", synced.append)
+
+    _create(service, key="sync-publication-parents")
+
+    assert synced == [tmp_path / "tasks", tmp_path / "tasks" / ".staging"]
 
 
 def test_create_rejects_a_noncommit_head_even_when_it_is_40_hex(
@@ -490,6 +744,24 @@ def test_status_strictly_validates_brief_readback(
     atomic_write_json(status_path, status)
 
     with pytest.raises(TaskError, match=message):
+        service.status(task_id)
+
+
+def test_status_normalizes_a_lone_surrogate_in_a_tampered_brief(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service)
+    task_id = str(brief["task_id"])
+    brief_path = tmp_path / "tasks" / task_id / "brief.json"
+    brief["objective"] = "\ud800"
+    brief_path.write_text(
+        json.dumps(brief, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskError, match="UTF-8"):
         service.status(task_id)
 
 

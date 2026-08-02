@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import math
+import os
 import re
 import secrets
 import stat
@@ -19,6 +22,9 @@ _TASK_ID = re.compile(
 )
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TASK_STAGING_DIRECTORY = ".staging"
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
 _UTC_TIMESTAMP = re.compile(
     r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
     r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{3}Z$"
@@ -78,7 +84,7 @@ class TaskService:
         if supplied != resolved:
             raise TaskError(f"workspace must be the exact Git repository root: {supplied}")
         self.root = resolved
-        self._require_git_root()
+        self._git_dir = self._require_git_root()
         self._require_initialized_workspace()
 
     def create(
@@ -115,67 +121,105 @@ class TaskService:
 
         with file_lock(lock_path):
             _require_plain_file(lock_path, "task idempotency lock")
-            self._validate_inventory()
-            index_path = self._idempotency_index_path(key)
-            if _path_exists(index_path):
-                index = self._load_idempotency_index(index_path, key_digest)
-                task_id = str(index["task_id"])
-                brief = self._load_brief(task_id)
-                self._validate_index_binding(index, brief)
-                if index["request_sha256"] != request_sha256:
-                    raise TaskError(
-                        "idempotency key already belongs to a different task request"
-                    )
-                self._recover_prepared_records(brief)
-                return brief
+            publication_lock = self._publication_lock_path()
+            _require_plain_file_or_missing(
+                publication_lock,
+                "task record publication lock",
+            )
+            with file_lock(publication_lock):
+                _require_plain_file(
+                    publication_lock,
+                    "task record publication lock",
+                )
+                return self._create_locked(
+                    request,
+                    request_sha256,
+                    key,
+                    key_digest,
+                )
 
-            existing = self._brief_for_idempotency_key(key)
-            if existing is not None:
-                if existing["request_sha256"] != request_sha256:
-                    raise TaskError(
-                        "idempotency key already belongs to a different task request"
-                    )
-                self._recover_prepared_records(existing)
-                return existing
-
-            base_commit = self._git_output("rev-parse", "--verify", "HEAD^{commit}")
-            if base_commit is None or _COMMIT.fullmatch(base_commit) is None:
-                raise TaskError("child tasks require a committed 40-hex Git HEAD")
-            task_id = self._new_task_id(str(request["objective"]))
-            self._validate_task_id(task_id)
-            versioned_directory = self.root / "tasks" / task_id
-            runtime_directory = self.root / ".aros" / "tasks" / task_id
-            _require_absent(versioned_directory, "versioned task path")
-            _require_absent(runtime_directory, "runtime task path")
-            _create_plain_directory(versioned_directory, "versioned task path")
-            try:
-                _create_plain_directory(runtime_directory, "runtime task path")
-            except BaseException:
-                versioned_directory.rmdir()
-                raise
-
-            created_at = utc_now()
-            brief: dict[str, object] = {
-                "schema_version": 1,
-                "task_id": task_id,
-                **request,
-                "base_commit": base_commit,
-                "request_sha256": request_sha256,
-                "created_at": created_at,
-            }
-            brief["brief_sha256"] = _brief_sha256(brief)
-            if not create_json(versioned_directory / "brief.json", brief):
-                raise TaskError(f"task brief already exists: {task_id}")
-
-            status = _prepared_status(brief)
-            if not create_json(runtime_directory / "status.json", status):
-                raise TaskError(f"task status already exists: {task_id}")
-            if not create_json(index_path, _idempotency_index(brief, key_digest)):
-                raise TaskError("task idempotency index already exists")
+    def _create_locked(
+        self,
+        request: dict[str, object],
+        request_sha256: str,
+        key: str,
+        key_digest: str,
+    ) -> dict[str, object]:
+        self._reconcile_authoritative_briefs()
+        index_path = self._idempotency_index_path(key)
+        if _path_exists(index_path):
+            index = self._load_idempotency_index(index_path, key_digest)
+            task_id = str(index["task_id"])
+            brief = self._load_brief(task_id)
+            self._validate_index_binding(index, brief)
+            if index["request_sha256"] != request_sha256:
+                raise TaskError(
+                    "idempotency key already belongs to a different task request"
+                )
             return brief
+
+        existing = self._brief_for_idempotency_key(key)
+        if existing is not None:
+            if existing["request_sha256"] != request_sha256:
+                raise TaskError(
+                    "idempotency key already belongs to a different task request"
+                )
+            return existing
+
+        self._require_git_root()
+        base_commit = self._git_output(
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+            pinned=True,
+        )
+        self._require_git_root()
+        if base_commit is None or _COMMIT.fullmatch(base_commit) is None:
+            raise TaskError("child tasks require a committed 40-hex Git HEAD")
+        task_id = self._new_task_id(str(request["objective"]))
+        self._validate_task_id(task_id)
+        versioned_directory = self.root / "tasks" / task_id
+        runtime_directory = self.root / ".aros" / "tasks" / task_id
+        staging_directory = (
+            self.root / "tasks" / _TASK_STAGING_DIRECTORY / task_id
+        )
+        _require_absent(versioned_directory, "versioned task path")
+        _require_absent(runtime_directory, "runtime task path")
+        _require_absent(staging_directory, "versioned task staging path")
+
+        created_at = utc_now()
+        brief: dict[str, object] = {
+            "schema_version": 1,
+            "task_id": task_id,
+            **request,
+            "base_commit": base_commit,
+            "request_sha256": request_sha256,
+            "created_at": created_at,
+        }
+        brief["brief_sha256"] = _brief_sha256(brief)
+        _create_plain_directory(staging_directory, "versioned task staging path")
+        if not create_json(staging_directory / "brief.json", brief):
+            raise TaskError(f"staged task brief already exists: {task_id}")
+        if _read_object(staging_directory / "brief.json", "staged task brief") != brief:
+            raise TaskError(f"staged task brief differs after write: {task_id}")
+
+        self._publish_staged_brief(staging_directory, versioned_directory)
+        published = self._load_brief(task_id)
+        if published != brief:
+            raise TaskError(f"published task brief differs from staging: {task_id}")
+        self._recover_prepared_records(published)
+        self._validate_inventory()
+        return published
 
     def status(self, task_id: str) -> dict[str, object]:
         """Return prepared runtime state bound to its immutable brief."""
+        self._validate_task_id(task_id)
+        publication_lock = self._publication_lock_path()
+        _require_plain_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            return self._status_unlocked(task_id)
+
+    def _status_unlocked(self, task_id: str) -> dict[str, object]:
         brief = self._load_brief(task_id)
         self._load_bound_idempotency_index(brief)
         return self._load_prepared_status(brief)
@@ -212,9 +256,19 @@ class TaskService:
         """Return task statuses in stable task-ID order."""
         versioned = self._versioned_task_ids()
         runtime = self._runtime_task_ids()
+        if not versioned and not runtime:
+            return []
+        publication_lock = self._publication_lock_path()
+        _require_plain_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            return self._list_unlocked()
+
+    def _list_unlocked(self) -> list[dict[str, object]]:
+        versioned = self._versioned_task_ids()
+        runtime = self._runtime_task_ids()
         if versioned != runtime:
             raise TaskError("task record inventory conflict between versioned and runtime paths")
-        return [self.status(task_id) for task_id in sorted(versioned)]
+        return [self._status_unlocked(task_id) for task_id in sorted(versioned)]
 
     def _load_brief(self, task_id: str) -> dict[str, object]:
         self._validate_task_id(task_id)
@@ -310,7 +364,12 @@ class TaskService:
         task_id = str(brief["task_id"])
         key = str(brief["idempotency_key"])
         key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-        status_path = self.root / ".aros" / "tasks" / task_id / "status.json"
+        runtime_path = self.root / ".aros" / "tasks" / task_id
+        if not _path_exists(runtime_path):
+            _create_plain_directory(runtime_path, "runtime task path")
+        else:
+            _require_plain_directory(runtime_path, "task runtime directory")
+        status_path = runtime_path / "status.json"
         index_path = self._idempotency_index_path(key)
         if not _path_exists(status_path):
             create_json(status_path, _prepared_status(brief))
@@ -318,6 +377,29 @@ class TaskService:
             create_json(index_path, _idempotency_index(brief, key_digest))
         self._load_prepared_status(brief)
         self._load_bound_idempotency_index(brief)
+
+    def _reconcile_authoritative_briefs(self) -> None:
+        versioned = self._versioned_task_ids()
+        runtime = self._runtime_task_ids()
+        if runtime - versioned:
+            raise TaskError(
+                "task record inventory conflict: runtime state has no versioned brief"
+            )
+        for task_id in sorted(versioned):
+            self._recover_prepared_records(self._load_brief(task_id))
+        self._validate_inventory()
+
+    def _publish_staged_brief(self, staging: Path, target: Path) -> None:
+        _require_plain_directory(staging, "versioned task staging path")
+        _require_plain_file(staging / "brief.json", "staged task brief")
+        _require_absent(target, "versioned task path")
+        _rename_noreplace(staging, target)
+        _fsync_directory(target.parent)
+        _fsync_directory(staging.parent)
+        if _path_exists(staging):
+            raise TaskError(f"task staging path remains after publication: {staging}")
+        _require_plain_directory(target, "versioned task path")
+        _require_plain_file(target / "brief.json", "published task brief")
 
     def _brief_for_idempotency_key(self, key: str) -> dict[str, object] | None:
         matches = [
@@ -331,7 +413,12 @@ class TaskService:
 
     def _ensure_record_roots(self) -> None:
         _require_plain_directory(self.root / ".aros", "AROS runtime directory")
-        _ensure_plain_directory(self.root / "tasks", "versioned tasks directory")
+        versioned = self.root / "tasks"
+        _ensure_plain_directory(versioned, "versioned tasks directory")
+        _ensure_plain_directory(
+            versioned / _TASK_STAGING_DIRECTORY,
+            "task brief staging directory",
+        )
         runtime = self.root / ".aros" / "tasks"
         _ensure_plain_directory(runtime, "runtime tasks directory")
         _ensure_plain_directory(runtime / "idempotency", "task idempotency directory")
@@ -348,10 +435,48 @@ class TaskService:
         _require_plain_directory(self.root / ".aros", "AROS runtime directory")
         return _task_directory_ids(self.root / ".aros" / "tasks", runtime=True)
 
-    def _require_git_root(self) -> None:
+    def _require_git_root(self) -> Path:
         top = self._git_output("rev-parse", "--show-toplevel")
         if top is None or Path(top).resolve() != self.root:
             raise TaskError(f"workspace must be the Git repository root: {self.root}")
+        raw_git_dir = self._git_output("rev-parse", "--absolute-git-dir")
+        if raw_git_dir is None:
+            raise TaskError(f"unable to resolve Git directory association: {self.root}")
+        git_dir = Path(raw_git_dir).resolve()
+        marker_git_dir = self._git_directory_from_marker()
+        if git_dir != marker_git_dir:
+            raise TaskError(f"invalid Git directory association: {self.root}")
+        pinned = getattr(self, "_git_dir", git_dir)
+        if git_dir != pinned:
+            raise TaskError(f"Git directory association changed: {self.root}")
+        return git_dir
+
+    def _git_directory_from_marker(self) -> Path:
+        marker = self.root / ".git"
+        try:
+            mode = marker.lstat().st_mode
+        except OSError as error:
+            raise TaskError(f"invalid Git directory association: {self.root}") from error
+        if stat.S_ISDIR(mode):
+            return marker.resolve()
+        if not stat.S_ISREG(mode):
+            raise TaskError(f"invalid Git directory association: {self.root}")
+        try:
+            lines = marker.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as error:
+            raise TaskError(f"invalid Git directory association: {self.root}") from error
+        if len(lines) != 1 or not lines[0].startswith("gitdir: "):
+            raise TaskError(f"invalid Git directory association: {self.root}")
+        target = Path(lines[0].removeprefix("gitdir: "))
+        if not target.is_absolute():
+            target = self.root / target
+        try:
+            resolved = target.resolve(strict=True)
+        except OSError as error:
+            raise TaskError(f"invalid Git directory association: {self.root}") from error
+        if not resolved.is_dir():
+            raise TaskError(f"invalid Git directory association: {self.root}")
+        return resolved
 
     def _require_initialized_workspace(self) -> None:
         try:
@@ -365,14 +490,26 @@ class TaskService:
                 f"{self.root}: {error}"
             ) from error
 
-    def _git_output(self, *args: str) -> str | None:
+    def _git_output(self, *args: str, pinned: bool = False) -> str | None:
+        command = ["git"]
+        if pinned:
+            command.extend(
+                (
+                    f"--git-dir={self._git_dir}",
+                    f"--work-tree={self.root}",
+                )
+            )
+        else:
+            command.extend(("-C", str(self.root)))
+        command.extend(args)
         try:
             result = subprocess.run(
-                ["git", "-C", str(self.root), *args],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=10,
                 check=False,
+                env=_git_environment(),
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise TaskError(f"Git command failed: {' '.join(args)}") from error
@@ -390,6 +527,9 @@ class TaskService:
     def _idempotency_lock_path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return self.root / ".aros" / "locks" / f"task-idempotency-{digest}.lock"
+
+    def _publication_lock_path(self) -> Path:
+        return self.root / ".aros" / "locks" / "task-record-publication.lock"
 
     def _idempotency_index_path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -421,10 +561,21 @@ def _normalize_request(
     }
 
 
+def _git_environment() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+
+
 def _brief_sha256(brief: dict[str, object]) -> str:
     payload = dict(brief)
     payload.pop("brief_sha256", None)
-    return json_sha256(payload)
+    try:
+        return json_sha256(payload)
+    except (TypeError, UnicodeError) as error:
+        raise TaskError("task brief must be canonical UTF-8 JSON") from error
 
 
 def _prepared_status(brief: dict[str, object]) -> dict[str, object]:
@@ -458,11 +609,14 @@ def _valid_task_id(value: object) -> bool:
 def _validate_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise TaskError(f"{field} must be a non-empty string")
-    return value.strip()
+    return _validate_utf8(value.strip(), field)
 
 
 def _validate_mode(value: object) -> str:
-    if not isinstance(value, str) or value not in {"read_only", "write"}:
+    if not isinstance(value, str):
+        raise TaskError("mode must be read_only or write")
+    _validate_utf8(value, "mode")
+    if value not in {"read_only", "write"}:
         raise TaskError("mode must be read_only or write")
     return value
 
@@ -472,6 +626,8 @@ def _validate_argv(value: object) -> list[str]:
         raise TaskError("adapter_argv must be a non-empty list of strings")
     if any(not isinstance(item, str) or not item or "\x00" in item for item in value):
         raise TaskError("adapter_argv must contain only non-empty strings without NUL bytes")
+    for item in value:
+        _validate_utf8(item, "adapter_argv")
     return list(value)
 
 
@@ -486,7 +642,17 @@ def _validate_capabilities(value: object) -> dict[str, bool]:
 def _validate_string_list(value: object, field: str) -> list[str]:
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise TaskError(f"{field} must be a list of strings")
+    for item in value:
+        _validate_utf8(item, field)
     return list(value)
+
+
+def _validate_utf8(value: str, field: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise TaskError(f"{field} must be valid UTF-8") from error
+    return value
 
 
 def _validate_timeout(value: object) -> int | float:
@@ -523,6 +689,9 @@ def _task_directory_ids(root: Path, *, runtime: bool) -> set[str]:
     _require_plain_directory(root, "runtime tasks directory" if runtime else "versioned tasks directory")
     task_ids: set[str] = set()
     for entry in root.iterdir():
+        if not runtime and entry.name == _TASK_STAGING_DIRECTORY:
+            _require_plain_directory(entry, "task brief staging directory")
+            continue
         if runtime and entry.name == "idempotency":
             _require_plain_directory(entry, "task idempotency directory")
             continue
@@ -531,6 +700,50 @@ def _task_directory_ids(root: Path, *, runtime: bool) -> set[str]:
         _require_plain_directory(entry, "task record directory")
         task_ids.add(entry.name)
     return task_ids
+
+
+def _rename_noreplace(source: Path, target: Path) -> None:
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError) as error:
+        raise TaskError("atomic no-replace task publication is unavailable") from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(target),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise TaskError(f"versioned task path conflict: path already exists: {target}")
+    raise TaskError(
+        f"atomic no-replace task publication failed: {os.strerror(error_number)}"
+    )
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as error:
+        raise TaskError(f"unable to open task publication directory: {path}") from error
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        raise TaskError(f"unable to sync task publication directory: {path}") from error
+    finally:
+        os.close(descriptor)
 
 
 def _path_exists(path: Path) -> bool:

@@ -32,7 +32,7 @@ def _git_bytes(repo: Path, *args: str) -> bytes:
         check=False,
         capture_output=True,
     )
-    if result.returncode != 0:
+    if result.returncode != 0 or result.stderr:
         detail = (result.stderr.strip() or result.stdout.strip()).decode(
             errors="replace"
         )
@@ -165,10 +165,10 @@ def main() -> int:
                 "--raw",
                 "-z",
                 "--no-abbrev",
-                "--find-renames=1%",
-                "--find-copies=1%",
+                "--find-renames=50%",
+                "--find-copies=50%",
                 "--find-copies-harder",
-                "-l0",
+                "-l1000",
                 "--end-of-options",
                 args.base,
                 "--",
@@ -179,6 +179,7 @@ def main() -> int:
                 repo,
                 "ls-files",
                 "--others",
+                "--exclude-standard",
                 "-z",
                 "--",
                 *FROZEN_ROOTS,

@@ -20,7 +20,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          git fetch --no-tags origin "$BASE_SHA"
+          git fetch --depth=1 --no-tags origin "$BASE_SHA"
           python scripts/check_aros_legacy_freeze.py --repo . --base "$BASE_SHA"
       - uses: astral-sh/setup-uv@v5
         with:

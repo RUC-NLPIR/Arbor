@@ -22,6 +22,26 @@ FORBIDDEN_IMPORT_COMPONENTS = {
     "idea_tree",
     "orchestrator",
 }
+FROZEN_HELPER = """\
+def normalize_legacy(value):
+    stripped = value.strip()
+    lowered = stripped.lower()
+    replaced = lowered.replace("-", " ")
+    pieces = replaced.split()
+    joined = "_".join(pieces)
+    return joined
+"""
+INDEPENDENT_UTILITY = """\
+def summarize_tokens(tokens):
+    filtered = [token for token in tokens if token]
+    unique = set(filtered)
+    pieces = sorted(unique)
+    joined = "_".join(pieces)
+    width = len(joined)
+    if width > 80:
+        joined = joined[:80]
+    return joined
+"""
 
 
 def test_ci_legacy_freeze_uses_immutable_pull_request_base_sha() -> None:
@@ -30,9 +50,18 @@ def test_ci_legacy_freeze_uses_immutable_pull_request_base_sha() -> None:
     )
 
     assert "github.event.pull_request.base.sha" in workflow
-    assert 'git fetch --no-tags origin "$BASE_SHA"' in workflow
+    assert 'git fetch --depth=1 --no-tags origin "$BASE_SHA"' in workflow
     assert '--base "$BASE_SHA"' in workflow
     assert "GITHUB_BASE_REF" not in workflow
+
+
+def test_legacy_freeze_bounds_rename_and_copy_detection() -> None:
+    checker = CHECKER.read_text(encoding="utf-8")
+
+    assert '"--find-renames=50%"' in checker
+    assert '"--find-copies=50%"' in checker
+    assert '"-l1000"' in checker
+    assert '"-l0"' not in checker
 
 
 def _import_components(node: ast.Import | ast.ImportFrom) -> set[str]:
@@ -88,10 +117,15 @@ def legacy_repo(tmp_path: Path) -> tuple[Path, str]:
         path.write_text("legacy one\nlegacy two\n", encoding="utf-8")
     (repo / "src" / "coordinator" / "state.bin").write_bytes(b"\x00legacy")
     (repo / "src" / "coordinator" / "empty").touch()
+    (repo / "src" / "coordinator" / "helper.py").write_text(
+        FROZEN_HELPER, encoding="utf-8"
+    )
     (repo / ".gitignore").write_text(
-        "src/coordinator/untracked.py\n"
-        "src/coordinator/untracked.bin\n"
-        "src/coordinator/untracked.empty\n",
+        "src/coordinator/ignored.py\n"
+        "src/coordinator/ignored.bin\n"
+        "src/coordinator/ignored.empty\n"
+        "__pycache__/\n"
+        "build/\n",
         encoding="utf-8",
     )
     (repo / "README.md").write_text("outside\n", encoding="utf-8")
@@ -198,6 +232,77 @@ def test_legacy_freeze_rejects_untracked_files(
 
     assert result.returncode == 2
     assert relative_path in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "content"),
+    (
+        ("src/coordinator/ignored.py", b"ignored behavior\n"),
+        ("src/coordinator/ignored.bin", b"\x00ignored"),
+        ("src/coordinator/ignored.empty", b""),
+        ("src/coordinator/__pycache__/helper.pyc", b"\x00cache"),
+        ("src/executor/build/generated.py", b"generated\n"),
+    ),
+)
+def test_legacy_freeze_permits_ignored_untracked_files(
+    legacy_repo: tuple[Path, str], relative_path: str, content: bytes
+) -> None:
+    repo, base = legacy_repo
+    path = repo / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_legacy_freeze_fails_closed_when_copy_detection_limit_is_hit(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, _ = legacy_repo
+    sources = repo / "bulk-sources"
+    sources.mkdir()
+    for number in range(1001):
+        (sources / f"source-{number}.txt").write_text(
+            f"source {number}\n", encoding="utf-8"
+        )
+    _git(repo, "add", "bulk-sources")
+    _git(repo, "commit", "-qm", "add copy candidates")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    destination = repo / "copied" / "helper.py"
+    destination.parent.mkdir()
+    destination.write_text(FROZEN_HELPER + "# new behavior\n", encoding="utf-8")
+    candidates = repo / "bulk-destinations"
+    candidates.mkdir()
+    for number in range(1001):
+        (candidates / f"destination-{number}.txt").write_text(
+            f"destination {number}\n", encoding="utf-8"
+        )
+    _git(repo, "add", "copied", "bulk-destinations")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "too many files" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("delete_frozen_helper", (False, True))
+def test_legacy_freeze_permits_independent_low_similarity_utility(
+    legacy_repo: tuple[Path, str], delete_frozen_helper: bool
+) -> None:
+    repo, base = legacy_repo
+    utility_path = repo / "src" / "independent_utility.py"
+    utility_path.write_text(INDEPENDENT_UTILITY, encoding="utf-8")
+    _git(repo, "add", str(utility_path.relative_to(repo)))
+    if delete_frozen_helper:
+        helper_path = repo / "src" / "coordinator" / "helper.py"
+        helper_path.unlink()
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_legacy_freeze_rejects_rename_from_frozen_root(

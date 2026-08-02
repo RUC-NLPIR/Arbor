@@ -23,8 +23,11 @@
 
 > **AROS migration:** The Agent-centric AROS path is being commissioned now.
 > Installations from this repository expose `aros` as the direct entry for
-> bootable workspaces and durable runs. Existing `arbor` research commands are
-> frozen compatibility paths until equivalent AROS modules pass commissioning.
+> bootable workspaces and durable runs; see the [AROS public guide](docs/aros/README.md).
+> `arbor aros` is a temporary forwarding compatibility route. CI freezes feature
+> growth only in the legacy semantic Coordinator/Executor and run/review roots:
+> `src/coordinator`, `src/executor`, `src/run.py`, and `src/review.py`.
+> Other `arbor` commands remain legacy implementations until migrated.
 
 <p align="center">
   <i>Give Arbor a benchmark and a goal. It proposes hypotheses, edits code, runs real

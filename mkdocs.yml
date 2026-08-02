@@ -46,6 +46,7 @@ exclude_docs: |
 
 nav:
   - Home: index.md
+  - AROS: aros/README.md
   - Getting Started:
       - Installation: installation.md
       - Quickstart: quickstart.md

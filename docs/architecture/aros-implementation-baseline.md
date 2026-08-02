@@ -17,7 +17,7 @@ AROS 只保留四个不可约部分：
 
 - 单 Git repository、Linux/POSIX、单个 active Principal。
 - 直接复用 Arbor 的 Agent loop、provider、基础文件工具及可验证的 Git/process utility。
-- 新路径以 `arbor aros` 渐进进入；commissioning 通过前保留 legacy Arbor 路径。
+- 新原生入口直接使用 `aros`；`arbor aros` 仅作为临时转发兼容入口（temporary forwarding compatibility route）。其他 `arbor` 命令在逐项迁移前仍是 legacy implementation。
 - write-heavy child worktree 统一位于仓库的 `.worktree/`。
 - 每完成一个模块都先执行该模块的真实行为测试，再进入下一模块。
 

@@ -18,6 +18,14 @@
       "agent_visibility": "on_demand"
     },
     {
+      "id": "aros-public-guide",
+      "title": "AROS Public Guide",
+      "path": "docs/aros/README.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
+    },
+    {
       "id": "aros-design-book-v1-0-zh",
       "title": "AR OS Agent-Principal Design Book v1.0 (ZH)",
       "path": "AR_OS_AGENT_PRINCIPAL_DESIGN_BOOK_v1_0_zh.md",

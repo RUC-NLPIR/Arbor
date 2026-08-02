@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import json
+import runpy
 from pathlib import Path
+
+import yaml
 
 
 _ROOT = Path(__file__).resolve().parent.parent
 _REGISTRY = _ROOT / "docs" / "document_registry.json"
+_FROZEN_ROOTS = tuple(
+    runpy.run_path(str(_ROOT / "scripts" / "check_aros_legacy_freeze.py"))[
+        "FROZEN_ROOTS"
+    ]
+)
 _ENTRY_FIELDS = {
     "id",
     "title",
@@ -26,8 +34,35 @@ _AUTHORITIES = {
 _VISIBILITIES = {"default", "on_demand"}
 
 
+class _MkDocsLoader(yaml.SafeLoader):
+    pass
+
+
+_MkDocsLoader.add_multi_constructor(
+    "tag:yaml.org,2002:python/name:",
+    lambda _loader, suffix, _node: suffix,
+)
+
+
 def _load_registry() -> dict:
     return json.loads(_REGISTRY.read_text(encoding="utf-8"))
+
+
+def _load_mkdocs_config() -> dict:
+    return yaml.load(
+        (_ROOT / "mkdocs.yml").read_text(encoding="utf-8"),
+        Loader=_MkDocsLoader,
+    )
+
+
+def _nav_paths(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [path for item in value for path in _nav_paths(item)]
+    if isinstance(value, dict):
+        return [path for item in value.values() for path in _nav_paths(item)]
+    return []
 
 
 def test_document_registry_has_supported_schema_and_enums() -> None:
@@ -101,6 +136,28 @@ def test_registry_contains_approved_aros_v1_design() -> None:
     }
 
 
+def test_registry_contains_current_public_aros_guide() -> None:
+    by_id = {document["id"]: document for document in _load_registry()["documents"]}
+
+    assert by_id["aros-public-guide"] == {
+        "id": "aros-public-guide",
+        "title": "AROS Public Guide",
+        "path": "docs/aros/README.md",
+        "status": "current",
+        "authority": "informative",
+        "agent_visibility": "on_demand",
+    }
+
+
+def test_current_default_baseline_uses_direct_aros_entry() -> None:
+    by_id = {document["id"]: document for document in _load_registry()["documents"]}
+    baseline_path = _ROOT / by_id["aros-implementation-baseline"]["path"]
+    baseline = baseline_path.read_text(encoding="utf-8")
+
+    assert "新原生入口直接使用 `aros`" in baseline
+    assert "`arbor aros` 仅作为临时转发兼容入口" in baseline
+
+
 def test_aros_public_docs_use_direct_entry() -> None:
     text = (_ROOT / "docs" / "aros" / "README.md").read_text(encoding="utf-8")
 
@@ -112,7 +169,7 @@ def test_aros_public_docs_use_direct_entry() -> None:
         "aros run start|status|list|tail|stop",
     ):
         assert command in text
-    assert "arbor aros" not in text
+    assert "`arbor aros` is a temporary forwarding compatibility route" in text
     assert "## Not yet implemented" in text
     for unavailable_capability in (
         "child task substrate",
@@ -124,10 +181,44 @@ def test_aros_public_docs_use_direct_entry() -> None:
         assert unavailable_capability in text
 
 
+def test_aros_public_guide_states_runtime_prerequisites() -> None:
+    text = (_ROOT / "docs" / "aros" / "README.md").read_text(encoding="utf-8")
+
+    assert "exposed command surface" in text
+    assert "clean committed Git HEAD" in text
+    assert "`tmux`" in text
+    assert "supported Linux architecture (x86_64 or aarch64)" in text
+    assert "exactly Landlock ABI 4" in text
+    assert "`libseccomp`" in text
+    assert "`trusted-local` is explicitly not a security sandbox" in text
+
+
+def test_aros_migration_docs_match_the_ci_freeze_scope() -> None:
+    root_readme = (_ROOT / "README.md").read_text(encoding="utf-8")
+    public_guide = (_ROOT / "docs" / "aros" / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    for text in (root_readme, public_guide):
+        for frozen_root in _FROZEN_ROOTS:
+            assert f"`{frozen_root}`" in text
+        assert "Other `arbor` commands remain legacy implementations until migrated." in text
+        assert "Existing Arbor research commands remain frozen" not in text
+        assert "frozen compatibility paths" not in text
+
+
 def test_aros_public_docs_route_and_describe_migration() -> None:
     root_readme = (_ROOT / "README.md").read_text(encoding="utf-8")
     docs_readme = (_ROOT / "docs" / "README.md").read_text(encoding="utf-8")
 
     assert "direct entry for\n> bootable workspaces and durable runs" in root_readme
-    assert "frozen compatibility paths" in root_readme
+    assert "[AROS public guide](docs/aros/README.md)" in root_readme
     assert "[aros/README.md](aros/README.md)" in docs_readme
+
+
+def test_mkdocs_nav_includes_registered_public_aros_guide() -> None:
+    by_id = {document["id"]: document for document in _load_registry()["documents"]}
+    guide_path = by_id["aros-public-guide"]["path"]
+    config = _load_mkdocs_config()
+
+    assert guide_path.removeprefix("docs/") in _nav_paths(config["nav"])

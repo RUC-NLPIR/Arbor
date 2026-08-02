@@ -10,6 +10,11 @@ from pathlib import Path
 
 import pytest
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHECKER = REPO_ROOT / "scripts" / "check_aros_legacy_freeze.py"
@@ -23,6 +28,8 @@ FROZEN_FILES = (
 ALLOWED_INTERNAL_PREFIXES = (
     "arbor.aros",
     "arbor.core",
+)
+ALLOWED_INTERNAL_MODULES = (
     "arbor.cli.aros_app",
     "arbor.cli.commands.aros_cmd",
     "arbor.cli.user_config",
@@ -40,19 +47,33 @@ BOUNDARY_PATHS = (
     REPO_ROOT / "src" / "cli" / "aros_app.py",
     REPO_ROOT / "src" / "cli" / "commands" / "aros_cmd.py",
 )
-PROJECT_MODULES = {
-    ".".join(
-        (
-            "arbor",
-            *(
-                path.parent.relative_to(REPO_ROOT / "src").parts
-                if path.name == "__init__.py"
-                else path.relative_to(REPO_ROOT / "src").with_suffix("").parts
-            ),
-        )
+def _configured_project_module_paths() -> dict[str, Path]:
+    metadata = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
-    for path in (REPO_ROOT / "src").rglob("*.py")
-}
+    setuptools_config = metadata["tool"]["setuptools"]
+    package_dirs = setuptools_config["package-dir"]
+    module_paths: dict[str, Path] = {}
+
+    for package, directory in package_dirs.items():
+        package_path = REPO_ROOT / directory
+        for path in package_path.rglob("*.py"):
+            relative = path.relative_to(package_path)
+            suffix = (
+                relative.parent.parts
+                if path.name == "__init__.py"
+                else relative.with_suffix("").parts
+            )
+            if any(not part.isidentifier() for part in suffix):
+                continue
+            module = ".".join((package, *suffix))
+            module_paths[module] = path
+
+    return module_paths
+
+
+PROJECT_MODULE_PATHS = _configured_project_module_paths()
+PROJECT_MODULES = set(PROJECT_MODULE_PATHS)
 DYNAMIC_IMPORT_CALL = "<dynamic import call>"
 DYNAMIC_IMPORT_REFERENCES = {"__import__", "import_module"}
 DYNAMIC_EXECUTION_NAMES = {"eval", "exec", "__import__"}
@@ -83,6 +104,7 @@ def summarize_tokens(tokens):
         joined = joined[:80]
     return joined
 """
+APPROVED_E4_SHIM_BLOB = "6e406e7fc783f6c7df5fa348dbed6e68790ba90a"
 
 
 def test_ci_legacy_freeze_uses_immutable_pull_request_base_sha() -> None:
@@ -105,27 +127,99 @@ def test_legacy_freeze_bounds_rename_and_copy_detection() -> None:
     assert '"-l0"' not in checker
 
 
+def test_legacy_freeze_does_not_claim_a_semantic_equivalence_gate() -> None:
+    checker = CHECKER.read_text(encoding="utf-8")
+
+    assert "legacy source freeze violation" in checker
+    assert "legacy semantic freeze violation" not in checker
+
+
 def test_aros_docs_describe_the_complete_source_growth_policy() -> None:
     for relative_path in ("README.md", "docs/aros/README.md"):
         text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
-        assert "all non-allowlisted legacy source paths under `src/`" in text
-        assert "especially frozen" in text
+        text = " ".join(line.lstrip("> ") for line in text.splitlines())
+        text = " ".join(text.split())
+        assert "all non-allowlisted legacy source paths under `src/`" in text.lower()
+        assert "transitive project-import reachability" in text
+        assert "configured local Python package" in text
+        assert "conservative module-scope" in text
+        assert "legacy source LOC may only stay level or decrease" in text
+        assert "`AROS_RETIREMENT_GATE_E4`" in text
+        assert "exact approved Git blob" in text
+        assert "semantic duplication" in text
+        assert "module commissioning review" in text
+        assert "padded copy" in text
+        assert "`R100` move" in text
+        assert "remaining entry or import" in text
+        assert "not configured as a Python package" in text
         for allowed in (
             "src/aros/",
-            "src/core/",
             "src/cli/aros_app.py",
             "src/cli/commands/aros_cmd.py",
-            "src/cli/app.py",
         ):
             assert f"`{allowed}`" in text
+        assert "`src/core/` remains legacy-frozen" in text
+
+
+def test_aros_boundary_indexes_configured_external_package_roots() -> None:
+    assert PROJECT_MODULE_PATHS["arbor.skills_suite"] == (
+        REPO_ROOT / "skills" / "__init__.py"
+    )
+
+
+def test_aros_boundary_resolves_configured_external_package_modules() -> None:
+    assert _module_and_package(
+        PROJECT_MODULE_PATHS["arbor.skills_suite"]
+    ) == ("arbor.skills_suite", "arbor.skills_suite")
+
+
+def test_aros_boundary_indexes_nested_modules_in_configured_external_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.setuptools]\n"
+        'package-dir = { "arbor.skills_suite" = "skills" }\n'
+        'packages = ["arbor.skills_suite"]\n',
+        encoding="utf-8",
+    )
+    package_root = tmp_path / "skills"
+    package_root.mkdir()
+    (package_root / "__init__.py").write_text("", encoding="utf-8")
+    nested = package_root / "legacy" / "bridge.py"
+    nested.parent.mkdir()
+    nested.write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    module_paths = _configured_project_module_paths()
+
+    assert "arbor.skills_suite.legacy.bridge" in module_paths
+    assert module_paths["arbor.skills_suite.legacy.bridge"] == nested
+    monkeypatch.setattr(
+        sys.modules[__name__], "PROJECT_MODULE_PATHS", module_paths
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__], "PROJECT_MODULES", set(module_paths)
+    )
+    tree = ast.parse("import arbor.skills_suite.legacy.bridge")
+    assert {
+        module for _, module in _forbidden_imports(tree, "arbor.aros")
+    } == {"arbor.skills_suite.legacy.bridge"}
 
 
 def _module_and_package(path: Path) -> tuple[str, str]:
-    relative = path.relative_to(REPO_ROOT / "src")
+    module = next(
+        (
+            name
+            for name, module_path in PROJECT_MODULE_PATHS.items()
+            if module_path == path
+        ),
+        None,
+    )
+    if module is None:
+        raise ValueError(f"path is not a configured project module: {path}")
     if path.name == "__init__.py":
-        module = ".".join(("arbor", *relative.parent.parts))
         return module, module
-    module = ".".join(("arbor", *relative.with_suffix("").parts))
     return module, module.rpartition(".")[0]
 
 
@@ -134,12 +228,27 @@ def _is_project_module(module: str) -> bool:
 
 
 def _is_allowed_internal(module: str) -> bool:
-    return any(
-        module == allowed
-        or module.startswith(f"{allowed}.")
-        or allowed.startswith(f"{module}.")
-        for allowed in ALLOWED_INTERNAL_PREFIXES
+    return (
+        any(
+            module == allowed or module.startswith(f"{allowed}.")
+            for allowed in ALLOWED_INTERNAL_PREFIXES
+        )
+        or module in ALLOWED_INTERNAL_MODULES
+        or any(
+            allowed.startswith(f"{module}.")
+            for allowed in (*ALLOWED_INTERNAL_PREFIXES, *ALLOWED_INTERNAL_MODULES)
+        )
     )
+
+
+def _project_module_with_packages(module: str) -> list[str]:
+    modules = [module]
+    parent = module
+    while "." in parent:
+        parent = parent.rpartition(".")[0]
+        if parent in PROJECT_MODULES:
+            modules.append(parent)
+    return modules
 
 
 def _resolve_import_from(node: ast.ImportFrom, package: str) -> str:
@@ -163,6 +272,36 @@ def _static_imports(tree: ast.AST, package: str) -> list[tuple[int, str]]:
                 if _is_project_module(candidate):
                     imports.append((node.lineno, candidate))
     return imports
+
+
+class _ModuleImportVisitor(ast.NodeVisitor):
+    def __init__(self, package: str) -> None:
+        self.package = package
+        self.imports: list[tuple[int, str]] = []
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.imports.extend((node.lineno, name.name) for name in node.names)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        base = _resolve_import_from(node, self.package)
+        if base:
+            self.imports.append((node.lineno, base))
+        for name in node.names:
+            candidate = f"{base}.{name.name}" if base else name.name
+            if _is_project_module(candidate):
+                self.imports.append((node.lineno, candidate))
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        pass
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_Lambda = visit_FunctionDef
+
+
+def _module_static_imports(tree: ast.AST, package: str) -> list[tuple[int, str]]:
+    visitor = _ModuleImportVisitor(package)
+    visitor.visit(tree)
+    return visitor.imports
 
 
 def _terminal_name(node: ast.AST) -> str | None:
@@ -593,17 +732,164 @@ def _forbidden_imports(tree: ast.AST, package: str) -> list[tuple[int, str]]:
     ]
 
 
+def _transitive_static_import_violations() -> list[str]:
+    entry_modules = {_module_and_package(path)[0] for path in BOUNDARY_PATHS}
+    pending = [
+        module
+        for path in BOUNDARY_PATHS
+        for module in _project_module_with_packages(_module_and_package(path)[0])
+    ]
+    visited: set[str] = set()
+    violations: list[str] = []
+
+    while pending:
+        module = pending.pop()
+        if module in visited:
+            continue
+        visited.add(module)
+        path = PROJECT_MODULE_PATHS[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        _, package = _module_and_package(path)
+        imports = (
+            _static_imports(tree, package)
+            if module in entry_modules
+            else _module_static_imports(tree, package)
+        )
+        for line, imported in imports:
+            if not _is_project_module(imported):
+                continue
+            if not _is_allowed_internal(imported):
+                violations.append(
+                    f"{path.relative_to(REPO_ROOT)}:{line}: {imported}"
+                )
+            pending.extend(_project_module_with_packages(imported))
+
+    return list(dict.fromkeys(violations))
+
+
 def test_aros_imports_only_use_the_one_way_internal_boundary() -> None:
     """Enforce reviewable architecture discipline; this is not a sandbox."""
-    violations: list[str] = []
+    violations = _transitive_static_import_violations()
 
     for path in BOUNDARY_PATHS:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        _, package = _module_and_package(path)
-        for line, module in _forbidden_imports(tree, package):
+        for line, module in _dynamic_imports(tree):
             violations.append(f"{path.relative_to(REPO_ROOT)}:{line}: {module}")
 
     assert not violations, "AROS imports cross the one-way boundary:\n" + "\n".join(violations)
+
+
+def _install_synthetic_project_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sources: dict[str, tuple[Path, str]],
+    entry_module: str,
+) -> None:
+    for path, content in sources.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "BOUNDARY_PATHS",
+        (sources[entry_module][0],),
+    )
+    monkeypatch.setattr(sys.modules[__name__], "PROJECT_MODULES", set(sources))
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "PROJECT_MODULE_PATHS",
+        {module: path for module, (path, _) in sources.items()},
+        raising=False,
+    )
+
+
+def test_aros_boundary_rejects_transitive_config_resolve_coordinator_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "src"
+    sources = {
+        "arbor.aros.entry": (
+            source_root / "aros" / "entry.py",
+            "from ..core import config_resolve\n",
+        ),
+        "arbor.core.config_resolve": (
+            source_root / "core" / "config_resolve.py",
+            "from ..coordinator import main\n",
+        ),
+        "arbor.coordinator.main": (
+            source_root / "coordinator" / "main.py",
+            "VALUE = 1\n",
+        ),
+    }
+    _install_synthetic_project_graph(
+        tmp_path,
+        monkeypatch,
+        sources,
+        "arbor.aros.entry",
+    )
+
+    with pytest.raises(AssertionError, match=r"arbor\.coordinator\.main"):
+        test_aros_imports_only_use_the_one_way_internal_boundary()
+
+
+def test_aros_boundary_does_not_scan_core_dynamic_provider_internals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "src"
+    sources = {
+        "arbor.aros.entry": (
+            source_root / "aros" / "entry.py",
+            "from ..core import provider\n",
+        ),
+        "arbor.core.provider": (
+            source_root / "core" / "provider.py",
+            "import importlib\n\n"
+            "def load(name):\n"
+            "    return importlib.import_module(name)\n",
+        ),
+    }
+    _install_synthetic_project_graph(
+        tmp_path,
+        monkeypatch,
+        sources,
+        "arbor.aros.entry",
+    )
+
+    test_aros_imports_only_use_the_one_way_internal_boundary()
+
+
+def test_aros_boundary_conservatively_scans_module_scope_branches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "src"
+    sources = {
+        "arbor.aros.entry": (
+            source_root / "aros" / "entry.py",
+            "from ..core import provider\n",
+        ),
+        "arbor.core.provider": (
+            source_root / "core" / "provider.py",
+            "if False:\n"
+            "    from ..coordinator import main\n",
+        ),
+        "arbor.coordinator.main": (
+            source_root / "coordinator" / "main.py",
+            "VALUE = 1\n",
+        ),
+    }
+    _install_synthetic_project_graph(
+        tmp_path,
+        monkeypatch,
+        sources,
+        "arbor.aros.entry",
+    )
+
+    with pytest.raises(AssertionError, match=r"arbor\.coordinator\.main"):
+        test_aros_imports_only_use_the_one_way_internal_boundary()
 
 
 @pytest.mark.parametrize(
@@ -673,6 +959,7 @@ def test_aros_imports_only_use_the_one_way_internal_boundary() -> None:
         ("from .builtins import helper", set()),
         ("from .importlib import helper", set()),
         ("from ..core import config", set()),
+        ("import arbor.skills_suite", {"arbor.skills_suite"}),
     ),
 )
 def test_aros_boundary_resolves_relative_imports_and_rejects_dynamic_imports(
@@ -729,7 +1016,7 @@ def test_aros_boundary_gate_is_documented_as_architecture_discipline() -> None:
 
 
 def test_config_substrate_is_in_the_canonical_allowlist() -> None:
-    assert {"arbor._app", "arbor.cli.user_config"} <= set(ALLOWED_INTERNAL_PREFIXES)
+    assert {"arbor._app", "arbor.cli.user_config"} <= set(ALLOWED_INTERNAL_MODULES)
 
 
 def test_direct_aros_import_loads_no_forbidden_project_modules() -> None:
@@ -1059,18 +1346,33 @@ def test_legacy_freeze_permits_independent_low_similarity_utility(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_legacy_freeze_rejects_padded_copy_outside_growth_allowlist(
+def test_legacy_freeze_rejects_padded_copy_in_core_by_path_growth(
     legacy_repo: tuple[Path, str],
 ) -> None:
     repo, base = legacy_repo
-    destination = repo / "src" / "control_v2.py"
+    destination = repo / "src" / "core" / "control_v2.py"
+    destination.parent.mkdir()
     destination.write_text(PADDED_FROZEN_SOURCE + PADDING, encoding="utf-8")
-    _git(repo, "add", "src/control_v2.py")
+    _git(repo, "add", "src/core/control_v2.py")
 
     result = _run_checker(repo, base)
 
     assert result.returncode == 2
-    assert "src/control_v2.py" in result.stdout + result.stderr
+    assert "src/core/control_v2.py" in result.stdout + result.stderr
+
+
+def test_legacy_freeze_permits_padded_copy_in_aros_for_commissioning_review(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    destination = repo / "src" / "aros" / "control_v2.py"
+    destination.parent.mkdir()
+    destination.write_text(PADDED_FROZEN_SOURCE + PADDING, encoding="utf-8")
+    _git(repo, "add", "src/aros/control_v2.py")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_legacy_freeze_rejects_growth_in_existing_legacy_source(
@@ -1343,10 +1645,8 @@ def test_legacy_freeze_rejects_staged_c100_hidden_by_unstaged_delete(
     "relative_path",
     (
         "src/aros/new_behavior.py",
-        "src/core/new_behavior.py",
         "src/cli/aros_app.py",
         "src/cli/commands/aros_cmd.py",
-        "src/cli/app.py",
     ),
 )
 def test_legacy_freeze_permits_explicit_aros_growth(
@@ -1356,6 +1656,102 @@ def test_legacy_freeze_permits_explicit_aros_growth(
     path = repo / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("new AROS behavior\n", encoding="utf-8")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_legacy_freeze_rejects_core_growth(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    path = repo / "src" / "core" / "new_behavior.py"
+    path.parent.mkdir()
+    path.write_text("new behavior\n", encoding="utf-8")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/core/new_behavior.py" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("staged", (False, True))
+def test_legacy_freeze_permits_only_current_e4_shim_blob(
+    legacy_repo: tuple[Path, str], staged: bool
+) -> None:
+    repo, base = legacy_repo
+    shim = repo / "src" / "cli" / "app.py"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    if staged:
+        _git(repo, "add", "src/cli/app.py")
+
+    result = _run_checker(repo, base)
+
+    checker = CHECKER.read_text(encoding="utf-8")
+    assert f'AROS_RETIREMENT_GATE_E4 = "{APPROVED_E4_SHIM_BLOB}"' in checker
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("staged", (False, True))
+@pytest.mark.parametrize("deletion_only", (False, True))
+def test_legacy_freeze_rejects_e4_shim_hash_mutation(
+    legacy_repo: tuple[Path, str], staged: bool, deletion_only: bool
+) -> None:
+    repo, _ = legacy_repo
+    shim = repo / "src" / "cli" / "app.py"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    _git(repo, "add", "src/cli/app.py")
+    _git(repo, "commit", "-qm", "add approved shim")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    content = shim.read_bytes()
+    shim.write_bytes(content[:-1] if deletion_only else content + b"# mutation\n")
+    if staged:
+        _git(repo, "add", "src/cli/app.py")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/cli/app.py" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("staged", (False, True))
+def test_legacy_freeze_rejects_e4_shim_mode_change(
+    legacy_repo: tuple[Path, str], staged: bool
+) -> None:
+    repo, _ = legacy_repo
+    shim = repo / "src" / "cli" / "app.py"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    _git(repo, "add", "src/cli/app.py")
+    _git(repo, "commit", "-qm", "add approved shim")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    shim.chmod(0o755)
+    if staged:
+        _git(repo, "add", "src/cli/app.py")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/cli/app.py" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("staged", (False, True))
+def test_legacy_freeze_permits_e4_shim_retirement_deletion(
+    legacy_repo: tuple[Path, str], staged: bool
+) -> None:
+    repo, _ = legacy_repo
+    shim = repo / "src" / "cli" / "app.py"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    _git(repo, "add", "src/cli/app.py")
+    _git(repo, "commit", "-qm", "add approved shim")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    shim.unlink()
+    if staged:
+        _git(repo, "add", "-u", "src/cli/app.py")
 
     result = _run_checker(repo, base)
 
@@ -1411,24 +1807,26 @@ def test_legacy_freeze_permits_crlf_text_deletion(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_legacy_freeze_rejects_rename_from_frozen_root(
+def test_legacy_freeze_permits_r100_move_from_source_to_outside_source(
     legacy_repo: tuple[Path, str],
 ) -> None:
     repo, base = legacy_repo
     destination = repo / "moved" / "main.py"
     destination.parent.mkdir()
     _git(repo, "mv", "src/coordinator/main.py", "moved/main.py")
-    destination.write_text(
-        destination.read_text(encoding="utf-8") + "new behavior\n",
-        encoding="utf-8",
-    )
+    raw = _git(
+        repo,
+        "diff",
+        "--raw",
+        "--find-renames=50%",
+        base,
+        "--",
+    ).stdout
+    assert "R100" in raw
 
     result = _run_checker(repo, base)
 
-    assert result.returncode == 2
-    output = result.stdout + result.stderr
-    assert "src/coordinator/main.py" in output
-    assert "moved/main.py" in output
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_legacy_freeze_rejects_rename_when_git_rename_limit_is_low(

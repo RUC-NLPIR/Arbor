@@ -18,13 +18,14 @@ FROZEN_ROOTS = (
 )
 GROWTH_ROOTS = (
     "src/aros",
-    "src/core",
 )
 GROWTH_FILES = (
     "src/cli/aros_app.py",
     "src/cli/commands/aros_cmd.py",
-    "src/cli/app.py",
 )
+AROS_RETIREMENT_GATE_E4 = "6e406e7fc783f6c7df5fa348dbed6e68790ba90a"
+AROS_RETIREMENT_GATE_E4_PATH = "src/cli/app.py"
+AROS_RETIREMENT_GATE_E4_MODE = "100644"
 Change = tuple[str, tuple[str, ...], str, str, str, str]
 
 
@@ -100,7 +101,7 @@ def _parse_raw(output: str) -> list[Change]:
             raise ValueError(f"missing path for Git status: {status!r}")
         paths = tuple(fields[position : position + path_count])
         position += path_count
-        changes.append((kind, paths, old_mode, new_mode, old_oid, new_oid))
+        changes.append((status, paths, old_mode, new_mode, old_oid, new_oid))
     return changes
 
 
@@ -119,6 +120,29 @@ def _allows_growth(path: str) -> bool:
     )
 
 
+def _worktree_blob_oid(repo: Path, path: str) -> str:
+    return _git(
+        repo,
+        "hash-object",
+        "-w",
+        f"--path={path}",
+        "--",
+        path,
+    ).strip()
+
+
+def _is_approved_e4_untracked(repo: Path, path: str) -> bool:
+    if path != AROS_RETIREMENT_GATE_E4_PATH:
+        return False
+    current_path = repo / path
+    return (
+        current_path.is_file()
+        and not current_path.is_symlink()
+        and not current_path.stat().st_mode & 0o111
+        and _worktree_blob_oid(repo, path) == AROS_RETIREMENT_GATE_E4
+    )
+
+
 def _text_lines(
     repo: Path,
     path: str,
@@ -129,14 +153,7 @@ def _text_lines(
         current_path = repo / path
         if current_path.is_symlink() or not current_path.is_file():
             return None
-        normalized_oid = _git(
-            repo,
-            "hash-object",
-            "-w",
-            f"--path={path}",
-            "--",
-            path,
-        ).strip()
+        normalized_oid = _worktree_blob_oid(repo, path)
         content = _git_bytes(repo, "cat-file", "blob", normalized_oid)
     else:
         content = _git_bytes(repo, "cat-file", "blob", blob_oid)
@@ -156,9 +173,18 @@ def _violates_source_growth(
     *,
     staged: bool,
 ) -> bool:
-    kind, paths, old_mode, new_mode, old_oid, new_oid = change
+    status, paths, old_mode, new_mode, old_oid, new_oid = change
+    kind = status[0]
     path = paths[-1]
-    if kind == "D" or not _is_source(path) or _allows_growth(path):
+    if kind == "D" or not _is_source(path):
+        return False
+    if path == AROS_RETIREMENT_GATE_E4_PATH:
+        resulting_oid = new_oid if staged else _worktree_blob_oid(repo, path)
+        return not (
+            new_mode == AROS_RETIREMENT_GATE_E4_MODE
+            and resulting_oid == AROS_RETIREMENT_GATE_E4
+        )
+    if _allows_growth(path):
         return False
     if kind in {"A", "R", "C", "T"} or new_mode in {"120000", "160000"}:
         return True
@@ -217,13 +243,22 @@ def _find_violations(
     violations = [
         path
         for path in untracked
-        if _is_frozen(path) or not _allows_growth(path)
+        if _is_frozen(path)
+        or (not _allows_growth(path) and not _is_approved_e4_untracked(repo, path))
     ]
     for change in changes:
-        kind, paths, _, _, _, _ = change
+        status, paths, _, _, _, _ = change
+        kind = status[0]
         frozen_paths = [path for path in paths if _is_frozen(path)]
         if frozen_paths:
-            if kind in {"R", "C"}:
+            is_r100_move_out = (
+                status == "R100"
+                and _is_source(paths[0])
+                and not _is_source(paths[1])
+            )
+            if is_r100_move_out:
+                pass
+            elif kind in {"R", "C"}:
                 violations.extend(paths)
             elif kind == "D":
                 pass
@@ -309,7 +344,7 @@ def main() -> int:
         return 2
 
     for path in violations:
-        print(f"legacy semantic freeze violation: {path}", file=sys.stderr)
+        print(f"legacy source freeze violation: {path}", file=sys.stderr)
     return 2 if violations else 0
 
 

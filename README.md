@@ -24,12 +24,28 @@
 > **AROS migration:** The Agent-centric AROS path is being commissioned now.
 > Installations from this repository expose `aros` as the direct entry for
 > bootable workspaces and durable runs; see the [AROS public guide](docs/aros/README.md).
-> `arbor aros` is a temporary forwarding compatibility route. CI freezes growth
-> across all non-allowlisted legacy source paths under `src/`. Only `src/aros/`,
-> `src/core/`, the direct AROS adapters `src/cli/aros_app.py` and
-> `src/cli/commands/aros_cmd.py`, and the temporary `src/cli/app.py` shim are
-> growth-allowlisted. The especially frozen semantic routes are `src/coordinator`,
-> `src/executor`, `src/run.py`, `src/review.py`, and `src/cli/commands/run.py`.
+> `arbor aros` is a temporary forwarding compatibility route. CI hard-gates
+> transitive project-import reachability from every AROS module and the direct
+> adapters. Its conservative module-scope graph indexes every configured local
+> Python package. CI also hard-gates source-path growth, the compatibility-shim
+> hash, and legacy LOC non-increase. Within `src/`, only `src/aros/`,
+> `src/cli/aros_app.py`, and
+> `src/cli/commands/aros_cmd.py` may gain source. All non-allowlisted legacy source paths under `src/`
+> are frozen against added lines or files;
+> `src/core/` remains legacy-frozen, so legacy source LOC may only stay level or
+> decrease. The especially frozen paths are `src/coordinator`, `src/executor`,
+> `src/run.py`, `src/review.py`, and `src/cli/commands/run.py`. The
+> `src/cli/app.py` warning is a narrow sunset exception:
+> `AROS_RETIREMENT_GATE_E4` accepts only its exact approved Git blob until the
+> shim is deleted.
+>
+> These mechanical gates do not prove the absence of semantic duplication. A
+> new or padded copy under `src/aros/` can pass and still requires module
+> commissioning review; the same padded copy under `src/core/` fails path
+> growth independently of similarity. The path gate treats an exact `R100` move
+> from `src/` to outside `src/` as no growth inside its guarded source scope;
+> review must confirm that the destination is not configured as a Python package
+> and that no remaining entry or import refers to it.
 > Other `arbor` commands remain legacy implementations until migrated.
 
 <p align="center">

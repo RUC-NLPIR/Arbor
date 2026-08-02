@@ -67,7 +67,7 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
 - [ ] RED tests:
   - start requires committed brief at current clean HEAD;
   - every task, including read-only, receives .worktree/tasks/TASK-ID;
-  - detached task worktree starts at brief base commit on branch aros/task/TASK-ID;
+  - dedicated branch-attached task worktree starts at brief base commit on branch aros/task/TASK-ID;
   - symlink/pre-existing path/registered branch conflicts fail closed;
   - owner/lease is recorded before adapter launch;
   - cleanup never removes dirty worktree;

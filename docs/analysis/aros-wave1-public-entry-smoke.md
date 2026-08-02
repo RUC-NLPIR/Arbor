@@ -8,13 +8,13 @@ complete.
 
 ## Source and environment
 
-- Source commit: `2b4ae0866d494822a98caa553ce1df3615359aa3`
-- Evidence time: `2026-08-02T20:32:38Z`
+- Source commit: `6b3595f3b55028cea09746da5df8193953a85583`
+- Evidence time: `2026-08-02T20:55:43Z`
 - Host: `Linux 6.8.0-124-generic x86_64 GNU/Linux`
 - Build and smoke Python: `Python 3.12.3`
 - Source worktree: `/workspace/Arbor/.worktree/aros-v1-design`
-- Fresh clean-clone source: `/tmp/aros-wave1-clean.xpDwQ5SfYP/source`
-- Fresh smoke root: `/tmp/aros-wave1-clean.xpDwQ5SfYP`
+- Fresh clean-clone source: `/tmp/aros-wave1-clean.pLySEu7hOE/source`
+- Fresh smoke root: `/tmp/aros-wave1-clean.pLySEu7hOE`
 
 The wheel was built from a new local clone of the exact committed source. The
 clone had no ignored build directory, distribution directory, egg-info,
@@ -53,8 +53,8 @@ Receipts:
 ```text
 Ruff: All checks passed! (0 diagnostics)
 Legacy semantic freeze checker: exit 0, no output
-Focused Wave 1: 249 passed in 10.56s
-Full suite: 785 passed, 6 skipped in 24.93s
+Focused Wave 1: 253 passed in 10.83s
+Full suite: 789 passed, 6 skipped in 25.94s
 git diff --check: exit 0, no output
 git diff --quiet -- uv.lock: exit 0, no output
 git diff --exit-code: exit 0, no output
@@ -79,7 +79,7 @@ git -C "$SMOKE_ROOT/source" status --short --branch
 ```
 
 ```text
-2b4ae0866d494822a98caa553ce1df3615359aa3
+6b3595f3b55028cea09746da5df8193953a85583
 aros-v1-design
 ## aros-v1-design...origin/aros-v1-design
 ```
@@ -103,8 +103,8 @@ pre-build artifact scan: no output
 pre-build ignored-file scan: no output
 ```
 
-The clone had no tags and contained 252 commits. The Git identity used by the
-version backend was therefore the exact clean `2b4ae086` checkout, not stale
+The clone had no tags and contained 254 commits. The Git identity used by the
+version backend was therefore the exact clean `6b3595f3` checkout, not stale
 metadata from the development worktree.
 
 ## Build isolation and wheel metadata
@@ -113,10 +113,10 @@ The distribution directory was outside the clone. Pip used its default PEP 517
 build isolation; `--no-build-isolation` was deliberately not passed:
 
 ```bash
-mkdir /tmp/aros-wave1-clean.xpDwQ5SfYP/dist
+mkdir /tmp/aros-wave1-clean.pLySEu7hOE/dist
 /workspace/Arbor/.venv/bin/python -m pip wheel \
   --verbose --no-deps \
-  --wheel-dir /tmp/aros-wave1-clean.xpDwQ5SfYP/dist \
+  --wheel-dir /tmp/aros-wave1-clean.pLySEu7hOE/dist \
   .
 ```
 
@@ -144,10 +144,10 @@ configured fallback is `fallback_version = "0.1.0"`, produced a version tied to
 the source commit:
 
 ```text
-wheel: arbor_agent-0.1.1.dev252+g2b4ae0866-py3-none-any.whl
-version: 0.1.1.dev252+g2b4ae0866
-size: 701247 bytes
-sha256: 784e654185ebec1df1bb98411fc6c9fd30b17445b4c43d9b2cc5719ec398dfd3
+wheel: arbor_agent-0.1.1.dev254+g6b3595f3b-py3-none-any.whl
+version: 0.1.1.dev254+g6b3595f3b
+size: 701248 bytes
+sha256: 999b8604f093a55e20203495431f6f3e1168b354c80a6ffc581a2aa67611833b
 ```
 
 The version is not the stale `0.0.0` placeholder.
@@ -167,7 +167,7 @@ from pathlib import Path
 from zipfile import ZipFile
 import tomllib
 
-root = Path('/tmp/aros-wave1-clean.xpDwQ5SfYP')
+root = Path('/tmp/aros-wave1-clean.pLySEu7hOE')
 wheel, = (root / 'dist').glob('*.whl')
 with (root / 'source' / 'pyproject.toml').open('rb') as stream:
     configured = tuple(tomllib.load(stream)['tool']['setuptools']['packages'])
@@ -200,7 +200,7 @@ review-research = arbor.review:cli
 run-research = arbor.run:cli
 '''
     assert metadata['Name'] == 'arbor-agent'
-    assert metadata['Version'] == '0.1.1.dev252+g2b4ae0866'
+    assert metadata['Version'] == '0.1.1.dev254+g6b3595f3b'
     assert not {
         name.split('/', 1)[0] for name in names
     } - {'arbor', dist_info}
@@ -279,26 +279,26 @@ venv, with no system-site-packages inheritance:
 
 ```bash
 /workspace/Arbor/.venv/bin/python -m venv \
-  /tmp/aros-wave1-clean.xpDwQ5SfYP/venv
-/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/python -m pip install \
+  /tmp/aros-wave1-clean.pLySEu7hOE/venv
+/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/python -m pip install \
   --no-deps --force-reinstall \
-  /tmp/aros-wave1-clean.xpDwQ5SfYP/dist/arbor_agent-0.1.1.dev252+g2b4ae0866-py3-none-any.whl
-/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/python -m pip show arbor-agent
+  /tmp/aros-wave1-clean.pLySEu7hOE/dist/arbor_agent-0.1.1.dev254+g6b3595f3b-py3-none-any.whl
+/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/python -m pip show arbor-agent
 ```
 
 ```text
-Successfully installed arbor-agent-0.1.1.dev252+g2b4ae0866
-Version: 0.1.1.dev252+g2b4ae0866
-Location: /tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages
+Successfully installed arbor-agent-0.1.1.dev254+g6b3595f3b
+Version: 0.1.1.dev254+g6b3595f3b
+Location: /tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages
 ```
 
 A dependency-free import exposed the expected runtime prerequisite:
 
 ```bash
 env -u PYTHONPATH \
-  HOME=/tmp/aros-wave1-clean.xpDwQ5SfYP/home \
+  HOME=/tmp/aros-wave1-clean.pLySEu7hOE/home \
   PYTHONNOUSERSITE=1 \
-  /tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/python \
+  /tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/python \
   -c 'import arbor.cli.aros_app'
 ```
 
@@ -310,7 +310,7 @@ The required `--no-deps` install was preserved. The main venv's physical
 site-packages was then used only as an offline runtime dependency pool:
 
 ```text
-PYTHONPATH=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages:/workspace/Arbor/.venv/lib/python3.12/site-packages
+PYTHONPATH=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages:/workspace/Arbor/.venv/lib/python3.12/site-packages
 ```
 
 The temporary wheel site is first. `.pth` files from the dependency pool were
@@ -320,10 +320,10 @@ and normal imports:
 
 ```bash
 env \
-  HOME=/tmp/aros-wave1-clean.xpDwQ5SfYP/home \
+  HOME=/tmp/aros-wave1-clean.pLySEu7hOE/home \
   PYTHONNOUSERSITE=1 \
-  PYTHONPATH=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages:/workspace/Arbor/.venv/lib/python3.12/site-packages \
-  /tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/python - <<'PY'
+  PYTHONPATH=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages:/workspace/Arbor/.venv/lib/python3.12/site-packages \
+  /tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/python - <<'PY'
 from importlib.metadata import distribution
 from pathlib import Path
 import sys
@@ -335,7 +335,7 @@ import arbor.core.oauth.anthropic as anthropic_oauth
 import arbor.core.oauth.openai as openai_oauth
 
 temp_site = Path(
-    '/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages'
+    '/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages'
 ).resolve()
 dependency_pool = Path(
     '/workspace/Arbor/.venv/lib/python3.12/site-packages'
@@ -356,7 +356,7 @@ assert all(Path(module.__file__).resolve().is_relative_to(temp_site)
            for module in modules.values())
 assert Path(dist.locate_file('')).resolve() == temp_site
 assert Path(dist._path).resolve().is_relative_to(temp_site)
-assert dist.version == '0.1.1.dev252+g2b4ae0866'
+assert dist.version == '0.1.1.dev254+g6b3595f3b'
 assert entries['aros'] == 'arbor.cli.aros_app:main'
 assert entries['arbor'] == 'arbor.cli.app:main'
 assert sys.path.index(str(temp_site)) < sys.path.index(str(dependency_pool))
@@ -380,16 +380,16 @@ PY
 It produced the following resolution receipt:
 
 ```text
-python=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/python
-pythonpath_order=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages:/workspace/Arbor/.venv/lib/python3.12/site-packages
-arbor=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages/arbor/__init__.py
-entry_module=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages/arbor/cli/aros_app.py
-oauth_package=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages/arbor/core/oauth/__init__.py
-openai_oauth_module=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages/arbor/core/oauth/openai.py
-anthropic_oauth_module=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages/arbor/core/oauth/anthropic.py
-distribution_version=0.1.1.dev252+g2b4ae0866
-distribution_root=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages
-distribution_metadata=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages/arbor_agent-0.1.1.dev252+g2b4ae0866.dist-info
+python=/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/python
+pythonpath_order=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages:/workspace/Arbor/.venv/lib/python3.12/site-packages
+arbor=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages/arbor/__init__.py
+entry_module=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages/arbor/cli/aros_app.py
+oauth_package=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages/arbor/core/oauth/__init__.py
+openai_oauth_module=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages/arbor/core/oauth/openai.py
+anthropic_oauth_module=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages/arbor/core/oauth/anthropic.py
+distribution_version=0.1.1.dev254+g6b3595f3b
+distribution_root=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages
+distribution_metadata=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages/arbor_agent-0.1.1.dev254+g6b3595f3b.dist-info
 aros_entry=arbor.cli.aros_app:main
 arbor_entry=arbor.cli.app:main
 editable_source_on_sys_path=false
@@ -399,7 +399,7 @@ main_editable_finder_loaded=false
 The generated `aros` and `arbor` scripts both used this shebang:
 
 ```text
-#!/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/python
+#!/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/python
 ```
 
 ## Installed-command smoke
@@ -409,16 +409,16 @@ runtime path:
 
 ```bash
 env \
-  HOME=/tmp/aros-wave1-clean.xpDwQ5SfYP/home \
+  HOME=/tmp/aros-wave1-clean.pLySEu7hOE/home \
   PYTHONNOUSERSITE=1 \
-  PYTHONPATH=/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/lib/python3.12/site-packages:/workspace/Arbor/.venv/lib/python3.12/site-packages
+  PYTHONPATH=/tmp/aros-wave1-clean.pLySEu7hOE/venv/lib/python3.12/site-packages:/workspace/Arbor/.venv/lib/python3.12/site-packages
 ```
 
 Direct and mounted help were exercised with the installed scripts:
 
 ```bash
-/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/aros --help
-/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/aros run --help
+/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/aros --help
+/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/aros run --help
 ```
 
 Captured assertions reported:
@@ -433,7 +433,7 @@ run_surface=start,status,list,tail,stop
 The packaged legacy CLI then exercised both OAuth provider imports:
 
 ```bash
-/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/arbor login status
+/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/arbor login status
 ```
 
 It exited 1, the command's expected unauthenticated status, after printing:
@@ -448,14 +448,14 @@ as shown above.
 A new Git workspace was initialized and configured:
 
 ```bash
-mkdir /tmp/aros-wave1-clean.xpDwQ5SfYP/workspace-temp-first
-git -C /tmp/aros-wave1-clean.xpDwQ5SfYP/workspace-temp-first init -q
-git -C /tmp/aros-wave1-clean.xpDwQ5SfYP/workspace-temp-first \
+mkdir /tmp/aros-wave1-clean.pLySEu7hOE/workspace-temp-first
+git -C /tmp/aros-wave1-clean.pLySEu7hOE/workspace-temp-first init -q
+git -C /tmp/aros-wave1-clean.pLySEu7hOE/workspace-temp-first \
   config user.email aros-smoke@example.invalid
-git -C /tmp/aros-wave1-clean.xpDwQ5SfYP/workspace-temp-first \
+git -C /tmp/aros-wave1-clean.pLySEu7hOE/workspace-temp-first \
   config user.name "AROS Smoke"
-/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/aros init \
-  --cwd /tmp/aros-wave1-clean.xpDwQ5SfYP/workspace-temp-first \
+/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/aros init \
+  --cwd /tmp/aros-wave1-clean.pLySEu7hOE/workspace-temp-first \
   --mission "Verify direct AROS entry"
 ```
 
@@ -470,7 +470,7 @@ The exact init receipt was:
     ".gitignore"
   ],
   "preserved": [],
-  "root": "/tmp/aros-wave1-clean.xpDwQ5SfYP/workspace-temp-first",
+  "root": "/tmp/aros-wave1-clean.pLySEu7hOE/workspace-temp-first",
   "updated": []
 }
 ```
@@ -478,10 +478,10 @@ The exact init receipt was:
 Status and boot used the installed direct entry:
 
 ```bash
-/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/aros status \
-  --cwd /tmp/aros-wave1-clean.xpDwQ5SfYP/workspace-temp-first --json
-/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/aros boot \
-  --cwd /tmp/aros-wave1-clean.xpDwQ5SfYP/workspace-temp-first
+/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/aros status \
+  --cwd /tmp/aros-wave1-clean.pLySEu7hOE/workspace-temp-first --json
+/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/aros boot \
+  --cwd /tmp/aros-wave1-clean.pLySEu7hOE/workspace-temp-first
 ```
 
 The status receipt established an initialized repository with unborn `master`,
@@ -507,13 +507,13 @@ view, and no frontier view:
         "branch": "master",
         "detached": false,
         "head": null,
-        "path": "/tmp/aros-wave1-clean.xpDwQ5SfYP/workspace-temp-first"
+        "path": "/tmp/aros-wave1-clean.pLySEu7hOE/workspace-temp-first"
       }
     ],
     "worktrees_truncated": false
   },
   "initialized": true,
-  "root": "/tmp/aros-wave1-clean.xpDwQ5SfYP/workspace-temp-first",
+  "root": "/tmp/aros-wave1-clean.pLySEu7hOE/workspace-temp-first",
   "runs": {
     "counts": {},
     "items": [],
@@ -557,7 +557,7 @@ The compatibility route was invoked separately with the installed `arbor`
 script. A captured-output assertion compared both command surfaces and stderr:
 
 ```bash
-/tmp/aros-wave1-clean.xpDwQ5SfYP/venv/bin/arbor aros --help
+/tmp/aros-wave1-clean.pLySEu7hOE/venv/bin/arbor aros --help
 ```
 
 ```text
@@ -583,6 +583,15 @@ The real initialized workspace therefore has `AROS.md`, `AGENTS.md`, durable
 ## Superseded evidence and preserved historical observation
 
 The immediately preceding clean-wheel receipt at source commit
+`2b4ae0866d494822a98caa553ce1df3615359aa3` used
+`arbor_agent-0.1.1.dev252+g2b4ae0866-py3-none-any.whl`, size 701247 bytes,
+and SHA-256
+`784e654185ebec1df1bb98411fc6c9fd30b17445b4c43d9b2cc5719ec398dfd3`.
+It used PEP 517 build isolation and remains a valid historical artifact, but
+its source, version, hash, and temporary paths are superseded by the current
+receipt above.
+
+An earlier clean-wheel receipt at source commit
 `c59a4d51299ebf8b10f3e5523c87d50961e7c040` used
 `arbor_agent-0.1.1.dev248+gc59a4d512-py3-none-any.whl`, size 700819 bytes,
 and SHA-256
@@ -606,7 +615,7 @@ cancelled before the client recorded `delivered=false`. No Wave 1 source or
 test change was made. The test then passed 10/10 isolated reruns, and subsequent
 full-suite runs passed. This preserves the observation; it does not claim that
 the timing race was fixed. The current clean-source pre-verification above
-completed with `785 passed, 6 skipped`.
+completed with `789 passed, 6 skipped`.
 
 ## Limits and prerequisites
 
@@ -628,10 +637,10 @@ completed with `785 passed, 6 skipped`.
 
 ## Exit result
 
-At source commit `2b4ae0866d494822a98caa553ce1df3615359aa3`, a wheel built
+At source commit `6b3595f3b55028cea09746da5df8193953a85583`, a wheel built
 from a genuinely clean committed-source clone with PEP 517 build isolation
 contains every configured package, including the complete OAuth package. Its
-setuptools-scm version is `0.1.1.dev252+g2b4ae0866`, not `0.0.0`. The installed
+setuptools-scm version is `0.1.1.dev254+g6b3595f3b`, not `0.0.0`. The installed
 direct entry creates and boots a fresh AROS workspace without `.arbor` state,
 and the transitional route exposes the same five-command surface with exactly
 one warning. This satisfies the narrow Wave 1 public-entry gate only, subject

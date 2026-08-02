@@ -15,10 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Enforce AROS legacy semantic freeze
-        if: github.event_name == 'pull_request'
+      - name: Enforce AROS legacy source freeze
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: |
           git fetch --depth=1 --no-tags origin "$BASE_SHA"
           python scripts/check_aros_legacy_freeze.py --repo . --base "$BASE_SHA"

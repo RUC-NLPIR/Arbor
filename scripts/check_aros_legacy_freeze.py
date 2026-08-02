@@ -23,6 +23,7 @@ GROWTH_FILES = (
     "src/cli/aros_app.py",
     "src/cli/commands/aros_cmd.py",
 )
+AROS_RETIREMENT_GATE_E4_BASE = "0563f98a0d6061745c099c8fd32fbb64e668a866"
 AROS_RETIREMENT_GATE_E4 = "6e406e7fc783f6c7df5fa348dbed6e68790ba90a"
 AROS_RETIREMENT_GATE_E4_PATH = "src/cli/app.py"
 AROS_RETIREMENT_GATE_E4_MODE = "100644"
@@ -131,18 +132,6 @@ def _worktree_blob_oid(repo: Path, path: str) -> str:
     ).strip()
 
 
-def _is_approved_e4_untracked(repo: Path, path: str) -> bool:
-    if path != AROS_RETIREMENT_GATE_E4_PATH:
-        return False
-    current_path = repo / path
-    return (
-        current_path.is_file()
-        and not current_path.is_symlink()
-        and not current_path.stat().st_mode & 0o111
-        and _worktree_blob_oid(repo, path) == AROS_RETIREMENT_GATE_E4
-    )
-
-
 def _text_lines(
     repo: Path,
     path: str,
@@ -181,7 +170,10 @@ def _violates_source_growth(
     if path == AROS_RETIREMENT_GATE_E4_PATH:
         resulting_oid = new_oid if staged else _worktree_blob_oid(repo, path)
         return not (
-            new_mode == AROS_RETIREMENT_GATE_E4_MODE
+            status == "M"
+            and old_mode == AROS_RETIREMENT_GATE_E4_MODE
+            and new_mode == AROS_RETIREMENT_GATE_E4_MODE
+            and old_oid == AROS_RETIREMENT_GATE_E4_BASE
             and resulting_oid == AROS_RETIREMENT_GATE_E4
         )
     if _allows_growth(path):
@@ -244,7 +236,7 @@ def _find_violations(
         path
         for path in untracked
         if _is_frozen(path)
-        or (not _allows_growth(path) and not _is_approved_e4_untracked(repo, path))
+        or not _allows_growth(path)
     ]
     for change in changes:
         status, paths, _, _, _, _ = change

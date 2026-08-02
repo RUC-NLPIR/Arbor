@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 try:
     import tomllib
@@ -47,12 +48,59 @@ BOUNDARY_PATHS = (
     REPO_ROOT / "src" / "cli" / "aros_app.py",
     REPO_ROOT / "src" / "cli" / "commands" / "aros_cmd.py",
 )
+WAVE1_PACKAGE_DIRS = {"arbor": "src", "arbor.skills_suite": "skills"}
+
+
+def _configured_package_path(package: str, package_dirs: dict[str, str]) -> Path:
+    prefix = max(
+        (
+            candidate
+            for candidate in package_dirs
+            if package == candidate or package.startswith(f"{candidate}.")
+        ),
+        key=len,
+    )
+    suffix = package.removeprefix(prefix).lstrip(".").split(".")
+    return (REPO_ROOT / package_dirs[prefix]).joinpath(*(part for part in suffix if part))
+
+
 def _configured_project_module_paths() -> dict[str, Path]:
     metadata = tomllib.loads(
         (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
     setuptools_config = metadata["tool"]["setuptools"]
     package_dirs = setuptools_config["package-dir"]
+    if package_dirs != WAVE1_PACKAGE_DIRS:
+        raise ValueError(
+            f"Wave 1 package-dir must be exactly {WAVE1_PACKAGE_DIRS!r}"
+        )
+    packages = setuptools_config["packages"]
+    if not isinstance(packages, list) or any(
+        not isinstance(package, str) for package in packages
+    ):
+        raise ValueError("tool.setuptools.packages must be a list of package names")
+    for package in packages:
+        if package != "arbor" and not package.startswith("arbor."):
+            continue
+        if any(not part.isidentifier() for part in package.split(".")):
+            raise ValueError(f"configured package name is not canonical: {package!r}")
+        actual_path = _configured_package_path(package, package_dirs)
+        expected_path = (
+            REPO_ROOT / "skills"
+            if package == "arbor.skills_suite"
+            else (REPO_ROOT / "src").joinpath(*package.split(".")[1:])
+        )
+        package_init = actual_path / "__init__.py"
+        if (
+            actual_path != expected_path
+            or not actual_path.is_dir()
+            or actual_path.resolve() != actual_path
+            or not package_init.is_file()
+            or package_init.resolve() != package_init
+        ):
+            raise ValueError(
+                f"configured package {package!r} must exist at {expected_path}"
+            )
     module_paths: dict[str, Path] = {}
 
     for package, directory in package_dirs.items():
@@ -76,10 +124,24 @@ PROJECT_MODULE_PATHS = _configured_project_module_paths()
 PROJECT_MODULES = set(PROJECT_MODULE_PATHS)
 DYNAMIC_IMPORT_CALL = "<dynamic import call>"
 DYNAMIC_IMPORT_REFERENCES = {"__import__", "import_module"}
-DYNAMIC_EXECUTION_NAMES = {"eval", "exec", "__import__"}
-DYNAMIC_IMPORT_STRINGS = {"__import__", "import_module"}
+DYNAMIC_EXECUTION_NAMES = {
+    "eval",
+    "exec",
+    "compile",
+    "__import__",
+    "import_module",
+    "FunctionType",
+}
+BUILTIN_EXECUTION_NAMES = {"eval", "exec", "compile", "__import__"}
 BUILTINS_NAMES = {"builtins", "__builtins__"}
-BindingState = tuple[set[str], set[str], set[str], set[str], dict[str, str]]
+BindingState = tuple[
+    set[str],
+    set[str],
+    set[str],
+    set[str],
+    set[str],
+    dict[str, str],
+]
 FROZEN_HELPER = """\
 def normalize_legacy(value):
     stripped = value.strip()
@@ -105,17 +167,33 @@ def summarize_tokens(tokens):
     return joined
 """
 APPROVED_E4_SHIM_BLOB = "6e406e7fc783f6c7df5fa348dbed6e68790ba90a"
+OLD_E4_SHIM_BLOB = "0563f98a0d6061745c099c8fd32fbb64e668a866"
 
 
-def test_ci_legacy_freeze_uses_immutable_pull_request_base_sha() -> None:
-    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
-        encoding="utf-8"
+def test_ci_legacy_freeze_uses_immutable_base_for_pull_requests_and_pushes() -> None:
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
     )
+    triggers = workflow[True]
+    assert triggers["push"]["branches"] == ["main"]
+    assert "pull_request" in triggers
 
-    assert "github.event.pull_request.base.sha" in workflow
-    assert 'git fetch --depth=1 --no-tags origin "$BASE_SHA"' in workflow
-    assert '--base "$BASE_SHA"' in workflow
-    assert "GITHUB_BASE_REF" not in workflow
+    lint_job = workflow["jobs"]["lint"]
+    assert "if" not in lint_job
+    freeze_step = next(
+        step
+        for step in lint_job["steps"]
+        if step.get("name") == "Enforce AROS legacy source freeze"
+    )
+    assert "if" not in freeze_step
+    assert freeze_step["env"]["BASE_SHA"] == (
+        "${{ github.event_name == 'pull_request' "
+        "&& github.event.pull_request.base.sha || github.event.before }}"
+    )
+    assert 'git fetch --depth=1 --no-tags origin "$BASE_SHA"' in freeze_step["run"]
+    assert '--base "$BASE_SHA"' in freeze_step["run"]
 
 
 def test_legacy_freeze_bounds_rename_and_copy_detection() -> None:
@@ -179,10 +257,13 @@ def test_aros_boundary_indexes_nested_modules_in_configured_external_roots(
 ) -> None:
     (tmp_path / "pyproject.toml").write_text(
         "[tool.setuptools]\n"
-        'package-dir = { "arbor.skills_suite" = "skills" }\n'
-        'packages = ["arbor.skills_suite"]\n',
+        'package-dir = { "arbor" = "src", "arbor.skills_suite" = "skills" }\n'
+        'packages = ["arbor", "arbor.skills_suite"]\n',
         encoding="utf-8",
     )
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    (source_root / "__init__.py").write_text("", encoding="utf-8")
     package_root = tmp_path / "skills"
     package_root.mkdir()
     (package_root / "__init__.py").write_text("", encoding="utf-8")
@@ -207,6 +288,69 @@ def test_aros_boundary_indexes_nested_modules_in_configured_external_roots(
     } == {"arbor.skills_suite.legacy.bridge"}
 
 
+def test_aros_boundary_rejects_package_dir_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.setuptools]\n"
+        'package-dir = { "arbor" = "src", "arbor.skills_suite" = "skills", '
+        '"arbor.core.alias" = "legacy" }\n'
+        'packages = ["arbor", "arbor.core.alias", "arbor.skills_suite"]\n',
+        encoding="utf-8",
+    )
+    for package_root in (tmp_path / "src", tmp_path / "skills", tmp_path / "legacy"):
+        package_root.mkdir()
+        (package_root / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    with pytest.raises(ValueError, match="package-dir"):
+        _configured_project_module_paths()
+
+
+def test_aros_boundary_rejects_configured_package_without_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.setuptools]\n"
+        'package-dir = { "arbor" = "src", "arbor.skills_suite" = "skills" }\n'
+        'packages = ["arbor", "arbor.core.missing", "arbor.skills_suite"]\n',
+        encoding="utf-8",
+    )
+    for package_root in (tmp_path / "src", tmp_path / "skills"):
+        package_root.mkdir()
+        (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "core" / "missing").mkdir(parents=True)
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    with pytest.raises(ValueError, match=r"arbor\.core\.missing"):
+        _configured_project_module_paths()
+
+
+def test_aros_boundary_rejects_noncanonical_package_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.setuptools]\n"
+        'package-dir = { "arbor" = "src", "arbor.skills_suite" = "skills" }\n'
+        'packages = ["arbor", "arbor...legacy", "arbor.skills_suite"]\n',
+        encoding="utf-8",
+    )
+    for package_root in (
+        tmp_path / "src",
+        tmp_path / "src" / "legacy",
+        tmp_path / "skills",
+    ):
+        package_root.mkdir(parents=True, exist_ok=True)
+        (package_root / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    with pytest.raises(ValueError, match=r"arbor\.\.\.legacy"):
+        _configured_project_module_paths()
+
+
 def _module_and_package(path: Path) -> tuple[str, str]:
     module = next(
         (
@@ -227,7 +371,7 @@ def _is_project_module(module: str) -> bool:
     return module in PROJECT_MODULES
 
 
-def _is_allowed_internal(module: str) -> bool:
+def _is_logically_allowed_internal(module: str) -> bool:
     return (
         any(
             module == allowed or module.startswith(f"{allowed}.")
@@ -239,6 +383,33 @@ def _is_allowed_internal(module: str) -> bool:
             for allowed in (*ALLOWED_INTERNAL_PREFIXES, *ALLOWED_INTERNAL_MODULES)
         )
     )
+
+
+def _canonical_module_paths(module: str) -> set[Path]:
+    suffix = module.split(".")[1:]
+    stem = (REPO_ROOT / "src").joinpath(*suffix)
+    if not suffix:
+        return {REPO_ROOT / "src" / "__init__.py"}
+    return {stem.with_suffix(".py"), stem / "__init__.py"}
+
+
+def _is_allowed_internal(module: str) -> bool:
+    if not _is_logically_allowed_internal(module):
+        return False
+    path = PROJECT_MODULE_PATHS.get(module)
+    if path is None or not path.is_file() or path.resolve() != path:
+        return False
+    exact_paths = {
+        "arbor.cli.aros_app": REPO_ROOT / "src" / "cli" / "aros_app.py",
+        "arbor.cli.commands.aros_cmd": (
+            REPO_ROOT / "src" / "cli" / "commands" / "aros_cmd.py"
+        ),
+        "arbor.cli.user_config": REPO_ROOT / "src" / "cli" / "user_config.py",
+        "arbor._app": REPO_ROOT / "src" / "_app.py",
+    }
+    if module in exact_paths:
+        return path == exact_paths[module]
+    return path in _canonical_module_paths(module)
 
 
 def _project_module_with_packages(module: str) -> list[str]:
@@ -338,6 +509,7 @@ class _DynamicImportVisitor(ast.NodeVisitor):
         self.execution_names = set(DYNAMIC_EXECUTION_NAMES)
         self.builtins_names = set(BUILTINS_NAMES)
         self.importlib_names = {"importlib"}
+        self.types_names = {"types"}
         self.string_bindings: dict[str, str] = {}
         self.class_outer_state: BindingState | None = None
 
@@ -350,6 +522,7 @@ class _DynamicImportVisitor(ast.NodeVisitor):
             set(self.execution_names),
             set(self.builtins_names),
             set(self.importlib_names),
+            set(self.types_names),
             dict(self.string_bindings),
         )
 
@@ -359,12 +532,14 @@ class _DynamicImportVisitor(ast.NodeVisitor):
             execution_names,
             builtins_names,
             importlib_names,
+            types_names,
             string_bindings,
         ) = state
         self.dynamic_import_names = set(dynamic_import_names)
         self.execution_names = set(execution_names)
         self.builtins_names = set(builtins_names)
         self.importlib_names = set(importlib_names)
+        self.types_names = set(types_names)
         self.string_bindings = dict(string_bindings)
 
     def _restore_name(self, name: str, state: BindingState) -> None:
@@ -373,6 +548,7 @@ class _DynamicImportVisitor(ast.NodeVisitor):
             self.execution_names,
             self.builtins_names,
             self.importlib_names,
+            self.types_names,
         ):
             names.discard(name)
         self.string_bindings.pop(name, None)
@@ -382,13 +558,14 @@ class _DynamicImportVisitor(ast.NodeVisitor):
                 self.execution_names,
                 self.builtins_names,
                 self.importlib_names,
+                self.types_names,
             ),
-            state[:4],
+            state[:5],
         ):
             if name in previous:
                 current.add(name)
-        if name in state[4]:
-            self.string_bindings[name] = state[4][name]
+        if name in state[5]:
+            self.string_bindings[name] = state[5][name]
 
     def _clear_binding(self, name: str) -> None:
         for names in (
@@ -396,6 +573,7 @@ class _DynamicImportVisitor(ast.NodeVisitor):
             self.execution_names,
             self.builtins_names,
             self.importlib_names,
+            self.types_names,
         ):
             names.discard(name)
         self.string_bindings.pop(name, None)
@@ -405,6 +583,8 @@ class _DynamicImportVisitor(ast.NodeVisitor):
             self.builtins_names.add(name)
         if name == "importlib":
             self.importlib_names.add(name)
+        if name == "types":
+            self.types_names.add(name)
 
     def _bind(self, name: str, value: ast.AST) -> None:
         source_name = _terminal_name(value)
@@ -413,11 +593,22 @@ class _DynamicImportVisitor(ast.NodeVisitor):
         is_execution = isinstance(value, ast.Name) and value.id in self.execution_names
         if isinstance(value, ast.Attribute):
             is_execution = (
-                value.attr in DYNAMIC_EXECUTION_NAMES
-                and _terminal_name(value.value) in self.builtins_names
+                (
+                    value.attr in BUILTIN_EXECUTION_NAMES
+                    and _terminal_name(value.value) in self.builtins_names
+                )
+                or (
+                    value.attr == "import_module"
+                    and _terminal_name(value.value) in self.importlib_names
+                )
+                or (
+                    value.attr == "FunctionType"
+                    and _terminal_name(value.value) in self.types_names
+                )
             )
         is_builtins = source_name in self.builtins_names
         is_importlib = source_name in self.importlib_names
+        is_types = source_name in self.types_names
         self._clear_binding(name)
         if literal is not None:
             self.string_bindings[name] = literal
@@ -429,6 +620,8 @@ class _DynamicImportVisitor(ast.NodeVisitor):
             self.builtins_names.add(name)
         if is_importlib:
             self.importlib_names.add(name)
+        if is_types:
+            self.types_names.add(name)
 
     def visit_Import(self, node: ast.Import) -> None:
         for imported in node.names:
@@ -444,6 +637,8 @@ class _DynamicImportVisitor(ast.NodeVisitor):
                     self.importlib_names.add("importlib")
             elif imported.name == "builtins":
                 self.builtins_names.add(bound)
+            elif imported.name == "types":
+                self.types_names.add(bound)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         for imported in node.names:
@@ -467,6 +662,12 @@ class _DynamicImportVisitor(ast.NodeVisitor):
                     self.dynamic_import_names.add(bound)
                 if imported.name in DYNAMIC_EXECUTION_NAMES:
                     self.execution_names.add(bound)
+            elif (
+                node.level == 0
+                and node.module == "types"
+                and imported.name == "FunctionType"
+            ):
+                self.execution_names.add(bound)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
@@ -581,13 +782,41 @@ class _DynamicImportVisitor(ast.NodeVisitor):
         )
         namespace = _terminal_name(node.args[0]) if node.args else None
         protected_getattr = _terminal_name(node.func) == "getattr" and (
-            (namespace in self.builtins_names and attribute in {"eval", "exec", "__import__"})
+            (
+                namespace in self.builtins_names
+                and attribute in BUILTIN_EXECUTION_NAMES
+            )
             or (namespace in self.importlib_names and attribute == "import_module")
+            or (namespace in self.types_names and attribute == "FunctionType")
         )
         direct_execution = (
             isinstance(node.func, ast.Name) and node.func.id in self.execution_names
         )
-        if protected_getattr or direct_execution:
+        protected_attribute = isinstance(node.func, ast.Attribute) and (
+            (
+                node.func.attr in BUILTIN_EXECUTION_NAMES
+                and _terminal_name(node.func.value) in self.builtins_names
+            )
+            or (
+                node.func.attr == "import_module"
+                and _terminal_name(node.func.value) in self.importlib_names
+            )
+            or (
+                node.func.attr == "FunctionType"
+                and _terminal_name(node.func.value) in self.types_names
+            )
+        )
+        lookup_key = (
+            _literal_string(node.func.slice, self.string_bindings)
+            if isinstance(node.func, ast.Subscript)
+            else None
+        )
+        if (
+            protected_getattr
+            or direct_execution
+            or protected_attribute
+            or lookup_key in DYNAMIC_EXECUTION_NAMES
+        ):
             self._mark(node)
         self.generic_visit(node)
 
@@ -597,15 +826,6 @@ class _DynamicImportVisitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr in self.dynamic_import_names:
-            self._mark(node)
-        self.generic_visit(node)
-
-    def visit_Constant(self, node: ast.Constant) -> None:
-        if isinstance(node.value, str) and node.value in DYNAMIC_IMPORT_STRINGS:
-            self._mark(node)
-
-    def visit_BinOp(self, node: ast.BinOp) -> None:
-        if _literal_string(node, {}) in DYNAMIC_IMPORT_STRINGS:
             self._mark(node)
         self.generic_visit(node)
 
@@ -748,6 +968,11 @@ def _transitive_static_import_violations() -> list[str]:
             continue
         visited.add(module)
         path = PROJECT_MODULE_PATHS[module]
+        if _is_logically_allowed_internal(module) and not _is_allowed_internal(module):
+            violations.append(
+                f"{path.relative_to(REPO_ROOT)}: invalid physical mapping for {module}"
+            )
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         _, package = _module_and_package(path)
         imports = (
@@ -831,6 +1056,80 @@ def test_aros_boundary_rejects_transitive_config_resolve_coordinator_import(
     )
 
     with pytest.raises(AssertionError, match=r"arbor\.coordinator\.main"):
+        test_aros_imports_only_use_the_one_way_internal_boundary()
+
+
+def test_aros_boundary_rejects_allowed_module_relabelled_to_legacy_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sources = {
+        "arbor.aros.entry": (
+            tmp_path / "src" / "aros" / "entry.py",
+            "from ..core import alias\n",
+        ),
+        "arbor.core.alias": (
+            tmp_path / "legacy" / "alias.py",
+            "VALUE = 1\n",
+        ),
+    }
+    _install_synthetic_project_graph(
+        tmp_path,
+        monkeypatch,
+        sources,
+        "arbor.aros.entry",
+    )
+
+    with pytest.raises(AssertionError, match=r"arbor\.core\.alias"):
+        test_aros_imports_only_use_the_one_way_internal_boundary()
+
+
+def test_aros_boundary_rejects_boundary_entry_relabelled_to_legacy_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sources = {
+        "arbor.aros.entry": (
+            tmp_path / "legacy" / "entry.py",
+            "VALUE = 1\n",
+        ),
+    }
+    _install_synthetic_project_graph(
+        tmp_path,
+        monkeypatch,
+        sources,
+        "arbor.aros.entry",
+    )
+
+    with pytest.raises(AssertionError, match=r"arbor\.aros\.entry"):
+        test_aros_imports_only_use_the_one_way_internal_boundary()
+
+
+def test_aros_boundary_rejects_allowed_module_symlinked_outside_physical_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alias = tmp_path / "src" / "core" / "alias.py"
+    sources = {
+        "arbor.aros.entry": (
+            tmp_path / "src" / "aros" / "entry.py",
+            "from ..core import alias\n",
+        ),
+        "arbor.core.alias": (alias, "VALUE = 1\n"),
+    }
+    _install_synthetic_project_graph(
+        tmp_path,
+        monkeypatch,
+        sources,
+        "arbor.aros.entry",
+    )
+    outside = tmp_path / "legacy" / "alias.py"
+    outside.parent.mkdir()
+    outside.write_text("VALUE = 1\n", encoding="utf-8")
+    alias.unlink()
+    alias.symlink_to(outside)
+
+    with pytest.raises(AssertionError, match=r"arbor\.core\.alias"):
         test_aros_imports_only_use_the_one_way_internal_boundary()
 
 
@@ -919,8 +1218,8 @@ def test_aros_boundary_conservatively_scans_module_scope_branches(
         ("from importlib import util", {DYNAMIC_IMPORT_CALL}),
         ("from importlib import import_module as load", {DYNAMIC_IMPORT_CALL}),
         ("load = __import__", {DYNAMIC_IMPORT_CALL}),
-        ("name = '__import__'", {DYNAMIC_IMPORT_CALL}),
-        ("name = 'import_module'", {DYNAMIC_IMPORT_CALL}),
+        ("name = '__import__'", set()),
+        ("name = 'import_module'", set()),
         ("import builtins\ngetattr(builtins, 'exec')", {DYNAMIC_IMPORT_CALL}),
         ("name = 'eval'", set()),
         ("model.eval()", set()),
@@ -969,6 +1268,60 @@ def test_aros_boundary_resolves_relative_imports_and_rejects_dynamic_imports(
     tree = ast.parse(source)
 
     assert {module for _, module in _forbidden_imports(tree, "arbor.aros")} == expected
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "compile(source, '<aros>', 'exec')",
+        "FunctionType(code, globals())",
+        "import builtins\nbuiltins.eval(source)",
+        "import builtins as b\nb.exec(source)",
+        "import builtins\nbuiltins.compile(source, '<aros>', 'exec')",
+        "import types\ntypes.FunctionType(code, globals())",
+        "import types as t\nfactory = t.FunctionType\nfactory(code, globals())",
+    ),
+)
+def test_aros_boundary_rejects_direct_dynamic_execution_calls(source: str) -> None:
+    assert _forbidden_imports(ast.parse(source), "arbor.aros")
+
+
+@pytest.mark.parametrize(
+    "name",
+    ("eval", "exec", "compile", "__import__", "import_module", "FunctionType"),
+)
+def test_aros_boundary_rejects_callable_string_lookups(name: str) -> None:
+    tree = ast.parse(f"dispatch[{name!r}](source)")
+
+    assert _forbidden_imports(tree, "arbor.aros")
+
+
+def test_aros_boundary_rejects_folded_builtin_dict_execution_lookup() -> None:
+    tree = ast.parse("builtins.__dict__['ev' + 'al'](source)")
+
+    assert _forbidden_imports(tree, "arbor.aros")
+
+
+def test_aros_boundary_rejects_protected_compile_getattr() -> None:
+    tree = ast.parse("getattr(builtins, 'com' + 'pile')(source, '<aros>', 'exec')")
+
+    assert _forbidden_imports(tree, "arbor.aros")
+
+
+@pytest.mark.parametrize(
+    "name",
+    ("eval", "exec", "compile", "__import__", "import_module", "FunctionType"),
+)
+def test_aros_boundary_permits_harmless_execution_strings(name: str) -> None:
+    tree = ast.parse(f"label = {name!r}")
+
+    assert not _forbidden_imports(tree, "arbor.aros")
+
+
+def test_aros_boundary_permits_harmless_folded_execution_string() -> None:
+    tree = ast.parse("label = '__im' + 'port__'")
+
+    assert not _forbidden_imports(tree, "arbor.aros")
 
 
 @pytest.mark.parametrize("name", ("__import__", "import_module"))
@@ -1115,6 +1468,33 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
     )
+
+
+def _old_e4_shim_bytes() -> bytes:
+    approved = (REPO_ROOT / "src" / "cli" / "app.py").read_bytes()
+    warning = b'''def _warn_aros_forward(argv: list[str]) -> None:
+    if argv and argv[0] == "aros":
+        typer.secho(
+            "warning: arbor aros is deprecated; use aros directly",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+
+'''
+    call = b"    _warn_aros_forward(argv)\n"
+    assert approved.count(warning) == 1
+    assert approved.count(call) == 1
+    old = approved.replace(warning, b"").replace(call, b"")
+    blob_oid = subprocess.run(
+        ["git", "hash-object", "--stdin"],
+        cwd=REPO_ROOT,
+        input=old,
+        check=True,
+        capture_output=True,
+    ).stdout.decode().strip()
+    assert blob_oid == OLD_E4_SHIM_BLOB
+    return old
 
 
 @pytest.fixture
@@ -1677,7 +2057,30 @@ def test_legacy_freeze_rejects_core_growth(
 
 
 @pytest.mark.parametrize("staged", (False, True))
-def test_legacy_freeze_permits_only_current_e4_shim_blob(
+def test_legacy_freeze_permits_exact_old_to_approved_e4_transition(
+    legacy_repo: tuple[Path, str], staged: bool
+) -> None:
+    repo, _ = legacy_repo
+    shim = repo / "src" / "cli" / "app.py"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes(_old_e4_shim_bytes())
+    _git(repo, "add", "src/cli/app.py")
+    _git(repo, "commit", "-qm", "add old shim")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    if staged:
+        _git(repo, "add", "src/cli/app.py")
+
+    result = _run_checker(repo, base)
+
+    checker = CHECKER.read_text(encoding="utf-8")
+    assert f'AROS_RETIREMENT_GATE_E4_BASE = "{OLD_E4_SHIM_BLOB}"' in checker
+    assert f'AROS_RETIREMENT_GATE_E4 = "{APPROVED_E4_SHIM_BLOB}"' in checker
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("staged", (False, True))
+def test_legacy_freeze_rejects_approved_e4_shim_when_base_is_absent(
     legacy_repo: tuple[Path, str], staged: bool
 ) -> None:
     repo, base = legacy_repo
@@ -1689,9 +2092,35 @@ def test_legacy_freeze_permits_only_current_e4_shim_blob(
 
     result = _run_checker(repo, base)
 
-    checker = CHECKER.read_text(encoding="utf-8")
-    assert f'AROS_RETIREMENT_GATE_E4 = "{APPROVED_E4_SHIM_BLOB}"' in checker
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 2
+    assert "src/cli/app.py" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("staged", (False, True))
+def test_legacy_freeze_rejects_e4_shim_resurrection_after_deletion(
+    legacy_repo: tuple[Path, str], staged: bool
+) -> None:
+    repo, _ = legacy_repo
+    shim = repo / "src" / "cli" / "app.py"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes(_old_e4_shim_bytes())
+    _git(repo, "add", "src/cli/app.py")
+    _git(repo, "commit", "-qm", "add old shim")
+    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    _git(repo, "add", "src/cli/app.py")
+    _git(repo, "commit", "-qm", "approve shim")
+    shim.unlink()
+    _git(repo, "add", "-u", "src/cli/app.py")
+    _git(repo, "commit", "-qm", "retire shim")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    if staged:
+        _git(repo, "add", "src/cli/app.py")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/cli/app.py" in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("staged", (False, True))

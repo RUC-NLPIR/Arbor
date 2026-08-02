@@ -25,7 +25,7 @@ GROWTH_FILES = (
     "src/cli/commands/aros_cmd.py",
     "src/cli/app.py",
 )
-Change = tuple[str, tuple[str, ...], str, str, str]
+Change = tuple[str, tuple[str, ...], str, str, str, str]
 
 
 def _arguments() -> argparse.Namespace:
@@ -100,7 +100,7 @@ def _parse_raw(output: str) -> list[Change]:
             raise ValueError(f"missing path for Git status: {status!r}")
         paths = tuple(fields[position : position + path_count])
         position += path_count
-        changes.append((kind, paths, old_mode, new_mode, old_oid))
+        changes.append((kind, paths, old_mode, new_mode, old_oid, new_oid))
     return changes
 
 
@@ -119,11 +119,19 @@ def _allows_growth(path: str) -> bool:
     )
 
 
-def _current_text_lines(repo: Path, path: str) -> list[bytes] | None:
-    current_path = repo / path
-    if current_path.is_symlink() or not current_path.is_file():
-        return None
-    content = current_path.read_bytes()
+def _text_lines(
+    repo: Path,
+    path: str,
+    *,
+    blob_oid: str | None = None,
+) -> list[bytes] | None:
+    if blob_oid is None:
+        current_path = repo / path
+        if current_path.is_symlink() or not current_path.is_file():
+            return None
+        content = current_path.read_bytes()
+    else:
+        content = _git_bytes(repo, "cat-file", "blob", blob_oid)
     if b"\0" in content:
         return None
     return content.splitlines(keepends=True)
@@ -134,14 +142,25 @@ def _contains_added_lines(before: list[bytes], after: list[bytes]) -> bool:
     return not all(any(candidate == line for candidate in candidates) for line in after)
 
 
-def _has_source_additions(repo: Path, change: Change) -> bool:
-    kind, paths, old_mode, new_mode, old_oid = change
+def _violates_source_growth(
+    repo: Path,
+    change: Change,
+    *,
+    staged: bool,
+) -> bool:
+    kind, paths, old_mode, new_mode, old_oid, new_oid = change
     path = paths[-1]
     if kind == "D" or not _is_source(path) or _allows_growth(path):
         return False
+    if kind in {"R", "C"} or new_mode == "120000":
+        return True
     if new_mode not in {"100644", "100755"}:
         return False
-    after = _current_text_lines(repo, path)
+    after = _text_lines(
+        repo,
+        path,
+        blob_oid=new_oid if staged else None,
+    )
     if after is None:
         return False
     if kind in {"A", "C"} or old_mode not in {"100644", "100755"}:
@@ -155,29 +174,35 @@ def _has_source_additions(repo: Path, change: Change) -> bool:
     )
 
 
-def _is_text_deletion_only(repo: Path, change: Change) -> bool:
-    _, paths, old_mode, new_mode, old_oid = change
+def _is_text_deletion_only(
+    repo: Path,
+    change: Change,
+    *,
+    staged: bool,
+) -> bool:
+    _, paths, old_mode, new_mode, old_oid, new_oid = change
     if old_mode != new_mode or old_mode not in {"100644", "100755"}:
         return False
-    current_path = repo / paths[0]
-    if current_path.is_symlink() or not current_path.is_file():
+    before = _text_lines(repo, paths[0], blob_oid=old_oid)
+    after = _text_lines(
+        repo,
+        paths[0],
+        blob_oid=new_oid if staged else None,
+    )
+    if before is None or after is None:
         return False
-    before = _git_bytes(repo, "cat-file", "blob", old_oid)
-    after = current_path.read_bytes()
-    if b"\0" in before or b"\0" in after:
+    if len(after) >= len(before):
         return False
-    before_lines = before.splitlines(keepends=True)
-    after_lines = after.splitlines(keepends=True)
-    if len(after_lines) >= len(before_lines):
-        return False
-    candidates = iter(before_lines)
-    return all(any(candidate == line for candidate in candidates) for line in after_lines)
+    candidates = iter(before)
+    return all(any(candidate == line for candidate in candidates) for line in after)
 
 
 def _find_violations(
     repo: Path,
     changes: list[Change],
     untracked: list[str],
+    *,
+    staged: bool,
 ) -> list[str]:
     if any(not _is_source(path) for path in untracked):
         raise ValueError("Git returned an out-of-scope untracked path")
@@ -187,11 +212,14 @@ def _find_violations(
         if _is_frozen(path)
         or (
             not _allows_growth(path)
-            and bool(_current_text_lines(repo, path))
+            and (
+                (repo / path).is_symlink()
+                or bool(_text_lines(repo, path))
+            )
         )
     ]
     for change in changes:
-        kind, paths, _, _, _ = change
+        kind, paths, _, _, _, _ = change
         frozen_paths = [path for path in paths if _is_frozen(path)]
         if frozen_paths:
             if kind in {"R", "C"}:
@@ -200,13 +228,34 @@ def _find_violations(
                 pass
             elif kind == "M":
                 path = paths[0]
-                if not _is_text_deletion_only(repo, change):
+                if not _is_text_deletion_only(repo, change, staged=staged):
                     violations.append(path)
             else:
                 violations.extend(frozen_paths)
-        if _has_source_additions(repo, change):
+        if _violates_source_growth(repo, change, staged=staged):
             violations.append(paths[-1])
     return list(dict.fromkeys(violations))
+
+
+def _diff_changes(repo: Path, base: str, *, staged: bool) -> list[Change]:
+    cached = ("--cached",) if staged else ()
+    return _parse_raw(
+        _git(
+            repo,
+            "diff",
+            *cached,
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--find-renames=50%",
+            "--find-copies=50%",
+            "--find-copies-harder",
+            "-l1000",
+            "--end-of-options",
+            base,
+            "--",
+        )
+    )
 
 
 def main() -> int:
@@ -223,22 +272,8 @@ def main() -> int:
                 f"--repo must resolve exactly to the Git top level: {repo} != {top_level}"
             )
 
-        changes = _parse_raw(
-            _git(
-                repo,
-                "diff",
-                "--raw",
-                "-z",
-                "--no-abbrev",
-                "--find-renames=50%",
-                "--find-copies=50%",
-                "--find-copies-harder",
-                "-l1000",
-                "--end-of-options",
-                args.base,
-                "--",
-            )
-        )
+        changes = _diff_changes(repo, args.base, staged=False)
+        staged_changes = _diff_changes(repo, args.base, staged=True)
         untracked = _nul_fields(
             _git(
                 repo,
@@ -250,7 +285,21 @@ def main() -> int:
                 "src",
             )
         )
-        violations = _find_violations(repo, changes, untracked)
+        violations = _find_violations(
+            repo,
+            changes,
+            untracked,
+            staged=False,
+        )
+        violations.extend(
+            _find_violations(
+                repo,
+                staged_changes,
+                [],
+                staged=True,
+            )
+        )
+        violations = list(dict.fromkeys(violations))
     except (OSError, RuntimeError, UnicodeError, ValueError) as error:
         print(
             f"legacy freeze check failed for base {args.base!r}: {error}",

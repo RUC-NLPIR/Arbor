@@ -91,6 +91,21 @@ def test_legacy_freeze_bounds_rename_and_copy_detection() -> None:
     assert '"-l0"' not in checker
 
 
+def test_aros_docs_describe_the_complete_source_growth_policy() -> None:
+    for relative_path in ("README.md", "docs/aros/README.md"):
+        text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        assert "all non-allowlisted legacy source paths under `src/`" in text
+        assert "especially frozen" in text
+        for allowed in (
+            "src/aros/",
+            "src/core/",
+            "src/cli/aros_app.py",
+            "src/cli/commands/aros_cmd.py",
+            "src/cli/app.py",
+        ):
+            assert f"`{allowed}`" in text
+
+
 def _module_and_package(path: Path) -> tuple[str, str]:
     relative = path.relative_to(REPO_ROOT / "src")
     if path.name == "__init__.py":
@@ -138,25 +153,23 @@ def _static_imports(tree: ast.AST, package: str) -> list[tuple[int, str]]:
 
 def _dynamic_imports(tree: ast.AST) -> list[tuple[int, str]]:
     dynamic_names = {"__import__", "import_module"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            dynamic_names.update(
-                name.asname or name.name
-                for name in node.names
-                if name.name in {"__import__", "import_module"}
-            )
-
     imports: list[tuple[int, str]] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        is_dynamic = (
-            isinstance(node.func, ast.Name) and node.func.id in dynamic_names
+        if isinstance(node, ast.ImportFrom):
+            for name in node.names:
+                if name.name in {"__import__", "import_module"}:
+                    dynamic_names.add(name.asname or name.name)
+                    imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in {"__import__", "import_module"}
         ) or (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"__import__", "import_module"}
-        )
-        if is_dynamic:
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in dynamic_names
+        ):
             imports.append((node.lineno, DYNAMIC_IMPORT_CALL))
     return imports
 
@@ -198,6 +211,9 @@ def test_aros_imports_only_use_the_one_way_internal_boundary() -> None:
         ("target = 'arbor.review'\nimport_module(target)", {DYNAMIC_IMPORT_CALL}),
         ("target = 'arbor.review'\nloader.import_module(target)", {DYNAMIC_IMPORT_CALL}),
         ("from importlib import import_module as load\ndef later(target):\n    return load(target)", {DYNAMIC_IMPORT_CALL}),
+        ("import importlib\nload = importlib.import_module\ndef later():\n    return load('arbor.review')", {DYNAMIC_IMPORT_CALL}),
+        ("from importlib import import_module as load", {DYNAMIC_IMPORT_CALL}),
+        ("load = __import__", {DYNAMIC_IMPORT_CALL}),
         ("from ..core import config", set()),
     ),
 )
@@ -281,6 +297,9 @@ def legacy_repo(tmp_path: Path) -> tuple[Path, str]:
     )
     (repo / "src" / "legacy.py").write_text(
         "legacy one\nlegacy two\n", encoding="utf-8"
+    )
+    (repo / "legacy_control.py").write_text(
+        "legacy control\n", encoding="utf-8"
     )
     (repo / ".gitignore").write_text(
         "src/coordinator/ignored.py\n"
@@ -492,6 +511,124 @@ def test_legacy_freeze_rejects_growth_in_existing_legacy_source(
 
     assert result.returncode == 2
     assert "src/legacy.py" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("staged", (False, True))
+def test_legacy_freeze_rejects_new_source_symlinks(
+    legacy_repo: tuple[Path, str], staged: bool
+) -> None:
+    repo, base = legacy_repo
+    path = repo / "src" / "legacy_link.py"
+    path.symlink_to("legacy.py")
+    if staged:
+        _git(repo, "add", "src/legacy_link.py")
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/legacy_link.py" in result.stdout + result.stderr
+
+
+def test_legacy_freeze_rejects_r100_move_into_non_allowlisted_source(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    _git(repo, "mv", "legacy_control.py", "src/control_v2.py")
+    raw = _git(
+        repo,
+        "diff",
+        "--raw",
+        "--find-renames=50%",
+        base,
+        "--",
+    ).stdout
+    assert "R100" in raw
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/control_v2.py" in result.stdout + result.stderr
+
+
+def test_legacy_freeze_rejects_staged_symlink_hidden_by_unstaged_delete(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    path = repo / "src" / "legacy_link.py"
+    path.symlink_to("legacy.py")
+    _git(repo, "add", "src/legacy_link.py")
+    path.unlink()
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/legacy_link.py" in result.stdout + result.stderr
+
+
+def test_legacy_freeze_rejects_staged_text_growth_hidden_by_unstaged_delete(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    path = repo / "src" / "new_legacy.py"
+    path.write_text("staged legacy behavior\n", encoding="utf-8")
+    _git(repo, "add", "src/new_legacy.py")
+    path.unlink()
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/new_legacy.py" in result.stdout + result.stderr
+
+
+def test_legacy_freeze_rejects_staged_r100_hidden_by_unstaged_delete(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    destination = repo / "src" / "control_v2.py"
+    _git(repo, "mv", "legacy_control.py", "src/control_v2.py")
+    destination.unlink()
+    cached = _git(
+        repo,
+        "diff",
+        "--cached",
+        "--raw",
+        "--find-renames=50%",
+        base,
+        "--",
+    ).stdout
+    assert "R100" in cached
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/control_v2.py" in result.stdout + result.stderr
+
+
+def test_legacy_freeze_rejects_staged_c100_hidden_by_unstaged_delete(
+    legacy_repo: tuple[Path, str],
+) -> None:
+    repo, base = legacy_repo
+    source = repo / "legacy_control.py"
+    destination = repo / "src" / "control_copy.py"
+    destination.write_bytes(source.read_bytes())
+    _git(repo, "add", "src/control_copy.py")
+    destination.unlink()
+    cached = _git(
+        repo,
+        "diff",
+        "--cached",
+        "--raw",
+        "--find-copies=50%",
+        "--find-copies-harder",
+        base,
+        "--",
+    ).stdout
+    assert "C100" in cached
+
+    result = _run_checker(repo, base)
+
+    assert result.returncode == 2
+    assert "src/control_copy.py" in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(

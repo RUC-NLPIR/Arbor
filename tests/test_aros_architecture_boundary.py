@@ -698,13 +698,11 @@ class _DynamicImportVisitor(ast.NodeVisitor):
         if name == "types":
             self.types_names.add(name)
 
-    def _bind(self, name: str, value: ast.AST) -> None:
-        source_name = _terminal_name(value)
-        literal = _literal_string(value, self.string_bindings)
-        is_dynamic_import = source_name in self.dynamic_import_names
-        is_execution = isinstance(value, ast.Name) and value.id in self.execution_names
+    def _is_execution_expression(self, value: ast.AST) -> bool:
+        if isinstance(value, ast.Name):
+            return value.id in self.execution_names
         if isinstance(value, ast.Attribute):
-            is_execution = (
+            return (
                 (
                     value.attr in BUILTIN_EXECUTION_NAMES
                     and _terminal_name(value.value) in self.builtins_names
@@ -718,6 +716,29 @@ class _DynamicImportVisitor(ast.NodeVisitor):
                     and _terminal_name(value.value) in self.types_names
                 )
             )
+        if isinstance(value, ast.Subscript):
+            key = _literal_string(value.slice, self.string_bindings)
+            return key in DYNAMIC_EXECUTION_NAMES
+        if isinstance(value, ast.Call) and _terminal_name(value.func) == "getattr":
+            attribute = (
+                _literal_string(value.args[1], self.string_bindings)
+                if len(value.args) >= 2
+                else None
+            )
+            namespace = _terminal_name(value.args[0]) if value.args else None
+            return (
+                namespace in self.builtins_names
+                and attribute in BUILTIN_EXECUTION_NAMES
+            ) or (
+                namespace in self.importlib_names and attribute == "import_module"
+            ) or (namespace in self.types_names and attribute == "FunctionType")
+        return False
+
+    def _bind(self, name: str, value: ast.AST) -> None:
+        source_name = _terminal_name(value)
+        literal = _literal_string(value, self.string_bindings)
+        is_dynamic_import = source_name in self.dynamic_import_names
+        is_execution = self._is_execution_expression(value)
         is_builtins = source_name in self.builtins_names
         is_importlib = source_name in self.importlib_names
         is_types = source_name in self.types_names
@@ -1412,6 +1433,38 @@ def test_aros_boundary_rejects_folded_builtin_dict_execution_lookup() -> None:
     tree = ast.parse("builtins.__dict__['ev' + 'al'](source)")
 
     assert _forbidden_imports(tree, "arbor.aros")
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "load = builtins.__dict__['__import__']\nload('arbor.review')",
+        "run = builtins.__dict__['ev' + 'al']\nrun(source)",
+    ),
+)
+def test_aros_boundary_tracks_dynamic_subscript_aliases(source: str) -> None:
+    tree = ast.parse(source)
+
+    assert (2, DYNAMIC_IMPORT_CALL) in _dynamic_imports(tree)
+
+
+def test_aros_boundary_tracks_protected_getattr_alias_call() -> None:
+    tree = ast.parse(
+        "load = getattr(builtins, '__im' + 'port__')\n"
+        "load('arbor.review')"
+    )
+
+    assert (2, DYNAMIC_IMPORT_CALL) in _dynamic_imports(tree)
+
+
+def test_aros_boundary_permits_harmless_subscript_alias() -> None:
+    tree = ast.parse(
+        "callbacks = {'safe': callback}\n"
+        "load = callbacks['safe']\n"
+        "load(source)"
+    )
+
+    assert not _forbidden_imports(tree, "arbor.aros")
 
 
 def test_aros_boundary_rejects_protected_compile_getattr() -> None:

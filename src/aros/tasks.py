@@ -118,12 +118,12 @@ class TaskService:
         key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         self._ensure_record_roots()
         lock_path = self._idempotency_lock_path(key)
-        _require_plain_file_or_missing(lock_path, "task idempotency lock")
+        _ensure_durable_lock_file(lock_path, "task idempotency lock")
 
         with file_lock(lock_path):
             _require_plain_file(lock_path, "task idempotency lock")
             publication_lock = self._publication_lock_path()
-            _require_plain_file_or_missing(
+            _ensure_durable_lock_file(
                 publication_lock,
                 "task record publication lock",
             )
@@ -215,8 +215,10 @@ class TaskService:
     def status(self, task_id: str) -> dict[str, object]:
         """Return prepared runtime state bound to its immutable brief."""
         self._validate_task_id(task_id)
+        self._load_brief(task_id)
+        self._ensure_record_roots()
         publication_lock = self._publication_lock_path()
-        _require_plain_file(publication_lock, "task record publication lock")
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
         with file_lock(publication_lock):
             self._reconcile_authoritative_briefs()
             return self._status_unlocked(task_id)
@@ -260,8 +262,9 @@ class TaskService:
         runtime = self._runtime_task_ids()
         if not versioned and not runtime:
             return []
+        self._ensure_record_roots()
         publication_lock = self._publication_lock_path()
-        _require_plain_file(publication_lock, "task record publication lock")
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
         with file_lock(publication_lock):
             self._reconcile_authoritative_briefs()
             return self._list_unlocked()
@@ -389,8 +392,44 @@ class TaskService:
                 "task record inventory conflict: runtime state has no versioned brief"
             )
         for task_id in sorted(versioned):
-            self._recover_prepared_records(self._load_brief(task_id))
+            brief = self._load_brief(task_id)
+            self._reconcile_staging_alias(task_id)
+            self._recover_prepared_records(brief)
         self._validate_inventory()
+
+    def _reconcile_staging_alias(self, task_id: str) -> None:
+        staging = self.root / "tasks" / _TASK_STAGING_DIRECTORY / task_id
+        if not _path_exists(staging):
+            return
+        authoritative = self.root / "tasks" / task_id / "brief.json"
+        staged_brief = staging / "brief.json"
+        try:
+            staging_identity = _plain_directory_identity(
+                staging,
+                "versioned task staging path",
+            )
+            if not _path_exists(staged_brief):
+                self._remove_empty_staging_directory(staging, staging_identity)
+                return
+            authoritative_identity = _plain_file_identity(
+                authoritative,
+                "authoritative task brief",
+            )
+            staged_identity = _plain_file_identity(
+                staged_brief,
+                "staged task brief",
+            )
+        except TaskError as error:
+            raise TaskError(f"ambiguous task staging material: {staging}") from error
+        if staged_identity != authoritative_identity:
+            raise TaskError(f"ambiguous task staging brief identity: {staging}")
+        self._remove_staging_alias(
+            staging,
+            staging_identity,
+            staged_brief,
+            staged_identity,
+            authoritative,
+        )
 
     def _publish_staged_brief(self, staging: Path, target: Path) -> None:
         staged_brief = staging / "brief.json"
@@ -445,6 +484,14 @@ class TaskService:
         except OSError as error:
             raise TaskError(f"unable to remove staged task brief alias: {staged_brief}") from error
         _fsync_directory(staging)
+
+        self._remove_empty_staging_directory(staging, staging_identity)
+
+    def _remove_empty_staging_directory(
+        self,
+        staging: Path,
+        staging_identity: tuple[int, int],
+    ) -> None:
         try:
             has_unexpected_content = any(staging.iterdir())
         except OSError as error:
@@ -484,6 +531,21 @@ class TaskService:
         _ensure_plain_directory(runtime, "runtime tasks directory")
         _ensure_plain_directory(runtime / "idempotency", "task idempotency directory")
         _ensure_plain_directory(self.root / ".aros" / "locks", "AROS locks directory")
+        self._sync_record_root_chain()
+
+    def _sync_record_root_chain(self) -> None:
+        paths = (
+            self.root,
+            self.root / ".aros",
+            self.root / "tasks",
+            self.root / "tasks" / _TASK_STAGING_DIRECTORY,
+            self.root / ".aros" / "tasks",
+            self.root / ".aros" / "tasks" / "idempotency",
+            self.root / ".aros" / "locks",
+        )
+        for path in paths:
+            _require_plain_directory(path, "task record root")
+            _fsync_directory(path)
 
     def _validate_inventory(self) -> None:
         if self._versioned_task_ids() != self._runtime_task_ids():
@@ -892,19 +954,48 @@ def _require_plain_file(path: Path, description: str) -> None:
         raise TaskError(f"{description} must be a plain file: {path}")
 
 
-def _require_plain_file_or_missing(path: Path, description: str) -> None:
-    if _path_exists(path):
+def _ensure_durable_lock_file(path: Path, description: str) -> None:
+    _require_plain_directory(path.parent, f"{description} parent")
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
         _require_plain_file(path, description)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise TaskError(f"unable to open {description}: {path}") from error
+    except OSError as error:
+        raise TaskError(f"unable to create {description}: {path}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise TaskError(f"{description} must be a plain file: {path}")
+        if (metadata.st_dev, metadata.st_ino) != _plain_file_identity(path, description):
+            raise TaskError(f"{description} identity changed while opening: {path}")
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    except OSError as error:
+        raise TaskError(f"unable to sync {description}: {path}") from error
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
+    _require_plain_file(path, description)
 
 
 def _ensure_plain_directory(path: Path, description: str) -> None:
+    created = False
     try:
         path.mkdir(mode=0o700)
+        created = True
     except FileExistsError:
         pass
     except OSError as error:
         raise TaskError(f"unable to create {description}: {path}") from error
     _require_plain_directory(path, description)
+    if created:
+        _fsync_directory(path.parent)
 
 
 def _create_plain_directory(path: Path, description: str) -> None:
@@ -915,6 +1006,7 @@ def _create_plain_directory(path: Path, description: str) -> None:
     except OSError as error:
         raise TaskError(f"unable to create {description}: {path}") from error
     _require_plain_directory(path, description)
+    _fsync_directory(path.parent)
 
 
 def _read_object(path: Path, description: str) -> dict[str, object]:

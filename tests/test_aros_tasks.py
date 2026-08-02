@@ -6,6 +6,7 @@ import errno
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -681,7 +682,8 @@ def test_publication_syncs_target_and_parent_before_staging_cleanup(
     brief = _create(service, key="sync-publication-parents")
 
     target = tmp_path / "tasks" / str(brief["task_id"])
-    assert synced[:2] == [target, tmp_path / "tasks"]
+    target_sync = synced.index(target)
+    assert synced[target_sync : target_sync + 2] == [target, tmp_path / "tasks"]
     assert tmp_path / "tasks" / ".staging" in synced
 
 
@@ -784,11 +786,169 @@ def test_immediate_post_link_crash_is_recoverable_and_preserves_staging(
         assert result["task_id"] == task_id  # type: ignore[index]
     else:
         assert [status["task_id"] for status in result] == [task_id]  # type: ignore[union-attr]
-    assert staged[0].is_file()
+    assert not staged[0].exists()
+    assert (targets[0] / "brief.json").stat().st_nlink == 1
+
+
+@pytest.mark.parametrize("kind", ("different_inode", "symlink"))
+def test_reconciliation_rejects_and_preserves_ambiguous_staging_brief(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service, key=f"ambiguous-staging-{kind}")
+    task_id = str(brief["task_id"])
+    authoritative = tmp_path / "tasks" / task_id / "brief.json"
+    staging = tmp_path / "tasks" / ".staging" / task_id
+    staging.mkdir()
+    staged_brief = staging / "brief.json"
+    if kind == "different_inode":
+        staged_brief.write_text("{}\n", encoding="utf-8")
+    else:
+        staged_brief.symlink_to(authoritative)
+
+    with pytest.raises(TaskError, match="ambiguous task staging"):
+        service.status(task_id)
+
+    assert staged_brief.exists()
+    assert authoritative.is_file()
+
+
+def test_reconciliation_unlinks_proven_alias_but_preserves_extra_staging_material(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service, key="staging-alias-with-extra")
+    task_id = str(brief["task_id"])
+    authoritative = tmp_path / "tasks" / task_id / "brief.json"
+    staging = tmp_path / "tasks" / ".staging" / task_id
+    staging.mkdir()
+    staged_brief = staging / "brief.json"
+    os.link(authoritative, staged_brief, follow_symlinks=False)
+    extra = staging / "unexpected.txt"
+    extra.write_text("preserve\n", encoding="utf-8")
+
+    with pytest.raises(TaskError, match="ambiguous material"):
+        service.list()
+
+    assert not staged_brief.exists()
+    assert extra.read_text(encoding="utf-8") == "preserve\n"
+    assert authoritative.stat().st_nlink == 1
+
+
+def test_reconciliation_removes_an_empty_staging_cleanup_remnant(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service, key="empty-staging-cleanup-remnant")
+    task_id = str(brief["task_id"])
+    staging = tmp_path / "tasks" / ".staging" / task_id
+    staging.mkdir()
+
+    assert service.status(task_id)["task_id"] == task_id
+
+    assert not staging.exists()
 
 
 def test_task_publication_has_no_linux_specific_rename_helper() -> None:
     assert not hasattr(tasks_module, "_rename_noreplace")
+
+
+def test_first_create_durably_syncs_record_roots_and_lock_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    synced_directories: list[Path] = []
+    synced_files: list[Path] = []
+    original_fsync = tasks_module.os.fsync
+
+    def record_file_sync(descriptor: int) -> None:
+        try:
+            synced_files.append(Path(f"/proc/self/fd/{descriptor}").resolve())
+        except OSError:
+            pass
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(tasks_module, "_fsync_directory", synced_directories.append)
+    monkeypatch.setattr(tasks_module.os, "fsync", record_file_sync)
+
+    _create(service, key="durable-first-create")
+
+    required_directories = {
+        tmp_path,
+        tmp_path / ".aros",
+        tmp_path / "tasks",
+        tmp_path / ".aros" / "tasks",
+        tmp_path / ".aros" / "locks",
+    }
+    assert required_directories <= set(synced_directories)
+    lock_files = [path for path in synced_files if path.parent.name == "locks"]
+    assert any(path.name.startswith("task-idempotency-") for path in lock_files)
+    assert any(path.name == "task-record-publication.lock" for path in lock_files)
+    for lock_file in (tmp_path / ".aros" / "locks").iterdir():
+        assert lock_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_create_restricts_existing_plain_lock_files_to_mode_0600(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    key = "restrict-existing-locks"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    locks_root = tmp_path / ".aros" / "locks"
+    locks_root.mkdir()
+    lock_paths = (
+        locks_root / f"task-idempotency-{digest}.lock",
+        locks_root / "task-record-publication.lock",
+    )
+    for lock_path in lock_paths:
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o666)
+    service = TaskService(tmp_path)
+
+    _create(service, key=key)
+
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in lock_paths)
+
+
+@pytest.mark.parametrize("reader", ("status", "list"))
+def test_fresh_read_durably_recreates_missing_derived_roots_and_publication_lock(
+    tmp_path: Path,
+    reader: str,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service, key=f"missing-derived-roots-{reader}")
+    task_id = str(brief["task_id"])
+    runtime_root = tmp_path / ".aros" / "tasks"
+    runtime_task = runtime_root / task_id
+    (runtime_task / "status.json").unlink()
+    runtime_task.rmdir()
+    for index in (runtime_root / "idempotency").iterdir():
+        index.unlink()
+    (runtime_root / "idempotency").rmdir()
+    runtime_root.rmdir()
+    locks_root = tmp_path / ".aros" / "locks"
+    for lock in locks_root.iterdir():
+        lock.unlink()
+    locks_root.rmdir()
+
+    fresh = TaskService(tmp_path)
+    result = fresh.status(task_id) if reader == "status" else fresh.list()
+
+    if reader == "status":
+        assert result["task_id"] == task_id  # type: ignore[index]
+    else:
+        assert [status["task_id"] for status in result] == [task_id]  # type: ignore[union-attr]
+    publication_lock = locks_root / "task-record-publication.lock"
+    assert publication_lock.is_file()
+    assert publication_lock.stat().st_mode & 0o777 == 0o600
+    assert (runtime_root / task_id / "status.json").is_file()
 
 
 def test_create_rejects_a_noncommit_head_even_when_it_is_40_hex(

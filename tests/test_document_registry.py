@@ -83,3 +83,51 @@ def test_document_registry_identifies_the_design_book_as_target_specification() 
 
     assert [document["id"] for document in target_specifications] == ["aros-design-book-v1-0-zh"]
     assert target_specifications[0]["status"] == "current"
+
+
+def test_registry_contains_approved_aros_v1_design() -> None:
+    by_id = {document["id"]: document for document in _load_registry()["documents"]}
+
+    assert by_id["aros-v1-product-migration-design"] == {
+        "id": "aros-v1-product-migration-design",
+        "title": "AROS v1 Product, Architecture, and Arbor Migration Design",
+        "path": (
+            "docs/superpowers/specs/"
+            "2026-08-02-aros-v1-product-and-migration-design.md"
+        ),
+        "status": "current",
+        "authority": "implementation_baseline",
+        "agent_visibility": "on_demand",
+    }
+
+
+def test_aros_public_docs_use_direct_entry() -> None:
+    text = (_ROOT / "docs" / "aros" / "README.md").read_text(encoding="utf-8")
+
+    for command in (
+        "aros init",
+        "aros boot",
+        "aros status",
+        "aros start",
+        "aros run start|status|list|tail|stop",
+    ):
+        assert command in text
+    assert "arbor aros" not in text
+    assert "## Not yet implemented" in text
+    for unavailable_capability in (
+        "child task substrate",
+        "deterministic/protected evaluation",
+        "migration adapters",
+        "MCP parity",
+        "Arbor retirement",
+    ):
+        assert unavailable_capability in text
+
+
+def test_aros_public_docs_route_and_describe_migration() -> None:
+    root_readme = (_ROOT / "README.md").read_text(encoding="utf-8")
+    docs_readme = (_ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+
+    assert "direct entry for\n> bootable workspaces and durable runs" in root_readme
+    assert "frozen compatibility paths" in root_readme
+    assert "[aros/README.md](aros/README.md)" in docs_readme

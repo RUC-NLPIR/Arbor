@@ -21,6 +21,11 @@
   <b>English</b> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
+> **AROS migration:** The Agent-centric AROS path is being commissioned now.
+> Installations from this repository expose `aros` as the direct entry for
+> bootable workspaces and durable runs. Existing `arbor` research commands are
+> frozen compatibility paths until equivalent AROS modules pass commissioning.
+
 <p align="center">
   <i>Give Arbor a benchmark and a goal. It proposes hypotheses, edits code, runs real
   experiments, and keeps only the gains that survive held-out data — growing a

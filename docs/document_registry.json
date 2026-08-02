@@ -10,6 +10,14 @@
       "agent_visibility": "default"
     },
     {
+      "id": "aros-v1-product-migration-design",
+      "title": "AROS v1 Product, Architecture, and Arbor Migration Design",
+      "path": "docs/superpowers/specs/2026-08-02-aros-v1-product-and-migration-design.md",
+      "status": "current",
+      "authority": "implementation_baseline",
+      "agent_visibility": "on_demand"
+    },
+    {
       "id": "aros-design-book-v1-0-zh",
       "title": "AR OS Agent-Principal Design Book v1.0 (ZH)",
       "path": "AR_OS_AGENT_PRINCIPAL_DESIGN_BOOK_v1_0_zh.md",

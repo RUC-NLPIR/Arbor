@@ -2,6 +2,8 @@
 
 所有 AROS 文档工作从这里开始。`document_registry.json` 是文档生命周期、权威类型和 Agent 默认可见性的唯一索引。
 
+- Public AROS CLI and current capability guide: [aros/README.md](aros/README.md)
+
 ## 默认读取规则
 
 - 默认上下文只包含同时标记为 `status=current` 和 `agent_visibility=default` 的条目。

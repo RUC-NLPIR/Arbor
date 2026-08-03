@@ -607,13 +607,15 @@ def test_worktree_add_uses_exact_argv_in_directory_fd_launcher(
 
     assert len(launches) == 1
     launcher, options = launches[0]
-    assert launcher[:3] == [
+    assert launcher[:5] == [
         sys.executable,
+        "-I",
+        "-S",
         "-c",
         tasks_module._DIRECTORY_FD_EXEC,
     ]
-    directory_fd = int(launcher[3])
-    git_argv = launcher[4:]
+    directory_fd = int(launcher[5])
+    git_argv = launcher[6:]
     assert options["pass_fds"] == (directory_fd,)
     assert not options.get("shell", False)
     assert "preexec_fn" not in options
@@ -633,6 +635,8 @@ def test_worktree_add_uses_exact_argv_in_directory_fd_launcher(
     environment = options["env"]
     assert isinstance(environment, dict)
     assert not any(key.startswith("GIT_") for key in environment)
+    assert not any(key.startswith("PYTHON") for key in environment)
+    assert environment.get("PATH") == os.environ.get("PATH")
     assert status["state"] == "worktree_ready"
     ownership = json.loads(
         (tmp_path / ".aros" / "tasks" / task_id / "ownership.json").read_text(
@@ -641,6 +645,32 @@ def test_worktree_add_uses_exact_argv_in_directory_fd_launcher(
     )
     assert ownership["worktree_path"] == str(target)
     assert f"worktree {target}" in _git(tmp_path, "worktree", "list", "--porcelain")
+
+
+def test_worktree_launcher_does_not_import_ambient_sitecustomize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service, key="malicious-python-startup")
+    task_id = str(brief["task_id"])
+    _commit_brief(tmp_path, brief)
+    marker = tmp_path / ".git" / "sitecustomize-ran"
+    python_path = tmp_path / ".git" / "malicious-pythonpath"
+    python_path.mkdir()
+    (python_path / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PYTHONPATH", str(python_path))
+    monkeypatch.setenv("PYTHONWARNINGS", "error")
+
+    status = service.start(task_id)
+
+    assert status["state"] == "worktree_ready"
+    assert not marker.exists()
 
 
 def test_concurrent_and_repeated_start_reuses_one_owned_worktree(
@@ -1027,23 +1057,32 @@ def test_start_git_commands_are_scrubbed_pinned_and_nondestructive(
             calls.append((command, environment))
         elif (
             isinstance(command, list)
-            and command[:3]
-            == [sys.executable, "-c", tasks_module._DIRECTORY_FD_EXEC]
+            and command[:5]
+            == [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                tasks_module._DIRECTORY_FD_EXEC,
+            ]
             and "worktree" in command
             and "add" in command
         ):
             assert isinstance(environment, dict)
-            calls.append((command[4:], environment))
+            calls.append((command[6:], environment))
         return original_run(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "foreign.git"))
     monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "foreign-worktree"))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "foreign-pythonpath"))
+    monkeypatch.setenv("PYTHONWARNINGS", "error")
     monkeypatch.setattr(tasks_module.subprocess, "run", record_git)
 
     service.start(task_id)
 
     assert calls
     assert all(not any(key.startswith("GIT_") for key in env) for _, env in calls)
+    assert all(not any(key.startswith("PYTHON") for key in env) for _, env in calls)
     assert all(
         any(str(service._git_dir) in argument for argument in command)
         for command, _ in calls

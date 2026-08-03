@@ -890,6 +890,8 @@ class TaskService:
             self._require_directory_fd_identity(root, directory_fd, identity)
             launcher = [
                 sys.executable,
+                "-I",
+                "-S",
                 "-c",
                 _DIRECTORY_FD_EXEC,
                 str(directory_fd),
@@ -1566,7 +1568,7 @@ def _git_environment() -> dict[str, str]:
     return {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("GIT_")
+        if not key.startswith(("GIT_", "PYTHON"))
     }
 
 

@@ -1,0 +1,99 @@
+{
+  "actor": "principal",
+  "actual_environment_sha256": "b5210c26efc78630725afe7c9eeba83f8e47f71e518ccb5ea03abea9011f1c9d",
+  "argv": [
+    "bash",
+    "-lc",
+    "cd /workspace/Arbor/.worktree/aros-wave2-child/.worktree/tasks/TASK-20260803-write-one-synthetic-wave-2-child-57f7 && printf 'HEAD '; git rev-parse HEAD && printf 'STATUS\\n'; git status --porcelain=v1 --untracked-files=all --ignored=matching --ignore-submodules=none"
+  ],
+  "base_commit": "01a8c3553c79f2239043a9f029ff9d4bbb518ed4",
+  "budget": {},
+  "candidate_commit": null,
+  "cwd": ".",
+  "dataset_ref": null,
+  "duration_seconds": 2.474859,
+  "environment_policy": {
+    "allowed_keys": [
+      "CUDA_VISIBLE_DEVICES",
+      "LANG",
+      "LC_ALL",
+      "LC_CTYPE",
+      "MKL_NUM_THREADS",
+      "OMP_NUM_THREADS",
+      "OPENBLAS_NUM_THREADS",
+      "PYTHONIOENCODING",
+      "PYTHONUNBUFFERED",
+      "TZ"
+    ],
+    "generated_keys": [
+      "AROS_SECURITY_PROFILE",
+      "HOME",
+      "PATH",
+      "PYTHONDONTWRITEBYTECODE",
+      "TMPDIR"
+    ],
+    "kind": "strict-allowlist-v1"
+  },
+  "environment_ref": {
+    "keys": [
+      "LANG",
+      "PATH",
+      "TZ"
+    ],
+    "kind": "allowlist-fingerprint-v1"
+  },
+  "environment_sha256": "b5210c26efc78630725afe7c9eeba83f8e47f71e518ccb5ea03abea9011f1c9d",
+  "error": "process launch failed: Exception occurred in preexec_fn.",
+  "evaluator_ref": null,
+  "evaluator_version": null,
+  "exit_code": null,
+  "experiment_ref": null,
+  "finalized_at": "2026-08-03T07:57:38.853Z",
+  "finished_at": "2026-08-03T07:57:38.853Z",
+  "host": "3d4a02699998",
+  "idempotency_key": "check-wave2-child-write-head-status-v2",
+  "isolation_limits": {
+    "address_space_bytes": 8589934592,
+    "cpu_seconds": 3600,
+    "file_size_bytes": 2147483648,
+    "open_files": 256,
+    "processes": 1
+  },
+  "launch_receipt_sha256": "ce579516647bfea965c18c7bf9bac1d678b9c22aa86d7e338a29e8b691e90449",
+  "manifest_sha256": "7785ac86bb71c2c6c82d5155d99e65ab6646d5283078b16377074b4271053fec",
+  "network_policy": "deny-all",
+  "output_paths": [
+    ".aros/runs/RUN-20260803-075735-check-write-task-worktree-b583/stdout.log",
+    ".aros/runs/RUN-20260803-075735-check-write-task-worktree-b583/stderr.log",
+    "runs/RUN-20260803-075735-check-write-task-worktree-b583/final.json"
+  ],
+  "prediction_ref": null,
+  "process_policy": "single-process-no-threads",
+  "question_refs": [],
+  "repository_ref": ".",
+  "resource_request": {},
+  "resource_usage": {
+    "wall_seconds": 2.474859
+  },
+  "run_id": "RUN-20260803-075735-check-write-task-worktree-b583",
+  "schema_version": 1,
+  "security_profile": "isolated-linux",
+  "seed": null,
+  "started_at": "2026-08-03T07:57:36.379Z",
+  "state": "failed_process",
+  "stderr": {
+    "bytes": 0,
+    "path": ".aros/runs/RUN-20260803-075735-check-write-task-worktree-b583/stderr.log",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "stdout": {
+    "bytes": 0,
+    "path": ".aros/runs/RUN-20260803-075735-check-write-task-worktree-b583/stdout.log",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "success_exit_codes": [
+    0
+  ],
+  "timeout_seconds": 60,
+  "writable_paths": []
+}

@@ -1,0 +1,82 @@
+{
+  "actor": "principal",
+  "argv": [
+    "bash",
+    "-lc",
+    "cd /workspace/Arbor/.worktree/aros-wave2-child/.worktree/tasks/TASK-20260803-write-one-synthetic-wave-2-child-57f7 && printf 'HEAD '; git rev-parse HEAD && printf 'STATUS\\n'; git status --porcelain=v1 --untracked-files=all --ignored=matching --ignore-submodules=none"
+  ],
+  "base_commit": "01a8c3553c79f2239043a9f029ff9d4bbb518ed4",
+  "budget": {},
+  "candidate_commit": null,
+  "container_ref": null,
+  "created_at": "2026-08-03T07:57:35.855Z",
+  "cwd": ".",
+  "dataset_ref": null,
+  "environment_policy": {
+    "allowed_keys": [
+      "CUDA_VISIBLE_DEVICES",
+      "LANG",
+      "LC_ALL",
+      "LC_CTYPE",
+      "MKL_NUM_THREADS",
+      "OMP_NUM_THREADS",
+      "OPENBLAS_NUM_THREADS",
+      "PYTHONIOENCODING",
+      "PYTHONUNBUFFERED",
+      "TZ"
+    ],
+    "generated_keys": [
+      "AROS_SECURITY_PROFILE",
+      "HOME",
+      "PATH",
+      "PYTHONDONTWRITEBYTECODE",
+      "TMPDIR"
+    ],
+    "kind": "strict-allowlist-v1"
+  },
+  "environment_ref": {
+    "keys": [
+      "LANG",
+      "PATH",
+      "TZ"
+    ],
+    "kind": "allowlist-fingerprint-v1"
+  },
+  "environment_sha256": "b5210c26efc78630725afe7c9eeba83f8e47f71e518ccb5ea03abea9011f1c9d",
+  "evaluator_ref": null,
+  "evaluator_version": null,
+  "experiment_ref": null,
+  "hard_safety_stop": {
+    "timeout_seconds": 60
+  },
+  "idempotency_key": "check-wave2-child-write-head-status-v2",
+  "isolation_limits": {
+    "address_space_bytes": 8589934592,
+    "cpu_seconds": 3600,
+    "file_size_bytes": 2147483648,
+    "open_files": 256,
+    "processes": 1
+  },
+  "label": "check-write-task-worktree",
+  "manifest_sha256": "7785ac86bb71c2c6c82d5155d99e65ab6646d5283078b16377074b4271053fec",
+  "network_policy": "deny-all",
+  "output_paths": [
+    ".aros/runs/RUN-20260803-075735-check-write-task-worktree-b583/stdout.log",
+    ".aros/runs/RUN-20260803-075735-check-write-task-worktree-b583/stderr.log",
+    "runs/RUN-20260803-075735-check-write-task-worktree-b583/final.json"
+  ],
+  "prediction_ref": null,
+  "process_policy": "single-process-no-threads",
+  "question_refs": [],
+  "repository_ref": ".",
+  "resource_request": {},
+  "run_id": "RUN-20260803-075735-check-write-task-worktree-b583",
+  "schema_version": 1,
+  "security_profile": "isolated-linux",
+  "seed": null,
+  "success_exit_codes": [
+    0
+  ],
+  "timeout_seconds": 60,
+  "writable_paths": []
+}

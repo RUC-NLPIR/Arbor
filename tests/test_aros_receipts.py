@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import arbor.aros.runner as runner_module
@@ -17,14 +19,10 @@ import arbor.aros.task_runner as task_runner_module
 import arbor.aros.tasks as tasks_module
 import pytest
 from arbor.aros.receipts import content_receipt, digest_chunks, record_sha256
+from arbor.aros.runs import RunService
 from arbor.aros.store import FINAL_IDENTITY_FIELDS, json_sha256
-from tests.test_aros_runs import (
-    _init_clean_repo,
-    _prepare,
-    _require_tmux,
-    _wait_for_state,
-)
-from tests.test_aros_task_runner import _create_committed_task, _wait_terminal
+from arbor.aros.tasks import TaskService
+from arbor.aros.workspace import init_workspace
 
 
 def test_record_sha256_excludes_only_named_hash_field() -> None:
@@ -52,24 +50,46 @@ def test_digest_chunks_hashes_content_without_joining() -> None:
     )
 
 
-def _worktree_python_launcher(root: Path) -> Path:
-    import_root = root / "runner-import"
-    import_root.mkdir()
-    (import_root / "arbor").symlink_to(
-        Path(__file__).resolve().parents[1] / "src",
-        target_is_directory=True,
+def _git(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    launcher = root / "python"
-    launcher.write_text(
-        f"#!{sys.executable}\n"
-        "import os\n"
-        "import sys\n"
-        f"os.environ['PYTHONPATH'] = {str(import_root)!r}\n"
-        f"os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n",
-        encoding="utf-8",
-    )
-    launcher.chmod(0o700)
-    return launcher
+    return result.stdout.strip()
+
+
+def _init_repo(root: Path, *, task_workspace: bool = False) -> None:
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "config", "user.email", "aros@example.invalid")
+    _git(root, "config", "user.name", "AROS test")
+    (root / "README.md").write_text("# receipt compatibility\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-qm", "initial state")
+    if task_workspace:
+        init_workspace(root, "Receipt compatibility")
+        _git(root, "add", ".gitignore", "AGENTS.md", "AROS.md", "memory/NOW.md")
+        _git(root, "commit", "-qm", "initialize AROS")
+
+
+def _wait_for_terminal(
+    status: Callable[[], dict[str, object]],
+    terminal_states: set[str],
+) -> dict[str, object]:
+    deadline = time.monotonic() + 10
+    latest: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        latest = status()
+        if latest["state"] in terminal_states:
+            return latest
+        time.sleep(0.02)
+    pytest.fail(f"operation did not reach a terminal state: {latest}")
+
+
+def _require_tmux() -> None:
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux is unavailable")
 
 
 def test_completed_run_persists_compatible_receipts(
@@ -94,24 +114,28 @@ def test_completed_run_persists_compatible_receipts(
         raising=False,
     )
     root = tmp_path / "workspace"
-    _init_clean_repo(root)
-    launcher = _worktree_python_launcher(tmp_path)
-    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "runner-import"))
-    service, manifest = _prepare(
-        root,
-        argv=[
+    _init_repo(root)
+    service = RunService(root)
+    manifest = service.prepare(
+        [
             sys.executable,
             "-c",
             "import sys;print('run stdout');print('run stderr', file=sys.stderr)",
         ],
-        key="receipt-compatibility-run",
+        timeout_seconds=10,
+        idempotency_key="receipt-compatibility-run",
+        actor="test-principal",
+        label="receipt-compatibility",
+        security_profile="trusted-local",
     )
     run_id = str(manifest["run_id"])
-    monkeypatch.setattr(runs_module, "sys", SimpleNamespace(executable=str(launcher)))
 
     try:
         service.start(run_id)
-        terminal = _wait_for_state(service, run_id)
+        terminal = _wait_for_terminal(
+            lambda: service.status(run_id),
+            {"completed", "failed_process", "timed_out", "cancelled", "lost"},
+        )
         final = json.loads(
             (root / "runs" / run_id / "final.json").read_text(encoding="utf-8")
         )
@@ -200,21 +224,34 @@ def test_completed_task_persists_compatible_receipts_and_self_hash(
         tasks_module, "content_receipt", observed_content_receipt, raising=False
     )
     root = tmp_path / "workspace"
-    service, brief = _create_committed_task(
-        root,
-        [
+    _init_repo(root, task_workspace=True)
+    service = TaskService(root)
+    brief = service.create(
+        "execute exact child adapter",
+        actor="principal",
+        mode="write",
+        adapter_argv=[
             sys.executable,
             "-c",
             "import sys;print('task stdout');print('task stderr', file=sys.stderr)",
         ],
-        key="receipt-compatibility-task",
+        capabilities={"network": True, "shell": True},
+        deliverables=["final receipt"],
+        acceptance=["inspect immutable final receipt"],
+        timeout_seconds=10,
+        idempotency_key="receipt-compatibility-task",
     )
     task_id = str(brief["task_id"])
+    _git(root, "add", f"tasks/{task_id}/brief.json")
+    _git(root, "commit", "-qm", f"record {task_id}")
     socket_name = tasks_module._tmux_socket_name(root, task_id)
 
     try:
         service.start(task_id)
-        terminal = _wait_terminal(service, task_id)
+        terminal = _wait_for_terminal(
+            lambda: service.status(task_id),
+            {"completed", "failed_process", "timed_out", "cancelled", "lost"},
+        )
         runtime = root / ".aros" / "tasks" / task_id
         final = json.loads((runtime / "final.json").read_text(encoding="utf-8"))
         expected_outputs = {

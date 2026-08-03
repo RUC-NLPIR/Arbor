@@ -201,6 +201,48 @@ def test_create_json_retry_fsyncs_existing_directory_chain_after_crash(
     assert synced[: len(expected)] == expected
 
 
+def test_relative_create_retry_fsyncs_absolute_directory_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_directory = tmp_path / "deep" / "cwd"
+    working_directory.mkdir(parents=True)
+    monkeypatch.chdir(working_directory)
+    target = Path("first") / "record.json"
+
+    class InjectedCrash(RuntimeError):
+        pass
+
+    def crash_before_first_directory_fsync(_path: Path) -> None:
+        raise InjectedCrash
+
+    monkeypatch.setattr(
+        store_module,
+        "_fsync_directory",
+        crash_before_first_directory_fsync,
+    )
+    with pytest.raises(InjectedCrash):
+        create_json(target, {"value": 1})
+    assert (working_directory / target.parent).is_dir()
+    assert not target.exists()
+
+    synced: list[Path] = []
+    monkeypatch.setattr(store_module, "_fsync_directory", synced.append)
+
+    assert create_json(target, {"value": 1}) is True
+
+    directory = working_directory / target.parent
+    device = directory.stat().st_dev
+    expected: list[Path] = []
+    while True:
+        expected.append(directory)
+        parent = directory.parent
+        if parent == directory or parent.stat().st_dev != device:
+            break
+        directory = parent
+    assert synced[: len(expected)] == expected
+
+
 def test_fsync_directory_chain_stops_at_device_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

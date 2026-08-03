@@ -299,8 +299,8 @@ def _durable_mkdir(path: Path) -> None:
 
 
 def _fsync_directory_chain(path: Path) -> None:
-    device = path.stat().st_dev
-    directory = path
+    directory = path.absolute()
+    device = directory.stat().st_dev
     while True:
         _fsync_directory(directory)
         parent = directory.parent

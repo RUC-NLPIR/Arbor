@@ -69,7 +69,7 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
   - every task, including read-only, receives .worktree/tasks/TASK-ID;
   - dedicated branch-attached task worktree starts at brief base commit on branch aros/task/TASK-ID;
   - symlink/pre-existing path/registered branch conflicts fail closed;
-  - owner/lease is recorded before adapter launch;
+  - durable non-expiring worktree ownership is recorded before launch;
   - cleanup never removes dirty worktree;
   - repeated start reattaches or rejects, never creates a second worktree.
 
@@ -99,6 +99,7 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
   - runner injects exact AROS_TASK_ID, AROS_TASK_BRIEF, AROS_TASK_WORKTREE, AROS_TASK_BASE_COMMIT, and AROS_TASK_BRIEF_SHA256 bindings; ambient values cannot override them;
   - launch/final record whether the workspace filesystem enforces mode 0600; trusted-local may proceed with false while preserving O_EXCL/no-follow/single-link/fd-bound integrity, but protected execution must fail closed;
   - runtime records PID, PGID, start token, host, started_at, heartbeat;
+  - create-once execution.json is the local one-attempt execution lease; holder death becomes lost and never transfers worktree ownership;
   - timeout and attributed stop terminate/reap process group;
   - Principal/CLI exit does not terminate child;
   - missing process + final receipt reconciles terminal;
@@ -197,7 +198,7 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
   - separate task IDs/worktrees/processes;
   - no parent checkout write;
   - child survives Principal/launcher exit;
-  - messages and status work;
+  - message append/hash-chain persistence and status work; mailbox delivery or acknowledgement is not claimed;
   - collect returns exact commit/diff/evidence;
   - Principal performs an explicit selective apply or rejection;
   - no automatic semantic assimilation;

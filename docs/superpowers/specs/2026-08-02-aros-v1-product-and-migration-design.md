@@ -229,7 +229,7 @@ A Principal-created task contains:
 - deliverables and acceptance checks;
 - budget/deadline;
 - child profile;
-- ownership lease;
+- durable worktree ownership claim plus a separate local execution claim;
 - return location.
 
 ### 8.2 Execution
@@ -240,6 +240,15 @@ A Principal-created task contains:
 - The task service records process/worktree truth but does not direct the child's scientific reasoning.
 - Cleanup removes only verified clean worktrees.
 - Dirty or ambiguous work is preserved.
+
+Worktree ownership is deliberately non-expiring: it binds task, actor, branch,
+path, and base until explicit clean prune, so session loss can never reassign or
+discard dirty work. The create-once execution claim is the Wave 2 local
+execution lease. It binds the ownership and launch to host, runner PID/PGID,
+process start token, and claim time before adapter execution. Direct process
+liveness determines active versus stale; a dead holder without a final receipt
+becomes `lost` and is never relaunched automatically. Generic TTL, renewal, and
+distributed heartbeat leases belong to the Operations wave.
 
 ### 8.3 Return and assimilation
 
@@ -402,9 +411,13 @@ The Principal decides the scientific allocation of remaining budget.
 Leases protect ownership and incompatible capabilities:
 
 - one active Principal lease;
-- task/worktree ownership;
+- non-expiring task/worktree ownership, released only by explicit clean prune;
+- a local task execution claim that acts as the one-attempt execution lease;
 - protected evaluation incompatible with AROS-mediated trusted-local execution;
 - expired leases are inspected, not silently stolen.
+
+An execution lease may become stale only after its exact holder identity is no
+longer live. Expiry or staleness never transfers the worktree or its contents.
 
 ### 11.4 Recovery
 
@@ -636,4 +649,3 @@ Arbor is removed only when:
 AROS v1 is complete when a new strong Agent can enter an existing project with no transcript, accurately understand the mission and live uncertainty, launch and observe durable work, delegate isolated children, obtain independent measurements, assimilate evidence, checkpoint its project memory, survive restart/provider change, and continue choosing scientific actions without a semantic controller.
 
 The implementation is successful only if the kernel remains smaller in meaning than the Agent: it enforces mechanics while leaving science in user space.
-

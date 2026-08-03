@@ -9,15 +9,22 @@ commissioned.
 ## Current position
 
 - Branch: `aros-wave2-child` in `/workspace/Arbor/.worktree/aros-wave2-child`.
-- Code baseline immediately before this checkpoint: `c5f58d62dd34470948766a1ee19335bf7eba325d`.
-- Wave 2 Tasks 1–5 are implemented and independently reviewed.
-- Real commissioning created two initial task briefs/worktrees, but their first
-  launch was preserved at `worktree_ready` because the workspace FUSE mount
-  cannot express mode `0600`. The Task runner now records this filesystem
-  capability explicitly for trusted-local execution; those original tasks are
-  not retried.
+- Code baseline immediately before this checkpoint: `f4165bdc358666e2270ae26b5cd75fce2b51a787`.
+- Wave 2 Tasks 1–6 are implemented, independently reviewed, and commissioned.
+- Registered evidence: `docs/analysis/aros-wave2-child-substrate-smoke.md`.
+- Real commissioning demonstrated concurrent read/write children, launcher-exit
+  survival, ordered messages, B-C-R returns, explicit rejection without
+  assimilation, dirty preservation, clean prune, and retained task branches.
+- The first two task launches remain preserved at `worktree_ready` because they
+  exposed that the workspace FUSE mount cannot express mode `0600`. The Task
+  runner now records this filesystem capability explicitly for trusted-local
+  execution; those original tasks were not retried.
 - Generic create-once JSON publication now writes complete temp content before
-  atomic no-replace publication and recovers exact interrupted aliases.
+  atomic no-replace publication, recovers exact interrupted aliases, and fsyncs
+  existing/relative directory chains.
+- Worktree ownership is non-expiring and can be released only by explicit clean
+  prune. The create-once execution claim is the local one-attempt execution
+  lease; dead holders become `lost` and never transfer ownership or relaunch.
 
 ## Preserved operational evidence
 
@@ -34,10 +41,7 @@ consolidation.
 
 ## Next obligations
 
-1. Resume Wave 2 commissioning with new task IDs and idempotency keys.
-2. Demonstrate concurrent read/write children, B-C-R returns, explicit rejection,
-   dirty preservation, clean prune, and public CLI receipts.
-3. Publish exact smoke evidence, run the Wave 2 full gate, and merge only after
-   final whole-wave review.
-4. Continue Eval, Operations, semantic K/M/G/Skills, MCP/provider parity, and
-   Arbor retirement waves.
+1. Run the final Wave 2 full gate and whole-wave review on the current code.
+2. Merge Wave 2 only after that review and keep all negative/positive receipts.
+3. Continue Eval, Operations/shared process core, semantic K/M/G/Skills,
+   MCP/provider parity, and Arbor retirement waves.

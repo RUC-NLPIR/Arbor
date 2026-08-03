@@ -255,6 +255,15 @@ local limitation: mode requests succeed but this FUSE mount normalizes 0600 to
 containment, schema, lineage, and hash checks rather than claiming permission
 isolation.
 
+Each `ownership.json` is a durable, non-expiring worktree ownership claim; it
+can be released only by explicit clean prune. Each create-once `execution.json`
+is the separate local execution lease, binding that ownership and launch to the
+runner host, PID/PGID, process start token, claim time, and execution hash before
+the adapter gate opens. Liveness is recovered from that exact identity. A dead
+holder without a final receipt becomes `lost`; it neither transfers ownership
+nor permits a second launch. Time-based/distributed leases are deferred to the
+Operations wave.
+
 ## Messages and adapter gates
 
 The messages were create-once files with contiguous 20-digit names and a strict
@@ -273,6 +282,11 @@ cleanliness, then waited up to 60 seconds for its distinct
 `/tmp/aros-wave2-TASK-ID.go` gate. Both gates contained exactly `go\n`, were
 published only after concurrent running/message evidence, and were removed
 after both final receipts were validated.
+
+The mailbox records were not used as a delivery or steering channel. The
+separate release gates controlled adapter progress, so this commissioning proves
+ordered create-once message persistence and hash chaining only; delivery and
+acknowledgement are explicitly not claimed.
 
 ## B-C-R results
 

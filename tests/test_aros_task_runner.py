@@ -545,6 +545,138 @@ def test_adapter_launch_failure_does_not_deadlock_finalization(
     assert terminal["state"] == "failed_process"
 
 
+def test_adapter_claim_failure_closes_gate_and_reaps_unclaimed_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code = (
+        "import time;from pathlib import Path;"
+        "Path('claim-failure-marker').touch();time.sleep(30)"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", code],
+        key="adapter-claim-failure",
+    )
+    task_id = str(brief["task_id"])
+    original_run = tasks_module.subprocess.run
+
+    def carrier_without_runner(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if isinstance(command, list) and "new-session" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    assert service.start(task_id)["state"] == "lost"
+    monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
+    original_popen = task_runner_module.subprocess.Popen
+    adapter_pids: list[int] = []
+
+    def capture_adapter(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = original_popen(*args, **kwargs)  # type: ignore[arg-type]
+        if kwargs.get("start_new_session") is True:
+            adapter_pids.append(process.pid)
+        return process
+
+    def fail_claim(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise OSError("injected adapter claim failure")
+
+    monkeypatch.setattr(task_runner_module.subprocess, "Popen", capture_adapter)
+    monkeypatch.setattr(task_runner_module, "create_adapter_claim", fail_claim)
+    marker = tmp_path / ".worktree" / "tasks" / task_id / "claim-failure-marker"
+
+    try:
+        assert run_task(tmp_path, task_id) == 1
+        assert adapter_pids
+        _assert_processes_stop(adapter_pids[0])
+        assert not marker.exists()
+        terminal = service.status(task_id)
+        assert terminal["state"] == "failed_process"
+        final = json.loads(
+            (tmp_path / ".aros" / "tasks" / task_id / "final.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert "adapter claim failure" in str(final["error"])
+    finally:
+        for pid in adapter_pids:
+            if _process_is_running(pid):
+                os.killpg(pid, signal.SIGKILL)
+
+
+def test_runner_hard_death_before_gate_never_executes_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code = (
+        "import time;from pathlib import Path;"
+        "Path('hard-crash-marker').touch();time.sleep(30)"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", code],
+        key="runner-hard-death-gate",
+    )
+    task_id = str(brief["task_id"])
+    original_run = tasks_module.subprocess.run
+
+    def carrier_without_runner(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if isinstance(command, list) and "new-session" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    assert service.start(task_id)["state"] == "lost"
+    monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
+    entered_read, entered_write = os.pipe()
+    pid_read, pid_write = os.pipe()
+    original_popen = task_runner_module.subprocess.Popen
+
+    def capture_adapter(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = original_popen(*args, **kwargs)  # type: ignore[arg-type]
+        if kwargs.get("start_new_session") is True:
+            os.write(pid_write, f"{process.pid}\n".encode())
+        return process
+
+    def block_claim(*_args: object, **_kwargs: object) -> dict[str, object]:
+        os.write(entered_write, b"1")
+        time.sleep(30)
+        raise AssertionError("runner claim block unexpectedly returned")
+
+    monkeypatch.setattr(task_runner_module.subprocess, "Popen", capture_adapter)
+    monkeypatch.setattr(task_runner_module, "create_adapter_claim", block_claim)
+    runner = os.fork()
+    if runner == 0:
+        os.close(entered_read)
+        os.close(pid_read)
+        try:
+            run_task(tmp_path, task_id)
+        except BaseException:
+            os._exit(2)
+        os._exit(0)
+    os.close(entered_write)
+    os.close(pid_write)
+    assert os.read(entered_read, 1) == b"1"
+    os.close(entered_read)
+    with os.fdopen(pid_read, "r", encoding="utf-8") as stream:
+        adapter_pid = int(stream.readline().strip())
+    marker = tmp_path / ".worktree" / "tasks" / task_id / "hard-crash-marker"
+
+    try:
+        os.kill(runner, signal.SIGKILL)
+        os.waitpid(runner, 0)
+        _assert_processes_stop(adapter_pid)
+        assert not marker.exists()
+        assert service.status(task_id)["state"] == "lost"
+    finally:
+        if _process_is_running(adapter_pid):
+            os.killpg(adapter_pid, signal.SIGKILL)
+
+
 def test_duplicate_runner_invocation_never_spawns_a_second_adapter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

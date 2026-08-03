@@ -203,6 +203,15 @@ _ALLOWED_SIGNALS = {
     "KILL": signal.SIGKILL,
 }
 _PROCESS_START_TOKEN = re.compile(r"^linux-proc-start:[0-9]+$")
+_ADAPTER_LAUNCH_GATE = (
+    "import os,sys;"
+    "fd=int(sys.argv[1]);"
+    "argv=sys.argv[2:];"
+    "token=os.read(fd,1);"
+    "os.close(fd);"
+    "token==b'\\x01' or sys.exit(125);"
+    "os.execvpe(argv[0],argv,os.environ)"
+)
 
 
 def adapter_environment(
@@ -1481,18 +1490,41 @@ def run(workspace: str | Path, task_id: str) -> int:
         process: subprocess.Popen[bytes] | None = None
         launch_error: Exception | None = None
         identity_error: TaskError | None = None
+        claim_error: Exception | None = None
+        gate_error: OSError | None = None
+        adapter_identity: tuple[int, int, str] | None = None
+        claim_succeeded = False
+        gate_read: int | None = None
+        gate_write: int | None = None
         try:
+            gate_read, gate_write = os.pipe()
             process = subprocess.Popen(
-                list(brief["adapter_argv"]),
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    _ADAPTER_LAUNCH_GATE,
+                    str(gate_read),
+                    *list(brief["adapter_argv"]),
+                ],
                 shell=False,
                 cwd=worktree,
                 env=environment,
                 stdout=stdout,
                 stderr=stderr,
                 start_new_session=True,
+                pass_fds=(gate_read,),
             )
         except (OSError, subprocess.SubprocessError, TypeError, ValueError) as error:
             launch_error = error
+        finally:
+            if gate_read is not None:
+                os.close(gate_read)
+                gate_read = None
+        if launch_error is not None:
+            if gate_write is not None:
+                os.close(gate_write)
+                gate_write = None
             stdout.close()
             stderr.close()
         if process is not None:
@@ -1500,25 +1532,42 @@ def run(workspace: str | Path, task_id: str) -> int:
                 adapter_identity = _identity(process.pid)
             except TaskError as error:
                 identity_error = error
+                if gate_write is not None:
+                    os.close(gate_write)
+                    gate_write = None
             else:
-                create_adapter_claim(
-                    service,
-                    brief,
-                    ownership,
-                    launch,
-                    execution,
-                    adapter_identity,
-                    started_at,
-                )
-                running = _running_status(
-                    brief,
-                    ownership,
-                    launch,
-                    runner_identity,
-                    adapter_identity,
-                    started_at,
-                )
-                atomic_write_json(service._status_path(task_id), running)
+                try:
+                    create_adapter_claim(
+                        service,
+                        brief,
+                        ownership,
+                        launch,
+                        execution,
+                        adapter_identity,
+                        started_at,
+                    )
+                    claim_succeeded = True
+                except Exception as error:
+                    claim_error = error
+                if claim_error is None:
+                    try:
+                        if gate_write is None or os.write(gate_write, b"\x01") != 1:
+                            raise OSError("unable to release task adapter launch gate")
+                    except OSError as error:
+                        gate_error = error
+                if gate_write is not None:
+                    os.close(gate_write)
+                    gate_write = None
+                if claim_error is None and gate_error is None:
+                    running = _running_status(
+                        brief,
+                        ownership,
+                        launch,
+                        runner_identity,
+                        adapter_identity,
+                        started_at,
+                    )
+                    atomic_write_json(service._status_path(task_id), running)
 
     if launch_error is not None:
         _write_terminal(
@@ -1539,10 +1588,28 @@ def run(workspace: str | Path, task_id: str) -> int:
         return 1
     if process is None:
         raise TaskError("task adapter launch produced no process")
-    if identity_error is not None:
-        _terminate_group(process, first_name="KILL", grace_seconds=0)
+    adapter_setup_error = identity_error or claim_error or gate_error
+    if adapter_setup_error is not None:
+        signal_sequence = _terminate_group(process)
         stdout.close()
         stderr.close()
+        if not claim_succeeded and _path_exists(service._adapter_path(task_id)):
+            try:
+                recorded_adapter = load_adapter_claim(
+                    service,
+                    brief,
+                    ownership,
+                    launch,
+                    execution,
+                )
+            except TaskError:
+                return 1
+            adapter_identity = (
+                int(recorded_adapter["adapter_pid"]),
+                int(recorded_adapter["adapter_pgid"]),
+                str(recorded_adapter["adapter_start_token"]),
+            )
+            claim_succeeded = True
         _write_terminal(
             service=service,
             brief=brief,
@@ -1550,15 +1617,22 @@ def run(workspace: str | Path, task_id: str) -> int:
             launch=launch,
             state="failed_process",
             runner_identity=runner_identity,
-            adapter_identity=(None, None, None),
+            adapter_identity=(
+                adapter_identity
+                if claim_succeeded and adapter_identity is not None
+                else (None, None, None)
+            ),
             started_at=started_at,
             started_monotonic=started_monotonic,
-            exit_code=None,
+            exit_code=process.returncode,
             timeout_triggered=False,
-            signal_sequence=["KILL"],
-            error=str(identity_error),
+            signal_sequence=signal_sequence,
+            error=f"adapter setup failed: {adapter_setup_error}",
         )
         return 1
+
+    if adapter_identity is None:
+        raise TaskError("task adapter identity is unavailable after gate release")
 
     timeout_seconds = float(brief["timeout_seconds"])
     timeout_triggered = False

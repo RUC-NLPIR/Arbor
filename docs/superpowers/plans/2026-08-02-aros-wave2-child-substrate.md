@@ -93,6 +93,7 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
 - Create: tests/test_aros_task_runner.py
 
 - [ ] RED tests:
+  - public start composes an internal ensure-worktree step with the task's sole launch attempt; ensure-worktree is not a separate public system call;
   - tmux is carrier only;
   - runner executes exact adapter argv in task worktree with scrubbed environment;
   - runtime records PID, PGID, start token, host, started_at, heartbeat;
@@ -101,6 +102,7 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
   - missing process + final receipt reconciles terminal;
   - missing process + no receipt becomes lost;
   - no automatic retry;
+  - once launch evidence exists, repeated start only reconciles or returns lost/terminal state and never spawns another adapter;
   - adapter stdout/stderr are stored below .aros/tasks/TASK-ID.
 
 - [ ] Implement task_runner with existing AROS store/process identity helpers. Wave 2 explicitly labels adapter execution trusted-local/application-scoped; the worktree is the attribution boundary, not a hostile-host sandbox.

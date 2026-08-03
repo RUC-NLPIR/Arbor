@@ -918,6 +918,36 @@ def test_run_final_integer_limit_precedes_serialization() -> None:
         )
 
 
+@pytest.mark.parametrize("container_kind", ("list", "dict"))
+def test_run_final_cumulative_integer_limit_precedes_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+    container_kind: str,
+) -> None:
+    request, execution, run_link, run_final = _lineage_records()
+    large_integer = 1 << 900_000
+    run_final["arbitrary_extra"] = (
+        [large_integer] * 4
+        if container_kind == "list"
+        else {f"value-{index}": large_integer for index in range(4)}
+    )
+    monkeypatch.setattr(
+        eval_records_module,
+        "_canonical_json_bytes",
+        lambda _value: pytest.fail("canonical serialization was reached"),
+    )
+
+    with pytest.raises(ValueError, match="cumulative"):
+        build_measurement_receipt(
+            request,
+            execution,
+            run_link,
+            run_final,
+            "valid",
+            _measurement("valid"),
+            "removed",
+        )
+
+
 @pytest.mark.parametrize(
     "case",
     (

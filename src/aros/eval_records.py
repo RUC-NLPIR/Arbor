@@ -22,6 +22,8 @@ _MAX_RECORD_BYTES = 1024 * 1024
 _MAX_RECORD_DEPTH = 64
 _MAX_RECORD_INTEGER_BITS = _MAX_RECORD_BYTES * 3
 _MAX_RECORD_NODES = 10_000
+_LOG10_2_UPPER_DENOMINATOR = 100_000
+_LOG10_2_UPPER_NUMERATOR = 30_103
 _SCORER_LAUNCHERS = {"python", "python3", "bash", "sh", sys.executable}
 _METRIC_FIELDS = {"schema_version", "metric", "sample_count"}
 
@@ -178,7 +180,7 @@ def _bounded_utf8_size(value: str, description: str, remaining: int) -> int:
 def _bounded_canonical_sha256(value: object, description: str) -> str:
     stack = [(value, 0)]
     node_count = 0
-    utf8_bytes = 0
+    estimated_bytes = 0
     while stack:
         item, depth = stack.pop()
         node_count += 1
@@ -193,10 +195,10 @@ def _bounded_canonical_sha256(value: object, description: str) -> str:
             for key in item:
                 if type(key) is not str:
                     raise ValueError(f"{description} keys must be strings")
-                utf8_bytes += _bounded_utf8_size(
+                estimated_bytes += _bounded_utf8_size(
                     key,
                     f"{description} key",
-                    _MAX_RECORD_BYTES - utf8_bytes,
+                    _MAX_RECORD_BYTES - estimated_bytes,
                 )
             stack.extend((child, depth + 1) for child in item.values())
         elif item_type is list:
@@ -204,17 +206,32 @@ def _bounded_canonical_sha256(value: object, description: str) -> str:
                 raise ValueError(f"{description} exceeds {_MAX_RECORD_NODES} nodes")
             stack.extend((child, depth + 1) for child in item)
         elif item_type is str:
-            utf8_bytes += _bounded_utf8_size(
+            estimated_bytes += _bounded_utf8_size(
                 item,
                 description,
-                _MAX_RECORD_BYTES - utf8_bytes,
+                _MAX_RECORD_BYTES - estimated_bytes,
             )
         elif item_type is float:
             if not math.isfinite(item):
                 raise ValueError(f"{description} contains a non-finite number")
         elif item_type is int:
-            if item.bit_length() > _MAX_RECORD_INTEGER_BITS:
+            bit_length = item.bit_length()
+            if bit_length > _MAX_RECORD_INTEGER_BITS:
                 raise ValueError(f"{description} contains an oversized integer")
+            integer_bytes = max(
+                1,
+                (
+                    bit_length * _LOG10_2_UPPER_NUMERATOR
+                    + _LOG10_2_UPPER_DENOMINATOR
+                    - 1
+                )
+                // _LOG10_2_UPPER_DENOMINATOR,
+            ) + int(item < 0)
+            if integer_bytes > _MAX_RECORD_BYTES - estimated_bytes:
+                raise ValueError(
+                    f"{description} exceeds the cumulative encoded byte limit"
+                )
+            estimated_bytes += integer_bytes
         elif item is not None and item_type is not bool:
             raise ValueError(f"{description} contains a non-JSON value")
     try:

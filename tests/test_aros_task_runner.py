@@ -224,6 +224,27 @@ def _assert_processes_stop(*pids: int) -> None:
     assert all(not _process_is_running(pid) for pid in pids)
 
 
+def _best_effort_test_pid(path: Path, field: str | None = None) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        value = int(raw) if field is None else json.loads(raw).get(field)
+    except (AttributeError, OSError, UnicodeError, ValueError):
+        return None
+    return value if type(value) is int and value > 1 else None
+
+
+def _kill_test_process(pid: int | None, *, group: bool) -> None:
+    if pid is None or not _process_is_running(pid):
+        return
+    try:
+        if group:
+            os.killpg(pid, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 @contextmanager
 def _persistent_escaped_session_task(
     root: Path,
@@ -249,22 +270,24 @@ def _persistent_escaped_session_task(
         key=key,
     )
     task_id = str(brief["task_id"])
-    service.start(task_id)
     runtime = root / ".aros" / "tasks" / task_id
     worktree = root / ".worktree" / "tasks" / task_id
-    ready_path = worktree / "escaped.ready"
-    deadline = time.monotonic() + 5
-    while not ready_path.exists() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert ready_path.exists()
-    descendant_pid = int(
-        (worktree / "escaped.pid").read_text(encoding="utf-8")
-    )
-    execution = json.loads((runtime / "execution.json").read_text(encoding="utf-8"))
-    adapter = json.loads((runtime / "adapter.json").read_text(encoding="utf-8"))
-    runner_pid = int(execution["runner_pid"])
-    adapter_pid = int(adapter["adapter_pid"])
+    runner_pid: int | None = None
+    adapter_pid: int | None = None
+    descendant_pid: int | None = None
+    service.start(task_id)
     try:
+        ready_path = worktree / "escaped.ready"
+        deadline = time.monotonic() + 5
+        while not ready_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready_path.exists()
+        descendant_pid = _best_effort_test_pid(worktree / "escaped.pid")
+        runner_pid = _best_effort_test_pid(runtime / "execution.json", "runner_pid")
+        adapter_pid = _best_effort_test_pid(runtime / "adapter.json", "adapter_pid")
+        assert runner_pid is not None
+        assert adapter_pid is not None
+        assert descendant_pid is not None
         yield (
             service,
             task_id,
@@ -276,14 +299,28 @@ def _persistent_escaped_session_task(
         )
     finally:
         if wait_for_leader_release:
-            (worktree / "leader.release").touch(exist_ok=True)
-        if _process_is_running(adapter_pid):
-            os.killpg(adapter_pid, signal.SIGKILL)
-        if _process_is_running(runner_pid):
-            os.kill(runner_pid, signal.SIGKILL)
-        if _process_is_running(descendant_pid):
-            os.killpg(descendant_pid, signal.SIGKILL)
-        _assert_processes_stop(adapter_pid, runner_pid, descendant_pid)
+            try:
+                (worktree / "leader.release").touch(exist_ok=True)
+            except OSError:
+                pass
+        runner_pid = runner_pid or _best_effort_test_pid(
+            runtime / "execution.json",
+            "runner_pid",
+        )
+        adapter_pid = adapter_pid or _best_effort_test_pid(
+            runtime / "adapter.json",
+            "adapter_pid",
+        )
+        descendant_pid = descendant_pid or _best_effort_test_pid(
+            worktree / "escaped.pid"
+        )
+        _kill_test_process(adapter_pid, group=True)
+        _kill_test_process(runner_pid, group=False)
+        _kill_test_process(descendant_pid, group=True)
+        recorded_pids = tuple(
+            pid for pid in (adapter_pid, runner_pid, descendant_pid) if pid is not None
+        )
+        _assert_processes_stop(*recorded_pids)
 
 
 def _spawn_unreaped_zombie_session_leader() -> tuple[int, str]:
@@ -381,6 +418,46 @@ def test_exact_live_claimed_group_skips_process_group_scan(
     )
 
     assert task_runner_module._claimed_group_is_live(pid, pid, token)
+
+
+@pytest.mark.parametrize("initial_state", (None, "Z"), ids=("gone", "zombie"))
+def test_claimed_group_scan_rechecks_and_rejects_reused_leader_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    initial_state: str | None,
+) -> None:
+    pid = 4242
+    token = "linux-proc-start:123"
+    initial_identity = (
+        None if initial_state is None else (initial_state, pid, token)
+    )
+    identities = iter(
+        (initial_identity, ("S", pid, "linux-proc-start:124"))
+    )
+    identity_reads: list[int] = []
+    group_scans: list[int] = []
+
+    def sequenced_identity(observed_pid: int) -> tuple[str, int, str] | None:
+        identity_reads.append(observed_pid)
+        return next(identities)
+
+    def live_group(observed_pgid: int) -> bool:
+        group_scans.append(observed_pgid)
+        return True
+
+    monkeypatch.setattr(
+        task_runner_module,
+        "_process_state_group_and_token",
+        sequenced_identity,
+    )
+    monkeypatch.setattr(
+        task_runner_module,
+        "_process_group_has_live_member",
+        live_group,
+    )
+
+    assert not task_runner_module._claimed_group_is_live(pid, pid, token)
+    assert identity_reads == [pid, pid]
+    assert group_scans == [pid]
 
 
 def test_zombie_only_group_termination_delivers_no_signal() -> None:

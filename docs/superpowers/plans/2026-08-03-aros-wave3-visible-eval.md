@@ -465,12 +465,13 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
 
 - [ ] **Step 1: Write RED execution-bundle tests**
 
-Add five exact tests:
+Add six exact tests:
 
 - `test_prepare_bundle_keeps_control_state_in_primary_workspace`;
 - `test_bundle_run_reads_candidate_and_apparatus_but_cannot_write_them`;
 - `test_runner_revalidates_both_trees_immediately_before_spawn`;
 - `test_bundle_run_rejects_path_symlink_head_tree_or_filter_drift`;
+- `test_bundle_run_honors_declared_nonzero_success_exit_codes`;
 - `test_existing_run_manifest_and_final_schema_remain_readable`.
 
 Each test asserts exact manifest/final hashes and that failure leaves both
@@ -491,9 +492,11 @@ byte-for-byte equal while a bundle manifest binds the optional bundle fields.
 - [ ] **Step 3: Add the internal Run seam**
 
 Add `RunService.prepare_bundle(bundle, argv, *, cwd, timeout_seconds,
-idempotency_key, actor, label=None) -> dict[str, object]`. It validates all
-arguments before publication and delegates common Run manifest publication to
-the same private helper as `prepare`.
+success_exit_codes, idempotency_key, actor, label=None) -> dict[str, object]`.
+It validates `success_exit_codes` as a non-empty duplicate-free list of plain
+integers, stores it in the Run manifest, and delegates common Run manifest
+publication to the same private helper as `prepare`. Existing `prepare`
+continues to pass `[0]`.
 
 The manifest records bundle-relative paths, both commits/trees, and
 `bundle_sha256`; it never records a caller-supplied unvalidated absolute root.
@@ -699,6 +702,8 @@ validates the bundle, calls `RunService.prepare_bundle`, publishes `run.json`,
 then calls `RunService.start` once. Add fault injection immediately before/after bundle
 creation, Run prepare, run-link publication, and Run start. Every replay proves
 the same key creates at most one bundle and one Run.
+The bundle prepare call passes the descriptor's exact validated
+`success_exit_codes`; Eval never reinterprets exit success after Run finalizes.
 
 After start, it polls only `RunService.status` while the referenced state is
 `launched` or `running`.
@@ -992,6 +997,22 @@ test "$RUN_COUNT_AFTER" -eq "$((RUN_COUNT_BEFORE + 1))"
 kill -KILL "$NEW_BROKER_PID"
 wait "$NEW_BROKER_PID" || test "$?" -eq 137
 aros run stop "$NEW_RUN_ID" --reason commissioning --cwd "$PROJECT"
+
+for ACTIVE_RUN_ID in "$RUN_ID" "$NEW_RUN_ID"; do
+  for _attempt in $(seq 1 200); do
+    TERMINAL_STATE=$(/workspace/Arbor/.venv/bin/python -c \
+      'import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); print(json.loads(p.read_text())["state"] if p.exists() else "")' \
+      "$PROJECT/.aros/runs/$ACTIVE_RUN_ID/status.json")
+    case "$TERMINAL_STATE" in
+      completed|failed_process|timed_out|cancelled|lost) break ;;
+    esac
+    sleep 0.05
+  done
+  case "$TERMINAL_STATE" in
+    completed|failed_process|timed_out|cancelled|lost) ;;
+    *) exit 1 ;;
+  esac
+done
 ```
 
 After recording preservation evidence, validate/clean the stopped commissioning

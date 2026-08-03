@@ -159,11 +159,12 @@ idempotency key. A create-once `request.json` binds:
 A separate create-once local execution claim records broker PID/start token and
 holds a per-evaluation flock during the sole attempt. The claim never transfers
 or authorizes relaunch. A create-once `run.json` separately binds the request
-hash, Run ID, Run manifest hash, and execution-bundle hash. For visible Eval,
-status follows the linked Run while it
-is active, remains finalizing while the execution lock is held, and becomes
-`lost` only if Run terminates and the lock is released without a measurement
-receipt.
+hash, Run ID, Run manifest hash, and execution-bundle hash. While the visible
+Eval execution lock is held, status reports its current Run/finalization facts.
+Once that lock is released without a measurement receipt,
+`evaluation_state=lost` immediately, regardless of whether the linked Run is
+prepared, running, or terminal. `referenced_process_state` continues to report
+the Run independently for observation and audit.
 For protected Eval, a released execution lock with no protected receipt is
 `lost`.
 
@@ -181,8 +182,9 @@ Visible launch ordering is fixed:
 A crash before step 4 may leave a prepared, unlinked Run, which remains
 discoverable for audit but is never started or adopted automatically. A crash
 after step 4 leaves an exact linked prepared/running Run. In either case the
-evaluation request is `lost` after its lock is released, and the same key may
-not prepare or launch a second Run.
+evaluation request is immediately `lost` after its lock is released; a linked
+Run keeps its independent process state, and the same key may not prepare,
+launch, attach, or finalize a second evaluation attempt.
 
 ### 4.3 Metric document
 

@@ -131,6 +131,12 @@ def validate_detached_checkout(
     checkout: CheckoutBinding,
 ) -> None:
     """Reject any drift from an exact detached clean checkout binding."""
+    _reject_checkout_filters(repo)
+    _reject_checkout_filters(
+        repo,
+        git_dir=checkout.git_dir,
+        work_tree=checkout.path,
+    )
     _validate_checkout_authority(repo, checkout)
     if not _checkout_is_clean(repo, checkout):
         raise WorktreeError(f"checkout is not exactly clean: {checkout.path}")
@@ -180,6 +186,12 @@ def validate_execution_bundle(
 ) -> None:
     """Validate both exact checkouts and the portable bundle binding."""
     _reject_checkout_filters(repo)
+    for checkout in (bundle.candidate, bundle.apparatus):
+        _reject_checkout_filters(
+            repo,
+            git_dir=checkout.git_dir,
+            work_tree=checkout.path,
+        )
     _validate_execution_bundle_authority(repo, bundle)
     candidate_clean = _checkout_is_clean(repo, bundle.candidate)
     apparatus_clean = _checkout_is_clean(repo, bundle.apparatus)
@@ -295,7 +307,12 @@ def remove_clean_checkout(
     return True
 
 
-def _reject_checkout_filters(repo: RepositoryBinding) -> None:
+def _reject_checkout_filters(
+    repo: RepositoryBinding,
+    *,
+    git_dir: Path | None = None,
+    work_tree: Path | None = None,
+) -> None:
     result = _git_result(
         repo,
         "config",
@@ -303,6 +320,8 @@ def _reject_checkout_filters(repo: RepositoryBinding) -> None:
         "--name-only",
         "--get-regexp",
         r"^filter\..*\.(clean|smudge|process|required)$",
+        git_dir=git_dir,
+        work_tree=work_tree,
     )
     if result.returncode not in {0, 1}:
         raise WorktreeError(f"unable to inspect Git filter configuration: {_git_error(result)}")

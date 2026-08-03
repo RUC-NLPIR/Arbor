@@ -238,6 +238,40 @@ def test_checkout_validation_rejects_head_index_or_registration_drift(
         assert tracked.read_text(encoding="utf-8") == "staged index drift\n"
 
 
+def test_detached_checkout_validation_rejects_worktree_filter_before_driver(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _init_repository(root)
+    (root / ".gitattributes").write_text(
+        "tracked.txt filter=runtime\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", ".gitattributes")
+    _git(root, "commit", "-qm", "declare runtime filter")
+    commit = _git(root, "rev-parse", "HEAD").stdout.strip()
+    repository = bind_repository(root)
+    checkout = create_detached_checkout(
+        repository,
+        root / ".worktree" / "eval" / "filter-drift" / "candidate",
+        commit,
+    )
+    marker = tmp_path / "filter-driver-ran"
+    _git(root, "config", "extensions.worktreeConfig", "true")
+    _git(
+        checkout.path,
+        "config",
+        "--worktree",
+        "filter.runtime.clean",
+        f"sh -c 'touch {shlex.quote(str(marker))}; cat'",
+    )
+
+    with pytest.raises(WorktreeError, match="filter"):
+        validate_detached_checkout(repository, checkout)
+
+    assert not marker.exists()
+
+
 def test_remove_returns_false_and_preserves_dirty_checkout(tmp_path: Path) -> None:
     root = tmp_path / "repository"
     commit, _tree = _init_repository(root)

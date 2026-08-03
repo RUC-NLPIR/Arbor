@@ -29,6 +29,7 @@ from .worktrees import (
     CheckoutBinding,
     ExecutionBundle,
     RepositoryBinding,
+    WorktreeError,
     bind_repository,
     validate_execution_bundle,
 )
@@ -249,15 +250,6 @@ def run(workspace: str, run_id: str) -> int:
     if final_path.exists():
         return 0
 
-    execution_root = root
-    bundle_binding: tuple[RepositoryBinding, ExecutionBundle] | None = None
-    if "execution_bundle" in manifest:
-        execution_root, repository, bundle = _execution_bundle_binding(root, manifest)
-        bundle_binding = repository, bundle
-    cwd = (execution_root / str(manifest["cwd"])).resolve()
-    cwd.relative_to(execution_root)
-    if not cwd.is_dir():
-        raise ValueError("manifest cwd is unavailable")
     stdout_path = runtime / "stdout.log"
     stderr_path = runtime / "stderr.log"
     runtime.mkdir(parents=True, exist_ok=True)
@@ -286,6 +278,17 @@ def run(workspace: str, run_id: str) -> int:
     popen_options: dict[str, Any] = {}
     actual_environment_sha256 = _environment_sha256()
     try:
+        execution_root = root
+        bundle_binding: tuple[RepositoryBinding, ExecutionBundle] | None = None
+        if "execution_bundle" in manifest:
+            execution_root, repository, bundle = _execution_bundle_binding(
+                root, manifest
+            )
+            bundle_binding = repository, bundle
+        cwd = (execution_root / str(manifest["cwd"])).resolve()
+        cwd.relative_to(execution_root)
+        if not cwd.is_dir():
+            raise ValueError("manifest cwd is unavailable")
         profile = manifest.get("security_profile")
         if profile == "isolated-linux":
             raw_limits = manifest.get("isolation_limits")
@@ -331,6 +334,7 @@ def run(workspace: str, run_id: str) -> int:
         OSError,
         subprocess.SubprocessError,
         TypeError,
+        WorktreeError,
         ValueError,
     ) as error:
         _finish(

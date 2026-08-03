@@ -705,7 +705,69 @@ def test_runner_revalidates_both_trees_immediately_before_spawn(
     assert events == ["validated-both-trees", "spawn"]
 
 
-@pytest.mark.parametrize("drift", ("path", "symlink", "head", "tree", "filter"))
+@pytest.mark.parametrize("missing_checkout", ("candidate", "apparatus"))
+def test_bundle_runner_finalizes_missing_checkout_marker_without_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_checkout: str,
+) -> None:
+    _repository, bundle = _create_test_execution_bundle(
+        tmp_path,
+        f"EVAL-missing-{missing_checkout}-marker",
+    )
+    service = RunService(tmp_path)
+    manifest = service.prepare_bundle(
+        bundle,
+        ["/usr/bin/python3", "-c", "pass"],
+        cwd=".",
+        timeout_seconds=10,
+        success_exit_codes=[0],
+        idempotency_key=f"bundle-missing-{missing_checkout}-marker",
+        actor="test-principal",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    checkout = getattr(bundle, missing_checkout)
+    (checkout.path / ".git").unlink()
+    spawned = False
+    real_popen = runner_module.subprocess.Popen
+
+    def observe_spawn(*args: object, **kwargs: object):
+        nonlocal spawned
+        if args and args[0] == manifest["argv"]:
+            spawned = True
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", observe_spawn)
+
+    assert runner_module.run(str(tmp_path), run_id) == 1
+
+    final = json.loads(
+        (tmp_path / "runs" / run_id / "final.json").read_text(encoding="utf-8")
+    )
+    assert final["state"] == "failed_process"
+    assert "process launch failed" in final["error"]
+    assert service.status(run_id, reconcile=False)["state"] == "failed_process"
+    assert spawned is False
+    assert bundle.candidate.path.is_dir()
+    assert bundle.apparatus.path.is_dir()
+    assert bundle.temp.is_dir()
+    registrations = _git(tmp_path, "worktree", "list", "--porcelain")
+    assert str(bundle.candidate.path) in registrations
+    assert str(bundle.apparatus.path) in registrations
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "path",
+        "symlink",
+        "head",
+        "tree",
+        "filter",
+        "candidate-filter",
+        "apparatus-filter",
+    ),
+)
 def test_bundle_run_rejects_path_symlink_head_tree_or_filter_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -714,7 +776,13 @@ def test_bundle_run_rejects_path_symlink_head_tree_or_filter_drift(
     _repository, bundle = _create_test_execution_bundle(
         tmp_path,
         f"EVAL-drift-{drift}",
-        candidate_files={"candidate.txt": "candidate\n"},
+        candidate_files={
+            "candidate.txt": "candidate\n",
+            ".gitattributes": (
+                "candidate.txt filter=runtime\n"
+                "apparatus.txt filter=runtime\n"
+            ),
+        },
     )
     service = RunService(tmp_path)
     manifest = service.prepare_bundle(
@@ -727,6 +795,7 @@ def test_bundle_run_rejects_path_symlink_head_tree_or_filter_drift(
         actor="test-principal",
     )
     run_id = _mark_runner_launched(tmp_path, service, manifest)
+    driver_marker: Path | None = None
     if drift == "path":
         (bundle.root / "unexpected").mkdir()
     elif drift == "symlink":
@@ -741,8 +810,20 @@ def test_bundle_run_rejects_path_symlink_head_tree_or_filter_drift(
             "drifted apparatus bytes\n",
             encoding="utf-8",
         )
-    else:
+    elif drift == "filter":
         _git(tmp_path, "config", "filter.runtime.smudge", "cat")
+    else:
+        checkout_name = drift.removesuffix("-filter")
+        checkout = getattr(bundle, checkout_name)
+        driver_marker = tmp_path / f"{checkout_name}-filter-driver-ran"
+        _git(tmp_path, "config", "extensions.worktreeConfig", "true")
+        _git(
+            checkout.path,
+            "config",
+            "--worktree",
+            "filter.runtime.clean",
+            f"sh -c 'touch {driver_marker}; cat'",
+        )
     spawned = False
     real_popen = runner_module.subprocess.Popen
 
@@ -763,6 +844,7 @@ def test_bundle_run_rejects_path_symlink_head_tree_or_filter_drift(
     assert final["manifest_sha256"] == manifest["manifest_sha256"]
     assert "process launch failed" in final["error"]
     assert spawned is False
+    assert driver_marker is None or not driver_marker.exists()
     assert bundle.candidate.path.is_dir()
     assert bundle.apparatus.path.is_dir()
     registrations = _git(tmp_path, "worktree", "list", "--porcelain")

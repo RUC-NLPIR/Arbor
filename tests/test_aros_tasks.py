@@ -172,6 +172,30 @@ def test_permission_probe_observes_mode_when_fchmod_is_unsupported(
     assert set(runtime.iterdir()) == entries_before
 
 
+def test_permission_probe_never_enforces_when_fchmod_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    runtime = tmp_path / ".aros"
+    entries_before = set(runtime.iterdir())
+
+    def unsupported(_descriptor: int, _mode: int) -> None:
+        raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
+
+    monkeypatch.setattr(tasks_module.os, "fchmod", unsupported)
+
+    evidence = tasks_module._probe_filesystem_permissions(runtime)
+
+    assert evidence == {
+        "requested_mode": 0o600,
+        "observed_mode": 0o600,
+        "device": runtime.stat().st_dev,
+        "enforced": False,
+    }
+    assert set(runtime.iterdir()) == entries_before
+
+
 def test_permission_probe_rejects_other_fchmod_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

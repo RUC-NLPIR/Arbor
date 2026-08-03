@@ -2857,12 +2857,14 @@ def _record_sha256(record: dict[str, object], hash_field: str) -> str:
         raise TaskError("task execution record must be canonical UTF-8 JSON") from error
 
 
-def _request_file_mode(descriptor: int, mode: int) -> None:
+def _request_file_mode(descriptor: int, mode: int) -> bool:
     try:
         os.fchmod(descriptor, mode)
     except OSError as error:
         if error.errno not in _UNSUPPORTED_FILE_MODE_ERRNOS:
             raise
+        return False
+    return True
 
 
 def _probe_filesystem_permissions(runtime: Path) -> dict[str, object]:
@@ -2885,7 +2887,7 @@ def _probe_filesystem_permissions(runtime: Path) -> dict[str, object]:
         os.close(descriptor)
         raise TaskError(f"unable to inspect filesystem permission probe: {path}") from error
     try:
-        _request_file_mode(descriptor, 0o600)
+        mode_supported = _request_file_mode(descriptor, 0o600)
         observed = os.fstat(descriptor)
         pathname = path.lstat()
         if (
@@ -2901,7 +2903,7 @@ def _probe_filesystem_permissions(runtime: Path) -> dict[str, object]:
             "requested_mode": 0o600,
             "observed_mode": stat.S_IMODE(observed.st_mode),
             "device": observed.st_dev,
-            "enforced": stat.S_IMODE(observed.st_mode) == 0o600,
+            "enforced": mode_supported and stat.S_IMODE(observed.st_mode) == 0o600,
         }
     except OSError as error:
         raise TaskError(f"unable to observe filesystem permissions: {path}") from error

@@ -135,6 +135,62 @@ def test_service_observes_filesystem_permissions_once_per_instance(
     assert second._filesystem_permissions_enforced is False
 
 
+@pytest.mark.parametrize(
+    "unsupported_errno",
+    sorted(
+        {
+            errno.EOPNOTSUPP,
+            getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+            errno.ENOSYS,
+        }
+    ),
+)
+def test_permission_probe_observes_mode_when_fchmod_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsupported_errno: int,
+) -> None:
+    _init_workspace(tmp_path)
+    runtime = tmp_path / ".aros"
+    entries_before = set(runtime.iterdir())
+    original_fchmod = tasks_module.os.fchmod
+
+    def unsupported(descriptor: int, _mode: int) -> None:
+        original_fchmod(descriptor, 0o666)
+        raise OSError(unsupported_errno, os.strerror(unsupported_errno))
+
+    monkeypatch.setattr(tasks_module.os, "fchmod", unsupported)
+
+    evidence = tasks_module._probe_filesystem_permissions(runtime)
+
+    assert evidence == {
+        "requested_mode": 0o600,
+        "observed_mode": 0o666,
+        "device": runtime.stat().st_dev,
+        "enforced": False,
+    }
+    assert set(runtime.iterdir()) == entries_before
+
+
+def test_permission_probe_rejects_other_fchmod_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    runtime = tmp_path / ".aros"
+    entries_before = set(runtime.iterdir())
+
+    def denied(_descriptor: int, _mode: int) -> None:
+        raise OSError(errno.EPERM, os.strerror(errno.EPERM))
+
+    monkeypatch.setattr(tasks_module.os, "fchmod", denied)
+
+    with pytest.raises(TaskError, match="observe filesystem permissions"):
+        tasks_module._probe_filesystem_permissions(runtime)
+
+    assert set(runtime.iterdir()) == entries_before
+
+
 def _request_from_brief(brief: dict[str, object]) -> dict[str, object]:
     return {
         field: brief[field]
@@ -2077,6 +2133,74 @@ def test_create_restricts_existing_plain_lock_files_to_mode_0600(
     _create(service, key=key)
 
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in lock_paths)
+
+
+@pytest.mark.parametrize(
+    "unsupported_errno",
+    sorted(
+        {
+            errno.EOPNOTSUPP,
+            getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+            errno.ENOSYS,
+        }
+    ),
+)
+def test_durable_lock_accepts_unsupported_fchmod_without_losing_integrity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsupported_errno: int,
+) -> None:
+    _init_workspace(tmp_path)
+    TaskService(tmp_path)
+    locks = tmp_path / ".aros" / "locks"
+    locks.mkdir()
+    lock = locks / "unsupported-mode.lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o666)
+    synced: list[Path] = []
+    original_fsync = tasks_module.os.fsync
+
+    def unsupported(_descriptor: int, _mode: int) -> None:
+        raise OSError(unsupported_errno, os.strerror(unsupported_errno))
+
+    def record_sync(descriptor: int) -> None:
+        synced.append(Path(f"/proc/self/fd/{descriptor}").resolve())
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(tasks_module.os, "fchmod", unsupported)
+    monkeypatch.setattr(tasks_module.os, "fsync", record_sync)
+
+    tasks_module._ensure_durable_lock_file(lock, "test durable lock")
+    with tasks_module.file_lock(lock):
+        pass
+
+    assert lock in synced
+    assert lock.stat().st_nlink == 1
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o666
+
+
+def test_durable_lock_rejects_other_fchmod_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    TaskService(tmp_path)
+    locks = tmp_path / ".aros" / "locks"
+    locks.mkdir()
+    lock = locks / "denied-mode.lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o666)
+
+    def denied(_descriptor: int, _mode: int) -> None:
+        raise OSError(errno.EPERM, os.strerror(errno.EPERM))
+
+    monkeypatch.setattr(tasks_module.os, "fchmod", denied)
+
+    with pytest.raises(TaskError, match="sync.*durable lock"):
+        tasks_module._ensure_durable_lock_file(lock, "test durable lock")
+
+    assert lock.stat().st_nlink == 1
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o666
 
 
 def test_create_rejects_a_hardlinked_lock_before_changing_its_mode(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -168,6 +169,11 @@ _TASK_RUNNER_BOOTSTRAP = (
     "sys.path.insert(0,controlled);"
     "runpy.run_module('arbor.aros.task_runner',run_name='__main__')"
 )
+_UNSUPPORTED_FILE_MODE_ERRNOS = {
+    errno.ENOSYS,
+    getattr(errno, "ENOTSUP", errno.ENOSYS),
+    getattr(errno, "EOPNOTSUPP", errno.ENOSYS),
+}
 
 
 class TaskError(ValueError):
@@ -2851,6 +2857,14 @@ def _record_sha256(record: dict[str, object], hash_field: str) -> str:
         raise TaskError("task execution record must be canonical UTF-8 JSON") from error
 
 
+def _request_file_mode(descriptor: int, mode: int) -> None:
+    try:
+        os.fchmod(descriptor, mode)
+    except OSError as error:
+        if error.errno not in _UNSUPPORTED_FILE_MODE_ERRNOS:
+            raise
+
+
 def _probe_filesystem_permissions(runtime: Path) -> dict[str, object]:
     _require_plain_directory(runtime, "AROS runtime directory")
     path = runtime / f".task-permission-probe-{secrets.token_hex(16)}"
@@ -2871,7 +2885,7 @@ def _probe_filesystem_permissions(runtime: Path) -> dict[str, object]:
         os.close(descriptor)
         raise TaskError(f"unable to inspect filesystem permission probe: {path}") from error
     try:
-        os.fchmod(descriptor, 0o600)
+        _request_file_mode(descriptor, 0o600)
         observed = os.fstat(descriptor)
         pathname = path.lstat()
         if (
@@ -3368,7 +3382,7 @@ def _ensure_durable_lock_file(path: Path, description: str) -> None:
         if (metadata.st_dev, metadata.st_ino) != _plain_file_identity(path, description):
             raise TaskError(f"{description} identity changed while opening: {path}")
         if stat.S_IMODE(metadata.st_mode) != 0o600:
-            os.fchmod(descriptor, 0o600)
+            _request_file_mode(descriptor, 0o600)
         os.fsync(descriptor)
     except OSError as error:
         raise TaskError(f"unable to sync {description}: {path}") from error

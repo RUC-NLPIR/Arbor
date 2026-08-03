@@ -294,15 +294,16 @@ def _remove_json_temp_aliases(
 
 
 def _durable_mkdir(path: Path) -> None:
-    missing: list[Path] = []
-    current = path
-    while not current.exists():
-        missing.append(current)
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
     path.mkdir(parents=True, exist_ok=True)
-    for directory in reversed(missing):
-        _fsync_directory(directory.parent)
+    _fsync_directory_chain(path)
+
+
+def _fsync_directory_chain(path: Path) -> None:
+    device = path.stat().st_dev
+    directory = path
+    while True:
         _fsync_directory(directory)
+        parent = directory.parent
+        if parent == directory or parent.stat().st_dev != device:
+            return
+        directory = parent

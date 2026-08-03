@@ -9,6 +9,7 @@ import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import BinaryIO, Callable
 
 import pytest
@@ -159,6 +160,69 @@ def test_json_writes_fsync_each_new_ancestor_directory(
     assert tmp_path / "first" / "second" in synced
     assert read_json(target) == {"value": 1}
     assert _temporary_paths(target) == []
+
+
+def test_create_json_retry_fsyncs_existing_directory_chain_after_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "first" / "second" / "record.json"
+
+    class InjectedCrash(RuntimeError):
+        pass
+
+    def crash_before_first_directory_fsync(_path: Path) -> None:
+        raise InjectedCrash
+
+    monkeypatch.setattr(
+        store_module,
+        "_fsync_directory",
+        crash_before_first_directory_fsync,
+    )
+    with pytest.raises(InjectedCrash):
+        create_json(target, {"value": 1})
+    assert target.parent.is_dir()
+    assert not target.exists()
+
+    synced: list[Path] = []
+    monkeypatch.setattr(store_module, "_fsync_directory", synced.append)
+
+    assert create_json(target, {"value": 1}) is True
+
+    device = target.parent.stat().st_dev
+    expected: list[Path] = []
+    directory = target.parent
+    while True:
+        expected.append(directory)
+        parent = directory.parent
+        if parent == directory or parent.stat().st_dev != device:
+            break
+        directory = parent
+    assert synced[: len(expected)] == expected
+
+
+def test_fsync_directory_chain_stops_at_device_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leaf = tmp_path / "leaf"
+    leaf.mkdir()
+    device = leaf.stat().st_dev
+    boundary = tmp_path.parent
+    real_stat = Path.stat
+
+    def stat_with_boundary(path: Path, *args: object, **kwargs: object) -> object:
+        if path == boundary:
+            return SimpleNamespace(st_dev=device + 1)
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    synced: list[Path] = []
+    monkeypatch.setattr(Path, "stat", stat_with_boundary)
+    monkeypatch.setattr(store_module, "_fsync_directory", synced.append)
+
+    store_module._fsync_directory_chain(leaf)
+
+    assert synced == [leaf, tmp_path]
 
 
 def test_read_json_recovers_same_inode_temp_alias_after_process_crash(

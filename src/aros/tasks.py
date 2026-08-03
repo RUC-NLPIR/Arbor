@@ -1243,15 +1243,26 @@ class TaskService:
         )
         if changed_in_return != relative.encode("utf-8") + b"\0":
             raise TaskError(f"task return commit must change only {relative}")
+        tree = self._safe_git_bytes(
+            "ls-tree",
+            "-z",
+            return_commit,
+            "--",
+            relative,
+        )
+        entries = tree.split(b"\0")
+        if len(entries) != 2 or entries[1] or not entries[0]:
+            raise TaskError(f"task return path is ambiguous in Git tree: {task_id}")
+        metadata, separator, path = entries[0].partition(b"\t")
+        fields = metadata.split(b" ")
         if (
-            self._safe_git_text(
-                "cat-file",
-                "-t",
-                f"{return_commit}:{relative}",
-            )
-            != "blob"
+            not separator
+            or len(fields) != 3
+            or path != relative.encode("utf-8")
+            or fields[0] not in {b"100644", b"100755"}
+            or fields[1] != b"blob"
         ):
-            raise TaskError(f"task return path is not a Git blob: {task_id}")
+            raise TaskError(f"task return path must be a regular Git file: {task_id}")
         blob = self._safe_git_bytes(
             "cat-file",
             "blob",

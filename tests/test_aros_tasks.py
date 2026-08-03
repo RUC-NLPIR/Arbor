@@ -3013,6 +3013,44 @@ def test_collect_rejects_a_non_return_only_or_multiparent_r(
     assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
 
 
+def test_collect_rejects_a_return_symlink_whose_target_is_strict_json(
+    tmp_path: Path,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    returned, child_commit, _return_commit = _commit_child_return(
+        tmp_path,
+        brief,
+        ownership,
+    )
+    worktree = Path(str(ownership["worktree_path"]))
+    relative = f"tasks/{task_id}/return.json"
+    return_path = worktree / relative
+    _git(worktree, "reset", "--soft", child_commit)
+    return_path.unlink()
+    target = json.dumps(
+        returned,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return_path.symlink_to(target)
+    _git(worktree, "add", "--", relative)
+    _git(worktree, "commit", "-qm", "record symlink child return")
+    return_commit = _git(worktree, "rev-parse", "HEAD")
+
+    assert return_path.is_symlink()
+    assert json.loads(os.readlink(return_path)) == returned
+    assert _git(worktree, "ls-tree", return_commit, "--", relative).startswith(
+        "120000 blob "
+    )
+
+    with pytest.raises(TaskError, match="return.*regular|return.*mode"):
+        service.collect(task_id)
+
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+
+
 @pytest.mark.parametrize("material", ("modified", "staged", "untracked", "ignored"))
 def test_collect_rejects_and_preserves_all_dirty_child_material(
     tmp_path: Path,

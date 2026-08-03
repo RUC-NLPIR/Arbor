@@ -663,16 +663,15 @@ def test_reconciliation_marks_claimed_unreaped_zombie_lost(
     runtime = tmp_path / ".aros" / "tasks" / task_id
     ownership = json.loads((runtime / "ownership.json").read_text(encoding="utf-8"))
     launch = json.loads((runtime / "launch.json").read_text(encoding="utf-8"))
-    child, child_token = _spawn_unreaped_zombie_session_leader()
+    runner, runner_token = _spawn_unreaped_zombie_session_leader()
+    adapter_process, adapter_token = _spawn_unreaped_zombie_session_leader()
     try:
-        runner_token = process_start_token(os.getpid())
-        assert runner_token is not None
         execution = task_runner_module.create_execution_claim(
             service,
             brief,
             ownership,
             launch,
-            (os.getpid(), os.getpgid(os.getpid()), runner_token),
+            (runner, runner, runner_token),
         )
         assert execution is not None
         adapter = task_runner_module.create_adapter_claim(
@@ -681,7 +680,7 @@ def test_reconciliation_marks_claimed_unreaped_zombie_lost(
             ownership,
             launch,
             execution,
-            (child, child, child_token),
+            (adapter_process, adapter_process, adapter_token),
             str(launch["launched_at"]),
         )
         running = task_runner_module.running_status_from_claims(
@@ -697,8 +696,94 @@ def test_reconciliation_marks_claimed_unreaped_zombie_lost(
 
         assert reconciled["state"] == "lost"
         assert reconciled["reason"] == "process_absent_without_final_receipt"
+        assert service.start(task_id)["state"] == "lost"
+        assert not (runtime / "final.json").exists()
     finally:
-        os.waitpid(child, 0)
+        os.waitpid(runner, 0)
+        os.waitpid(adapter_process, 0)
+
+
+def test_reconciliation_keeps_dead_adapter_running_while_runner_finalizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "Path('adapter.ready').touch()\n"
+        "while not Path('adapter.exit').exists():\n"
+        "    time.sleep(0.01)\n"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", code],
+        key="runner-finalization-pending",
+    )
+    task_id = str(brief["task_id"])
+    original_run = tasks_module.subprocess.run
+
+    def carrier_without_runner(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if isinstance(command, list) and "new-session" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    assert service.start(task_id)["state"] == "lost"
+    monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    adapter_pid: list[int] = []
+    runner_reaped_adapter = Event()
+    release_finalization = Event()
+    original_popen_wait = task_runner_module.subprocess.Popen.wait
+
+    def pause_after_adapter_reap(
+        process: subprocess.Popen[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        result = original_popen_wait(
+            process,
+            *args,  # type: ignore[arg-type]
+            **kwargs,  # type: ignore[arg-type]
+        )
+        if adapter_pid and process.pid == adapter_pid[0]:
+            runner_reaped_adapter.set()
+            assert release_finalization.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        task_runner_module.subprocess.Popen,
+        "wait",
+        pause_after_adapter_reap,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        runner = pool.submit(run_task, tmp_path, task_id)
+        running = _wait_state(service, task_id, "running")
+        monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+        adapter_pid.append(int(running["adapter_pid"]))
+        ready_path = worktree / "adapter.ready"
+        deadline = time.monotonic() + 5
+        while not ready_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready_path.exists()
+        (worktree / "adapter.exit").touch()
+        try:
+            assert runner_reaped_adapter.wait(timeout=5)
+            assert not (runtime / "final.json").exists()
+            pending = service.status(task_id)
+            assert pending["state"] == "running"
+        finally:
+            release_finalization.set()
+        assert runner.result(timeout=5) == 0
+
+    terminal = service.status(task_id)
+    assert terminal["state"] == "completed"
+    assert terminal["exit_code"] == 0
 
 
 def test_tmux_client_timeout_remains_uncertain_and_never_invents_final(

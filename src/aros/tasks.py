@@ -1981,6 +1981,7 @@ class TaskService:
     ) -> dict[str, object]:
         from .task_runner import (
             adapter_claim_is_live,
+            execution_claim_is_live,
             launched_status,
             load_adapter_claim,
             load_execution_claim,
@@ -2024,6 +2025,8 @@ class TaskService:
         elif raw_status is not None and raw_status.get("state") in _TERMINAL_STATES:
             raise TaskError(f"terminal task is missing its final receipt: {task_id}")
 
+        execution = None
+        adapter = None
         if _path_exists(self._adapter_path(task_id)):
             execution = load_execution_claim(self, brief, ownership, launch)
             adapter = load_adapter_claim(
@@ -2043,6 +2046,24 @@ class TaskService:
                 )
                 atomic_write_json(self._status_path(task_id), running)
                 return self._load_task_status(brief, ownership)
+        elif _path_exists(self._execution_path(task_id)):
+            execution = load_execution_claim(self, brief, ownership, launch)
+
+        if execution is not None and execution_claim_is_live(execution):
+            if adapter is not None:
+                running = running_status_from_claims(
+                    brief,
+                    ownership,
+                    launch,
+                    execution,
+                    adapter,
+                )
+                atomic_write_json(self._status_path(task_id), running)
+                return self._load_task_status(brief, ownership)
+            launched = launched_status(brief, ownership, launch)
+            if raw_status != launched:
+                atomic_write_json(self._status_path(task_id), launched)
+            return launched
 
         if _seconds_since(str(launch["launched_at"])) < _LAUNCH_GRACE_SECONDS:
             launched = launched_status(brief, ownership, launch)

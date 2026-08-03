@@ -860,6 +860,36 @@ def process_status_is_live(status: dict[str, object]) -> bool:
     return _claimed_group_is_live(pid, pgid, token)
 
 
+def execution_claim_is_live(execution: dict[str, object]) -> bool:
+    pid = execution.get("runner_pid")
+    pgid = execution.get("runner_pgid")
+    token = execution.get("runner_start_token")
+    if (
+        execution.get("host") != socket.gethostname()
+        or type(pid) is not int
+        or pid <= 1
+        or type(pgid) is not int
+        or pgid <= 1
+        or not isinstance(token, str)
+    ):
+        return False
+    identity = _process_state_group_and_token(pid)
+    if (
+        identity is None
+        or identity[0] in {"Z", "X", "x"}
+        or identity[1] != pgid
+        or identity[2] != token
+    ):
+        return False
+    confirmed = _process_state_group_and_token(pid)
+    return bool(
+        confirmed is not None
+        and confirmed[0] not in {"Z", "X", "x"}
+        and confirmed[1] == pgid
+        and confirmed[2] == token
+    )
+
+
 def adapter_claim_is_live(adapter: dict[str, object]) -> bool:
     return process_status_is_live(
         {

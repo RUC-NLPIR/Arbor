@@ -136,6 +136,19 @@ def test_registry_contains_approved_aros_v1_design() -> None:
     }
 
 
+def test_registry_contains_current_wave3_eval_design() -> None:
+    by_id = {document["id"]: document for document in _load_registry()["documents"]}
+
+    assert by_id["aros-wave3-eval-design"] == {
+        "id": "aros-wave3-eval-design",
+        "title": "AROS Wave 3 Evaluation Design",
+        "path": "docs/superpowers/specs/2026-08-03-aros-wave3-eval-design.md",
+        "status": "current",
+        "authority": "implementation_baseline",
+        "agent_visibility": "on_demand",
+    }
+
+
 def test_registry_contains_current_public_aros_guide() -> None:
     by_id = {document["id"]: document for document in _load_registry()["documents"]}
 

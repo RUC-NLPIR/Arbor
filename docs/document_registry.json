@@ -18,6 +18,14 @@
       "agent_visibility": "on_demand"
     },
     {
+      "id": "aros-wave3-eval-design",
+      "title": "AROS Wave 3 Evaluation Design",
+      "path": "docs/superpowers/specs/2026-08-03-aros-wave3-eval-design.md",
+      "status": "current",
+      "authority": "implementation_baseline",
+      "agent_visibility": "on_demand"
+    },
+    {
       "id": "aros-public-guide",
       "title": "AROS Public Guide",
       "path": "docs/aros/README.md",

@@ -16,6 +16,7 @@ from typing import Any, Iterator
 
 _thread_locks_guard = threading.Lock()
 _thread_locks: dict[str, threading.RLock] = {}
+_link = os.link
 ENVIRONMENT_ALLOWLIST = (
     "CUDA_VISIBLE_DEVICES",
     "LANG",
@@ -126,7 +127,7 @@ def read_json(path: str | Path) -> Any:
 def atomic_write_json(path: str | Path, value: Any) -> None:
     """Durably replace *path* with one complete JSON document."""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _durable_mkdir(target.parent)
     payload = (
         json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
@@ -151,24 +152,32 @@ def atomic_write_json(path: str | Path, value: Any) -> None:
 def create_json(path: str | Path, value: Any) -> bool:
     """Create an immutable JSON document, returning false if it exists."""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _durable_mkdir(target.parent)
     payload = (
         json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
-    try:
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return False
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    temporary_path = Path(temporary)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        try:
+            _link(temporary_path, target, follow_symlinks=False)
+        except FileExistsError:
+            return False
         _fsync_directory(target.parent)
-    except BaseException:
-        target.unlink(missing_ok=True)
-        raise
-    return True
+        return True
+    finally:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        finally:
+            _fsync_directory(target.parent)
 
 
 @contextmanager
@@ -195,3 +204,18 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _durable_mkdir(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    path.mkdir(parents=True, exist_ok=True)
+    for directory in reversed(missing):
+        _fsync_directory(directory.parent)
+        _fsync_directory(directory)

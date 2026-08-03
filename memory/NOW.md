@@ -9,7 +9,7 @@ commissioned.
 ## Current position
 
 - Branch: `aros-wave2-child` in `/workspace/Arbor/.worktree/aros-wave2-child`.
-- Final post-review code baseline: `114da5959ae39be4b6977550ab291f9045d23679`.
+- Current post-status-fix code baseline: `68b6ddddb1d1998b6b03380118129f0906ee8255`.
 - Wave 2 Tasks 1–6 are implemented, independently reviewed, and commissioned.
 - Registered evidence: `docs/analysis/aros-wave2-child-substrate-smoke.md`.
 - Real commissioning demonstrated concurrent read/write children, launcher-exit
@@ -29,6 +29,15 @@ commissioned.
   midpoint it may complete only the exact prunable worktree registration bound
   by the persisted prune intent. It rejects unrelated prunable registrations
   and never invokes global `git worktree prune`.
+- Replaceable Run status snapshots receive at most three strict read attempts;
+  the default immutable `read_json` contract is unchanged. The pre-fix timeout
+  stress reproduced the strict-read race at iteration 43, the deterministic
+  replacement-during-read regression was RED, and the fixed stress passed
+  100/100 iterations.
+- Non-blocking shared-core caveat: runner bootstrap strict read remains; actual
+  unresolved issue is launch vs unlocked reconcile transition and must be
+  solved by serialization or immutable prelaunch transition validation, not
+  retry.
 - Task adapters are trusted-local and application-scoped, not a security
   sandbox. Network and shell capability flags are audit declarations and are
   not enforced. Secrets and untrusted adapters are unsupported. Daemonizing or
@@ -41,11 +50,14 @@ commissioned.
   the Wave 2 security claim.
 - The `254f754a122bcaea6852abc55480eff339cbe889` post-containment receipts
   remain valid for that code but are superseded for current verification.
-- Fresh verification at the exact final post-review baseline reached
-  `1177 passed, 6 skipped in 260.91s`; Tasks reached `258 passed in 122.38s`,
-  task runner reached `75 passed in 111.16s`, architecture/public-entry/registry
-  reached `227 passed in 9.61s`, and TaskTool/CLI/Principal reached
-  `46 passed in 0.93s`. Maintained Ruff, diff, and
+- The `114da5959ae39be4b6977550ab291f9045d23679` final-Wave 2 receipts remain
+  valid as prior pre-status-fix evidence and are superseded for current code
+  verification.
+- Fresh verification at the exact current baseline reached
+  `1178 passed, 6 skipped in 259.42s`; the affected five-suite gate reached `259 passed`,
+  architecture/public-entry/registry reached `227 passed in 9.72s`, and the
+  strict transient/persistent/immutable targeted gate reached
+  `3 passed in 0.71s`. Maintained Ruff, diff, and
   working-tree/commissioning-baseline lock gates are green.
 
 ## Preserved operational evidence

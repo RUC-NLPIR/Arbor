@@ -554,7 +554,7 @@ Working-tree uv.lock comparison:         unchanged
 Commissioning-baseline uv.lock comparison: unchanged
 ```
 
-## Final post-review Wave 2 verification
+## Prior final Wave 2 verification
 
 The final review added intent-bound targeted recovery for a prune interrupted
 at the worktree-removal midpoint. Recovery may complete only the exact
@@ -562,8 +562,10 @@ prunable worktree registration bound by the persisted prune intent, rejects
 unrelated prunable registrations, and never invokes global
 `git worktree prune`.
 
-The following fresh receipts cover exact code baseline
-`114da5959ae39be4b6977550ab291f9045d23679`:
+The following receipts cover exact code baseline
+`114da5959ae39be4b6977550ab291f9045d23679`. They remain valid final-Wave 2
+evidence for that code, but are superseded for current code verification by the
+post-status-fix receipts below.
 
 ```bash
 .venv/bin/python -m pytest -o addopts= -q
@@ -599,5 +601,51 @@ TaskTool/CLI/Principal:                   46 passed in 0.93s
 Maintained src/tests/scripts Ruff:       All checks passed
 Git diff-check:                          exit 0
 Working-tree uv.lock comparison:         unchanged
+Commissioning-baseline uv.lock comparison: unchanged
+```
+
+## Stable Run status verification
+
+At the pre-fix baseline, the timeout test reproduced a strict-read replacement
+race at iteration 43. A deterministic replacement-during-read regression was
+then RED. The fix is limited to replaceable Run status snapshots: RunService
+performs at most three strict reads, while the default immutable `read_json`
+contract remains unchanged. After the fix, the timeout stress passed 100/100
+iterations and the affected five-suite gate passed 259 tests.
+
+Non-blocking shared-core caveat: runner bootstrap strict read remains; actual
+unresolved issue is launch vs unlocked reconcile transition and must be solved
+by serialization or immutable prelaunch transition validation, not retry.
+
+The following fresh receipts cover exact code baseline
+`68b6ddddb1d1998b6b03380118129f0906ee8255`:
+
+```bash
+.venv/bin/python -m pytest -o addopts= -q
+
+.venv/bin/python -m pytest -o addopts= -q \
+  tests/test_aros_architecture_boundary.py \
+  tests/test_aros_public_entry.py \
+  tests/test_document_registry.py
+
+.venv/bin/ruff check src tests scripts
+git diff --check
+git diff --quiet -- uv.lock
+git diff --quiet e4db5f5602fca83dfd3003fc32fd36458feee06c -- uv.lock
+```
+
+Receipts:
+
+```text
+Baseline timeout reproduction:            strict-read race at iteration 43
+Deterministic replacement-during-read:     RED before fix
+Timeout stress:                            100/100
+Affected five-suite gate:                  259 passed
+Full suite:                                1178 passed, 6 skipped in 259.42s
+Architecture/public-entry/registry:        227 passed in 9.72s
+Strict transient/persistent/immutable:     3 passed in 0.71s
+Maintained src/tests/scripts Ruff:         All checks passed
+Git diff-check:                            exit 0
+Working-tree uv.lock comparison:           unchanged
 Commissioning-baseline uv.lock comparison: unchanged
 ```

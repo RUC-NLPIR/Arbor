@@ -38,7 +38,20 @@ class ExecutionBundle:
     apparatus: CheckoutBinding
     temp: Path
     bundle_sha256: str
+
+@dataclass(frozen=True)
+class ExistingEvaluation:
+    status: dict[str, object]
+
+@dataclass
+class ExecutionLease:
+    request: dict[str, object]
+    execution: dict[str, object]
+    lock_fd: int
 ```
+
+`ExecutionLease` is a context manager that closes/unlocks `lock_fd` exactly
+once. `ExistingEvaluation` has no lock and permits no materialization.
 
 `bundle_sha256` hashes only this portable payload; absolute paths never enter a
 manifest hash:
@@ -168,6 +181,8 @@ Add one parameterized real-thread test. The fake tmux call pauses after
 must block on the same run lock and must never publish `lost` during that pause.
 
 ```python
+import threading
+
 @pytest.mark.parametrize("operation", ("status", "reconcile"))
 def test_reconcile_waits_for_inflight_launch_lock(tmp_path, monkeypatch, operation):
     _init_clean_repo(tmp_path)
@@ -352,7 +367,7 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
 
 - [ ] **Step 1: Write RED tests for repository and detached checkouts**
 
-Cover real Git behavior with six exact tests:
+Cover real Git behavior with eight exact tests:
 
 - `test_detached_checkout_is_exact_clean_and_hermetic`: assert detached HEAD,
   exact commit/tree, empty porcelain status, and disabled hooks/global config.
@@ -380,6 +395,7 @@ class ExecutionBundle:
     root: Path
     candidate: CheckoutBinding
     apparatus: CheckoutBinding
+    temp: Path
     bundle_sha256: str
 ```
 
@@ -548,10 +564,13 @@ thresholds, direction, or verdict fields.
 
 Implement exactly four public-internal functions:
 `parse_visible_manifest(value)`, `parse_scalar_metric(raw, contract)`,
-`build_measurement_receipt(request, run_final, measurement_state,
-measurement, bundle_cleanup_state)`, and `validate_measurement_receipt(value)`.
+`build_measurement_receipt(request, execution, run_link, run_final,
+measurement_state, measurement, bundle_cleanup_state)`, and
+`validate_measurement_receipt(value)`.
 `build_measurement_receipt` emits exactly the fixed receipt fields above and
-enforces the state-pairing table before hashing. All return new plain
+copies `execution_sha256` and every Run/bundle lineage hash only from the
+validated execution/link/final records, then enforces the state-pairing table
+before hashing. All return new plain
 dictionaries; none mutates input or imports Agent/provider code.
 
 - [ ] **Step 4: Verify GREEN**
@@ -584,7 +603,9 @@ Add exact tests named
 `test_eval_id_is_full_idempotency_digest_and_request_is_create_once`,
 `test_same_key_different_request_rejects_without_materialization`, and
 `test_execution_claim_is_local_one_attempt_and_never_transfers`, plus
-`test_existing_released_claim_returns_lost_before_bundle_or_run_creation`.
+`test_existing_released_claim_returns_lost_before_bundle_or_run_creation`,
+`test_crash_after_request_before_claim_is_irrevocably_lost`, and
+`test_concurrent_same_key_publishes_one_request_and_one_claim`.
 
 - [ ] **Step 2: Verify RED**
 
@@ -596,18 +617,24 @@ Add exact tests named
 
 Add `EvalService.register(manifest_ref, *, actor)`, private
 `_publish_request(evaluator_id, version, candidate_commit, actor,
-idempotency_key)`, and private `_claim_execution(request)` context manager.
-They return validated copies of exact persisted records; none creates a bundle,
-prepares a Run, or starts a process.
+idempotency_key) -> tuple[dict[str, object], bool]`, and private
+`_begin_execution(evaluator_id, version, candidate_commit, actor,
+idempotency_key) -> ExecutionLease | ExistingEvaluation`. None creates a
+bundle, prepares a Run, or starts a process.
 
 `register` reads exact Git blobs and publishes one descriptor below
 `.aros/evaluators/`. Evaluation IDs have the exact form
 `EVAL-<64-lowercase-hex>`. `_publish_request` writes only
-`.aros/evaluations/<eval-id>/request.json`. `_claim_execution` first acquires
-the per-evaluation flock nonblocking, then publishes `execution.json`, and holds
-the flock until its context exits. If an execution claim already exists and no
-receipt exists, callers return its current factual state (`running` while the
-holder/lock is live, otherwise `lost`) before any bundle or Run side effect.
+`.aros/evaluations/<eval-id>/request.json` and returns `created=True` only to
+the winning creator. `_begin_execution` holds the idempotency-key lock across
+request publication, per-evaluation flock acquisition, and `execution.json`
+publication. Only `created=True` may produce `ExecutionLease`; then the
+idempotency lock is released while `ExecutionLease` keeps the execution flock
+held. Every existing request returns `ExistingEvaluation`: receipt if present,
+running if its claim/lock is live, otherwise `lost`. An existing request with
+no execution claim is always `lost`; it never becomes a fresh winner. Thus a
+crash in the request-to-claim window releases both locks and cannot transfer
+the attempt.
 The eventual measurement receipt lives at
 `eval/evaluations/<eval-id>/receipt.json`. Crash injection tests cover request
 publication and claim publication; recovery never transfers the claim.
@@ -650,6 +677,10 @@ Add exact tests named
 `test_verified_run_output_rejects_symlink_hardlink_hash_size_and_read_race`,
 and `test_eval_module_has_no_process_or_process_final_implementation`.
 
+The architecture guard is a pre-implementation characterization and may pass
+immediately; the behavioral Eval/output tests must fail for the missing
+composition and verified-read behavior before production changes.
+
 - [ ] **Step 2: Verify RED**
 
 ```bash
@@ -661,12 +692,11 @@ and `test_eval_module_has_no_process_or_process_final_implementation`.
 
 - [ ] **Step 3: Add the foreground composition**
 
-`EvalService.run` publishes/loads `request.json` first. If a receipt exists it
-returns it. If an execution claim already exists without a receipt it returns
-running/lost before any materialization. Only the fresh winner enters
-`_claim_execution`; while holding that lock it creates and validates the bundle,
-calls `RunService.prepare_bundle`, publishes `run.json`, then calls
-`RunService.start` once. Add fault injection immediately before/after bundle
+`EvalService.run` calls `_begin_execution` before every other side effect. An
+`ExistingEvaluation` is returned directly as receipt/running/lost. Only an
+`ExecutionLease` winner may continue; while holding that lock it creates and
+validates the bundle, calls `RunService.prepare_bundle`, publishes `run.json`,
+then calls `RunService.start` once. Add fault injection immediately before/after bundle
 creation, Run prepare, run-link publication, and Run start. Every replay proves
 the same key creates at most one bundle and one Run.
 
@@ -675,10 +705,13 @@ After start, it polls only `RunService.status` while the referenced state is
 Each active poll waits 20 milliseconds; observer callers use the same factual
 status API rather than a second watcher loop.
 After a terminal Run state it calls `_publish_visible_receipt` once. No branch
-calls `prepare_visible` or `start` after a released prior execution claim.
+calls `RunService.prepare_bundle` or `RunService.start` after an
+`ExistingEvaluation` result or a released prior execution claim.
 
 Add `RunService.read_verified_output(run_id, stream, max_bytes=65536) -> bytes`.
-It loads the validated final receipt, `lstat`s the declared log as a regular
+It requires the receipt path to equal the canonical
+f-string `.aros/runs/{run_id}/{stream}.log` before any filesystem access. It loads the
+validated final receipt, `lstat`s that canonical log as a regular
 single-link file, opens with `O_RDONLY|O_NOFOLLOW`, compares `fstat` identity,
 rejects a declared size above the bound, reads exactly the declared byte count,
 checks SHA-256, and repeats path identity/link/type checks after reading.
@@ -697,6 +730,10 @@ failed/timed-out/cancelled Run remains `not_available`. No metric from a dirty
 bundle is accepted. A crash
 after clean removal but before receipt publication is `lost` and never causes
 re-parsing during recovery.
+If bundle removal raises after only one targeted checkout was removed, Eval
+publishes no receipt; releasing the execution lock makes the evaluation
+`lost`, and the remaining checkout/registration is preserved exactly for
+audit. Status and replay never resume cleanup.
 
 The architecture test parses `src/aros/eval.py` and rejects direct imports or
 calls of `subprocess`, `Popen`, tmux, `killpg`, `prctl`, process status writers,
@@ -885,6 +922,25 @@ for _attempt in $(seq 1 200); do
   sleep 0.05
 done
 test -f "$PROJECT/.aros/evaluations/$EVAL_ID/run.json"
+RUN_ID=$(/workspace/Arbor/.venv/bin/python -c \
+  'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["run_id"])' \
+  "$PROJECT/.aros/evaluations/$EVAL_ID/run.json")
+for _attempt in $(seq 1 200); do
+  RUN_STATE=$(/workspace/Arbor/.venv/bin/python -c \
+    'import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); print(json.loads(p.read_text())["state"] if p.exists() else "")' \
+    "$PROJECT/.aros/runs/$RUN_ID/status.json")
+  READY=$(/workspace/Arbor/.venv/bin/python -c \
+    'import pathlib,sys; p=pathlib.Path(sys.argv[1]); print("yes" if p.exists() and "broker-ready" in p.read_text() else "no")' \
+    "$PROJECT/.aros/runs/$RUN_ID/stderr.log")
+  if test "$RUN_STATE" = "running"; then
+    if test "$READY" = "yes"; then
+      break
+    fi
+  fi
+  sleep 0.05
+done
+test "$RUN_STATE" = "running"
+test "$READY" = "yes"
 kill -KILL "$BROKER_PID"
 wait "$BROKER_PID" || test "$?" -eq 137
 BEFORE_RUNS=$(find "$PROJECT/runs" -name manifest.json -print | sort)
@@ -892,11 +948,55 @@ aros eval status "$EVAL_ID" --cwd "$PROJECT"
 test "$(find "$PROJECT/runs" -name manifest.json -print | sort)" = "$BEFORE_RUNS"
 ```
 
-Invoke the same `aros eval run` command/key once more; it must return lost and
-the Run manifest list must remain byte-identical. Release/stop the independently
-running Run explicitly with `aros run stop <run-id> --reason commissioning`,
-then invoke a new idempotency key and prove it creates
-one new Eval/Run. Show:
+Invoke the same key exactly and verify the returned projection plus Run list:
+
+```bash
+REPLAY_OUT="$PROJECT/../visible-lost-replay.json"
+aros eval run quality 1 "$CANDIDATE" \
+  --idempotency-key visible-lost-1 --cwd "$PROJECT" >"$REPLAY_OUT"
+/workspace/Arbor/.venv/bin/python -c \
+  'import json,sys; assert json.load(open(sys.argv[1]))["evaluation_state"] == "lost"' \
+  "$REPLAY_OUT"
+test "$(find "$PROJECT/runs" -name manifest.json -print | sort)" = "$BEFORE_RUNS"
+aros run stop "$RUN_ID" --reason commissioning --cwd "$PROJECT"
+
+RUN_COUNT_BEFORE=$(find "$PROJECT/runs" -name manifest.json -print | wc -l)
+aros eval run quality 1 "$CANDIDATE" \
+  --idempotency-key visible-lost-2 --cwd "$PROJECT" \
+  >"$PROJECT/../visible-new-key.out" 2>"$PROJECT/../visible-new-key.err" &
+NEW_BROKER_PID=$!
+NEW_EVAL_ID=$(/workspace/Arbor/.venv/bin/python -c \
+  'import hashlib; print("EVAL-" + hashlib.sha256(b"visible-lost-2").hexdigest())')
+for _attempt in $(seq 1 200); do
+  if test -f "$PROJECT/.aros/evaluations/$NEW_EVAL_ID/run.json"; then
+    break
+  fi
+  sleep 0.05
+done
+test -f "$PROJECT/.aros/evaluations/$NEW_EVAL_ID/run.json"
+NEW_RUN_ID=$(/workspace/Arbor/.venv/bin/python -c \
+  'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["run_id"])' \
+  "$PROJECT/.aros/evaluations/$NEW_EVAL_ID/run.json")
+for _attempt in $(seq 1 200); do
+  NEW_RUN_STATE=$(/workspace/Arbor/.venv/bin/python -c \
+    'import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); print(json.loads(p.read_text())["state"] if p.exists() else "")' \
+    "$PROJECT/.aros/runs/$NEW_RUN_ID/status.json")
+  if test "$NEW_RUN_STATE" = "running"; then
+    break
+  fi
+  sleep 0.05
+done
+test "$NEW_RUN_STATE" = "running"
+RUN_COUNT_AFTER=$(find "$PROJECT/runs" -name manifest.json -print | wc -l)
+test "$RUN_COUNT_AFTER" -eq "$((RUN_COUNT_BEFORE + 1))"
+kill -KILL "$NEW_BROKER_PID"
+wait "$NEW_BROKER_PID" || test "$?" -eq 137
+aros run stop "$NEW_RUN_ID" --reason commissioning --cwd "$PROJECT"
+```
+
+After recording preservation evidence, validate/clean the stopped commissioning
+bundles with the same clean-only helper and prove the commissioning project Git
+status is restored. Show:
 
 ```text
 evaluation_state = lost

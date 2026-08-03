@@ -1711,6 +1711,186 @@ def test_timeout_terminates_persistent_descendant_after_leader_exits(
         _assert_processes_stop(descendant_pid)
 
 
+@pytest.mark.parametrize("release_group", (True, False), ids=("drains", "stuck"))
+def test_timeout_waits_for_claimed_group_drain_after_kill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_group: bool,
+) -> None:
+    code = (
+        "import signal,time;"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+        "time.sleep(30)"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", code],
+        timeout_seconds=0.2,
+        key=f"post-kill-drain-{release_group}",
+    )
+    task_id = str(brief["task_id"])
+    original_run = tasks_module.subprocess.run
+
+    def carrier_without_runner(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if isinstance(command, list) and "new-session" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    assert service.start(task_id)["state"] == "lost"
+    monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
+    if not release_group:
+        monkeypatch.setattr(
+            task_runner_module,
+            "_GROUP_DRAIN_TIMEOUT_SECONDS",
+            0.1,
+            raising=False,
+        )
+
+    kill_sent = Event()
+    post_kill_check = Event()
+    release_drain = Event()
+    original_claimed_group_is_live = task_runner_module._claimed_group_is_live
+    original_signal_group = task_runner_module._signal_group
+
+    def gated_claimed_group_is_live(pid: int, pgid: int, token: str) -> bool:
+        if kill_sent.is_set():
+            post_kill_check.set()
+            if not release_drain.is_set():
+                return True
+        return original_claimed_group_is_live(pid, pgid, token)
+
+    def observe_group_signal(
+        pgid: int,
+        signal_number: int,
+        **kwargs: object,
+    ) -> bool:
+        delivered = original_signal_group(
+            pgid,
+            signal_number,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        if delivered and signal_number == signal.SIGKILL:
+            kill_sent.set()
+        return delivered
+
+    monkeypatch.setattr(
+        task_runner_module,
+        "_claimed_group_is_live",
+        gated_claimed_group_is_live,
+    )
+    monkeypatch.setattr(task_runner_module, "_signal_group", observe_group_signal)
+    final_path = tmp_path / ".aros" / "tasks" / task_id / "final.json"
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        runner = pool.submit(run_task, tmp_path, task_id)
+        try:
+            assert kill_sent.wait(timeout=5)
+            assert post_kill_check.wait(timeout=1)
+            assert not final_path.exists()
+            if release_group:
+                assert not runner.done()
+                release_drain.set()
+                assert runner.result(timeout=5) == 0
+                final = json.loads(final_path.read_text(encoding="utf-8"))
+                assert final["state"] == "timed_out"
+            else:
+                with pytest.raises(TaskError, match="group.*drain"):
+                    runner.result(timeout=5)
+                assert not final_path.exists()
+        finally:
+            release_drain.set()
+
+
+def test_concurrent_stop_delivery_signals_process_group_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code = (
+        "import signal,time;"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+        "time.sleep(30)"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", code],
+        timeout_seconds=30,
+        key="single-stop-delivery-owner",
+    )
+    task_id = str(brief["task_id"])
+    original_run = tasks_module.subprocess.run
+
+    def carrier_without_runner(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if isinstance(command, list) and "new-session" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    assert service.start(task_id)["state"] == "lost"
+    monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
+    monkeypatch.setattr(task_runner_module, "_timestamp_age", lambda _value: 2.0)
+
+    signals: list[int] = []
+    first_kill = Event()
+    release_drain = Event()
+    original_claimed_group_is_live = task_runner_module._claimed_group_is_live
+
+    def gated_claimed_group_is_live(pid: int, pgid: int, token: str) -> bool:
+        if first_kill.is_set() and not release_drain.is_set():
+            return True
+        return original_claimed_group_is_live(pid, pgid, token)
+
+    def record_group_signal(
+        _pgid: int,
+        signal_number: int,
+        **_kwargs: object,
+    ) -> bool:
+        signals.append(signal_number)
+        if signal_number == signal.SIGKILL:
+            first_kill.set()
+        return True
+
+    monkeypatch.setattr(
+        task_runner_module,
+        "_claimed_group_is_live",
+        gated_claimed_group_is_live,
+    )
+    monkeypatch.setattr(task_runner_module, "_signal_group", record_group_signal)
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    final_path = runtime / "final.json"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        runner = pool.submit(run_task, tmp_path, task_id)
+        running = _wait_state(service, task_id, "running")
+        stopper = pool.submit(
+            service.stop,
+            task_id,
+            actor="human",
+            reason="single delivery owner",
+        )
+        try:
+            assert first_kill.wait(timeout=5)
+            assert signals == [signal.SIGTERM, signal.SIGKILL]
+            assert not final_path.exists()
+        finally:
+            if _process_is_running(int(running["adapter_pid"])):
+                os.killpg(int(running["adapter_pgid"]), signal.SIGKILL)
+            release_drain.set()
+        assert stopper.result(timeout=5)["reason"] == "single delivery owner"
+        assert runner.result(timeout=5) == 0
+
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert final["state"] == "cancelled"
+    assert final["stop"]["signal_sequence"] == ["TERM", "KILL"]
+
+
 def test_stop_arriving_during_timeout_keeps_timeout_signal_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

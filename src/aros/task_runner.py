@@ -12,7 +12,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
@@ -208,6 +208,7 @@ _ALLOWED_SIGNALS = {
     "INT": signal.SIGINT,
     "KILL": signal.SIGKILL,
 }
+_GROUP_DRAIN_TIMEOUT_SECONDS = 2.0
 _PROCESS_START_TOKEN = re.compile(r"^linux-proc-start:[0-9]+$")
 _ADAPTER_LAUNCH_GATE = (
     "import os,sys;"
@@ -830,6 +831,19 @@ def _claimed_group_is_live(pid: int, pgid: int, token: str) -> bool:
     return confirmed is None or (confirmed[1] == pgid and confirmed[2] == token)
 
 
+def _wait_for_claimed_group_drain(
+    pid: int,
+    pgid: int,
+    token: str,
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while _claimed_group_is_live(pid, pgid, token):
+        if time.monotonic() >= deadline:
+            raise TaskError(f"task process group did not drain after termination: {pgid}")
+        time.sleep(0.02)
+
+
 def process_status_is_live(status: dict[str, object]) -> bool:
     pid = status.get("adapter_pid")
     pgid = status.get("adapter_pgid")
@@ -1185,6 +1199,7 @@ def _terminate_recorded_group(
     request: dict[str, object],
     *,
     grace_seconds: float = 1.0,
+    record_signal_sequence: Callable[[list[str]], None] | None = None,
 ) -> list[str]:
     pid = request["adapter_pid"]
     pgid = request["adapter_pgid"]
@@ -1217,6 +1232,13 @@ def _terminate_recorded_group(
             adapter_identity=adapter_identity,
         ):
             sequence.append("KILL")
+    if record_signal_sequence is not None:
+        record_signal_sequence(sequence)
+    if sequence:
+        _wait_for_claimed_group_drain(
+            *adapter_identity,
+            timeout_seconds=_GROUP_DRAIN_TIMEOUT_SECONDS,
+        )
     return sequence
 
 
@@ -1229,15 +1251,28 @@ def deliver_stop(service: TaskService, task_id: str) -> dict[str, object]:
         request = validate_stop_request(service, brief, ownership, launch)
         if _path_exists(service._stop_result_path(task_id)):
             return validate_stop_result(service, brief, ownership, launch)
-        sequence = _terminate_recorded_group(request)
-        return _record_stop_result(
-            service,
-            brief,
-            ownership,
-            launch,
+        recorded: dict[str, object] | None = None
+
+        def record_signal_sequence(sequence: list[str]) -> None:
+            nonlocal recorded
+            recorded = _record_stop_result(
+                service,
+                brief,
+                ownership,
+                launch,
+                request,
+                sequence,
+            )
+
+        sequence = _terminate_recorded_group(
             request,
-            sequence,
+            record_signal_sequence=record_signal_sequence,
         )
+        if recorded is None:
+            record_signal_sequence(sequence)
+        if recorded is None:
+            raise TaskError(f"task stop delivery result is unavailable: {task_id}")
+        return recorded
 
 
 def _final_record(
@@ -1426,6 +1461,19 @@ def _terminate_group(
             adapter_identity=adapter_identity,
         ):
             sequence.append("KILL")
+    if sequence and adapter_identity is not None:
+        _wait_for_claimed_group_drain(
+            *adapter_identity,
+            timeout_seconds=_GROUP_DRAIN_TIMEOUT_SECONDS,
+        )
+    elif sequence:
+        deadline = time.monotonic() + _GROUP_DRAIN_TIMEOUT_SECONDS
+        while _process_group_has_live_member(pgid):
+            if time.monotonic() >= deadline:
+                raise TaskError(
+                    f"task process group did not drain after termination: {pgid}"
+                )
+            time.sleep(0.02)
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired as error:
@@ -1797,34 +1845,15 @@ def run(workspace: str | Path, task_id: str) -> int:
                     stop_result is None
                     and _timestamp_age(stop_request["requested_at"]) >= 1.5
                 ):
-                    identity_matches = (
-                        stop_request["adapter_pid"] == adapter_identity[0]
-                        and stop_request["adapter_pgid"] == adapter_identity[1]
-                        and stop_request["adapter_start_token"] == adapter_identity[2]
-                        and process_status_is_live(stop_request)
-                    )
-                    stop_sequence = (
-                        _terminate_group(
-                            process,
-                            first_name=str(stop_request["signal"]),
-                            adapter_identity=adapter_identity,
-                        )
-                        if identity_matches
-                        else []
-                    )
-                    with file_lock(lifecycle_lock):
-                        stop_result = _record_stop_result(
-                            service,
-                            brief,
-                            ownership,
-                            launch,
-                            stop_request,
-                            stop_sequence,
-                        )
+                    stop_result = deliver_stop(service, task_id)
                 if stop_result is not None:
-                    stop_handled = True
                     if stop_result["delivered"] is True:
+                        _wait_for_claimed_group_drain(
+                            *adapter_identity,
+                            timeout_seconds=_GROUP_DRAIN_TIMEOUT_SECONDS,
+                        )
                         signal_sequence = list(stop_result["signal_sequence"])
+                    stop_handled = True
         if (
             stop_request is None
             and time.monotonic() - started_monotonic >= timeout_seconds

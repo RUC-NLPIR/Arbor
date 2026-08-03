@@ -484,7 +484,7 @@ The current implementation also uses atomic create-once JSON publication with
 interrupted-alias recovery and durable absolute directory-chain fsync. Worktree
 ownership remains non-expiring; the create-once execution claim is the local
 one-attempt execution lease. These changes were verified at code baseline
-`5254cc1d` before this evidence refresh:
+`5254cc159986d6c9eed79878356d9ab564979ab1` before this evidence refresh:
 
 ```text
 Full pytest:                              1133 passed, 6 skipped in 202.62s

@@ -2609,13 +2609,24 @@ def test_stop_race_is_not_cancelled_when_no_signal_was_delivered(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    code = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "Path('adapter.ready').touch()\n"
+        "while not Path('adapter.release').exists():\n"
+        "    time.sleep(0.01)\n"
+    )
     service, brief = _create_committed_task(
         tmp_path,
-        [sys.executable, "-c", "import time;time.sleep(0.3)"],
+        [sys.executable, "-c", code],
         timeout_seconds=10,
         key="undelivered-stop-race",
     )
     task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    ready_path = worktree / "adapter.ready"
+    release_path = worktree / "adapter.release"
     original_run = tasks_module.subprocess.run
 
     def carrier_without_runner(*args: object, **kwargs: object) -> object:
@@ -2637,16 +2648,28 @@ def test_stop_race_is_not_cancelled_when_no_signal_was_delivered(
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         runner = pool.submit(run_task, tmp_path, task_id)
-        _wait_state(service, task_id, "running")
-        service.stop(task_id, actor="human", reason="natural-exit race")
+        try:
+            running = _wait_state(service, task_id, "running")
+            deadline = time.monotonic() + 5
+            while not ready_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert ready_path.exists()
+            service.stop(task_id, actor="human", reason="natural-exit race")
+            stop_result = json.loads(
+                (runtime / "stop-result.json").read_text(encoding="utf-8")
+            )
+            assert stop_result["delivered"] is False
+            assert stop_result["signal_sequence"] == []
+            assert _process_is_running(int(running["adapter_pid"]))
+        finally:
+            release_path.touch()
         assert runner.result(timeout=5) == 0
 
     terminal = service.status(task_id)
     final = json.loads(
-        (tmp_path / ".aros" / "tasks" / task_id / "final.json").read_text(
-            encoding="utf-8"
-        )
+        (runtime / "final.json").read_text(encoding="utf-8")
     )
     assert terminal["state"] == "completed"
+    assert terminal["exit_code"] == 0
     assert final["stop"]["delivered"] is False
     assert final["signal_sequence"] == []

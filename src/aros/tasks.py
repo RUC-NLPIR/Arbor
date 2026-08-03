@@ -12,7 +12,14 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .store import create_json, file_lock, json_sha256, read_json, utc_now
+from .store import (
+    atomic_write_json,
+    create_json,
+    file_lock,
+    json_sha256,
+    read_json,
+    utc_now,
+)
 
 
 _TASK_ID = re.compile(
@@ -52,6 +59,19 @@ _STATUS_FIELDS = {
     "brief_sha256",
     "updated_at",
 }
+_READY_STATUS_FIELDS = {*_STATUS_FIELDS, "ownership_sha256"}
+_OWNERSHIP_FIELDS = {
+    "schema_version",
+    "task_id",
+    "brief_sha256",
+    "actor",
+    "worktree_path",
+    "branch",
+    "base_commit",
+    "parent_head",
+    "acquired_at",
+    "ownership_sha256",
+}
 _INDEX_FIELDS = {
     "schema_version",
     "idempotency_key_sha256",
@@ -60,6 +80,11 @@ _INDEX_FIELDS = {
     "brief_sha256",
     "created_at",
 }
+_FILTER_CONFIG_KEY = re.compile(
+    r"^filter\.(.+)\.(?:clean|smudge|process|required)$",
+    re.IGNORECASE,
+)
+_FILTER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class TaskError(ValueError):
@@ -212,25 +237,106 @@ class TaskService:
         self._validate_inventory()
         return published
 
-    def status(self, task_id: str) -> dict[str, object]:
-        """Return prepared runtime state bound to its immutable brief."""
+    def start(
+        self,
+        task_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        """Prepare one owned task worktree without launching its adapter."""
         self._validate_task_id(task_id)
-        self._load_brief(task_id)
         self._ensure_record_roots()
         publication_lock = self._publication_lock_path()
         _ensure_durable_lock_file(publication_lock, "task record publication lock")
         with file_lock(publication_lock):
-            self._reconcile_authoritative_briefs()
-            return self._status_unlocked(task_id)
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                self._reconcile_authoritative_briefs()
+                brief = self._load_brief(task_id)
+                return self._start_locked(brief, actor)
+
+    def _start_locked(
+        self,
+        brief: dict[str, object],
+        actor: str | None,
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        status = self._status_unlocked(task_id)
+        owner = _validate_text(
+            actor if actor is not None else brief["actor"],
+            "actor",
+        )
+        parent_head = self._require_startable_parent(brief)
+        if status["state"] == "worktree_ready":
+            ownership = self._load_ownership(brief)
+            if actor is not None and ownership["actor"] != owner:
+                raise TaskError(f"task ownership actor conflict: {task_id}")
+            self._require_parent_unchanged(brief, parent_head)
+            return self._load_task_status(brief, self._load_ownership(brief))
+
+        target = self._worktree_target(task_id, create_roots=True)
+        branch = f"aros/task/{task_id}"
+        self._require_unallocated_worktree(target, branch)
+        self._add_task_worktree(target, branch, str(brief["base_commit"]))
+        self._require_parent_unchanged(brief, parent_head)
+        self._validate_new_worktree(target, branch, str(brief["base_commit"]))
+
+        acquired_at = utc_now()
+        ownership: dict[str, object] = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "brief_sha256": brief["brief_sha256"],
+            "actor": owner,
+            "worktree_path": str(target),
+            "branch": branch,
+            "base_commit": brief["base_commit"],
+            "parent_head": parent_head,
+            "acquired_at": acquired_at,
+        }
+        ownership["ownership_sha256"] = _ownership_sha256(ownership)
+        ownership_path = self._ownership_path(task_id)
+        if not create_json(ownership_path, ownership):
+            raise TaskError(f"task ownership already exists: {task_id}")
+        recorded = self._load_ownership(brief)
+        if recorded != ownership:
+            raise TaskError(f"task ownership differs after write: {task_id}")
+        self._require_parent_unchanged(brief, parent_head)
+
+        ready = _worktree_ready_status(brief, recorded)
+        atomic_write_json(self._status_path(task_id), ready)
+        self._require_parent_unchanged(brief, parent_head)
+        return self._load_task_status(brief, self._load_ownership(brief))
+
+    def status(self, task_id: str) -> dict[str, object]:
+        """Return validated prepared or worktree-ready runtime state."""
+        self._validate_task_id(task_id)
+        self._ensure_record_roots()
+        publication_lock = self._publication_lock_path()
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                self._reconcile_authoritative_briefs()
+                return self._status_unlocked(task_id)
 
     def _status_unlocked(self, task_id: str) -> dict[str, object]:
         brief = self._load_brief(task_id)
         self._load_bound_idempotency_index(brief)
-        return self._load_prepared_status(brief)
+        ownership = (
+            self._load_ownership(brief)
+            if _path_exists(self._ownership_path(task_id))
+            else None
+        )
+        return self._load_task_status(brief, ownership)
 
-    def _load_prepared_status(
+    def _load_task_status(
         self,
         brief: dict[str, object],
+        ownership: dict[str, object] | None,
+        *,
+        check_material: bool = True,
     ) -> dict[str, object]:
         task_id = str(brief["task_id"])
         _require_plain_directory(self.root / ".aros", "AROS runtime directory")
@@ -240,20 +346,38 @@ class TaskService:
         runtime_directory = self.root / ".aros" / "tasks" / task_id
         _require_plain_directory(runtime_directory, "task runtime directory")
         status = _read_object(runtime_directory / "status.json", "task status")
-        if set(status) != _STATUS_FIELDS or type(status.get("schema_version")) is not int:
+        state = status.get("state")
+        fields = _READY_STATUS_FIELDS if state == "worktree_ready" else _STATUS_FIELDS
+        if set(status) != fields or type(status.get("schema_version")) is not int:
             raise TaskError(f"invalid task status schema: {task_id}")
         if status["schema_version"] != 1:
             raise TaskError(f"invalid task status schema version: {task_id}")
         if status["task_id"] != task_id:
             raise TaskError(f"task status identity mismatch: {task_id}")
-        if status["state"] != "prepared":
+        if state not in {"prepared", "worktree_ready"}:
             raise TaskError(f"invalid task status state: {task_id}")
         _validate_hash(status["brief_sha256"], "task status brief_sha256")
         if status["brief_sha256"] != brief["brief_sha256"]:
             raise TaskError(f"task status brief hash mismatch: {task_id}")
         _validate_timestamp(status["updated_at"], "task status updated_at")
-        if status["updated_at"] != brief["created_at"]:
-            raise TaskError(f"task status timestamp mismatch: {task_id}")
+        if state == "prepared":
+            if ownership is not None:
+                raise TaskError(f"prepared task has unreconciled ownership: {task_id}")
+            if status["updated_at"] != brief["created_at"]:
+                raise TaskError(f"task status timestamp mismatch: {task_id}")
+            if check_material:
+                self._require_no_unowned_worktree_material(brief)
+        else:
+            if ownership is None:
+                raise TaskError(f"worktree-ready task ownership is missing: {task_id}")
+            _validate_hash(
+                status["ownership_sha256"],
+                "task status ownership_sha256",
+            )
+            if status["ownership_sha256"] != ownership["ownership_sha256"]:
+                raise TaskError(f"task status ownership hash mismatch: {task_id}")
+            if status["updated_at"] != ownership["acquired_at"]:
+                raise TaskError(f"task status timestamp mismatch: {task_id}")
         return status
 
     def list(self) -> list[dict[str, object]]:
@@ -274,7 +398,13 @@ class TaskService:
         runtime = self._runtime_task_ids()
         if versioned != runtime:
             raise TaskError("task record inventory conflict between versioned and runtime paths")
-        return [self._status_unlocked(task_id) for task_id in sorted(versioned)]
+        statuses: list[dict[str, object]] = []
+        for task_id in sorted(versioned):
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                statuses.append(self._status_unlocked(task_id))
+        return statuses
 
     def _load_brief(self, task_id: str) -> dict[str, object]:
         self._validate_task_id(task_id)
@@ -376,12 +506,35 @@ class TaskService:
         else:
             _require_plain_directory(runtime_path, "task runtime directory")
         status_path = runtime_path / "status.json"
+        ownership_path = self._ownership_path(task_id)
         index_path = self._idempotency_index_path(key)
-        if not _path_exists(status_path):
-            create_json(status_path, _prepared_status(brief))
         if not _path_exists(index_path):
             create_json(index_path, _idempotency_index(brief, key_digest))
-        self._load_prepared_status(brief)
+        ownership = (
+            self._load_ownership(brief)
+            if _path_exists(ownership_path)
+            else None
+        )
+        if not _path_exists(status_path):
+            derived = (
+                _worktree_ready_status(brief, ownership)
+                if ownership is not None
+                else _prepared_status(brief)
+            )
+            create_json(status_path, derived)
+        elif ownership is not None:
+            status = _read_object(status_path, "task status")
+            if status.get("state") == "prepared":
+                self._load_task_status(
+                    brief,
+                    None,
+                    check_material=False,
+                )
+                atomic_write_json(
+                    status_path,
+                    _worktree_ready_status(brief, ownership),
+                )
+        self._load_task_status(brief, ownership)
         self._load_bound_idempotency_index(brief)
 
     def _reconcile_authoritative_briefs(self) -> None:
@@ -519,6 +672,598 @@ class TaskService:
             raise TaskError("duplicate task briefs use the same idempotency key")
         return matches[0] if matches else None
 
+    def _load_ownership(
+        self,
+        brief: dict[str, object],
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        ownership = _read_object(
+            self._ownership_path(task_id),
+            "task ownership",
+        )
+        if (
+            set(ownership) != _OWNERSHIP_FIELDS
+            or type(ownership.get("schema_version")) is not int
+        ):
+            raise TaskError(f"invalid task ownership schema: {task_id}")
+        if ownership["schema_version"] != 1:
+            raise TaskError(f"invalid task ownership schema version: {task_id}")
+        if ownership["task_id"] != task_id:
+            raise TaskError(f"task ownership identity mismatch: {task_id}")
+        _validate_hash(ownership["brief_sha256"], "task ownership brief_sha256")
+        if ownership["brief_sha256"] != brief["brief_sha256"]:
+            raise TaskError(f"task ownership brief hash mismatch: {task_id}")
+        actor = _validate_text(ownership["actor"], "task ownership actor")
+        if actor != ownership["actor"]:
+            raise TaskError(f"task ownership actor is not canonical: {task_id}")
+        target = self._worktree_target(task_id, create_roots=False)
+        if ownership["worktree_path"] != str(target):
+            raise TaskError(f"task ownership worktree path mismatch: {task_id}")
+        branch = f"aros/task/{task_id}"
+        if ownership["branch"] != branch:
+            raise TaskError(f"task ownership branch mismatch: {task_id}")
+        if ownership["base_commit"] != brief["base_commit"]:
+            raise TaskError(f"task ownership base commit mismatch: {task_id}")
+        parent_head = ownership["parent_head"]
+        if not isinstance(parent_head, str) or _COMMIT.fullmatch(parent_head) is None:
+            raise TaskError(f"invalid task ownership parent HEAD: {task_id}")
+        if not self._is_commit(parent_head):
+            raise TaskError(f"task ownership parent HEAD is not a commit: {task_id}")
+        _validate_timestamp(ownership["acquired_at"], "task ownership acquired_at")
+        _validate_hash(
+            ownership["ownership_sha256"],
+            "task ownership ownership_sha256",
+        )
+        if ownership["ownership_sha256"] != _ownership_sha256(ownership):
+            raise TaskError(f"task ownership hash mismatch: {task_id}")
+        self._validate_owned_worktree(ownership)
+        return ownership
+
+    def _require_startable_parent(
+        self,
+        brief: dict[str, object],
+    ) -> str:
+        self._require_git_root()
+        head = self._safe_git_text("rev-parse", "--verify", "HEAD^{commit}")
+        if _COMMIT.fullmatch(head) is None:
+            raise TaskError("task start requires a committed 40-hex parent HEAD")
+        dirty = self._safe_git_bytes(
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        )
+        if dirty:
+            raise TaskError("task start requires a clean parent workspace")
+
+        task_id = str(brief["task_id"])
+        relative = f"tasks/{task_id}/brief.json"
+        blob = self._safe_git_text(
+            "rev-parse",
+            "--verify",
+            f"{head}:{relative}",
+        )
+        if not blob or self._safe_git_text("cat-file", "-t", blob) != "blob":
+            raise TaskError(f"task start requires a committed brief at HEAD: {task_id}")
+        committed = self._safe_git_bytes("cat-file", "blob", blob)
+        working = _read_plain_bytes(
+            self.root / relative,
+            "working task brief",
+        )
+        if (
+            committed != working
+            or hashlib.sha256(committed).digest()
+            != hashlib.sha256(working).digest()
+        ):
+            raise TaskError(f"committed brief bytes mismatch working brief: {task_id}")
+        index_entries = self._safe_git_bytes("ls-files", "-v", "-z")
+        if any(
+            record[:1] == b"S" or record[:1].islower()
+            for record in index_entries.split(b"\0")
+            if record
+        ):
+            raise TaskError(
+                "task start requires an unambiguous clean parent index; "
+                "assume-unchanged and skip-worktree entries are not allowed"
+            )
+
+        base_commit = str(brief["base_commit"])
+        if not self._is_commit(base_commit):
+            raise TaskError(f"task brief base commit is not a commit: {task_id}")
+        if not self._safe_git_success(
+            "merge-base",
+            "--is-ancestor",
+            base_commit,
+            head,
+        ):
+            raise TaskError(
+                f"task brief base commit is not an ancestor of parent HEAD: {task_id}"
+            )
+        self._require_git_root()
+        if self._safe_git_text("rev-parse", "--verify", "HEAD^{commit}") != head:
+            raise TaskError("parent HEAD changed during task start validation")
+        return head
+
+    def _require_parent_unchanged(
+        self,
+        brief: dict[str, object],
+        expected_head: str,
+    ) -> None:
+        if self._require_startable_parent(brief) != expected_head:
+            raise TaskError("parent HEAD changed during task start")
+
+    def _worktree_target(self, task_id: str, *, create_roots: bool) -> Path:
+        root = self.root / ".worktree"
+        tasks = root / "tasks"
+        if create_roots:
+            _ensure_plain_directory(root, "AROS worktree root")
+            _ensure_plain_directory(tasks, "task worktree root")
+        else:
+            if _path_exists(root):
+                _require_plain_directory(root, "AROS worktree root")
+            if _path_exists(tasks):
+                _require_plain_directory(tasks, "task worktree root")
+        target = tasks / task_id
+        if not target.is_absolute() or target.parent != tasks:
+            raise TaskError(f"unsafe task worktree containment: {target}")
+        if _path_exists(tasks) and tasks.resolve(strict=True) != tasks:
+            raise TaskError(f"unsafe task worktree containment: {tasks}")
+        return target
+
+    def _require_no_unowned_worktree_material(
+        self,
+        brief: dict[str, object],
+    ) -> None:
+        task_id = str(brief["task_id"])
+        target = self._worktree_target(task_id, create_roots=False)
+        branch_ref = f"refs/heads/aros/task/{task_id}"
+        if _path_exists(target):
+            raise TaskError(f"unowned task worktree path exists: {target}")
+        registrations = self._worktree_registrations()
+        if any(
+            self._same_path(str(item["worktree"]), target)
+            or item.get("branch") == branch_ref
+            for item in registrations
+        ):
+            raise TaskError(
+                f"unowned task worktree or branch registration exists: {task_id}"
+            )
+        if branch_ref in self._local_branch_refs():
+            raise TaskError(f"unowned task branch exists: {branch_ref}")
+
+    def _require_unallocated_worktree(self, target: Path, branch: str) -> None:
+        _require_absent(target, "task worktree target")
+        branch_ref = f"refs/heads/{branch}"
+        registrations = self._worktree_registrations()
+        if any(
+            self._same_path(str(item["worktree"]), target)
+            for item in registrations
+        ):
+            raise TaskError(f"task worktree target is already registered: {target}")
+        if any(item.get("branch") == branch_ref for item in registrations):
+            raise TaskError(f"task branch is checked out elsewhere: {branch}")
+        for existing in self._local_branch_refs():
+            if (
+                existing == branch_ref
+                or existing.startswith(f"{branch_ref}/")
+                or branch_ref.startswith(f"{existing}/")
+            ):
+                raise TaskError(f"task branch ref conflict: {existing}")
+
+    def _add_task_worktree(self, target: Path, branch: str, base_commit: str) -> None:
+        result = self._safe_git_result(
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(target),
+            base_commit,
+        )
+        if result.returncode != 0:
+            raise TaskError(
+                f"unable to create task worktree: {_git_error(result)}"
+            )
+
+    def _validate_new_worktree(
+        self,
+        target: Path,
+        branch: str,
+        base_commit: str,
+    ) -> None:
+        tip = self._validate_worktree(target, branch, base_commit)
+        if tip != base_commit:
+            raise TaskError("new task worktree does not start at its brief base commit")
+        self._verify_checkout_bytes(target, base_commit)
+
+    def _validate_owned_worktree(self, ownership: dict[str, object]) -> None:
+        self._validate_worktree(
+            Path(str(ownership["worktree_path"])),
+            str(ownership["branch"]),
+            str(ownership["base_commit"]),
+        )
+
+    def _validate_worktree(
+        self,
+        target: Path,
+        branch: str,
+        base_commit: str,
+    ) -> str:
+        self._require_git_root()
+        _require_plain_directory(target, "owned task worktree")
+        branch_ref = f"refs/heads/{branch}"
+        registrations = self._worktree_registrations()
+        path_matches = [
+            item
+            for item in registrations
+            if self._same_path(str(item["worktree"]), target)
+        ]
+        if len(path_matches) != 1:
+            raise TaskError(f"owned task worktree is not uniquely registered: {target}")
+        registration = path_matches[0]
+        if registration.get("branch") != branch_ref:
+            raise TaskError(f"owned task worktree branch registration mismatch: {target}")
+        branch_matches = [
+            item for item in registrations if item.get("branch") == branch_ref
+        ]
+        if len(branch_matches) != 1:
+            raise TaskError(f"owned task branch is registered elsewhere: {branch}")
+
+        child_git_dir = self._worktree_git_directory(target)
+        child_git_identity = _plain_directory_identity(
+            child_git_dir,
+            "task worktree Git directory",
+        )
+        common = Path(
+            self._safe_git_text(
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                git_dir=child_git_dir,
+                work_tree=target,
+            )
+        ).resolve(strict=True)
+        if (
+            common != self._git_common_dir
+            or _plain_directory_identity(common, "common Git directory")
+            != self._git_common_dir_identity
+        ):
+            raise TaskError(f"owned task worktree common Git directory mismatch: {target}")
+        top = Path(
+            self._safe_git_text(
+                "rev-parse",
+                "--show-toplevel",
+                git_dir=child_git_dir,
+                work_tree=target,
+            )
+        ).resolve(strict=True)
+        if top != target:
+            raise TaskError(f"owned task worktree root mismatch: {target}")
+        attached = self._safe_git_text(
+            "symbolic-ref",
+            "-q",
+            "HEAD",
+            git_dir=child_git_dir,
+            work_tree=target,
+        )
+        if attached != branch_ref:
+            raise TaskError(f"owned task worktree is not attached to {branch}")
+        tip = self._safe_git_text(
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+            git_dir=child_git_dir,
+            work_tree=target,
+        )
+        if _COMMIT.fullmatch(tip) is None:
+            raise TaskError(f"owned task worktree has an invalid HEAD: {target}")
+        if registration.get("HEAD") != tip:
+            raise TaskError(f"owned task worktree registry HEAD mismatch: {target}")
+        branch_tip = self._safe_git_text(
+            "rev-parse",
+            "--verify",
+            f"{branch_ref}^{{commit}}",
+        )
+        if branch_tip != tip:
+            raise TaskError(f"owned task branch tip mismatch: {branch}")
+        if not self._safe_git_success(
+            "merge-base",
+            "--is-ancestor",
+            base_commit,
+            tip,
+        ):
+            raise TaskError(f"owned task branch no longer descends from its base: {branch}")
+        if (
+            self._worktree_git_directory(target) != child_git_dir
+            or _plain_directory_identity(
+                child_git_dir,
+                "task worktree Git directory",
+            )
+            != child_git_identity
+        ):
+            raise TaskError(f"owned task worktree Git identity changed: {target}")
+        self._require_git_root()
+        return tip
+
+    def _verify_checkout_bytes(self, target: Path, commit: str) -> None:
+        entries = self._safe_git_bytes(
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            commit,
+        )
+        for record in entries.split(b"\0"):
+            if not record:
+                continue
+            header, separator, raw_path = record.partition(b"\t")
+            if not separator:
+                raise TaskError("invalid Git tree entry while verifying checkout")
+            try:
+                mode, kind, object_id = header.split(b" ", 2)
+            except ValueError as error:
+                raise TaskError(
+                    "invalid Git tree entry while verifying checkout"
+                ) from error
+            relative = Path(os.fsdecode(raw_path))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise TaskError("unsafe Git tree path while verifying checkout")
+            path = target / relative
+            blob = self._safe_git_bytes("cat-file", "blob", os.fsdecode(object_id))
+            if kind == b"blob" and mode in {b"100644", b"100755"}:
+                actual = _read_plain_bytes(path, "task checkout file")
+            elif kind == b"blob" and mode == b"120000":
+                try:
+                    metadata = path.lstat()
+                    actual = os.fsencode(os.readlink(path))
+                except OSError as error:
+                    raise TaskError(f"unable to verify checkout symlink: {path}") from error
+                if not stat.S_ISLNK(metadata.st_mode):
+                    raise TaskError(f"task checkout entry is not a symlink: {path}")
+            elif kind == b"commit" and mode == b"160000":
+                continue
+            else:
+                raise TaskError("unsupported Git tree entry while verifying checkout")
+            if actual != blob:
+                raise TaskError(
+                    f"task checkout bytes differ from repository blob: {relative}"
+                )
+
+    def _worktree_git_directory(self, target: Path) -> Path:
+        marker = target / ".git"
+        raw = _read_plain_bytes(marker, "task worktree Git marker")
+        try:
+            line = raw.decode("utf-8").rstrip("\n")
+        except UnicodeError as error:
+            raise TaskError(f"invalid task worktree Git marker: {marker}") from error
+        if "\n" in line or not line.startswith("gitdir: "):
+            raise TaskError(f"invalid task worktree Git marker: {marker}")
+        git_dir = Path(line.removeprefix("gitdir: "))
+        if not git_dir.is_absolute():
+            git_dir = target / git_dir
+        try:
+            resolved = git_dir.resolve(strict=True)
+        except OSError as error:
+            raise TaskError(f"invalid task worktree Git directory: {target}") from error
+        _plain_directory_identity(resolved, "task worktree Git directory")
+        if not resolved.is_relative_to(self._git_common_dir / "worktrees"):
+            raise TaskError(f"task worktree Git directory escaped common Git data: {target}")
+        return resolved
+
+    def _worktree_registrations(self) -> list[dict[str, object]]:
+        raw = self._safe_git_bytes(
+            "worktree",
+            "list",
+            "--porcelain",
+            "-z",
+            "--expire=now",
+        )
+        registrations: list[dict[str, object]] = []
+        for raw_record in raw.split(b"\0\0"):
+            if not raw_record:
+                continue
+            record: dict[str, object] = {}
+            for field in raw_record.strip(b"\0").split(b"\0"):
+                key, separator, value = field.partition(b" ")
+                try:
+                    name = key.decode("ascii")
+                except UnicodeError as error:
+                    raise TaskError("invalid Git worktree registration") from error
+                if name in record:
+                    raise TaskError("ambiguous Git worktree registration")
+                if not separator:
+                    record[name] = True
+                elif name == "worktree":
+                    record[name] = os.fsdecode(value)
+                else:
+                    try:
+                        record[name] = value.decode("utf-8")
+                    except UnicodeError as error:
+                        raise TaskError("invalid Git worktree registration") from error
+            if not isinstance(record.get("worktree"), str):
+                raise TaskError("invalid Git worktree registration")
+            if "prunable" in record:
+                raise TaskError(
+                    f"stale or prunable Git worktree registration: "
+                    f"{record['worktree']}"
+                )
+            registered_path = Path(str(record["worktree"]))
+            try:
+                registered_mode = registered_path.lstat().st_mode
+            except OSError as error:
+                raise TaskError(
+                    f"stale Git worktree registration: {registered_path}"
+                ) from error
+            if stat.S_ISLNK(registered_mode) or not stat.S_ISDIR(registered_mode):
+                raise TaskError(
+                    f"ambiguous Git worktree registration path: {registered_path}"
+                )
+            registrations.append(record)
+        return registrations
+
+    def _local_branch_refs(self) -> set[str]:
+        output = self._safe_git_text(
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+        )
+        return set(output.splitlines()) if output else set()
+
+    def _is_commit(self, value: str) -> bool:
+        if _COMMIT.fullmatch(value) is None:
+            return False
+        result = self._safe_git_result(
+            "rev-parse",
+            "--verify",
+            f"{value}^{{commit}}",
+        )
+        return result.returncode == 0 and result.stdout.strip() == value.encode()
+
+    def _safe_git_text(
+        self,
+        *args: str,
+        git_dir: Path | None = None,
+        work_tree: Path | None = None,
+    ) -> str:
+        result = self._safe_git_result(
+            *args,
+            git_dir=git_dir,
+            work_tree=work_tree,
+        )
+        if result.returncode != 0:
+            raise TaskError(f"Git command failed: {' '.join(args)}: {_git_error(result)}")
+        try:
+            return result.stdout.decode("utf-8").strip()
+        except UnicodeError as error:
+            raise TaskError(f"Git command returned invalid UTF-8: {' '.join(args)}") from error
+
+    def _safe_git_bytes(
+        self,
+        *args: str,
+        git_dir: Path | None = None,
+        work_tree: Path | None = None,
+    ) -> bytes:
+        result = self._safe_git_result(
+            *args,
+            git_dir=git_dir,
+            work_tree=work_tree,
+        )
+        if result.returncode != 0:
+            raise TaskError(f"Git command failed: {' '.join(args)}: {_git_error(result)}")
+        return result.stdout
+
+    def _safe_git_success(self, *args: str) -> bool:
+        return self._safe_git_result(*args).returncode == 0
+
+    def _safe_git_result(
+        self,
+        *args: str,
+        git_dir: Path | None = None,
+        work_tree: Path | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return self._pinned_git_result(
+            *args,
+            git_dir=git_dir,
+            work_tree=work_tree,
+            configs=self._safe_git_configs(),
+        )
+
+    def _safe_git_configs(self) -> tuple[str, ...]:
+        base = (
+            "core.hooksPath=/dev/null",
+            "core.fsmonitor=false",
+            "core.autocrlf=false",
+            "core.attributesFile=/dev/null",
+        )
+        result = self._pinned_git_result(
+            "config",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process|required)$",
+            configs=base,
+        )
+        if result.returncode not in {0, 1}:
+            raise TaskError(f"unable to inspect Git filter configuration: {_git_error(result)}")
+        names: set[str] = set()
+        for raw_key in result.stdout.split(b"\0"):
+            if not raw_key:
+                continue
+            try:
+                key = raw_key.decode("utf-8")
+            except UnicodeError as error:
+                raise TaskError("ambiguous Git filter configuration") from error
+            match = _FILTER_CONFIG_KEY.fullmatch(key)
+            if match is None or _FILTER_NAME.fullmatch(match.group(1)) is None:
+                raise TaskError(f"ambiguous Git filter configuration: {key!r}")
+            names.add(match.group(1))
+        overrides = list(base)
+        for name in sorted(names):
+            overrides.extend(
+                (
+                    f"filter.{name}.clean=cat",
+                    f"filter.{name}.smudge=cat",
+                    f"filter.{name}.process=",
+                    f"filter.{name}.required=false",
+                )
+            )
+        return tuple(overrides)
+
+    def _pinned_git_result(
+        self,
+        *args: str,
+        git_dir: Path | None = None,
+        work_tree: Path | None = None,
+        configs: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[bytes]:
+        self._require_pinned_git_identity()
+        selected_git_dir = git_dir or self._git_dir
+        selected_work_tree = work_tree or self.root
+        command = [
+            "git",
+            "--no-replace-objects",
+            f"--git-dir={selected_git_dir}",
+            f"--work-tree={selected_work_tree}",
+        ]
+        for config in configs:
+            command.extend(("-c", config))
+        command.extend(args)
+        try:
+            return subprocess.run(
+                command,
+                capture_output=True,
+                text=False,
+                timeout=10,
+                check=False,
+                env=_git_environment(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise TaskError(f"Git command failed: {' '.join(args)}") from error
+
+    def _require_pinned_git_identity(self) -> None:
+        if (
+            _plain_directory_identity(self._git_dir, "Git directory")
+            != self._git_dir_identity
+        ):
+            raise TaskError(f"Git directory identity changed: {self.root}")
+        if (
+            _plain_directory_identity(self._git_common_dir, "common Git directory")
+            != self._git_common_dir_identity
+        ):
+            raise TaskError(f"common Git directory identity changed: {self.root}")
+
+    @staticmethod
+    def _same_path(raw: str, target: Path) -> bool:
+        raw_absolute = Path(raw).absolute()
+        target_absolute = target.absolute()
+        if os.path.normcase(str(raw_absolute)) == os.path.normcase(
+            str(target_absolute)
+        ):
+            return True
+        return os.path.normcase(str(raw_absolute.resolve(strict=False))) == os.path.normcase(
+            str(target_absolute.resolve(strict=False))
+        )
+
     def _ensure_record_roots(self) -> None:
         _require_plain_directory(self.root / ".aros", "AROS runtime directory")
         versioned = self.root / "tasks"
@@ -561,10 +1306,15 @@ class TaskService:
     def _require_git_root(
         self,
     ) -> tuple[Path, tuple[int, int], Path, tuple[int, int]]:
-        top = self._git_output("rev-parse", "--show-toplevel")
+        pinned = hasattr(self, "_git_dir")
+        top = self._git_output("rev-parse", "--show-toplevel", pinned=pinned)
         if top is None or Path(top).resolve() != self.root:
             raise TaskError(f"workspace must be the Git repository root: {self.root}")
-        raw_git_dir = self._git_output("rev-parse", "--absolute-git-dir")
+        raw_git_dir = self._git_output(
+            "rev-parse",
+            "--absolute-git-dir",
+            pinned=pinned,
+        )
         if raw_git_dir is None:
             raise TaskError(f"unable to resolve Git directory association: {self.root}")
         git_dir = Path(raw_git_dir).resolve()
@@ -587,6 +1337,7 @@ class TaskService:
             "rev-parse",
             "--path-format=absolute",
             "--git-common-dir",
+            pinned=pinned,
         )
         if raw_common_dir is None:
             raise TaskError(f"unable to resolve common Git directory: {self.root}")
@@ -650,7 +1401,7 @@ class TaskService:
             ) from error
 
     def _git_output(self, *args: str, pinned: bool = False) -> str | None:
-        command = ["git"]
+        command = ["git", "--no-replace-objects"]
         if pinned:
             command.extend(
                 (
@@ -689,6 +1440,15 @@ class TaskService:
 
     def _publication_lock_path(self) -> Path:
         return self.root / ".aros" / "locks" / "task-record-publication.lock"
+
+    def _lifecycle_lock_path(self, task_id: str) -> Path:
+        return self.root / ".aros" / "locks" / f"task-lifecycle-{task_id}.lock"
+
+    def _status_path(self, task_id: str) -> Path:
+        return self.root / ".aros" / "tasks" / task_id / "status.json"
+
+    def _ownership_path(self, task_id: str) -> Path:
+        return self.root / ".aros" / "tasks" / task_id / "ownership.json"
 
     def _idempotency_index_path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -737,6 +1497,15 @@ def _brief_sha256(brief: dict[str, object]) -> str:
         raise TaskError("task brief must be canonical UTF-8 JSON") from error
 
 
+def _ownership_sha256(ownership: dict[str, object]) -> str:
+    payload = dict(ownership)
+    payload.pop("ownership_sha256", None)
+    try:
+        return json_sha256(payload)
+    except (TypeError, UnicodeError) as error:
+        raise TaskError("task ownership must be canonical UTF-8 JSON") from error
+
+
 def _prepared_status(brief: dict[str, object]) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -744,6 +1513,20 @@ def _prepared_status(brief: dict[str, object]) -> dict[str, object]:
         "state": "prepared",
         "brief_sha256": brief["brief_sha256"],
         "updated_at": brief["created_at"],
+    }
+
+
+def _worktree_ready_status(
+    brief: dict[str, object],
+    ownership: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "task_id": brief["task_id"],
+        "state": "worktree_ready",
+        "brief_sha256": brief["brief_sha256"],
+        "ownership_sha256": ownership["ownership_sha256"],
+        "updated_at": ownership["acquired_at"],
     }
 
 
@@ -872,6 +1655,35 @@ def _task_directory_ids(root: Path, *, runtime: bool) -> set[str]:
             _require_plain_file(brief_path, "versioned task brief")
         task_ids.add(entry.name)
     return task_ids
+
+
+def _read_plain_bytes(path: Path, description: str) -> bytes:
+    identity = _plain_file_identity(path, description)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise TaskError(f"unable to open {description}: {path}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise TaskError(f"{description} must be a plain file: {path}")
+        if (metadata.st_dev, metadata.st_ino) != identity:
+            raise TaskError(f"{description} identity changed while opening: {path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            payload = handle.read()
+    except OSError as error:
+        raise TaskError(f"unable to read {description}: {path}") from error
+    finally:
+        os.close(descriptor)
+    if _plain_file_identity(path, description) != identity:
+        raise TaskError(f"{description} identity changed while reading: {path}")
+    return payload
+
+
+def _git_error(result: subprocess.CompletedProcess[bytes]) -> str:
+    detail = (result.stderr or result.stdout).decode("utf-8", errors="replace").strip()
+    return detail or f"exit {result.returncode}"
 
 
 def _fsync_directory(path: Path) -> None:

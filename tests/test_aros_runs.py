@@ -805,6 +805,39 @@ def test_list_fails_closed_on_unreadable_run_status(tmp_path: Path) -> None:
         service.list()
 
 
+def test_status_retries_atomic_replacement_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path)
+    run_id = str(manifest["run_id"])
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    replacement_path = status_path.with_name("replacement.json")
+    replacement = json.loads(status_path.read_text(encoding="utf-8"))
+    replacement["updated_at"] = "2026-08-03T12:34:56.789Z"
+    atomic_write_json(replacement_path, replacement)
+    real_lstat = Path.lstat
+    status_lstats = 0
+
+    def replace_before_final_lstat(
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal status_lstats
+        if path == status_path:
+            status_lstats += 1
+            if status_lstats == 2:
+                replacement_path.replace(status_path)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", replace_before_final_lstat)
+
+    assert service.status(run_id, reconcile=False) == replacement
+    assert status_lstats >= 4
+
+
 def test_reconcile_restores_missing_completion_event(tmp_path: Path) -> None:
     _init_clean_repo(tmp_path)
     service, manifest = _prepare(tmp_path)

@@ -336,7 +336,7 @@ class RunService:
         status_path = self._runtime_path(run_id) / "status.json"
         if not status_path.is_file():
             raise RunError(f"run status does not exist: {run_id}")
-        status = _read_object(status_path, "run status")
+        status = _read_run_status(status_path)
         if status.get("run_id") != run_id:
             raise RunError(f"run status identity mismatch: {run_id}")
         if status.get("manifest_sha256") != manifest.get("manifest_sha256"):
@@ -509,7 +509,7 @@ class RunService:
     def reconcile(self, run_id: str) -> dict[str, object]:
         manifest = self._load_manifest(run_id)
         runtime = self._runtime_path(run_id)
-        status = _read_object(runtime / "status.json", "run status")
+        status = _read_run_status(runtime / "status.json")
         if status.get("manifest_sha256") != manifest.get("manifest_sha256"):
             raise RunError(f"run status manifest hash mismatch: {run_id}")
         final_path = self._final_path(run_id)
@@ -596,7 +596,7 @@ class RunService:
         run_id = str(manifest["run_id"])
         finished_at = _utc_now()
         runtime = self._runtime_path(run_id)
-        status = _read_object(runtime / "status.json", "run status")
+        status = _read_run_status(runtime / "status.json")
         final = _final_identity(manifest)
         final.update(
             {
@@ -761,7 +761,7 @@ class RunService:
             status_path = self._runtime_path(run_id) / "status.json"
             if not status_path.is_file():
                 return False
-            status = _read_object(status_path, "run status")
+            status = _read_run_status(status_path)
             if status.get("manifest_sha256") != manifest.get("manifest_sha256"):
                 return False
             if kind == "manifest":
@@ -947,6 +947,18 @@ def _read_object(path: Path, description: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise RunError(f"invalid {description}: {path}")
     return value
+
+
+def _read_run_status(path: Path) -> dict[str, object]:
+    first_error: RunError | None = None
+    for _attempt in range(3):
+        try:
+            return _read_object(path, "run status")
+        except RunError as error:
+            if first_error is None:
+                first_error = error
+    assert first_error is not None
+    raise first_error
 
 
 def _porcelain_path(line: str) -> str:

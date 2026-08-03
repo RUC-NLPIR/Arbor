@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import signal
 import socket
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .isolation import IsolationError, IsolationLimits, build_isolated_linux
+from .receipts import content_receipt, digest_chunks
 from .store import (
     atomic_write_json,
     create_json,
@@ -28,14 +28,12 @@ from .store import (
 
 
 def _file_receipt(path: Path, relative: str) -> dict[str, object]:
-    digest = hashlib.sha256()
-    size = 0
     with path.open("rb") as handle:
         os.fsync(handle.fileno())
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            size += len(chunk)
-            digest.update(chunk)
-    return {"path": relative, "bytes": size, "sha256": digest.hexdigest()}
+        size, sha256 = digest_chunks(
+            iter(lambda: handle.read(1024 * 1024), b"")
+        )
+    return content_receipt(relative, size, sha256)
 
 
 def _read_object(path: Path) -> dict[str, Any]:

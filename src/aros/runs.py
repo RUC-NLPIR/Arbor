@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .isolation import IsolationError, isolated_linux_policy, probe_isolated_linux
+from .receipts import record_sha256
 from .store import (
     atomic_write_json,
     create_json,
@@ -881,9 +882,7 @@ class RunService:
 
 
 def _receipt_sha256(receipt: dict[str, object]) -> str:
-    payload = dict(receipt)
-    payload.pop("receipt_sha256", None)
-    return _sha256(payload)
+    return record_sha256(receipt, "receipt_sha256")
 
 
 def _request_sha256(manifest: dict[str, object]) -> str:

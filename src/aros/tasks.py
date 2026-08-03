@@ -19,6 +19,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .receipts import content_receipt, digest_chunks, record_sha256
 from .store import (
     atomic_write_json,
     create_json,
@@ -3122,10 +3123,8 @@ class TaskService:
 
 
 def _record_sha256(record: dict[str, object], hash_field: str) -> str:
-    payload = dict(record)
-    payload.pop(hash_field, None)
     try:
-        return json_sha256(payload)
+        return record_sha256(record, hash_field)
     except (TypeError, UnicodeError) as error:
         raise TaskError("task execution record must be canonical UTF-8 JSON") from error
 
@@ -3276,8 +3275,6 @@ def _file_receipt(
         descriptor = os.open(path, flags)
     except OSError as error:
         raise TaskError(f"unable to open task output log: {path}") from error
-    digest = hashlib.sha256()
-    size = 0
     try:
         metadata = os.fstat(descriptor)
         if (
@@ -3293,9 +3290,9 @@ def _file_receipt(
         expected_size = metadata.st_size
         os.fsync(descriptor)
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                size += len(chunk)
-                digest.update(chunk)
+            size, sha256 = digest_chunks(
+                iter(lambda: handle.read(1024 * 1024), b"")
+            )
         final_metadata = os.fstat(descriptor)
         if (
             size != expected_size
@@ -3308,7 +3305,7 @@ def _file_receipt(
         raise TaskError(f"unable to read task output log: {path}") from error
     finally:
         os.close(descriptor)
-    return {"path": relative, "bytes": size, "sha256": digest.hexdigest()}
+    return content_receipt(relative, size, sha256)
 
 
 def _normalize_request(

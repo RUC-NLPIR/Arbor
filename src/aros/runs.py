@@ -36,6 +36,12 @@ from .store import (
     read_json,
     utc_now as _utc_now,
 )
+from .worktrees import (
+    ExecutionBundle,
+    WorktreeError,
+    bind_repository,
+    validate_execution_bundle,
+)
 
 
 _RUN_ID = re.compile(r"^RUN-[A-Za-z0-9][A-Za-z0-9-]*$")
@@ -120,7 +126,105 @@ class RunService:
             "actor": run_actor,
             "label": run_label,
         }
-        request_sha256 = _sha256(requested)
+        return self._publish_manifest(
+            requested,
+            repository_ref=".",
+            candidate_commit=None,
+            success_exit_codes=[0],
+        )
+
+    def prepare_bundle(
+        self,
+        bundle: ExecutionBundle,
+        argv: list[str],
+        *,
+        cwd: str,
+        timeout_seconds: float,
+        success_exit_codes: list[int],
+        idempotency_key: str,
+        actor: str,
+        label: str | None = None,
+    ) -> dict[str, object]:
+        """Freeze a verified two-checkout launch manifest."""
+        if not isinstance(bundle, ExecutionBundle):
+            raise RunError("bundle must be an ExecutionBundle")
+        try:
+            repository = bind_repository(self.root)
+            validate_execution_bundle(repository, bundle)
+        except WorktreeError as error:
+            raise RunError(f"invalid execution bundle: {error}") from error
+        repository_ref = self._bundle_repository_ref(bundle.root)
+        normalized_argv = _validate_argv(argv)
+        normalized_cwd = self._normalize_bundle_cwd(bundle, cwd)
+        timeout = _validate_timeout(timeout_seconds)
+        exit_codes = _validate_success_exit_codes(success_exit_codes)
+        key = _validate_text(idempotency_key, "idempotency_key")
+        run_actor = _validate_text(actor, "actor")
+        run_label = _normalize_label(label)
+        try:
+            policy = isolated_linux_policy(bundle.root, ["tmp"])
+        except IsolationError as error:
+            raise RunError(f"invalid isolated-linux policy: {error}") from error
+        environment_ref, environment_sha256 = _environment_fingerprint()
+        requested = {
+            "argv": normalized_argv,
+            "cwd": normalized_cwd,
+            "timeout_seconds": timeout,
+            "idempotency_key": key,
+            "security_profile": "isolated-linux",
+            "writable_paths": list(policy.writable_paths),
+            "network_policy": policy.network_policy,
+            "process_policy": policy.process_policy,
+            "environment_policy": policy.environment_policy,
+            "isolation_limits": asdict(policy.limits),
+            "environment_ref": environment_ref,
+            "environment_sha256": environment_sha256,
+            "actor": run_actor,
+            "label": run_label,
+        }
+        execution_bundle = {
+            "candidate": {
+                "path": "candidate",
+                "commit": bundle.candidate.commit,
+                "tree": bundle.candidate.tree,
+            },
+            "apparatus": {
+                "path": "apparatus",
+                "commit": bundle.apparatus.commit,
+                "tree": bundle.apparatus.tree,
+            },
+            "temp": "tmp",
+            "bundle_sha256": bundle.bundle_sha256,
+        }
+        return self._publish_manifest(
+            requested,
+            repository_ref=repository_ref,
+            candidate_commit=bundle.candidate.commit,
+            success_exit_codes=exit_codes,
+            execution_bundle=execution_bundle,
+        )
+
+    def _publish_manifest(
+        self,
+        requested: dict[str, object],
+        *,
+        repository_ref: str,
+        candidate_commit: str | None,
+        success_exit_codes: list[int],
+        execution_bundle: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        key = str(requested["idempotency_key"])
+        request_binding = dict(requested)
+        if execution_bundle is not None:
+            request_binding.update(
+                {
+                    "repository_ref": repository_ref,
+                    "candidate_commit": candidate_commit,
+                    "success_exit_codes": success_exit_codes,
+                    "execution_bundle": execution_bundle,
+                }
+            )
+        request_sha256 = _request_sha256(request_binding)
         lock_path = self._idempotency_lock_path(key)
 
         with file_lock(lock_path):
@@ -138,13 +242,13 @@ class RunService:
             if not base_commit:
                 raise RunError("durable runs require a committed Git HEAD")
             created_at = _utc_now()
-            run_id = self._new_run_id(run_label)
+            run_id = self._new_run_id(str(requested["label"]))
             manifest: dict[str, object] = {
                 "schema_version": 1,
                 "run_id": run_id,
-                "repository_ref": ".",
+                "repository_ref": repository_ref,
                 "base_commit": base_commit,
-                "candidate_commit": None,
+                "candidate_commit": candidate_commit,
                 "question_refs": [],
                 "experiment_ref": None,
                 "prediction_ref": None,
@@ -159,12 +263,16 @@ class RunService:
                     f".aros/runs/{run_id}/stderr.log",
                     f"runs/{run_id}/final.json",
                 ],
-                "success_exit_codes": [0],
+                "success_exit_codes": success_exit_codes,
                 "container_ref": None,
-                "hard_safety_stop": {"timeout_seconds": timeout},
+                "hard_safety_stop": {
+                    "timeout_seconds": requested["timeout_seconds"]
+                },
                 **requested,
                 "created_at": created_at,
             }
+            if execution_bundle is not None:
+                manifest["execution_bundle"] = execution_bundle
             manifest["manifest_sha256"] = _manifest_sha256(manifest)
 
             manifest_path = self._manifest_path(run_id)
@@ -196,6 +304,32 @@ class RunService:
             )
             return manifest
 
+    def _bundle_repository_ref(self, bundle_root: Path) -> str:
+        try:
+            relative = bundle_root.relative_to(self.root)
+        except ValueError as error:
+            raise RunError("execution bundle must remain inside the workspace") from error
+        if len(relative.parts) != 3 or relative.parts[:2] != (".worktree", "eval"):
+            raise RunError(
+                "execution bundle must be rooted at .worktree/eval/<eval-id>"
+            )
+        return relative.as_posix()
+
+    def _normalize_bundle_cwd(self, bundle: ExecutionBundle, cwd: str) -> str:
+        if not isinstance(cwd, str) or not cwd.strip():
+            raise RunError("cwd must be a non-empty candidate-relative path")
+        candidate = Path(cwd)
+        if candidate.is_absolute():
+            raise RunError("cwd must be a candidate-relative path")
+        resolved = (bundle.candidate.path / candidate).resolve()
+        try:
+            relative = resolved.relative_to(bundle.candidate.path)
+        except ValueError as error:
+            raise RunError("cwd must remain inside the candidate checkout") from error
+        if not resolved.is_dir():
+            raise RunError(f"cwd must be an existing candidate directory: {cwd}")
+        return Path("candidate", relative).as_posix()
+
     def start(
         self,
         run_id: str,
@@ -219,7 +353,18 @@ class RunService:
             return status
         self._validate_manifest_against_status(manifest, status)
         self._require_clean_git_for_start(manifest)
-        self._normalize_cwd(str(manifest["cwd"]))
+        if "execution_bundle" in manifest:
+            bundle_root = (self.root / str(manifest["repository_ref"])).resolve()
+            try:
+                bundle_root.relative_to(self.root)
+                bundle_cwd = (bundle_root / str(manifest["cwd"])).resolve()
+                bundle_cwd.relative_to(bundle_root)
+            except ValueError as error:
+                raise RunError("bundle cwd must remain inside the workspace") from error
+            if not bundle_cwd.is_dir():
+                raise RunError("bundle cwd is unavailable")
+        else:
+            self._normalize_cwd(str(manifest["cwd"]))
         if manifest.get("security_profile") == "isolated-linux":
             try:
                 probe_isolated_linux()
@@ -886,27 +1031,35 @@ def _receipt_sha256(receipt: dict[str, object]) -> str:
 
 
 def _request_sha256(manifest: dict[str, object]) -> str:
-    return _sha256(
-        {
-            field: manifest.get(field)
-            for field in (
-                "argv",
-                "cwd",
-                "timeout_seconds",
-                "idempotency_key",
-                "security_profile",
-                "writable_paths",
-                "network_policy",
-                "process_policy",
-                "environment_policy",
-                "isolation_limits",
-                "environment_ref",
-                "environment_sha256",
-                "actor",
-                "label",
-            )
-        }
-    )
+    requested = {
+        field: manifest.get(field)
+        for field in (
+            "argv",
+            "cwd",
+            "timeout_seconds",
+            "idempotency_key",
+            "security_profile",
+            "writable_paths",
+            "network_policy",
+            "process_policy",
+            "environment_policy",
+            "isolation_limits",
+            "environment_ref",
+            "environment_sha256",
+            "actor",
+            "label",
+        )
+    }
+    if "execution_bundle" in manifest:
+        requested.update(
+            {
+                "repository_ref": manifest.get("repository_ref"),
+                "candidate_commit": manifest.get("candidate_commit"),
+                "success_exit_codes": manifest.get("success_exit_codes"),
+                "execution_bundle": manifest.get("execution_bundle"),
+            }
+        )
+    return _sha256(requested)
 
 
 def _validate_argv(argv: list[str]) -> list[str]:
@@ -921,6 +1074,16 @@ def _validate_timeout(value: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise RunError("timeout_seconds must be a positive number")
     return value
+
+
+def _validate_success_exit_codes(value: list[int]) -> list[int]:
+    if not isinstance(value, list) or not value:
+        raise RunError("success_exit_codes must be a non-empty list of integers")
+    if any(type(code) is not int for code in value):
+        raise RunError("success_exit_codes must contain only plain integers")
+    if len(set(value)) != len(value):
+        raise RunError("success_exit_codes must not contain duplicates")
+    return list(value)
 
 
 def _validate_security_profile(value: str) -> str:

@@ -7,6 +7,7 @@ tests do not require it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+import arbor.aros.runner as runner_module
 from arbor.aros.isolation import (
     ENVIRONMENT_POLICY,
     NETWORK_POLICY,
@@ -25,7 +27,14 @@ from arbor.aros.isolation import (
     probe_isolated_linux,
 )
 from arbor.aros.runs import RunError, RunService
-from arbor.aros.store import atomic_write_json
+from arbor.aros.store import atomic_write_json, manifest_sha256
+from arbor.aros.worktrees import (
+    ExecutionBundle,
+    RepositoryBinding,
+    bind_repository,
+    create_execution_bundle,
+    validate_execution_bundle,
+)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -46,6 +55,56 @@ def _init_clean_repo(root: Path) -> str:
     _git(root, "add", "README.md")
     _git(root, "commit", "-qm", "initial state")
     return _git(root, "rev-parse", "HEAD")
+
+
+def _create_test_execution_bundle(
+    root: Path,
+    eval_id: str,
+    *,
+    candidate_files: dict[str, str] | None = None,
+    apparatus_files: dict[str, str] | None = None,
+) -> tuple[RepositoryBinding, ExecutionBundle]:
+    _init_clean_repo(root)
+    files = {".gitignore": "/.worktree/\n", **(candidate_files or {})}
+    for relative, content in files.items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "add candidate")
+    candidate_commit = _git(root, "rev-parse", "HEAD")
+    for relative, content in (
+        apparatus_files or {"apparatus.txt": "apparatus\n"}
+    ).items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "add apparatus")
+    apparatus_commit = _git(root, "rev-parse", "HEAD")
+    repository = bind_repository(root)
+    bundle = create_execution_bundle(
+        repository,
+        root / ".worktree" / "eval" / eval_id,
+        candidate_commit,
+        apparatus_commit,
+    )
+    return repository, bundle
+
+
+def _mark_runner_launched(
+    root: Path,
+    service: RunService,
+    manifest: dict[str, object],
+) -> str:
+    run_id = str(manifest["run_id"])
+    launched = service.status(run_id, reconcile=False)
+    launched.update({"state": "launched", "launch_receipt_sha256": "a" * 64})
+    atomic_write_json(
+        root / ".aros" / "runs" / run_id / "status.json",
+        launched,
+    )
+    return run_id
 
 
 def _prepare(
@@ -151,6 +210,160 @@ def test_prepare_freezes_a_versioned_manifest_and_runtime_status(tmp_path: Path)
     }
     assert not (tmp_path / "runs" / run_id / "status.json").exists()
     assert not (tmp_path / "runs" / run_id / "stdout.log").exists()
+
+
+def test_prepare_bundle_keeps_control_state_in_primary_workspace(
+    tmp_path: Path,
+) -> None:
+    _repository, bundle = _create_test_execution_bundle(
+        tmp_path,
+        "EVAL-control-root",
+        candidate_files={"scorer/.keep": ""},
+    )
+
+    manifest = RunService(tmp_path).prepare_bundle(
+        bundle,
+        ["/usr/bin/python3", "../apparatus/score.py"],
+        cwd="scorer",
+        timeout_seconds=30,
+        success_exit_codes=[0],
+        idempotency_key="bundle-control-root",
+        actor="test-principal",
+        label="bundle-control",
+    )
+
+    run_id = str(manifest["run_id"])
+    payload = {
+        "candidate": {
+            "path": "candidate",
+            "commit": bundle.candidate.commit,
+            "tree": bundle.candidate.tree,
+        },
+        "apparatus": {
+            "path": "apparatus",
+            "commit": bundle.apparatus.commit,
+            "tree": bundle.apparatus.tree,
+        },
+        "temp": "tmp",
+        "bundle_sha256": bundle.bundle_sha256,
+    }
+    assert manifest["repository_ref"] == ".worktree/eval/EVAL-control-root"
+    assert manifest["cwd"] == "candidate/scorer"
+    assert manifest["candidate_commit"] == bundle.candidate.commit
+    assert manifest["execution_bundle"] == payload
+    assert manifest["success_exit_codes"] == [0]
+    assert manifest["manifest_sha256"] == manifest_sha256(manifest)
+    assert manifest["output_paths"] == [
+        f".aros/runs/{run_id}/stdout.log",
+        f".aros/runs/{run_id}/stderr.log",
+        f"runs/{run_id}/final.json",
+    ]
+    assert (tmp_path / "runs" / run_id / "manifest.json").is_file()
+    assert (tmp_path / ".aros" / "runs" / run_id / "status.json").is_file()
+    assert not (bundle.root / "runs").exists()
+    assert not (bundle.root / ".aros").exists()
+
+
+def test_prepare_bundle_requires_strict_success_exit_codes(tmp_path: Path) -> None:
+    _repository, bundle = _create_test_execution_bundle(
+        tmp_path,
+        "EVAL-exit-code-validation",
+    )
+    service = RunService(tmp_path)
+    invalid_values: tuple[object, ...] = (
+        [],
+        [0, 0],
+        [True],
+        [1.0],
+        (0,),
+        "0",
+    )
+
+    for index, invalid in enumerate(invalid_values):
+        with pytest.raises(RunError, match="success_exit_codes"):
+            service.prepare_bundle(
+                bundle,
+                ["/usr/bin/python3", "-c", "pass"],
+                cwd=".",
+                timeout_seconds=10,
+                success_exit_codes=invalid,  # type: ignore[arg-type]
+                idempotency_key=f"invalid-exit-codes-{index}",
+                actor="test-principal",
+            )
+
+    assert not (tmp_path / "runs").exists()
+
+
+def test_bundle_run_honors_declared_nonzero_success_exit_codes(
+    tmp_path: Path,
+) -> None:
+    _repository, bundle = _create_test_execution_bundle(
+        tmp_path,
+        "EVAL-nonzero-exit",
+    )
+    service = RunService(tmp_path)
+    manifest = service.prepare_bundle(
+        bundle,
+        ["/usr/bin/python3", "-c", "raise SystemExit(7)"],
+        cwd=".",
+        timeout_seconds=10,
+        success_exit_codes=[7],
+        idempotency_key="bundle-nonzero-exit",
+        actor="test-principal",
+    )
+    assert manifest["success_exit_codes"] == [7]
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+
+    assert runner_module.run(str(tmp_path), run_id) == 0
+
+    final = json.loads(
+        (tmp_path / "runs" / run_id / "final.json").read_text(encoding="utf-8")
+    )
+    assert final["state"] == "completed"
+    assert final["exit_code"] == 7
+    assert final["success_exit_codes"] == [7]
+    assert final["manifest_sha256"] == manifest["manifest_sha256"]
+
+
+def test_existing_run_manifest_and_final_schema_remain_readable(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=["/usr/bin/python3", "-c", "pass"],
+        key="existing-schema-v1",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    manifest_path = tmp_path / "runs" / run_id / "manifest.json"
+    final_path = tmp_path / "runs" / run_id / "final.json"
+    manifest_bytes = manifest_path.read_bytes()
+    final_bytes = final_path.read_bytes()
+    final = json.loads(final_bytes)
+
+    recovered = RunService(tmp_path)
+
+    assert "execution_bundle" not in manifest
+    assert "execution_bundle" not in final
+    assert manifest["manifest_sha256"] == manifest_sha256(manifest)
+    assert final["manifest_sha256"] == manifest["manifest_sha256"]
+    assert final["stdout"] == {
+        "path": f".aros/runs/{run_id}/stdout.log",
+        "bytes": 0,
+        "sha256": hashlib.sha256(b"").hexdigest(),
+    }
+    assert final["stderr"] == {
+        "path": f".aros/runs/{run_id}/stderr.log",
+        "bytes": 0,
+        "sha256": hashlib.sha256(b"").hexdigest(),
+    }
+    assert recovered.status(run_id)["state"] == "completed"
+    assert recovered.list() == [recovered.status(run_id)]
+    assert recovered.stop(run_id, actor="reader", reason="already final") == final
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    assert manifest_path.read_bytes() == manifest_bytes
+    assert final_path.read_bytes() == final_bytes
 
 
 def test_prepare_defaults_to_isolated_linux_and_freezes_capability_policy(
@@ -375,6 +588,186 @@ print(json.dumps({
     assert observed["profile"] == "isolated-linux"
     assert (scratch / "result.txt").read_text(encoding="utf-8") == "ok"
     assert not (tmp_path / "forbidden.txt").exists()
+
+
+def test_bundle_run_reads_candidate_and_apparatus_but_cannot_write_them(
+    tmp_path: Path,
+) -> None:
+    try:
+        probe_isolated_linux()
+    except IsolationError as error:
+        pytest.skip(f"isolated-linux is unavailable: {error}")
+    scorer = r"""
+import json, pathlib
+apparatus = pathlib.Path(__file__).resolve().parent
+bundle = apparatus.parent
+candidate = bundle / "candidate"
+temporary = bundle / "tmp"
+def attempt(operation):
+    try:
+        return {"ok": True, "value": operation()}
+    except OSError as error:
+        return {"ok": False, "errno": error.errno}
+print(json.dumps({
+    "candidate_read": attempt(lambda: (candidate / "candidate.txt").read_text()),
+    "apparatus_read": attempt(lambda: (apparatus / "score.py").read_text()),
+    "candidate_write": attempt(lambda: (candidate / "blocked.txt").write_text("bad")),
+    "apparatus_write": attempt(lambda: (apparatus / "blocked.txt").write_text("bad")),
+    "bundle_write": attempt(lambda: (bundle / "blocked.txt").write_text("bad")),
+    "temp_write": attempt(lambda: (temporary / "allowed.txt").write_text("ok")),
+}))
+"""
+    _repository, bundle = _create_test_execution_bundle(
+        tmp_path,
+        "EVAL-isolation",
+        candidate_files={"candidate.txt": "candidate bytes\n"},
+        apparatus_files={"score.py": scorer},
+    )
+    service = RunService(tmp_path)
+    manifest = service.prepare_bundle(
+        bundle,
+        ["/usr/bin/python3", "../apparatus/score.py"],
+        cwd=".",
+        timeout_seconds=10,
+        success_exit_codes=[0],
+        idempotency_key="bundle-isolation",
+        actor="test-principal",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    status = service.status(run_id)
+    observed = json.loads(service.tail(run_id))
+
+    assert status["state"] == "completed"
+    assert observed["candidate_read"] == {
+        "ok": True,
+        "value": "candidate bytes\n",
+    }
+    assert observed["apparatus_read"]["ok"] is True
+    assert observed["candidate_write"]["ok"] is False
+    assert observed["apparatus_write"]["ok"] is False
+    assert observed["bundle_write"]["ok"] is False
+    assert observed["temp_write"] == {"ok": True, "value": 2}
+    assert (bundle.temp / "allowed.txt").read_text(encoding="utf-8") == "ok"
+    assert not (bundle.candidate.path / "blocked.txt").exists()
+    assert not (bundle.apparatus.path / "blocked.txt").exists()
+    assert not (bundle.root / "blocked.txt").exists()
+    assert (tmp_path / ".aros" / "runs" / run_id / "stdout.log").is_file()
+    assert not (bundle.root / ".aros").exists()
+
+
+def test_runner_revalidates_both_trees_immediately_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, bundle = _create_test_execution_bundle(
+        tmp_path,
+        "EVAL-pre-spawn",
+        candidate_files={"candidate.txt": "candidate\n"},
+    )
+    service = RunService(tmp_path)
+    manifest = service.prepare_bundle(
+        bundle,
+        ["/usr/bin/python3", "-c", "pass"],
+        cwd=".",
+        timeout_seconds=10,
+        success_exit_codes=[0],
+        idempotency_key="bundle-pre-spawn",
+        actor="test-principal",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    events: list[str] = []
+
+    def observe_validation(observed_repository, observed_bundle) -> None:
+        assert observed_repository == repository
+        assert observed_bundle.candidate == bundle.candidate
+        assert observed_bundle.apparatus == bundle.apparatus
+        validate_execution_bundle(observed_repository, observed_bundle)
+        events.append("validated-both-trees")
+
+    real_popen = runner_module.subprocess.Popen
+
+    def observe_spawn(*args: object, **kwargs: object):
+        if args and args[0] == manifest["argv"]:
+            events.append("spawn")
+            assert events == ["validated-both-trees", "spawn"]
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runner_module,
+        "validate_execution_bundle",
+        observe_validation,
+        raising=False,
+    )
+    monkeypatch.setattr(runner_module.subprocess, "Popen", observe_spawn)
+
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    assert events == ["validated-both-trees", "spawn"]
+
+
+@pytest.mark.parametrize("drift", ("path", "symlink", "head", "tree", "filter"))
+def test_bundle_run_rejects_path_symlink_head_tree_or_filter_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    _repository, bundle = _create_test_execution_bundle(
+        tmp_path,
+        f"EVAL-drift-{drift}",
+        candidate_files={"candidate.txt": "candidate\n"},
+    )
+    service = RunService(tmp_path)
+    manifest = service.prepare_bundle(
+        bundle,
+        ["/usr/bin/python3", "-c", "pass"],
+        cwd=".",
+        timeout_seconds=10,
+        success_exit_codes=[0],
+        idempotency_key=f"bundle-drift-{drift}",
+        actor="test-principal",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    if drift == "path":
+        (bundle.root / "unexpected").mkdir()
+    elif drift == "symlink":
+        bundle.temp.rmdir()
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-temp"
+        outside.mkdir()
+        bundle.temp.symlink_to(outside, target_is_directory=True)
+    elif drift == "head":
+        _git(bundle.candidate.path, "reset", "--hard", bundle.apparatus.commit)
+    elif drift == "tree":
+        (bundle.apparatus.path / "apparatus.txt").write_text(
+            "drifted apparatus bytes\n",
+            encoding="utf-8",
+        )
+    else:
+        _git(tmp_path, "config", "filter.runtime.smudge", "cat")
+    spawned = False
+    real_popen = runner_module.subprocess.Popen
+
+    def observe_spawn(*args: object, **kwargs: object):
+        nonlocal spawned
+        if args and args[0] == manifest["argv"]:
+            spawned = True
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", observe_spawn)
+
+    assert runner_module.run(str(tmp_path), run_id) == 1
+
+    final = json.loads(
+        (tmp_path / "runs" / run_id / "final.json").read_text(encoding="utf-8")
+    )
+    assert final["state"] == "failed_process"
+    assert final["manifest_sha256"] == manifest["manifest_sha256"]
+    assert "process launch failed" in final["error"]
+    assert spawned is False
+    assert bundle.candidate.path.is_dir()
+    assert bundle.apparatus.path.is_dir()
+    registrations = _git(tmp_path, "worktree", "list", "--porcelain")
+    assert str(bundle.candidate.path) in registrations
+    assert str(bundle.apparatus.path) in registrations
 
 
 def test_start_rejects_manifest_tamper_and_unrelated_dirty_work(tmp_path: Path) -> None:

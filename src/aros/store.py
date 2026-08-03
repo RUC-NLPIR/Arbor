@@ -117,7 +117,10 @@ def process_start_token(pid: int) -> str | None:
 
 
 def final_identity(manifest: dict[str, Any]) -> dict[str, Any]:
-    return {field: manifest[field] for field in FINAL_IDENTITY_FIELDS}
+    identity = {field: manifest[field] for field in FINAL_IDENTITY_FIELDS}
+    if "execution_bundle" in manifest:
+        identity["execution_bundle"] = manifest["execution_bundle"]
+    return identity
 
 
 def read_json(path: str | Path) -> Any:

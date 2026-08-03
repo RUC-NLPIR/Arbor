@@ -16,10 +16,38 @@ import pytest
 
 import arbor.aros.task_runner as task_runner_module
 import arbor.aros.store as store_module
-from arbor.aros.store import atomic_write_json, create_json, read_json
+from arbor.aros.store import (
+    FINAL_IDENTITY_FIELDS,
+    atomic_write_json,
+    canonical_json_bytes,
+    create_json,
+    final_identity,
+    read_json,
+)
 
 
 _CRASH_AFTER_LINK_EXIT = 91
+
+
+def test_bundle_final_identity_extends_without_changing_legacy_identity() -> None:
+    legacy_manifest = {
+        field: f"legacy-{field}" for field in FINAL_IDENTITY_FIELDS
+    }
+    legacy_identity = dict(legacy_manifest)
+    legacy_bytes = canonical_json_bytes(legacy_identity)
+    execution_bundle = {
+        "candidate": {"path": "candidate", "commit": "a" * 40, "tree": "b" * 40},
+        "apparatus": {"path": "apparatus", "commit": "c" * 40, "tree": "d" * 40},
+        "temp": "tmp",
+        "bundle_sha256": "e" * 64,
+    }
+
+    assert canonical_json_bytes(final_identity(legacy_manifest)) == legacy_bytes
+    assert final_identity({**legacy_manifest, "execution_bundle": execution_bundle}) == {
+        **legacy_identity,
+        "execution_bundle": execution_bundle,
+    }
+    assert canonical_json_bytes(final_identity(legacy_manifest)) == legacy_bytes
 
 
 def _temporary_paths(target: Path) -> list[Path]:

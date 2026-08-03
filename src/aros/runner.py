@@ -25,6 +25,13 @@ from .store import (
     read_json,
     utc_now as _utc_now,
 )
+from .worktrees import (
+    CheckoutBinding,
+    ExecutionBundle,
+    RepositoryBinding,
+    bind_repository,
+    validate_execution_bundle,
+)
 
 
 def _file_receipt(path: Path, relative: str) -> dict[str, object]:
@@ -169,6 +176,63 @@ def _terminate_for_timeout(process: subprocess.Popen[bytes]) -> list[str]:
     return sequence
 
 
+def _execution_bundle_binding(
+    root: Path,
+    manifest: dict[str, Any],
+) -> tuple[Path, RepositoryBinding, ExecutionBundle]:
+    payload = manifest.get("execution_bundle")
+    if not isinstance(payload, dict) or set(payload) != {
+        "candidate",
+        "apparatus",
+        "temp",
+        "bundle_sha256",
+    }:
+        raise ValueError("manifest execution_bundle has an invalid shape")
+    repository_ref = manifest.get("repository_ref")
+    if not isinstance(repository_ref, str):
+        raise ValueError("bundle repository_ref must be workspace-relative")
+    relative_root = Path(repository_ref)
+    if (
+        relative_root.is_absolute()
+        or len(relative_root.parts) != 3
+        or relative_root.parts[:2] != (".worktree", "eval")
+    ):
+        raise ValueError("bundle repository_ref must be .worktree/eval/<eval-id>")
+    bundle_root = root / relative_root
+    repository = bind_repository(root)
+
+    def checkout(name: str) -> CheckoutBinding:
+        record = payload.get(name)
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"path", "commit", "tree"}
+            or record.get("path") != name
+            or not isinstance(record.get("commit"), str)
+            or not isinstance(record.get("tree"), str)
+        ):
+            raise ValueError(f"manifest execution_bundle {name} is invalid")
+        checkout_repository = bind_repository(bundle_root / name)
+        return CheckoutBinding(
+            path=bundle_root / name,
+            git_dir=checkout_repository.git_dir,
+            commit=str(record["commit"]),
+            tree=str(record["tree"]),
+        )
+
+    if payload.get("temp") != "tmp" or not isinstance(
+        payload.get("bundle_sha256"), str
+    ):
+        raise ValueError("manifest execution_bundle temp or hash is invalid")
+    bundle = ExecutionBundle(
+        root=bundle_root,
+        candidate=checkout("candidate"),
+        apparatus=checkout("apparatus"),
+        temp=bundle_root / "tmp",
+        bundle_sha256=str(payload["bundle_sha256"]),
+    )
+    return bundle_root, repository, bundle
+
+
 def run(workspace: str, run_id: str) -> int:
     root = Path(workspace).expanduser().resolve()
     manifest_path = root / "runs" / run_id / "manifest.json"
@@ -185,8 +249,13 @@ def run(workspace: str, run_id: str) -> int:
     if final_path.exists():
         return 0
 
-    cwd = (root / str(manifest["cwd"])).resolve()
-    cwd.relative_to(root)
+    execution_root = root
+    bundle_binding: tuple[RepositoryBinding, ExecutionBundle] | None = None
+    if "execution_bundle" in manifest:
+        execution_root, repository, bundle = _execution_bundle_binding(root, manifest)
+        bundle_binding = repository, bundle
+    cwd = (execution_root / str(manifest["cwd"])).resolve()
+    cwd.relative_to(execution_root)
     if not cwd.is_dir():
         raise ValueError("manifest cwd is unavailable")
     stdout_path = runtime / "stdout.log"
@@ -224,7 +293,7 @@ def run(workspace: str, run_id: str) -> int:
                 raise ValueError("isolated manifest is missing isolation_limits")
             limits = IsolationLimits(**raw_limits)
             launch = build_isolated_linux(
-                root,
+                execution_root,
                 manifest.get("writable_paths", []),
                 limits=limits,
             )
@@ -247,6 +316,8 @@ def run(workspace: str, run_id: str) -> int:
         with stdout_path.open("ab", buffering=0) as stdout, stderr_path.open(
             "ab", buffering=0
         ) as stderr:
+            if bundle_binding is not None:
+                validate_execution_bundle(*bundle_binding)
             process = subprocess.Popen(
                 list(manifest["argv"]),
                 cwd=cwd,

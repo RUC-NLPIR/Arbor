@@ -179,6 +179,7 @@ def validate_execution_bundle(
     bundle: ExecutionBundle,
 ) -> None:
     """Validate both exact checkouts and the portable bundle binding."""
+    _reject_checkout_filters(repo)
     _validate_execution_bundle_authority(repo, bundle)
     candidate_clean = _checkout_is_clean(repo, bundle.candidate)
     apparatus_clean = _checkout_is_clean(repo, bundle.apparatus)

@@ -275,8 +275,8 @@ def _persistent_escaped_session_task(
     runner_pid: int | None = None
     adapter_pid: int | None = None
     descendant_pid: int | None = None
-    service.start(task_id)
     try:
+        service.start(task_id)
         ready_path = worktree / "escaped.ready"
         deadline = time.monotonic() + 5
         while not ready_path.exists() and time.monotonic() < deadline:
@@ -2202,40 +2202,51 @@ def test_runner_reaps_adopted_zombies_while_adapter_leader_is_live(
         key="reap-adopted-zombies-live-leader",
     )
     task_id = str(brief["task_id"])
-
-    service.start(task_id)
     runtime = tmp_path / ".aros" / "tasks" / task_id
     worktree = tmp_path / ".worktree" / "tasks" / task_id
-    ready_path = worktree / "leader.ready"
-    deadline = time.monotonic() + 5
-    while not ready_path.exists() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert ready_path.exists()
-    descendant_pids = {
-        int(path.read_text(encoding="utf-8"))
-        for path in worktree.glob("adopted-*.pid")
-    }
-    assert len(descendant_pids) == grandchild_count
-    execution = json.loads((runtime / "execution.json").read_text(encoding="utf-8"))
-    adapter = json.loads((runtime / "adapter.json").read_text(encoding="utf-8"))
-    runner_pid = int(execution["runner_pid"])
-    adapter_pid = int(adapter["adapter_pid"])
-    adapter_pgid = int(adapter["adapter_pgid"])
-    children_path = Path(f"/proc/{runner_pid}/task/{runner_pid}/children")
-    deadline = time.monotonic() + 5
-    runner_children: set[int] = set()
-    while time.monotonic() < deadline:
-        runner_children = {
-            int(value) for value in children_path.read_text(encoding="utf-8").split()
-        }
-        if descendant_pids <= runner_children:
-            break
-        time.sleep(0.02)
-
     adopted_release = worktree / "adopted.release"
     leader_release = worktree / "leader.release"
     final_path = runtime / "final.json"
+    runner_pid: int | None = None
+    adapter_pid: int | None = None
+    adapter_pgid: int | None = None
+    descendant_pids: set[int] = set()
+    runner_children: set[int] = set()
     try:
+        service.start(task_id)
+        ready_path = worktree / "leader.ready"
+        deadline = time.monotonic() + 5
+        while not ready_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready_path.exists()
+        descendant_pids = {
+            int(path.read_text(encoding="utf-8"))
+            for path in worktree.glob("adopted-*.pid")
+        }
+        assert len(descendant_pids) == grandchild_count
+        runner_pid = _best_effort_test_pid(
+            runtime / "execution.json",
+            "runner_pid",
+        )
+        adapter_pid = _best_effort_test_pid(runtime / "adapter.json", "adapter_pid")
+        adapter_pgid = _best_effort_test_pid(
+            runtime / "adapter.json",
+            "adapter_pgid",
+        )
+        assert runner_pid is not None
+        assert adapter_pid is not None
+        assert adapter_pgid is not None
+        children_path = Path(f"/proc/{runner_pid}/task/{runner_pid}/children")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            runner_children = {
+                int(value)
+                for value in children_path.read_text(encoding="utf-8").split()
+            }
+            if descendant_pids <= runner_children:
+                break
+            time.sleep(0.02)
+
         assert descendant_pids <= runner_children
         assert _process_is_running(adapter_pid)
         adopted_release.touch()
@@ -2258,14 +2269,44 @@ def test_runner_reaps_adopted_zombies_while_adapter_leader_is_live(
         assert terminal["exit_code"] == 23
         assert final["exit_code"] == 23
     finally:
-        adopted_release.touch(exist_ok=True)
-        leader_release.touch(exist_ok=True)
+        if worktree.is_dir():
+            for release_path in (adopted_release, leader_release):
+                try:
+                    release_path.touch(exist_ok=True)
+                except OSError:
+                    pass
+            for path in worktree.glob("adopted-*.pid"):
+                child_pid = _best_effort_test_pid(path)
+                if child_pid is not None:
+                    descendant_pids.add(child_pid)
+        runner_pid = runner_pid or _best_effort_test_pid(
+            runtime / "execution.json",
+            "runner_pid",
+        )
+        adapter_pid = adapter_pid or _best_effort_test_pid(
+            runtime / "adapter.json",
+            "adapter_pid",
+        )
+        adapter_pgid = adapter_pgid or _best_effort_test_pid(
+            runtime / "adapter.json",
+            "adapter_pgid",
+        )
         deadline = time.monotonic() + 5
         while not final_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
-        if _process_is_running(adapter_pid):
-            os.killpg(adapter_pgid, signal.SIGKILL)
-        _assert_processes_stop(adapter_pid, *descendant_pids)
+        if adapter_pid is not None and adapter_pgid == adapter_pid:
+            _kill_test_process(adapter_pid, group=True)
+        else:
+            _kill_test_process(adapter_pid, group=False)
+        _kill_test_process(runner_pid, group=False)
+        for child_pid in descendant_pids:
+            _kill_test_process(child_pid, group=False)
+        recorded_pids = tuple(
+            pid
+            for pid in (adapter_pid, runner_pid, *sorted(descendant_pids))
+            if pid is not None
+        )
+        _assert_processes_stop(*recorded_pids)
 
 
 def test_runner_waits_for_process_group_drain_before_finalizing_late_stdout(

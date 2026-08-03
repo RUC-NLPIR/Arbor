@@ -511,12 +511,13 @@ Git diff-check:                           exit 0
 uv.lock comparison:                       unchanged
 ```
 
-## Post-containment verification
+## Prior post-containment verification
 
-The following fresh receipts cover exact code baseline
-`254f754a122bcaea6852abc55480eff339cbe889`. They are the current verification
-evidence for the trusted-local live-subreaper boundary; the older receipts above
-remain historical commissioning and pre-containment evidence.
+The following receipts cover exact code baseline
+`254f754a122bcaea6852abc55480eff339cbe889`. They remain valid evidence for the
+trusted-local live-subreaper boundary at that code, but are superseded for
+current code verification by the final post-review receipts below. The older
+receipts above remain historical commissioning and pre-containment evidence.
 
 ```bash
 .venv/bin/python -m pytest -o addopts= -q
@@ -547,6 +548,54 @@ Full suite:                              1175 passed, 6 skipped in 251.13s
 Task/runner:                             331 passed in 225.05s
 Architecture/public-entry/registry:      227 passed in 12.45s
 TaskTool/CLI/Principal:                   46 passed in 2.22s
+Maintained src/tests/scripts Ruff:       All checks passed
+Git diff-check:                          exit 0
+Working-tree uv.lock comparison:         unchanged
+Commissioning-baseline uv.lock comparison: unchanged
+```
+
+## Final post-review Wave 2 verification
+
+The final review added intent-bound targeted recovery for a prune interrupted
+at the worktree-removal midpoint. Recovery may complete only the exact
+prunable worktree registration bound by the persisted prune intent, rejects
+unrelated prunable registrations, and never invokes global
+`git worktree prune`.
+
+The following fresh receipts cover exact code baseline
+`114da5959ae39be4b6977550ab291f9045d23679`:
+
+```bash
+.venv/bin/python -m pytest -o addopts= -q
+
+.venv/bin/python -m pytest -o addopts= -q tests/test_aros_tasks.py
+
+.venv/bin/python -m pytest -o addopts= -q tests/test_aros_task_runner.py
+
+.venv/bin/python -m pytest -o addopts= -q \
+  tests/test_aros_architecture_boundary.py \
+  tests/test_aros_public_entry.py \
+  tests/test_document_registry.py
+
+.venv/bin/python -m pytest -o addopts= -q \
+  tests/test_aros_task_tool.py \
+  tests/test_aros_task_cli.py \
+  tests/test_aros_principal.py
+
+.venv/bin/ruff check src tests scripts
+git diff --check
+git diff --quiet -- uv.lock
+git diff --quiet e4db5f5602fca83dfd3003fc32fd36458feee06c -- uv.lock
+```
+
+Receipts:
+
+```text
+Full suite:                              1177 passed, 6 skipped in 260.91s
+Tasks:                                   258 passed in 122.38s
+Task runner:                             75 passed in 111.16s
+Architecture/public-entry/registry:      227 passed in 9.61s
+TaskTool/CLI/Principal:                   46 passed in 0.93s
 Maintained src/tests/scripts Ruff:       All checks passed
 Git diff-check:                          exit 0
 Working-tree uv.lock comparison:         unchanged

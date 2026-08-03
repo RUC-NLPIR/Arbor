@@ -9,7 +9,7 @@ commissioned.
 ## Current position
 
 - Branch: `aros-wave2-child` in `/workspace/Arbor/.worktree/aros-wave2-child`.
-- Post-containment code baseline: `254f754a122bcaea6852abc55480eff339cbe889`.
+- Final post-review code baseline: `114da5959ae39be4b6977550ab291f9045d23679`.
 - Wave 2 Tasks 1–6 are implemented, independently reviewed, and commissioned.
 - Registered evidence: `docs/analysis/aros-wave2-child-substrate-smoke.md`.
 - Real commissioning demonstrated concurrent read/write children, launcher-exit
@@ -25,6 +25,10 @@ commissioned.
 - Worktree ownership is non-expiring and can be released only by explicit clean
   prune. The create-once execution claim is the local one-attempt execution
   lease; dead holders become `lost` and never transfer ownership or relaunch.
+- Interrupted prune recovery is intent-bound and targeted: at the removal
+  midpoint it may complete only the exact prunable worktree registration bound
+  by the persisted prune intent. It rejects unrelated prunable registrations
+  and never invokes global `git worktree prune`.
 - Task adapters are trusted-local and application-scoped, not a security
   sandbox. Network and shell capability flags are audit declarations and are
   not enforced. Secrets and untrusted adapters are unsupported. Daemonizing or
@@ -35,11 +39,14 @@ commissioned.
   claimed contained and cannot justify a clean final receipt or prune.
   Delegated per-task cgroups belong to the shared Operations process core, not
   the Wave 2 security claim.
-- Fresh verification at the exact post-containment baseline reached
-  `1175 passed, 6 skipped in 251.13s`; Task/runner reached `331 passed in 225.05s`,
-  architecture/public-entry/registry reached `227 passed in 12.45s`, and
-  TaskTool/CLI/Principal reached `46 passed in 2.22s`. Maintained Ruff, diff,
-  and working-tree/commissioning-baseline lock gates are green.
+- The `254f754a122bcaea6852abc55480eff339cbe889` post-containment receipts
+  remain valid for that code but are superseded for current verification.
+- Fresh verification at the exact final post-review baseline reached
+  `1177 passed, 6 skipped in 260.91s`; Tasks reached `258 passed in 122.38s`,
+  task runner reached `75 passed in 111.16s`, architecture/public-entry/registry
+  reached `227 passed in 9.61s`, and TaskTool/CLI/Principal reached
+  `46 passed in 0.93s`. Maintained Ruff, diff, and
+  working-tree/commissioning-baseline lock gates are green.
 
 ## Preserved operational evidence
 

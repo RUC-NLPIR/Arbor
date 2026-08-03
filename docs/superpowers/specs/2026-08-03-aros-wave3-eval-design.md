@@ -58,7 +58,7 @@ machines, locks, recovery, error types, and service-specific schemas.
 
 ```text
 Principal selects versioned evaluator + exact candidate commit
-  -> Eval freezes request and creates candidate/apparatus checkouts
+  -> Eval freezes request and creates a bound candidate/apparatus execution bundle
   -> RunService executes the scorer in isolated-linux
   -> Run owns process identity, logs, timeout, stop, final, and lost truth
   -> Eval verifies Run receipt and parses exact scorer stdout
@@ -68,6 +68,15 @@ Principal selects versioned evaluator + exact candidate commit
 
 Eval may derive status from its request, Run ID, Run state, and measurement
 receipt. It does not mirror Run process state into a second authority.
+
+The execution bundle is one directory below `.worktree/eval/<eval-id>/` with
+separate exact `candidate/` and `apparatus/` detached checkouts. Its binding
+records both Git directories, commits, and tree hashes. Run receives the bundle
+root, a cwd below `candidate/`, exact argv that references the apparatus by a
+bundle-relative path, and both roots as read-only isolation inputs. Neither
+checkout is writable; temporary files live in a separate ephemeral Run temp
+root. Runner revalidates the bundle immediately before process launch, while
+Run control state and logs remain in the primary workspace.
 
 ### 3.3 Protected flow
 
@@ -139,18 +148,19 @@ apparatus and disclosure hashes.
 ### 4.2 Evaluation request
 
 The evaluation ID is deterministically derived from the full SHA-256 of the
-idempotency key. A create-once request binds:
+idempotency key. A create-once `request.json` binds:
 
 - evaluator descriptor hash;
 - candidate and apparatus commits/trees;
 - exact commands and cwd;
 - actor, environment, seed, limits, and created time;
-- request self-hash;
-- visible Run ID when materialized.
+- request self-hash.
 
 A separate create-once local execution claim records broker PID/start token and
 holds a per-evaluation flock during the sole attempt. The claim never transfers
-or authorizes relaunch. For visible Eval, status follows the linked Run while it
+or authorizes relaunch. A create-once `run.json` separately binds the request
+hash, Run ID, Run manifest hash, and execution-bundle hash. For visible Eval,
+status follows the linked Run while it
 is active, remains finalizing while the execution lock is held, and becomes
 `lost` only if Run terminates and the lock is released without a measurement
 receipt.
@@ -159,6 +169,20 @@ For protected Eval, a released execution lock with no protected receipt is
 
 The same key with the same request returns the existing state. The same key
 with different inputs is rejected. A lost request remains lost forever.
+
+Visible launch ordering is fixed:
+
+1. publish and validate `request.json`, then acquire the sole execution lock;
+2. materialize and validate the execution bundle;
+3. call `RunService.prepare` without launching;
+4. publish `run.json` with the exact Run and bundle hashes;
+5. call `RunService.start` and wait/observe through RunService.
+
+A crash before step 4 may leave a prepared, unlinked Run, which remains
+discoverable for audit but is never started or adopted automatically. A crash
+after step 4 leaves an exact linked prepared/running Run. In either case the
+evaluation request is `lost` after its lock is released, and the same key may
+not prepare or launch a second Run.
 
 ### 4.3 Metric document
 
@@ -178,20 +202,31 @@ scientific pass/fail judgment.
 
 ## 5. State and recovery
 
-Process and measurement truth remain separate:
+Evaluation lifecycle, referenced process truth, and measurement truth remain
+separate:
 
 ```text
-process_state:
-  completed | failed_process | timed_out | cancelled | lost
+evaluation_state:
+  prepared | running | finalizing | completed | lost
+
+referenced_process_state:
+  prepared | launched | running | completed | failed_process |
+  timed_out | cancelled | lost
 
 measurement_state:
   valid | underpowered | invalid_eval | not_available
 ```
 
-Valid pairings are:
+Terminal measurement receipts use `evaluation_state=completed`. Their valid
+process/measurement pairings are:
 
 - `completed` with `valid`, `underpowered`, or `invalid_eval`;
-- `failed_process`, `timed_out`, `cancelled`, or `lost` with `not_available`.
+- `failed_process`, `timed_out`, or `cancelled` with `not_available`.
+
+`evaluation_state=lost` has no terminal measurement receipt. Its status may
+still report the last referenced Run state, including `completed`, together
+with `measurement_state=not_available`; this is an operationally lost
+evaluation, not a contradiction or a scientific result.
 
 Visible process truth is the referenced Run receipt. Protected process truth is
 the foreground broker/phase identities plus the single external protected
@@ -238,6 +273,11 @@ For protected target/scorer phases:
 - Landlock, seccomp, no-new-privileges, capability drop, and resource limits
   fail closed;
 - foreground children use `PDEATHSIG` with the post-`prctl` parent check;
+- protected pre-exec performs all credential/capability changes first, installs
+  `PDEATHSIG=SIGKILL`, rechecks the expected parent, then installs
+  no-new-privileges, Landlock, and seccomp;
+- seccomp denies later `prctl`, fork/clone/vfork, unshare/setns, and setsid so
+  untrusted code cannot clear the death signal or escape the phase boundary;
 - unconfirmed reap means no terminal receipt.
 
 The v1 claim covers isolated children and ordinary AROS-mediated tool misuse.
@@ -293,8 +333,8 @@ The following are prohibited imports or ports:
 - launch/reconcile transition is serialized and runner bootstrap stays strict;
 - receipt extraction is byte-for-byte compatible;
 - attached Task and new detached Eval checkout tests pass;
-- Run can execute in a bound external checkout while keeping control receipts
-  in the primary workspace.
+- Run can execute in a two-checkout bound execution bundle, revalidate both
+  exact trees, and keep control receipts in the primary workspace.
 
 ### Gate B: visible evaluation
 
@@ -310,6 +350,8 @@ The following are prohibited imports or ports:
 
 - Run behavior is unchanged after `processes.py` extraction;
 - broker-death, timeout, TERM/KILL, FD survival, and reap tests pass;
+- an adversarial child cannot clear `PDEATHSIG`; killing the broker leaves no
+  live target/scorer descendant and no false terminal receipt;
 - activity lock and disclosure reservation are atomic and fail closed;
 - protected isolation tests prove path/FD separation.
 

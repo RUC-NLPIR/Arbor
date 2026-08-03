@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import posixpath
@@ -10,11 +11,15 @@ from datetime import datetime
 from pathlib import PurePosixPath
 
 from .receipts import record_sha256 as _record_sha256
+from .store import canonical_json_bytes as _canonical_json_bytes
 from .store import json_sha256 as _json_sha256
 
 
 _MAX_METRIC_BYTES = 65_536
 _MAX_NUMBER_TOKEN = 128
+_MAX_RECORD_BYTES = 1024 * 1024
+_MAX_RECORD_DEPTH = 64
+_MAX_RECORD_NODES = 10_000
 _METRIC_FIELDS = {"schema_version", "metric", "sample_count"}
 
 
@@ -153,6 +158,45 @@ def _finite_number(value: object, field: str) -> int | float:
     return value
 
 
+def _bounded_canonical_sha256(value: object, description: str) -> str:
+    stack = [(value, 0)]
+    node_count = 0
+    while stack:
+        item, depth = stack.pop()
+        node_count += 1
+        if node_count > _MAX_RECORD_NODES:
+            raise ValueError(f"{description} exceeds {_MAX_RECORD_NODES} nodes")
+        if depth > _MAX_RECORD_DEPTH:
+            raise ValueError(f"{description} exceeds depth {_MAX_RECORD_DEPTH}")
+        item_type = type(item)
+        if item_type is dict:
+            for key in item:
+                if type(key) is not str:
+                    raise ValueError(f"{description} keys must be strings")
+                _utf8(key, f"{description} key")
+            if node_count + len(stack) + len(item) > _MAX_RECORD_NODES:
+                raise ValueError(f"{description} exceeds {_MAX_RECORD_NODES} nodes")
+            stack.extend((child, depth + 1) for child in item.values())
+        elif item_type is list:
+            if node_count + len(stack) + len(item) > _MAX_RECORD_NODES:
+                raise ValueError(f"{description} exceeds {_MAX_RECORD_NODES} nodes")
+            stack.extend((child, depth + 1) for child in item)
+        elif item_type is str:
+            _utf8(item, description)
+        elif item_type is float:
+            if not math.isfinite(item):
+                raise ValueError(f"{description} contains a non-finite number")
+        elif item is not None and item_type not in {bool, int}:
+            raise ValueError(f"{description} contains a non-JSON value")
+    try:
+        payload = _canonical_json_bytes(value)
+    except (RecursionError, TypeError, ValueError, UnicodeError) as error:
+        raise ValueError(f"{description} is not canonical JSON") from error
+    if len(payload) > _MAX_RECORD_BYTES:
+        raise ValueError(f"{description} exceeds {_MAX_RECORD_BYTES} encoded bytes")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def parse_visible_manifest(value: object) -> dict[str, object]:
     """Validate and copy one exact visible evaluator manifest."""
     if type(value) is not dict or set(value) != _VISIBLE_MANIFEST_FIELDS:
@@ -199,8 +243,23 @@ def parse_visible_manifest(value: object) -> dict[str, object]:
         posixpath.relpath(posixpath.join("apparatus", str(item["path"])), scorer_start)
         for item in apparatus_paths
     }
-    if not apparatus_arguments.intersection(scorer_argv):
-        raise ValueError("scorer_argv must reference a declared apparatus path")
+    apparatus_root = posixpath.relpath("apparatus", scorer_start)
+    explicit_apparatus_arguments = {
+        argument
+        for argument in scorer_argv
+        if argument == apparatus_root
+        or argument.startswith(f"{apparatus_root}/")
+    }
+    if not explicit_apparatus_arguments.issubset(apparatus_arguments):
+        raise ValueError("scorer_argv references an undeclared apparatus path")
+    direct_entry = scorer_argv[0] in apparatus_arguments
+    launched_entry = (
+        len(scorer_argv) > 1
+        and scorer_argv[0] not in explicit_apparatus_arguments
+        and scorer_argv[1] in apparatus_arguments
+    )
+    if not direct_entry and not launched_entry:
+        raise ValueError("scorer_argv must execute one declared apparatus entry")
 
     inputs = _string_list(value["inputs"], "inputs")
     environment_ref = _utf8(value["environment_ref"], "environment_ref", nonempty=True)
@@ -556,10 +615,7 @@ def build_measurement_receipt(
         "preserved",
     }:
         raise ValueError("invalid bundle_cleanup_state")
-    try:
-        run_final_sha256 = _json_sha256(run_final)
-    except (TypeError, UnicodeError) as error:
-        raise ValueError("Run final is not canonical JSON") from error
+    run_final_sha256 = _bounded_canonical_sha256(run_final, "Run final")
     receipt: dict[str, object] = {
         "schema_version": 1,
         "eval_id": validated_request["eval_id"],

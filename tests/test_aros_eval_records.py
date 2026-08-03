@@ -382,6 +382,39 @@ def test_visible_manifest_is_strict_and_self_hashed() -> None:
     assert json_sha256(parsed) == json_sha256(manifest)
 
 
+def test_visible_manifest_rejects_decoy_scorer_entry() -> None:
+    manifest = _visible_manifest()
+    manifest["scorer_argv"] = [
+        "python",
+        "untrusted.py",
+        "../apparatus/evaluation/score.py",
+    ]
+
+    with pytest.raises(ValueError):
+        parse_visible_manifest(manifest)
+
+
+def test_visible_manifest_rejects_undeclared_explicit_apparatus_path() -> None:
+    manifest = _visible_manifest()
+    manifest["scorer_argv"] = [
+        "python",
+        "../apparatus/evaluation/score.py",
+        "../apparatus/evaluation/undeclared.json",
+    ]
+
+    with pytest.raises(ValueError):
+        parse_visible_manifest(manifest)
+
+
+def test_visible_manifest_accepts_direct_declared_apparatus_entry() -> None:
+    manifest = _visible_manifest()
+    manifest["scorer_argv"] = ["../apparatus/evaluation/score.py"]
+
+    assert parse_visible_manifest(manifest)["scorer_argv"] == [
+        "../apparatus/evaluation/score.py"
+    ]
+
+
 @pytest.mark.parametrize(
     "case",
     (
@@ -621,6 +654,99 @@ def test_build_measurement_receipt_has_exact_lineage_and_self_hash() -> None:
     assert receipt["stdout"] is not run_final["stdout"]
     assert receipt["stderr"] is not run_final["stderr"]
     assert (request, execution, run_link, run_final, measurement) == inputs
+
+
+def test_build_measurement_receipt_rejects_nan_in_run_final_extra() -> None:
+    request, execution, run_link, run_final = _lineage_records()
+    run_final["arbitrary_extra"] = float("nan")
+
+    with pytest.raises(ValueError):
+        build_measurement_receipt(
+            request,
+            execution,
+            run_link,
+            run_final,
+            "valid",
+            _measurement("valid"),
+            "removed",
+        )
+
+
+def test_build_measurement_receipt_normalizes_deep_run_final_error() -> None:
+    request, execution, run_link, run_final = _lineage_records()
+    nested: object = None
+    for _depth in range(10_000):
+        nested = [nested]
+    run_final["arbitrary_extra"] = nested
+
+    with pytest.raises(ValueError):
+        build_measurement_receipt(
+            request,
+            execution,
+            run_link,
+            run_final,
+            "valid",
+            _measurement("valid"),
+            "removed",
+        )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(("tuple",), id="tuple"),
+        pytest.param({1: "non-string-key"}, id="non-string-key"),
+    ),
+)
+def test_build_measurement_receipt_rejects_noncanonical_run_final_extra(
+    extra: object,
+) -> None:
+    request, execution, run_link, run_final = _lineage_records()
+    run_final["arbitrary_extra"] = extra
+
+    with pytest.raises(ValueError):
+        build_measurement_receipt(
+            request,
+            execution,
+            run_link,
+            run_final,
+            "valid",
+            _measurement("valid"),
+            "removed",
+        )
+
+
+def test_build_measurement_receipt_rejects_excessive_run_final_nodes() -> None:
+    request, execution, run_link, run_final = _lineage_records()
+    run_final["arbitrary_extra"] = [None] * 10_001
+
+    with pytest.raises(ValueError):
+        build_measurement_receipt(
+            request,
+            execution,
+            run_link,
+            run_final,
+            "valid",
+            _measurement("valid"),
+            "removed",
+        )
+
+
+def test_build_measurement_receipt_rejects_oversized_run_final() -> None:
+    request, execution, run_link, run_final = _lineage_records()
+    run_final["arbitrary_extra"] = "x" * (1024 * 1024)
+
+    with pytest.raises(ValueError):
+        build_measurement_receipt(
+            request,
+            execution,
+            run_link,
+            run_final,
+            "valid",
+            _measurement("valid"),
+            "removed",
+        )
 
 
 @pytest.mark.parametrize(

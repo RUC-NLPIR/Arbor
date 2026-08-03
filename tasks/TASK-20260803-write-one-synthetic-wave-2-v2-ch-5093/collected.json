@@ -1,0 +1,39 @@
+{
+  "base_commit": "e4db5f5602fca83dfd3003fc32fd36458feee06c",
+  "branch_ref": "refs/heads/aros/task/TASK-20260803-write-one-synthetic-wave-2-v2-ch-5093",
+  "brief_sha256": "d9cb2025bc317f9830c097c34aa0a09b99408a15551667e70974573c71ca14ed",
+  "child_commit": "a20a46a9d6f077d90c03ac63521a4909383c09a2",
+  "collected_at": "2026-08-03T09:02:14.852Z",
+  "collected_sha256": "1d81b289bb064b663c00b048d82915ee6996ce726d0b0320c59eca4b094e093b",
+  "final_sha256": "b7e13d769feac1f0699c3cba1bfd9c2d2c41312326f23027fd8eeec74df13b43",
+  "final_state": "completed",
+  "ownership_sha256": "9e17553034fabe28efa12c99e6e40f58069bd3ac95d79efe818da9f200d9f697",
+  "return": {
+    "base_commit": "e4db5f5602fca83dfd3003fc32fd36458feee06c",
+    "brief_sha256": "d9cb2025bc317f9830c097c34aa0a09b99408a15551667e70974573c71ca14ed",
+    "changed_files": [
+      "artifacts/aros-wave2-task6.txt"
+    ],
+    "child_commit": "a20a46a9d6f077d90c03ac63521a4909383c09a2",
+    "deviations": [],
+    "evidence": [
+      "artifact_sha256=f6ff59b3b27cafffb8e0b60ebbf682356393c2c1d436c8a1d5eeb8497fa43383",
+      "child_commit=a20a46a9d6f077d90c03ac63521a4909383c09a2"
+    ],
+    "follow_up": [
+      "principal must review and explicitly accept or reject the synthetic child commit"
+    ],
+    "return_sha256": "ee33db0d02dd64709edee5d5d976ce25f59f0972bad8f2df40dfb728e273a3e1",
+    "schema_version": 1,
+    "summary": "Produced one synthetic artifact for explicit principal rejection.",
+    "task_id": "TASK-20260803-write-one-synthetic-wave-2-v2-ch-5093",
+    "uncertainty": [],
+    "work_performed": [
+      "validated injected task context and clean child ownership",
+      "wrote and committed exactly one synthetic artifact"
+    ]
+  },
+  "return_commit": "26c7fe0ffbaafd1f80ee694446ea12c55b68d822",
+  "schema_version": 1,
+  "task_id": "TASK-20260803-write-one-synthetic-wave-2-v2-ch-5093"
+}

@@ -72,6 +72,14 @@
       "status": "current",
       "authority": "informative",
       "agent_visibility": "on_demand"
+    },
+    {
+      "id": "aros-wave2-child-substrate-smoke",
+      "title": "AROS Wave 2 Child Task Substrate Smoke Evidence",
+      "path": "docs/analysis/aros-wave2-child-substrate-smoke.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
     }
   ]
 }

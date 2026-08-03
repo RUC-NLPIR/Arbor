@@ -11,16 +11,18 @@ The exposed command surface for the direct `aros` entry is:
 - `aros status`
 - `aros start`
 - `aros run start|status|list|tail|stop`
+- `aros task create|start|status|list|message|stop|collect|preserve|prune`
 
 ### Runtime requirements
 
 - Durable launch with `aros run start` requires a clean committed Git HEAD and `tmux`.
+- `aros task start` requires its immutable brief to be committed at a clean parent HEAD and requires `tmux`; collection records reviewed B-C-R pointers without merging or cherry-picking the child.
 - The default `isolated-linux` profile requires a supported Linux architecture (x86_64 or aarch64), exactly Landlock ABI 4, `libseccomp`, and `O_PATH` support; it fails closed instead of downgrading.
 - `trusted-local` is explicitly not a security sandbox and must be selected explicitly.
+- Child tasks currently run as `trusted-local` with application-level isolation and `capabilities_enforced=false`; brief capability flags are durable audit declarations, not an OS security boundary. Launch and final receipts record whether the filesystem enforces requested file modes. On a mode-normalizing filesystem, integrity checks remain active but `filesystem_permissions_enforced=false`, so untrusted adapters or secrets are out of scope.
 
 ## Not yet implemented
 
-- child task substrate
 - deterministic/protected evaluation
 - migration adapters
 - MCP parity

@@ -167,18 +167,20 @@ def test_aros_public_docs_use_direct_entry() -> None:
         "aros status",
         "aros start",
         "aros run start|status|list|tail|stop",
+        "aros task create|start|status|list|message|stop|collect|preserve|prune",
     ):
         assert command in text
     assert "`arbor aros` is a temporary forwarding compatibility route" in text
     assert "## Not yet implemented" in text
     for unavailable_capability in (
-        "child task substrate",
         "deterministic/protected evaluation",
         "migration adapters",
         "MCP parity",
         "Arbor retirement",
     ):
         assert unavailable_capability in text
+    assert "capabilities_enforced=false" in text
+    assert "filesystem_permissions_enforced=false" in text
 
 
 def test_aros_public_guide_states_runtime_prerequisites() -> None:

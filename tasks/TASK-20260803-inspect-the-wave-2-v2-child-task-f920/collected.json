@@ -1,0 +1,40 @@
+{
+  "base_commit": "e4db5f5602fca83dfd3003fc32fd36458feee06c",
+  "branch_ref": "refs/heads/aros/task/TASK-20260803-inspect-the-wave-2-v2-child-task-f920",
+  "brief_sha256": "16e8cfa8a5b9b4b2b3a7d09a594e14a6ed5c42e1d059076e30a4a902e6d43ffe",
+  "child_commit": "e4db5f5602fca83dfd3003fc32fd36458feee06c",
+  "collected_at": "2026-08-03T09:02:10.228Z",
+  "collected_sha256": "9d3e7877e4736247470d8074a070aa00af5a2a9bbb8e7f713b89e59a2f2853c8",
+  "final_sha256": "9ba54a932a0016dc72834728ebe1c4d7a1f787a69711232582347ea70dfd97c0",
+  "final_state": "completed",
+  "ownership_sha256": "2fbb11b5d73ce4b21271bdf142f614d9c5927e580b517c90f8300bb996b7139f",
+  "return": {
+    "base_commit": "e4db5f5602fca83dfd3003fc32fd36458feee06c",
+    "brief_sha256": "16e8cfa8a5b9b4b2b3a7d09a594e14a6ed5c42e1d059076e30a4a902e6d43ffe",
+    "changed_files": [],
+    "child_commit": "e4db5f5602fca83dfd3003fc32fd36458feee06c",
+    "deviations": [],
+    "evidence": [
+      "base_commit=e4db5f5602fca83dfd3003fc32fd36458feee06c",
+      "tree=e265d650584ca5f164c24388c3a004c0c2851f3d",
+      "pyproject_sha256=ff6b52e28b7e42001ea3d97c33cfaff60f8962fdff49471cc93b8fa4703ff672",
+      "tracked_paths=442"
+    ],
+    "follow_up": [
+      "principal should treat this read-only result as inspection evidence only"
+    ],
+    "return_sha256": "0cba20c036e707f923c19fce8cc370ae288e75a12356647137a8905c87e7c58d",
+    "schema_version": 1,
+    "summary": "Inspected the exact base commit without changing product material.",
+    "task_id": "TASK-20260803-inspect-the-wave-2-v2-child-task-f920",
+    "uncertainty": [],
+    "work_performed": [
+      "validated injected task context and clean child ownership",
+      "hashed pyproject.toml and inspected the base tree",
+      "counted tracked paths at the base commit"
+    ]
+  },
+  "return_commit": "ddb1106473b620051e8c1b46f1a8c2945cf1f560",
+  "schema_version": 1,
+  "task_id": "TASK-20260803-inspect-the-wave-2-v2-child-task-f920"
+}

@@ -673,6 +673,45 @@ def test_worktree_launcher_does_not_import_ambient_sitecustomize(
     assert not marker.exists()
 
 
+def test_git_subprocesses_do_not_load_ambient_dynamic_libraries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compiler = Path("/usr/bin/cc")
+    if not compiler.is_file():
+        pytest.skip("a C compiler is required for the LD_PRELOAD regression")
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service, key="malicious-dynamic-loader")
+    task_id = str(brief["task_id"])
+    _commit_brief(tmp_path, brief)
+    marker = tmp_path / ".git" / "preload-ran"
+    source = tmp_path / ".git" / "preload.c"
+    library = tmp_path / ".git" / "preload.so"
+    source.write_text(
+        "#include <fcntl.h>\n"
+        "#include <unistd.h>\n"
+        "__attribute__((constructor)) static void mark(void) {\n"
+        f"  int fd = open({json.dumps(str(marker))}, O_WRONLY | O_CREAT, 0600);\n"
+        "  if (fd >= 0) close(fd);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [str(compiler), "-shared", "-fPIC", "-o", str(library), str(source)],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setenv("LD_PRELOAD", str(library))
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(library.parent))
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", str(library))
+
+    status = service.start(task_id)
+
+    assert status["state"] == "worktree_ready"
+    assert not marker.exists()
+
+
 def test_concurrent_and_repeated_start_reuses_one_owned_worktree(
     tmp_path: Path,
 ) -> None:
@@ -906,6 +945,126 @@ def test_partial_start_with_valid_ownership_recovers_worktree_ready(
     assert ready["ownership_sha256"] == ownership["ownership_sha256"]
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ("commit", "untracked", "staged", "ignored", "mode", "hardlink"),
+)
+def test_start_never_promotes_a_racy_new_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    base_commit = _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service, key=f"new-checkout-race-{mutation}")
+    task_id = str(brief["task_id"])
+    _commit_brief(tmp_path, brief)
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    original_create_json = tasks_module.create_json
+    injected = False
+
+    def mutate_before_ownership(path: str | Path, value: object) -> bool:
+        nonlocal injected
+        if Path(path).name == "ownership.json" and not injected:
+            injected = True
+            if mutation == "commit":
+                (worktree / "README.md").write_text(
+                    "racy committed child\n",
+                    encoding="utf-8",
+                )
+                _git(worktree, "add", "README.md")
+                _git(worktree, "commit", "-qm", "racy child commit")
+            elif mutation == "untracked":
+                (worktree / "race-untracked.txt").write_text(
+                    "preserve\n",
+                    encoding="utf-8",
+                )
+            elif mutation == "staged":
+                (worktree / "README.md").write_text(
+                    "racy staged child\n",
+                    encoding="utf-8",
+                )
+                _git(worktree, "add", "README.md")
+            elif mutation == "ignored":
+                ignored = worktree / ".worktree" / "race-ignored.txt"
+                ignored.parent.mkdir()
+                ignored.write_text("preserve\n", encoding="utf-8")
+            elif mutation == "mode":
+                (worktree / "README.md").chmod(0o755)
+            else:
+                os.link(
+                    worktree / "README.md",
+                    tmp_path / ".git" / "race-hardlink",
+                )
+        return original_create_json(path, value)
+
+    monkeypatch.setattr(tasks_module, "create_json", mutate_before_ownership)
+
+    with pytest.raises(TaskError, match="checkout|base|clean|mode|index"):
+        service.start(task_id)
+
+    monkeypatch.setattr(tasks_module, "create_json", original_create_json)
+    assert injected
+    ownership_path = tmp_path / ".aros" / "tasks" / task_id / "ownership.json"
+    assert ownership_path.is_file()
+    status = json.loads(
+        (tmp_path / ".aros" / "tasks" / task_id / "status.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert status["state"] == "prepared"
+    with pytest.raises(TaskError, match="checkout|base|clean|mode|index"):
+        service.status(task_id)
+    if mutation == "commit":
+        assert _git(worktree, "rev-parse", "HEAD") != base_commit
+    elif mutation == "untracked":
+        assert (worktree / "race-untracked.txt").is_file()
+    elif mutation == "staged":
+        assert _git(worktree, "diff", "--cached", "--name-only") == "README.md"
+    elif mutation == "ignored":
+        assert (worktree / ".worktree" / "race-ignored.txt").is_file()
+    elif mutation == "mode":
+        assert (worktree / "README.md").stat().st_mode & 0o111
+    else:
+        assert (tmp_path / ".git" / "race-hardlink").is_file()
+        assert (worktree / "README.md").stat().st_nlink == 2
+
+
+@pytest.mark.parametrize("status_state", ("missing", "prepared"))
+def test_ownership_recovery_rejects_a_dirty_partial_checkout(
+    tmp_path: Path,
+    status_state: str,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service, key=f"dirty-ownership-recovery-{status_state}")
+    task_id = str(brief["task_id"])
+    _commit_brief(tmp_path, brief)
+    service.start(task_id)
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    dirty = worktree / "partial-untracked.txt"
+    dirty.write_text("preserve\n", encoding="utf-8")
+    status_path = tmp_path / ".aros" / "tasks" / task_id / "status.json"
+    if status_state == "missing":
+        status_path.unlink()
+    else:
+        atomic_write_json(
+            status_path,
+            {
+                "schema_version": 1,
+                "task_id": task_id,
+                "state": "prepared",
+                "brief_sha256": brief["brief_sha256"],
+                "updated_at": brief["created_at"],
+            },
+        )
+
+    with pytest.raises(TaskError, match="checkout|clean"):
+        TaskService(tmp_path).status(task_id)
+
+    assert dirty.read_text(encoding="utf-8") == "preserve\n"
+
+
 def test_parent_head_race_preserves_unowned_partial_start_and_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1035,6 +1194,46 @@ def test_start_fails_closed_if_checkout_bytes_differ_from_repository_blob(
     checkout = tmp_path / ".worktree" / "tasks" / task_id
     assert (checkout / "payload.txt").read_bytes() == b"repository bytes\r\n"
     assert not (tmp_path / ".aros" / "tasks" / task_id / "ownership.json").exists()
+
+
+def test_start_supports_a_local_gitlink_without_reading_it_as_a_blob(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    source = tmp_path / ".git" / "local-submodule-source"
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    _git(source, "config", "user.email", "aros@example.invalid")
+    _git(source, "config", "user.name", "AROS test")
+    (source / "data.txt").write_text("local submodule\n", encoding="utf-8")
+    _git(source, "add", "data.txt")
+    _git(source, "commit", "-qm", "local submodule state")
+    _git(
+        tmp_path,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(source),
+        "vendor/submodule",
+    )
+    _git(tmp_path, "commit", "-qam", "add local gitlink")
+    base_commit = _git(tmp_path, "rev-parse", "HEAD")
+    service = TaskService(tmp_path)
+    brief = _create(service, key="local-gitlink")
+    task_id = str(brief["task_id"])
+    _commit_brief(tmp_path, brief)
+
+    status = service.start(task_id)
+
+    assert status["state"] == "worktree_ready"
+    tree_entry = _git(
+        tmp_path,
+        "ls-tree",
+        base_commit,
+        "vendor/submodule",
+    )
+    assert tree_entry.startswith("160000 commit ")
 
 
 def test_start_git_commands_are_scrubbed_pinned_and_nondestructive(
@@ -1921,6 +2120,29 @@ def test_create_restricts_existing_plain_lock_files_to_mode_0600(
     _create(service, key=key)
 
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in lock_paths)
+
+
+def test_create_rejects_a_hardlinked_lock_before_changing_its_mode(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    locks_root = tmp_path / ".aros" / "locks"
+    locks_root.mkdir()
+    outside = tmp_path / ".git" / "outside-lock"
+    outside.write_text("preserve\n", encoding="utf-8")
+    outside.chmod(0o640)
+    lock = locks_root / "task-record-publication.lock"
+    os.link(outside, lock)
+    mode_before = outside.stat().st_mode & 0o777
+    service = TaskService(tmp_path)
+
+    with pytest.raises(TaskError, match="hardlink|link count"):
+        _create(service, key="hardlinked-publication-lock")
+
+    assert outside.read_text(encoding="utf-8") == "preserve\n"
+    assert outside.stat().st_nlink == lock.stat().st_nlink == 2
+    assert outside.stat().st_mode & 0o777 == mode_before
+    assert lock.stat().st_mode & 0o777 == mode_before
 
 
 @pytest.mark.parametrize("reader", ("status", "list"))

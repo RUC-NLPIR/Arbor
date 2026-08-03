@@ -286,7 +286,7 @@ class TaskService:
         self._require_unallocated_worktree(target, branch)
         self._add_task_worktree(target, branch, str(brief["base_commit"]))
         self._require_parent_unchanged(brief, parent_head)
-        self._validate_new_worktree(target, branch, str(brief["base_commit"]))
+        self._validate_new_checkout(target, branch, str(brief["base_commit"]))
 
         acquired_at = utc_now()
         ownership: dict[str, object] = {
@@ -308,6 +308,7 @@ class TaskService:
         if recorded != ownership:
             raise TaskError(f"task ownership differs after write: {task_id}")
         self._require_parent_unchanged(brief, parent_head)
+        self._validate_new_checkout(target, branch, str(brief["base_commit"]))
 
         ready = _worktree_ready_status(brief, recorded)
         atomic_write_json(self._status_path(task_id), ready)
@@ -522,6 +523,12 @@ class TaskService:
             else None
         )
         if not _path_exists(status_path):
+            if ownership is not None:
+                self._validate_new_checkout(
+                    Path(str(ownership["worktree_path"])),
+                    str(ownership["branch"]),
+                    str(ownership["base_commit"]),
+                )
             derived = (
                 _worktree_ready_status(brief, ownership)
                 if ownership is not None
@@ -535,6 +542,11 @@ class TaskService:
                     brief,
                     None,
                     check_material=False,
+                )
+                self._validate_new_checkout(
+                    Path(str(ownership["worktree_path"])),
+                    str(ownership["branch"]),
+                    str(ownership["base_commit"]),
                 )
                 atomic_write_json(
                     status_path,
@@ -934,7 +946,17 @@ class TaskService:
         if _plain_directory_identity(path, "task worktree root") != expected:
             raise TaskError(f"task worktree root pathname identity changed: {path}")
 
-    def _validate_new_worktree(
+    def _validate_new_checkout(
+        self,
+        target: Path,
+        branch: str,
+        base_commit: str,
+    ) -> None:
+        self._require_new_checkout_metadata(target, branch, base_commit)
+        self._verify_checkout_bytes(target, base_commit, strict=True)
+        self._require_new_checkout_metadata(target, branch, base_commit)
+
+    def _require_new_checkout_metadata(
         self,
         target: Path,
         branch: str,
@@ -942,8 +964,44 @@ class TaskService:
     ) -> None:
         tip = self._validate_worktree(target, branch, base_commit)
         if tip != base_commit:
-            raise TaskError("new task worktree does not start at its brief base commit")
-        self._verify_checkout_bytes(target, base_commit)
+            raise TaskError("new task checkout does not remain at its brief base commit")
+        child_git_dir = self._worktree_git_directory(target)
+        status = self._safe_git_bytes(
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--ignore-submodules=none",
+            git_dir=child_git_dir,
+            work_tree=target,
+        )
+        if status:
+            raise TaskError("new task checkout must be completely clean")
+        index_entries = self._safe_git_bytes(
+            "ls-files",
+            "-v",
+            "-z",
+            git_dir=child_git_dir,
+            work_tree=target,
+        )
+        if any(
+            record[:1] == b"S" or record[:1].islower()
+            for record in index_entries.split(b"\0")
+            if record
+        ):
+            raise TaskError("new task checkout index flags are ambiguous")
+        index = self._safe_git_result(
+            "diff-index",
+            "--cached",
+            "--quiet",
+            base_commit,
+            "--",
+            git_dir=child_git_dir,
+            work_tree=target,
+        )
+        if index.returncode != 0:
+            raise TaskError("new task checkout index differs from its base commit")
 
     def _validate_owned_worktree(self, ownership: dict[str, object]) -> None:
         self._validate_worktree(
@@ -1054,7 +1112,13 @@ class TaskService:
         self._require_git_root()
         return tip
 
-    def _verify_checkout_bytes(self, target: Path, commit: str) -> None:
+    def _verify_checkout_bytes(
+        self,
+        target: Path,
+        commit: str,
+        *,
+        strict: bool = False,
+    ) -> None:
         entries = self._safe_git_bytes(
             "ls-tree",
             "-r",
@@ -1078,10 +1142,33 @@ class TaskService:
             if relative.is_absolute() or ".." in relative.parts:
                 raise TaskError("unsafe Git tree path while verifying checkout")
             path = target / relative
-            blob = self._safe_git_bytes("cat-file", "blob", os.fsdecode(object_id))
+            if kind == b"commit" and mode == b"160000":
+                continue
             if kind == b"blob" and mode in {b"100644", b"100755"}:
+                blob = self._safe_git_bytes(
+                    "cat-file",
+                    "blob",
+                    os.fsdecode(object_id),
+                )
                 actual = _read_plain_bytes(path, "task checkout file")
+                if strict:
+                    metadata = path.lstat()
+                    if metadata.st_nlink != 1:
+                        raise TaskError(
+                            f"new task checkout file has unsafe hardlinks: {relative}"
+                        )
+                    expected_executable = mode == b"100755"
+                    actual_executable = bool(metadata.st_mode & 0o111)
+                    if actual_executable != expected_executable:
+                        raise TaskError(
+                            f"new task checkout executable mode mismatch: {relative}"
+                        )
             elif kind == b"blob" and mode == b"120000":
+                blob = self._safe_git_bytes(
+                    "cat-file",
+                    "blob",
+                    os.fsdecode(object_id),
+                )
                 try:
                     metadata = path.lstat()
                     actual = os.fsencode(os.readlink(path))
@@ -1089,8 +1176,6 @@ class TaskService:
                     raise TaskError(f"unable to verify checkout symlink: {path}") from error
                 if not stat.S_ISLNK(metadata.st_mode):
                     raise TaskError(f"task checkout entry is not a symlink: {path}")
-            elif kind == b"commit" and mode == b"160000":
-                continue
             else:
                 raise TaskError("unsupported Git tree entry while verifying checkout")
             if actual != blob:
@@ -1568,7 +1653,8 @@ def _git_environment() -> dict[str, str]:
     return {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("GIT_", "PYTHON"))
+        if not key.startswith(("GIT_", "PYTHON", "DYLD_"))
+        and key not in {"LD_PRELOAD", "LD_LIBRARY_PATH"}
     }
 
 
@@ -1867,6 +1953,8 @@ def _ensure_durable_lock_file(path: Path, description: str) -> None:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise TaskError(f"{description} must be a plain file: {path}")
+        if metadata.st_nlink != 1:
+            raise TaskError(f"{description} must not have a hardlink: {path}")
         if (metadata.st_dev, metadata.st_ino) != _plain_file_identity(path, description):
             raise TaskError(f"{description} identity changed while opening: {path}")
         if stat.S_IMODE(metadata.st_mode) != 0o600:

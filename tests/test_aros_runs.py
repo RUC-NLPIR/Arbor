@@ -11,6 +11,7 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -498,6 +499,39 @@ def test_concurrent_start_reattaches_without_a_second_tmux_launch(tmp_path: Path
     assert len(launch_events) == 1
 
 
+@pytest.mark.parametrize("operation", ("status", "reconcile"))
+def test_reconcile_waits_for_inflight_launch_lock(tmp_path, monkeypatch, operation):
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    real_run = subprocess.run
+
+    def paused_tmux(command, **_kwargs):
+        if command[0] == "/test/tmux" and "new-session" in command:
+            entered.set()
+            assert release.wait(5)
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return real_run(command, **_kwargs)
+
+    import arbor.aros.runs as runs_module
+
+    monkeypatch.setattr(runs_module.shutil, "which", lambda _name: "/test/tmux")
+    monkeypatch.setattr(runs_module.subprocess, "run", paused_tmux)
+    monkeypatch.setattr(runs_module, "_tmux_session_exists", lambda _name: True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        launch = pool.submit(service.start, manifest["run_id"])
+        assert entered.wait(5)
+        observer = pool.submit(getattr(service, operation), manifest["run_id"])
+        try:
+            with pytest.raises(TimeoutError):
+                observer.result(timeout=0.2)
+        finally:
+            release.set()
+        launch.result(timeout=5)
+        assert observer.result(timeout=5)["state"] != "lost"
+
+
 def test_timeout_is_a_process_state_with_automatic_final(tmp_path: Path) -> None:
     _require_tmux()
     _init_clean_repo(tmp_path)
@@ -562,6 +596,37 @@ def test_stop_on_terminal_run_returns_existing_final_without_new_signal(
 
     assert final["state"] == "completed"
     assert not (tmp_path / ".aros" / "receipts" / f"{run_id}-stop.json").exists()
+
+
+def test_stop_locked_does_not_reenter_run_flock(tmp_path: Path, monkeypatch) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key="locked-stop")
+    run_id = str(manifest["run_id"])
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
+    status.update(
+        {
+            "state": "running",
+            "process_pid": 12345,
+            "process_pgid": 12345,
+            "process_start_token": "stable-process",
+            "launch_receipt_sha256": "a" * 64,
+        }
+    )
+    atomic_write_json(runtime / "status.json", status)
+    monkeypatch.setattr(
+        "arbor.aros.runs._process_start_token", lambda _pid: "stable-process"
+    )
+    monkeypatch.setattr("arbor.aros.runs.os.killpg", lambda _pgid, _signal: None)
+
+    def fail_public_reconcile(_run_id: str) -> dict[str, object]:
+        raise AssertionError("stop must use the already-locked reconcile helper")
+
+    monkeypatch.setattr(service, "reconcile", fail_public_reconcile)
+
+    receipt = service.stop(run_id, actor="owner", reason="locked stop")
+
+    assert receipt["delivered"] is True
 
 
 def test_stop_persists_actor_reason_signal_request_and_receipt(tmp_path: Path) -> None:

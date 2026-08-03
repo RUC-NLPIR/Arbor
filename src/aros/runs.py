@@ -213,7 +213,7 @@ class RunService:
         manifest: dict[str, object],
         actor: str | None,
     ) -> dict[str, object]:
-        status = self.status(run_id)
+        status = self.status(run_id, reconcile=False)
         if status["state"] != "prepared":
             return status
         self._validate_manifest_against_status(manifest, status)
@@ -407,7 +407,7 @@ class RunService:
         normalized_signal = signal_name.upper()
         if normalized_signal not in _ALLOWED_SIGNALS:
             raise RunError("signal_name must be TERM, INT, or KILL")
-        status = self.status(run_id)
+        status = self._reconcile_locked(run_id)
         receipt_path = self._receipts_path() / f"{run_id}-stop.json"
         if receipt_path.is_file():
             return _read_object(receipt_path, "stop receipt")
@@ -507,6 +507,11 @@ class RunService:
         return receipt
 
     def reconcile(self, run_id: str) -> dict[str, object]:
+        self._validate_run_id(run_id)
+        with file_lock(self._run_lock_path(run_id)):
+            return self._reconcile_locked(run_id)
+
+    def _reconcile_locked(self, run_id: str) -> dict[str, object]:
         manifest = self._load_manifest(run_id)
         runtime = self._runtime_path(run_id)
         status = _read_run_status(runtime / "status.json")

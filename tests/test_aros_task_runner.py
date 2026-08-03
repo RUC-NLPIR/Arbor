@@ -1805,6 +1805,78 @@ def test_timeout_waits_for_claimed_group_drain_after_kill(
             release_drain.set()
 
 
+def test_timeout_deadline_natural_group_drain_preserves_leader_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "Path('adapter.ready').touch()\n"
+        "while not Path('adapter.exit').exists():\n"
+        "    time.sleep(0.01)\n"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", code],
+        timeout_seconds=0.2,
+        key="natural-drain-at-timeout",
+    )
+    task_id = str(brief["task_id"])
+    original_run = tasks_module.subprocess.run
+
+    def carrier_without_runner(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if isinstance(command, list) and "new-session" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    assert service.start(task_id)["state"] == "lost"
+    monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    timeout_entered = Event()
+    original_terminate_group = task_runner_module._terminate_group
+
+    def drain_before_timeout_signal(
+        process: subprocess.Popen[bytes],
+        **kwargs: object,
+    ) -> list[str]:
+        timeout_entered.set()
+        (worktree / "adapter.exit").touch()
+        deadline = time.monotonic() + 5
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert process.returncode == 0
+        return original_terminate_group(
+            process,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(
+        task_runner_module,
+        "_terminate_group",
+        drain_before_timeout_signal,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        runner = pool.submit(run_task, tmp_path, task_id)
+        assert timeout_entered.wait(timeout=5)
+        assert runner.result(timeout=5) == 0
+
+    final = json.loads(
+        (tmp_path / ".aros" / "tasks" / task_id / "final.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert final["state"] == "completed"
+    assert final["exit_code"] == 0
+    assert final["timeout"] == {"timeout_seconds": 0.2, "triggered": False}
+    assert final["signal_sequence"] == []
+
+
 def test_concurrent_stop_delivery_signals_process_group_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1889,6 +1961,96 @@ def test_concurrent_stop_delivery_signals_process_group_once(
     assert signals == [signal.SIGTERM, signal.SIGKILL]
     assert final["state"] == "cancelled"
     assert final["stop"]["signal_sequence"] == ["TERM", "KILL"]
+
+
+def test_runner_waits_for_paused_external_stop_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "import time;time.sleep(30)"],
+        timeout_seconds=30,
+        key="paused-external-stop-delivery",
+    )
+    task_id = str(brief["task_id"])
+    original_run = tasks_module.subprocess.run
+
+    def carrier_without_runner(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if isinstance(command, list) and "new-session" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    assert service.start(task_id)["state"] == "lost"
+    monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
+
+    term_delivered = Event()
+    release_delivery = Event()
+    runner_delivery_attempt = Event()
+    signals: list[int] = []
+    deliver_calls = 0
+    original_signal_group = task_runner_module._signal_group
+    original_deliver_stop = task_runner_module.deliver_stop
+
+    def pause_after_term(
+        pgid: int,
+        signal_number: int,
+        **kwargs: object,
+    ) -> bool:
+        delivered = original_signal_group(
+            pgid,
+            signal_number,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        if delivered:
+            signals.append(signal_number)
+        if delivered and signal_number == signal.SIGTERM:
+            term_delivered.set()
+            assert release_delivery.wait(timeout=5)
+        return delivered
+
+    def observe_deliver_stop(
+        delivery_service: TaskService,
+        delivery_task_id: str,
+    ) -> dict[str, object]:
+        nonlocal deliver_calls
+        deliver_calls += 1
+        if deliver_calls == 2:
+            runner_delivery_attempt.set()
+        return original_deliver_stop(delivery_service, delivery_task_id)
+
+    monkeypatch.setattr(task_runner_module, "_signal_group", pause_after_term)
+    monkeypatch.setattr(task_runner_module, "deliver_stop", observe_deliver_stop)
+    final_path = tmp_path / ".aros" / "tasks" / task_id / "final.json"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        runner = pool.submit(run_task, tmp_path, task_id)
+        _wait_state(service, task_id, "running")
+        stopper = pool.submit(
+            service.stop,
+            task_id,
+            actor="human",
+            reason="paused external delivery",
+        )
+        try:
+            assert term_delivered.wait(timeout=5)
+            assert runner_delivery_attempt.wait(timeout=5)
+            assert not final_path.exists()
+        finally:
+            release_delivery.set()
+        assert stopper.result(timeout=5)["reason"] == "paused external delivery"
+        assert runner.result(timeout=5) == 0
+
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    assert deliver_calls == 2
+    assert signals == [signal.SIGTERM]
+    assert final["state"] == "cancelled"
+    assert final["stop"]["delivered"] is True
+    assert final["stop"]["signal_sequence"] == ["TERM"]
 
 
 def test_stop_arriving_during_timeout_keeps_timeout_signal_authority(

@@ -1858,12 +1858,14 @@ def run(workspace: str | Path, task_id: str) -> int:
             stop_request is None
             and time.monotonic() - started_monotonic >= timeout_seconds
         ):
-            timeout_triggered = True
-            signal_sequence = _terminate_group(
+            timeout_sequence = _terminate_group(
                 process,
                 adapter_identity=adapter_identity,
             )
-            break
+            if timeout_sequence:
+                timeout_triggered = True
+                signal_sequence = timeout_sequence
+                break
         now = time.monotonic()
         if now - last_heartbeat >= 0.2:
             heartbeat_at = utc_now()
@@ -1877,40 +1879,7 @@ def run(workspace: str | Path, task_id: str) -> int:
 
     exit_code = process.wait()
     if _path_exists(service._stop_path(task_id)) and stop_result is None:
-        if stop_request is None:
-            with file_lock(lifecycle_lock):
-                stop_request = validate_stop_request(
-                    service,
-                    brief,
-                    ownership,
-                    launch,
-                )
-        result_deadline = time.monotonic() + max(
-            0.0,
-            1.2 - _timestamp_age(stop_request["requested_at"]),
-        )
-        while (
-            not _path_exists(service._stop_result_path(task_id))
-            and time.monotonic() < result_deadline
-        ):
-            time.sleep(0.02)
-        with file_lock(lifecycle_lock):
-            if _path_exists(service._stop_result_path(task_id)):
-                stop_result = validate_stop_result(
-                    service,
-                    brief,
-                    ownership,
-                    launch,
-                )
-            else:
-                stop_result = _record_stop_result(
-                    service,
-                    brief,
-                    ownership,
-                    launch,
-                    stop_request,
-                    [],
-                )
+        stop_result = deliver_stop(service, task_id)
     if (
         not timeout_triggered
         and stop_result is not None

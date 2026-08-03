@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -4470,6 +4471,155 @@ def test_prune_recovers_a_crash_after_git_removed_the_worktree(
     assert recovered["state"] == "pruned"
     assert TaskService(tmp_path).status(task_id) == recovered
     assert not worktree.exists()
+
+
+def test_prune_recovers_a_crash_before_git_removed_the_exact_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    collected = service.collect(task_id)
+    worktree = Path(str(ownership["worktree_path"]))
+
+    class InjectedCrash(RuntimeError):
+        pass
+
+    def remove_directory_only(target: Path) -> None:
+        shutil.rmtree(target)
+        raise InjectedCrash
+
+    monkeypatch.setattr(service, "_remove_task_worktree", remove_directory_only)
+    with pytest.raises(InjectedCrash):
+        service.prune(task_id)
+
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    intent_path = runtime / "prune.json"
+    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    assert intent["ownership_sha256"] == ownership["ownership_sha256"]
+    assert intent["collected_sha256"] == collected["collected_sha256"]
+    assert intent["branch_ref"] == f"refs/heads/{ownership['branch']}"
+    assert intent["worktree_path"] == str(worktree)
+    assert intent["prune_sha256"] == json_sha256(
+        {key: value for key, value in intent.items() if key != "prune_sha256"}
+    )
+    assert not worktree.exists()
+    assert not (runtime / "pruned.json").exists()
+    interrupted = _git(
+        tmp_path,
+        "worktree",
+        "list",
+        "--porcelain",
+        "--expire=now",
+    )
+    assert str(worktree) in interrupted
+    assert f"branch refs/heads/{ownership['branch']}" in interrupted
+    assert "prunable" in interrupted
+
+    worktree_calls: list[tuple[str, ...]] = []
+    original_git = TaskService._safe_git_result
+
+    def inspect_git(
+        self: TaskService,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args[:1] == ("worktree",):
+            worktree_calls.append(args)
+        return original_git(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(TaskService, "_safe_git_result", inspect_git)
+
+    recovered = TaskService(tmp_path).prune(task_id)
+
+    assert recovered["state"] == "pruned"
+    assert recovered["prune_sha256"] == intent["prune_sha256"]
+    assert recovered["pruned_sha256"] == json_sha256(
+        {key: value for key, value in recovered.items() if key != "pruned_sha256"}
+    )
+    assert (
+        json.loads((runtime / "pruned.json").read_text(encoding="utf-8")) == recovered
+    )
+    assert [call for call in worktree_calls if call[:2] == ("worktree", "remove")] == [
+        ("worktree", "remove", str(worktree))
+    ]
+    assert not any(call[:2] == ("worktree", "prune") for call in worktree_calls)
+    assert str(worktree) not in _git(
+        tmp_path,
+        "worktree",
+        "list",
+        "--porcelain",
+        "--expire=now",
+    )
+    assert _git(tmp_path, "rev-parse", f"refs/heads/{ownership['branch']}") == str(
+        collected["return_commit"]
+    )
+    assert TaskService(tmp_path).status(task_id) == recovered
+
+
+def test_prune_recovery_rejects_and_preserves_an_unrelated_prunable_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    service.collect(task_id)
+    worktree = Path(str(ownership["worktree_path"]))
+    unrelated = tmp_path / ".worktree" / "unrelated-prunable"
+    unrelated_branch = "unrelated-prunable"
+    _git(
+        tmp_path,
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        unrelated_branch,
+        str(unrelated),
+        "HEAD",
+    )
+
+    class InjectedCrash(RuntimeError):
+        pass
+
+    def remove_directory_only(target: Path) -> None:
+        shutil.rmtree(target)
+        raise InjectedCrash
+
+    monkeypatch.setattr(service, "_remove_task_worktree", remove_directory_only)
+    with pytest.raises(InjectedCrash):
+        service.prune(task_id)
+    shutil.rmtree(unrelated)
+
+    before = _git(
+        tmp_path,
+        "worktree",
+        "list",
+        "--porcelain",
+        "--expire=now",
+    )
+    assert str(worktree) in before
+    assert str(unrelated) in before
+    assert sum(line.startswith("prunable ") for line in before.splitlines()) == 2
+
+    with pytest.raises(
+        TaskError,
+        match=re.escape(f"stale or prunable Git worktree registration: {unrelated}"),
+    ):
+        TaskService(tmp_path).prune(task_id)
+
+    after = _git(
+        tmp_path,
+        "worktree",
+        "list",
+        "--porcelain",
+        "--expire=now",
+    )
+    assert after == before
+    assert _git_ref_exists(tmp_path, f"refs/heads/{ownership['branch']}")
+    assert _git_ref_exists(tmp_path, f"refs/heads/{unrelated_branch}")
+    assert not (tmp_path / ".aros" / "tasks" / task_id / "pruned.json").exists()
 
 
 def test_status_rejects_a_tampered_persisted_prune_intent(

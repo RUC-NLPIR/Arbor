@@ -1182,10 +1182,14 @@ class TaskService:
     def _worktree_removal_state(
         self,
         ownership: dict[str, object],
+        *,
+        allow_prunable: bool = False,
     ) -> str:
         target = Path(str(ownership["worktree_path"]))
         branch_ref = f"refs/heads/{ownership['branch']}"
-        registrations = self._worktree_registrations()
+        registrations = self._worktree_registrations(
+            allowed_prunable=(target, branch_ref) if allow_prunable else None,
+        )
         path_matches = [
             item
             for item in registrations
@@ -1195,10 +1199,23 @@ class TaskService:
             item for item in registrations if item.get("branch") == branch_ref
         ]
         exists = _path_exists(target)
-        if exists and len(path_matches) == 1 and path_matches == branch_matches:
+        if (
+            exists
+            and len(path_matches) == 1
+            and path_matches == branch_matches
+            and "prunable" not in path_matches[0]
+        ):
             return "present"
         if not exists and not path_matches and not branch_matches:
             return "absent"
+        if (
+            allow_prunable
+            and not exists
+            and len(path_matches) == 1
+            and path_matches == branch_matches
+            and "prunable" in path_matches[0]
+        ):
+            return "prunable"
         raise TaskError(f"task worktree removal state is ambiguous: {target}")
 
     def _remove_task_worktree(self, target: Path) -> None:
@@ -1732,13 +1749,19 @@ class TaskService:
             return
         if _path_exists(self._prune_path(task_id)):
             ownership = self._load_ownership(brief, check_worktree=False)
-            removal_state = self._worktree_removal_state(ownership)
             collected = self._load_historical_collection(
                 brief,
                 ownership,
             )
             self._require_collection_branch_tip(collected)
             intent = self._load_prune_intent(brief, ownership, collected)
+            removal_state = self._worktree_removal_state(
+                ownership,
+                allow_prunable=True,
+            )
+            if removal_state == "prunable":
+                self._remove_task_worktree(Path(str(intent["worktree_path"])))
+                removal_state = self._worktree_removal_state(ownership)
             if removal_state == "absent":
                 self._create_pruned_receipt(
                     brief,
@@ -2657,7 +2680,11 @@ class TaskService:
             raise TaskError(f"task worktree Git directory escaped common Git data: {target}")
         return resolved
 
-    def _worktree_registrations(self) -> list[dict[str, object]]:
+    def _worktree_registrations(
+        self,
+        *,
+        allowed_prunable: tuple[Path, str] | None = None,
+    ) -> list[dict[str, object]]:
         raw = self._safe_git_bytes(
             "worktree",
             "list",
@@ -2690,6 +2717,13 @@ class TaskService:
             if not isinstance(record.get("worktree"), str):
                 raise TaskError("invalid Git worktree registration")
             if "prunable" in record:
+                if (
+                    allowed_prunable is not None
+                    and self._same_path(str(record["worktree"]), allowed_prunable[0])
+                    and record.get("branch") == allowed_prunable[1]
+                ):
+                    registrations.append(record)
+                    continue
                 raise TaskError(
                     f"stale or prunable Git worktree registration: "
                     f"{record['worktree']}"

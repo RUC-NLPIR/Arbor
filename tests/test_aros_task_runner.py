@@ -1829,6 +1829,111 @@ def test_runner_waits_for_escaped_session_descendant_before_finalizing(
         _assert_processes_stop(descendant_pid)
 
 
+def test_runner_reaps_adopted_zombies_while_adapter_leader_is_live(
+    tmp_path: Path,
+) -> None:
+    grandchild_count = 8
+    leader = (
+        "import os,time\n"
+        "from pathlib import Path\n"
+        "intermediates=[]\n"
+        f"for index in range({grandchild_count}):\n"
+        "    pid=os.fork()\n"
+        "    if pid==0:\n"
+        "        grandchild=os.fork()\n"
+        "        if grandchild==0:\n"
+        "            Path(f'adopted-{index}.pid').write_text("
+        "str(os.getpid()),encoding='utf-8')\n"
+        "            while not Path('adopted.release').exists():\n"
+        "                time.sleep(0.01)\n"
+        "            os._exit(0)\n"
+        "        os._exit(0)\n"
+        "    intermediates.append(pid)\n"
+        "for pid in intermediates:\n"
+        "    os.waitpid(pid,0)\n"
+        "deadline=time.monotonic()+5\n"
+        f"while len(list(Path('.').glob('adopted-*.pid')))<{grandchild_count} "
+        "and time.monotonic()<deadline:\n"
+        "    time.sleep(0.01)\n"
+        f"if len(list(Path('.').glob('adopted-*.pid')))!={grandchild_count}:\n"
+        "    raise SystemExit(2)\n"
+        "Path('leader.ready').touch()\n"
+        "while not Path('leader.release').exists():\n"
+        "    time.sleep(0.01)\n"
+        "raise SystemExit(23)\n"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", leader],
+        key="reap-adopted-zombies-live-leader",
+    )
+    task_id = str(brief["task_id"])
+
+    service.start(task_id)
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    ready_path = worktree / "leader.ready"
+    deadline = time.monotonic() + 5
+    while not ready_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready_path.exists()
+    descendant_pids = {
+        int(path.read_text(encoding="utf-8"))
+        for path in worktree.glob("adopted-*.pid")
+    }
+    assert len(descendant_pids) == grandchild_count
+    execution = json.loads((runtime / "execution.json").read_text(encoding="utf-8"))
+    adapter = json.loads((runtime / "adapter.json").read_text(encoding="utf-8"))
+    runner_pid = int(execution["runner_pid"])
+    adapter_pid = int(adapter["adapter_pid"])
+    adapter_pgid = int(adapter["adapter_pgid"])
+    children_path = Path(f"/proc/{runner_pid}/task/{runner_pid}/children")
+    deadline = time.monotonic() + 5
+    runner_children: set[int] = set()
+    while time.monotonic() < deadline:
+        runner_children = {
+            int(value) for value in children_path.read_text(encoding="utf-8").split()
+        }
+        if descendant_pids <= runner_children:
+            break
+        time.sleep(0.02)
+
+    adopted_release = worktree / "adopted.release"
+    leader_release = worktree / "leader.release"
+    final_path = runtime / "final.json"
+    try:
+        assert descendant_pids <= runner_children
+        assert _process_is_running(adapter_pid)
+        adopted_release.touch()
+        deadline = time.monotonic() + 3
+        while (
+            any(_process_state(pid) is not None for pid in descendant_pids)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+
+        assert _process_is_running(adapter_pid)
+        assert all(_process_state(pid) is None for pid in descendant_pids)
+        assert service.status(task_id)["state"] == "running"
+        assert not final_path.exists()
+        leader_release.touch()
+
+        terminal = _wait_terminal(service, task_id)
+        final = json.loads(final_path.read_text(encoding="utf-8"))
+        assert terminal["state"] == "failed_process"
+        assert terminal["exit_code"] == 23
+        assert final["exit_code"] == 23
+    finally:
+        adopted_release.touch(exist_ok=True)
+        leader_release.touch(exist_ok=True)
+        deadline = time.monotonic() + 5
+        while not final_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if _process_is_running(adapter_pid):
+            os.killpg(adapter_pgid, signal.SIGKILL)
+        _assert_processes_stop(adapter_pid, *descendant_pids)
+
+
 def test_runner_waits_for_process_group_drain_before_finalizing_late_stdout(
     tmp_path: Path,
 ) -> None:

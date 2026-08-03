@@ -855,6 +855,22 @@ def _reap_exited_children() -> None:
             return
 
 
+def _reap_exited_adopted_children(runner_pid: int, adapter_pid: int) -> None:
+    for child_pid in _direct_child_pids(runner_pid):
+        if child_pid == adapter_pid:
+            continue
+        while True:
+            try:
+                os.waitpid(child_pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            except InterruptedError:
+                continue
+            except OSError as error:
+                raise TaskError("unable to reap adopted task child process") from error
+            break
+
+
 def _adopted_children_are_live(runner_pid: int) -> bool:
     def has_live_child() -> bool:
         for child_pid in _direct_child_pids(runner_pid):
@@ -1955,11 +1971,15 @@ def run(workspace: str | Path, task_id: str) -> int:
     stop_result: dict[str, object] | None = None
     stop_handled = False
     last_heartbeat = time.monotonic()
-    while (
-        process.poll() is None
-        or _claimed_group_is_live(*adapter_identity)
-        or _adopted_children_are_live(runner_identity[0])
-    ):
+    while True:
+        adapter_is_live = process.poll() is None
+        if adapter_is_live:
+            _reap_exited_adopted_children(runner_identity[0], process.pid)
+        elif not (
+            _claimed_group_is_live(*adapter_identity)
+            or _adopted_children_are_live(runner_identity[0])
+        ):
+            break
         if not stop_handled:
             with file_lock(lifecycle_lock):
                 if _path_exists(service._stop_path(task_id)):

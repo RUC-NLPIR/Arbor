@@ -1349,7 +1349,6 @@ class TaskService:
         base_commit: str,
     ) -> None:
         self._require_new_checkout_metadata(target, branch, base_commit)
-        self._require_new_checkout_metadata(target, branch, base_commit)
 
     def _require_new_checkout_metadata(
         self,
@@ -1649,6 +1648,7 @@ class TaskService:
     def _safe_git_configs(self) -> tuple[str, ...]:
         base = (
             "core.hooksPath=/dev/null",
+            "core.fileMode=true",
             "core.fsmonitor=false",
             "core.autocrlf=false",
             "core.attributesFile=/dev/null",

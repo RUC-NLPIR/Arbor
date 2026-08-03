@@ -1026,6 +1026,37 @@ def test_start_never_promotes_a_racy_new_checkout(
         assert (worktree / "README.md").stat().st_mode & 0o111
 
 
+def test_start_rejects_racy_mode_when_repository_disables_filemode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    _git(tmp_path, "config", "core.fileMode", "false")
+    service = TaskService(tmp_path)
+    brief = _create(service, key="new-checkout-race-disabled-filemode")
+    task_id = str(brief["task_id"])
+    _commit_brief(tmp_path, brief)
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    original_create_json = tasks_module.create_json
+    injected = False
+
+    def mutate_before_ownership(path: str | Path, value: object) -> bool:
+        nonlocal injected
+        if Path(path).name == "ownership.json" and not injected:
+            injected = True
+            (worktree / "README.md").chmod(0o755)
+        return original_create_json(path, value)
+
+    monkeypatch.setattr(tasks_module, "create_json", mutate_before_ownership)
+
+    with pytest.raises(TaskError, match="checkout|clean|mode"):
+        service._ensure_worktree(task_id)
+
+    assert injected
+    assert (worktree / "README.md").stat().st_mode & 0o111
+    assert (tmp_path / ".aros" / "tasks" / task_id / "ownership.json").is_file()
+
+
 @pytest.mark.parametrize("status_state", ("missing", "prepared"))
 def test_ownership_recovery_rejects_a_dirty_partial_checkout(
     tmp_path: Path,

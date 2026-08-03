@@ -251,6 +251,65 @@ def _commit_brief(root: Path, brief: dict[str, object]) -> str:
     return _git(root, "rev-parse", "HEAD")
 
 
+def _fake_tmux_carrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[list[str]]:
+    original_run = tasks_module.subprocess.run
+    carrier_calls: list[list[str]] = []
+
+    def run(command: list[str], *args: object, **kwargs: object) -> object:
+        if "new-session" in command:
+            carrier_calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: "/fake/tmux")
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", run)
+    return carrier_calls
+
+
+def _create_committed_task(
+    root: Path,
+    *,
+    key: str,
+) -> tuple[TaskService, dict[str, object], str, Path]:
+    _init_workspace(root)
+    service = TaskService(root)
+    brief = _create(service, key=key)
+    task_id = str(brief["task_id"])
+    _commit_brief(root, brief)
+    return service, brief, task_id, root / ".aros" / "tasks" / task_id
+
+
+def _publish_preparation_intent(
+    service: TaskService,
+    task_id: str,
+    runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service._ensure_worktree(task_id, actor="principal")
+
+    def stop_after_intent(_runtime: Path, **_kwargs: object) -> None:
+        raise RuntimeError("stop after preparation intent")
+
+    with monkeypatch.context() as preparation_context:
+        preparation_context.setattr(
+            tasks_module.shutil,
+            "which",
+            lambda _name: "/fake/tmux",
+        )
+        preparation_context.setattr(
+            service,
+            "_prepare_execution_paths",
+            stop_after_intent,
+        )
+        with pytest.raises(RuntimeError, match="after preparation"):
+            service.start(task_id, actor="principal")
+    assert (runtime / "preparation.json").is_file()
+    assert not (runtime / "launch.json").exists()
+
+
 def _create_terminal_task(
     root: Path,
     *,
@@ -476,6 +535,538 @@ def test_start_prepares_a_branch_attached_owned_worktree_without_execution(
     assert _git(worktree, "rev-parse", "HEAD") == base_commit
     assert _git(tmp_path, "rev-parse", "HEAD") == parent_head
     assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    ("home", "tmp", "import_alias", "stdout", "stderr"),
+)
+def test_start_resumes_owned_path_preparation_after_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+) -> None:
+    service, brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key=f"preparation-crash-{checkpoint}",
+    )
+    service._ensure_worktree(task_id, actor="principal")
+    ownership = json.loads(
+        (runtime / "ownership.json").read_text(encoding="utf-8")
+    )
+    original_fsync_directory = tasks_module._fsync_directory
+    crashed = False
+
+    def crash_after_checkpoint(path: Path) -> None:
+        nonlocal crashed
+        original_fsync_directory(path)
+        reached = (
+            checkpoint == "home"
+            and path == runtime
+            and (runtime / "home").is_dir()
+            and not (runtime / "tmp").exists()
+        ) or (
+            checkpoint == "tmp"
+            and path == runtime
+            and (runtime / "tmp").is_dir()
+            and not (runtime / "runner-import").exists()
+        ) or (
+            checkpoint == "import_alias"
+            and path == runtime / "runner-import"
+            and (runtime / "runner-import" / "arbor").is_symlink()
+        ) or (
+            checkpoint == "stdout"
+            and path == runtime
+            and (runtime / "stdout.log").is_file()
+            and not (runtime / "stderr.log").exists()
+        ) or (
+            checkpoint == "stderr"
+            and path == runtime
+            and (runtime / "stderr.log").is_file()
+            and not (runtime / "launch.json").exists()
+        )
+        if reached and not crashed:
+            crashed = True
+            raise RuntimeError(f"injected crash after {checkpoint}")
+
+    with monkeypatch.context() as crash_context:
+        crash_context.setattr(
+            tasks_module,
+            "_fsync_directory",
+            crash_after_checkpoint,
+        )
+        crash_context.setattr(
+            tasks_module.shutil,
+            "which",
+            lambda _name: "/fake/tmux",
+        )
+        with pytest.raises(RuntimeError, match=f"after {checkpoint}"):
+            service.start(task_id, actor="principal")
+
+    assert crashed
+    preparation_path = runtime / "preparation.json"
+    preparation = json.loads(preparation_path.read_text(encoding="utf-8"))
+    assert set(preparation) == {
+        "schema_version",
+        "task_id",
+        "brief_sha256",
+        "ownership_sha256",
+        "actor",
+        "filesystem_permissions_enforced",
+        "filesystem_permission_probe",
+        "paths",
+        "prepared_at",
+        "preparation_sha256",
+    }
+    assert preparation == {
+        **preparation,
+        "schema_version": 1,
+        "task_id": task_id,
+        "brief_sha256": brief["brief_sha256"],
+        "ownership_sha256": ownership["ownership_sha256"],
+        "actor": "principal",
+        "filesystem_permissions_enforced": (
+            service._filesystem_permissions_enforced
+        ),
+        "filesystem_permission_probe": service._filesystem_permission_probe,
+        "paths": {
+            "home": f".aros/tasks/{task_id}/home",
+            "tmp": f".aros/tasks/{task_id}/tmp",
+            "runner_import": f".aros/tasks/{task_id}/runner-import",
+            "stdout": f".aros/tasks/{task_id}/stdout.log",
+            "stderr": f".aros/tasks/{task_id}/stderr.log",
+        },
+        "preparation_sha256": json_sha256(
+            {
+                key: value
+                for key, value in preparation.items()
+                if key != "preparation_sha256"
+            }
+        ),
+    }
+    assert not (runtime / "launch.json").exists()
+
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+    restarted = TaskService(tmp_path)
+
+    assert restarted.start(task_id, actor="principal")["state"] == "lost"
+    assert len(carrier_calls) == 1
+    assert json.loads(preparation_path.read_text(encoding="utf-8")) == preparation
+    assert (runtime / "launch.json").is_file()
+    assert not (runtime / "final.json").exists()
+
+
+@pytest.mark.parametrize("preseed", ("path", "symlink", "nonempty"))
+def test_start_rejects_preseeded_paths_without_publishing_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preseed: str,
+) -> None:
+    service, _brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key=f"preparation-preseed-{preseed}",
+    )
+    outside = tmp_path / ".git" / "preparation-outside"
+    if preseed == "path":
+        seeded = runtime / "home"
+        seeded.mkdir()
+    elif preseed == "symlink":
+        outside.mkdir()
+        (outside / "preserve.txt").write_text("preserve\n", encoding="utf-8")
+        seeded = runtime / "tmp"
+        seeded.symlink_to(outside, target_is_directory=True)
+    else:
+        seeded = runtime / "stdout.log"
+        seeded.write_bytes(b"preserve pre-launch bytes\n")
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+
+    with pytest.raises(TaskError, match="conflict|exist|symlink|preparation"):
+        service.start(task_id, actor="principal")
+
+    assert seeded.exists()
+    if preseed == "nonempty":
+        assert seeded.read_bytes() == b"preserve pre-launch bytes\n"
+    elif preseed == "symlink":
+        assert seeded.is_symlink()
+        assert (outside / "preserve.txt").read_text(encoding="utf-8") == "preserve\n"
+    assert not (runtime / "preparation.json").exists()
+    assert not (runtime / "launch.json").exists()
+    assert carrier_calls == []
+
+
+@pytest.mark.parametrize(
+    "problem",
+    ("schema", "probe", "mode", "hardlink", "symlink"),
+)
+def test_start_rejects_tampered_or_linked_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    problem: str,
+) -> None:
+    service, _brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key=f"invalid-preparation-{problem}",
+    )
+    _publish_preparation_intent(service, task_id, runtime, monkeypatch)
+
+    preparation_path = runtime / "preparation.json"
+    outside = tmp_path / ".git" / f"preparation-{problem}"
+    if problem in {"schema", "probe"}:
+        preparation = json.loads(preparation_path.read_text(encoding="utf-8"))
+        if problem == "schema":
+            preparation["unexpected"] = True
+        else:
+            probe = preparation["filesystem_permission_probe"]
+            assert isinstance(probe, dict)
+            probe["device"] = int(probe["device"]) + 1
+        preparation["preparation_sha256"] = json_sha256(
+            {
+                key: value
+                for key, value in preparation.items()
+                if key != "preparation_sha256"
+            }
+        )
+        atomic_write_json(preparation_path, preparation)
+    elif problem == "mode":
+        preparation_path.chmod(0o666)
+    elif problem == "hardlink":
+        os.link(preparation_path, outside)
+    else:
+        preparation_path.replace(outside)
+        preparation_path.symlink_to(outside)
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+
+    with pytest.raises(
+        TaskError,
+        match="preparation|restrictive|plain|link|permission|schema|binding",
+    ):
+        TaskService(tmp_path).start(task_id, actor="principal")
+
+    assert not (runtime / "launch.json").exists()
+    assert carrier_calls == []
+    if problem == "hardlink":
+        assert preparation_path.stat().st_nlink == outside.stat().st_nlink == 2
+    elif problem == "symlink":
+        assert preparation_path.is_symlink()
+        assert outside.is_file()
+
+
+@pytest.mark.parametrize("name", ("home", "tmp", "runner-import"))
+def test_start_rejects_permissive_directory_during_preparation_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    service, _brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key=f"permissive-preparation-{name}",
+    )
+    _publish_preparation_intent(service, task_id, runtime, monkeypatch)
+
+    directory = runtime / name
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o777)
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+
+    with pytest.raises(TaskError, match="directory|mode|restrictive|preparation"):
+        TaskService(tmp_path).start(task_id, actor="principal")
+
+    assert stat.S_IMODE(directory.lstat().st_mode) == 0o777
+    assert not (runtime / "launch.json").exists()
+    assert carrier_calls == []
+
+
+def test_start_rejects_directory_replacement_during_preparation_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key="replaced-preparation-directory",
+    )
+    _publish_preparation_intent(service, task_id, runtime, monkeypatch)
+
+    home = runtime / "home"
+    displaced = runtime / "displaced-home"
+    home.mkdir(mode=0o700)
+    original_iterdir = Path.iterdir
+    replaced = False
+
+    def replace_before_iterdir(path: Path):  # type: ignore[no-untyped-def]
+        nonlocal replaced
+        if path == home and not replaced:
+            home.rename(displaced)
+            home.mkdir(mode=0o700)
+            replaced = True
+        return original_iterdir(path)
+
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+    monkeypatch.setattr(Path, "iterdir", replace_before_iterdir)
+
+    with pytest.raises(TaskError, match="directory|identity|changed|preparation"):
+        TaskService(tmp_path).start(task_id, actor="principal")
+
+    assert replaced
+    assert displaced.is_dir()
+    assert not (runtime / "launch.json").exists()
+    assert carrier_calls == []
+
+
+def test_start_rejects_directory_entry_added_during_preparation_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key="changed-preparation-directory-entries",
+    )
+    _publish_preparation_intent(service, task_id, runtime, monkeypatch)
+
+    home = runtime / "home"
+    home.mkdir(mode=0o700)
+    injected = home / "injected"
+    original_fsync_directory = tasks_module._fsync_directory
+
+    def inject_after_parent_sync(path: Path) -> None:
+        original_fsync_directory(path)
+        if path == runtime and not injected.exists():
+            injected.write_text("hostile\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_fsync_directory",
+        inject_after_parent_sync,
+    )
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+
+    with pytest.raises(TaskError, match="directory|entries|empty|changed"):
+        TaskService(tmp_path).start(task_id, actor="principal")
+
+    assert injected.read_text(encoding="utf-8") == "hostile\n"
+    assert not (runtime / "launch.json").exists()
+    assert carrier_calls == []
+
+
+def test_start_resyncs_import_alias_after_crash_before_first_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key="preparation-alias-presync-crash",
+    )
+    service._ensure_worktree(task_id, actor="principal")
+    import_root = runtime / "runner-import"
+    alias = import_root / "arbor"
+    original_fsync_directory = tasks_module._fsync_directory
+    crashed = False
+
+    def crash_before_alias_sync(path: Path) -> None:
+        nonlocal crashed
+        if path == import_root and alias.is_symlink() and not crashed:
+            crashed = True
+            raise RuntimeError("injected crash before alias sync")
+        original_fsync_directory(path)
+
+    with monkeypatch.context() as crash_context:
+        crash_context.setattr(
+            tasks_module,
+            "_fsync_directory",
+            crash_before_alias_sync,
+        )
+        crash_context.setattr(
+            tasks_module.shutil,
+            "which",
+            lambda _name: "/fake/tmux",
+        )
+        with pytest.raises(RuntimeError, match="before alias sync"):
+            service.start(task_id, actor="principal")
+
+    assert crashed
+    assert alias.is_symlink()
+    assert not (runtime / "launch.json").exists()
+    synced: list[Path] = []
+
+    def record_sync(path: Path) -> None:
+        original_fsync_directory(path)
+        synced.append(path)
+
+    monkeypatch.setattr(tasks_module, "_fsync_directory", record_sync)
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+
+    assert TaskService(tmp_path).start(task_id, actor="principal")["state"] == "lost"
+    assert import_root in synced
+    assert len(carrier_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("log_name", "replacement_stage"),
+    (
+        ("stdout.log", "file_sync"),
+        ("stdout.log", "parent_sync"),
+        ("stderr.log", "file_sync"),
+        ("stderr.log", "parent_sync"),
+    ),
+)
+def test_start_rejects_log_replacement_during_preparation_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log_name: str,
+    replacement_stage: str,
+) -> None:
+    service, _brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key=f"replaced-{log_name}-{replacement_stage}",
+    )
+    service._ensure_worktree(task_id, actor="principal")
+    original_fsync_directory = tasks_module._fsync_directory
+    crashed = False
+
+    def crash_after_stderr(path: Path) -> None:
+        nonlocal crashed
+        original_fsync_directory(path)
+        if (
+            path == runtime
+            and (runtime / "stderr.log").is_file()
+            and not (runtime / "launch.json").exists()
+            and not crashed
+        ):
+            crashed = True
+            raise RuntimeError("injected crash after stderr")
+
+    with monkeypatch.context() as crash_context:
+        crash_context.setattr(
+            tasks_module,
+            "_fsync_directory",
+            crash_after_stderr,
+        )
+        crash_context.setattr(
+            tasks_module.shutil,
+            "which",
+            lambda _name: "/fake/tmux",
+        )
+        with pytest.raises(RuntimeError, match="after stderr"):
+            service.start(task_id, actor="principal")
+
+    assert crashed
+    selected = runtime / log_name
+    selected_metadata = selected.lstat()
+    selected_identity = (selected_metadata.st_dev, selected_metadata.st_ino)
+    displaced = runtime / f"{log_name}.{replacement_stage}.original"
+    original_fsync = tasks_module.os.fsync
+    selected_synced = False
+    replaced = False
+
+    def replace_selected() -> None:
+        nonlocal replaced
+        selected.rename(displaced)
+        descriptor = os.open(
+            selected,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        os.close(descriptor)
+        replaced = True
+
+    def sync_and_maybe_replace(descriptor: int) -> None:
+        nonlocal selected_synced
+        original_fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) != selected_identity:
+            return
+        selected_synced = True
+        if replacement_stage == "file_sync" and not replaced:
+            replace_selected()
+
+    def sync_parent_and_maybe_replace(path: Path) -> None:
+        original_fsync_directory(path)
+        if (
+            replacement_stage == "parent_sync"
+            and path == runtime
+            and selected_synced
+            and not replaced
+        ):
+            replace_selected()
+
+    monkeypatch.setattr(tasks_module.os, "fsync", sync_and_maybe_replace)
+    monkeypatch.setattr(
+        tasks_module,
+        "_fsync_directory",
+        sync_parent_and_maybe_replace,
+    )
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+
+    with pytest.raises(TaskError, match="log|identity|changed|restrictive"):
+        TaskService(tmp_path).start(task_id, actor="principal")
+
+    assert replaced
+    assert displaced.is_file()
+    assert not (runtime / "launch.json").exists()
+    assert carrier_calls == []
+
+
+def test_concurrent_starts_share_one_preparation_and_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key="concurrent-preparation",
+    )
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        starts = list(
+            pool.map(
+                lambda _number: service.start(task_id, actor="principal"),
+                range(4),
+            )
+        )
+
+    preparation_path = runtime / "preparation.json"
+    launch_path = runtime / "launch.json"
+    preparation = json.loads(preparation_path.read_text(encoding="utf-8"))
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    assert all(start["state"] == "lost" for start in starts)
+    assert all(start["launch_sha256"] == launch["launch_sha256"] for start in starts)
+    assert preparation_path.lstat().st_nlink == 1
+    assert preparation["preparation_sha256"] == json_sha256(
+        {
+            key: value
+            for key, value in preparation.items()
+            if key != "preparation_sha256"
+        }
+    )
+    assert len(list(runtime.glob("preparation.json"))) == 1
+    assert len(list(runtime.glob("launch.json"))) == 1
+    assert len(carrier_calls) == 1
+
+
+def test_launch_evidence_prevents_automatic_carrier_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key="preparation-no-relaunch",
+    )
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+
+    first = service.start(task_id, actor="principal")
+    preparation_path = runtime / "preparation.json"
+    preparation_identity = (
+        preparation_path.lstat().st_dev,
+        preparation_path.lstat().st_ino,
+    )
+    second = TaskService(tmp_path).start(task_id, actor="principal")
+
+    assert first["state"] == second["state"] == "lost"
+    assert first["launch_sha256"] == second["launch_sha256"]
+    assert len(carrier_calls) == 1
+    assert (
+        preparation_path.lstat().st_dev,
+        preparation_path.lstat().st_ino,
+    ) == preparation_identity
 
 
 @pytest.mark.parametrize("dirty_kind", ("unstaged", "staged", "untracked"))

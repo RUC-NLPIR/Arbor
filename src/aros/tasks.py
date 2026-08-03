@@ -150,6 +150,18 @@ _OWNERSHIP_FIELDS = {
     "acquired_at",
     "ownership_sha256",
 }
+_PREPARATION_FIELDS = {
+    "schema_version",
+    "task_id",
+    "brief_sha256",
+    "ownership_sha256",
+    "actor",
+    "filesystem_permissions_enforced",
+    "filesystem_permission_probe",
+    "paths",
+    "prepared_at",
+    "preparation_sha256",
+}
 _INDEX_FIELDS = {
     "schema_version",
     "idempotency_key_sha256",
@@ -381,7 +393,17 @@ class TaskService:
                 if tmux is None:
                     raise TaskError("tmux is required for durable child tasks")
                 runtime = self._runtime_path(task_id)
-                self._prepare_execution_paths(runtime)
+                preparation = self._create_preparation(
+                    brief,
+                    ownership,
+                    launch_actor,
+                )
+                self._prepare_execution_paths(
+                    runtime,
+                    filesystem_permissions_enforced=preparation[
+                        "filesystem_permissions_enforced"
+                    ],
+                )
                 launched_at = utc_now()
                 session_name = f"aros-task-{task_id.lower()}"
                 socket_name = _tmux_socket_name(self.root, task_id)
@@ -408,10 +430,10 @@ class TaskService:
                     "isolation_scope": "application",
                     "capabilities_enforced": False,
                     "filesystem_permissions_enforced": (
-                        self._filesystem_permissions_enforced
+                        preparation["filesystem_permissions_enforced"]
                     ),
                     "filesystem_permission_probe": dict(
-                        self._filesystem_permission_probe
+                        preparation["filesystem_permission_probe"]  # type: ignore[arg-type]
                     ),
                     "carrier": "tmux",
                     "tmux_session": session_name,
@@ -2076,6 +2098,122 @@ class TaskService:
             atomic_write_json(self._status_path(task_id), lost)
         return lost
 
+    def _create_preparation(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        actor: str,
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        path = self._preparation_path(task_id)
+        if _path_exists(path):
+            return self._load_preparation(brief, ownership, actor)
+
+        runtime = self._runtime_path(task_id)
+        _require_plain_directory(runtime, "task runtime directory")
+        for name, description in (
+            ("home", "task adapter HOME"),
+            ("tmp", "task adapter TMPDIR"),
+            ("runner-import", "task runner import root"),
+            ("stdout.log", "task stdout log"),
+            ("stderr.log", "task stderr log"),
+            ("adapter.json", "task adapter claim"),
+            ("final.json", "task final receipt"),
+        ):
+            _require_absent(runtime / name, description)
+
+        preparation: dict[str, object] = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "brief_sha256": brief["brief_sha256"],
+            "ownership_sha256": ownership["ownership_sha256"],
+            "actor": actor,
+            "filesystem_permissions_enforced": (
+                self._filesystem_permissions_enforced
+            ),
+            "filesystem_permission_probe": dict(
+                self._filesystem_permission_probe
+            ),
+            "paths": _preparation_paths(task_id),
+            "prepared_at": utc_now(),
+        }
+        preparation["preparation_sha256"] = _record_sha256(
+            preparation,
+            "preparation_sha256",
+        )
+        if not create_json(path, preparation):
+            return self._load_preparation(brief, ownership, actor)
+        recorded = self._load_preparation(brief, ownership, actor)
+        if recorded != preparation:
+            raise TaskError(f"task preparation differs after write: {task_id}")
+        return recorded
+
+    def _load_preparation(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        actor: str,
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        path = self._preparation_path(task_id)
+        _require_restrictive_plain_file(
+            path,
+            "task preparation",
+            permissions_enforced=self._filesystem_permissions_enforced,
+        )
+        preparation = _read_object(path, "task preparation")
+        if (
+            set(preparation) != _PREPARATION_FIELDS
+            or type(preparation.get("schema_version")) is not int
+        ):
+            raise TaskError(f"invalid task preparation schema: {task_id}")
+        if preparation["schema_version"] != 1 or preparation["task_id"] != task_id:
+            raise TaskError(f"task preparation identity mismatch: {task_id}")
+        for field in (
+            "brief_sha256",
+            "ownership_sha256",
+            "preparation_sha256",
+        ):
+            _validate_hash(preparation[field], f"task preparation {field}")
+        preparation_actor = _validate_text(
+            preparation["actor"],
+            "task preparation actor",
+        )
+        probe = _validate_filesystem_permission_probe(
+            preparation["filesystem_permission_probe"],
+            "task preparation filesystem permission probe",
+        )
+        permissions_enforced = preparation["filesystem_permissions_enforced"]
+        if (
+            type(permissions_enforced) is not bool
+            or permissions_enforced is not (probe["enforced"] is True)
+        ):
+            raise TaskError(f"invalid task preparation permission policy: {task_id}")
+        expected = {
+            "brief_sha256": brief["brief_sha256"],
+            "ownership_sha256": ownership["ownership_sha256"],
+            "actor": actor,
+            "filesystem_permissions_enforced": (
+                self._filesystem_permissions_enforced
+            ),
+            "filesystem_permission_probe": self._filesystem_permission_probe,
+            "paths": _preparation_paths(task_id),
+        }
+        if preparation_actor != preparation["actor"] or any(
+            preparation[field] != value for field, value in expected.items()
+        ):
+            raise TaskError(f"task preparation binding mismatch: {task_id}")
+        _validate_timestamp(
+            preparation["prepared_at"],
+            "task preparation prepared_at",
+        )
+        if preparation["preparation_sha256"] != _record_sha256(
+            preparation,
+            "preparation_sha256",
+        ):
+            raise TaskError(f"task preparation hash mismatch: {task_id}")
+        return preparation
+
     def _prepare_execution_paths(
         self,
         runtime: Path,
@@ -2102,36 +2240,101 @@ class TaskService:
                 {"arbor"},
             )
         else:
-            _create_plain_directory(home, "task adapter HOME")
-            _create_plain_directory(temporary, "task adapter TMPDIR")
-            _create_plain_directory(import_root, "task runner import root")
+            home_entries = _ensure_preparation_directory_entries(
+                home,
+                "task adapter HOME",
+                permissions_enforced=filesystem_permissions_enforced,
+            )
+            if home_entries:
+                raise TaskError(f"task adapter HOME must be empty: {home}")
+            temporary_entries = _ensure_preparation_directory_entries(
+                temporary,
+                "task adapter TMPDIR",
+                permissions_enforced=filesystem_permissions_enforced,
+            )
+            if temporary_entries:
+                raise TaskError(f"task adapter TMPDIR must be empty: {temporary}")
+            import_entries = _ensure_preparation_directory_entries(
+                import_root,
+                "task runner import root",
+                permissions_enforced=filesystem_permissions_enforced,
+            )
+            if import_entries not in (set(), {"arbor"}):
+                raise TaskError(
+                    "task runner import root must contain only the controlled alias: "
+                    f"{import_root}"
+                )
         package_alias = import_root / "arbor"
         package_source = Path(__file__).resolve().parent.parent
         _require_plain_directory(package_source, "AROS Python package source")
-        if not reuse_logs:
+        if not reuse_logs and not _path_exists(package_alias):
             try:
                 package_alias.symlink_to(package_source, target_is_directory=True)
             except OSError as error:
                 raise TaskError("unable to create task runner package alias") from error
-            _fsync_directory(import_root)
+        if reuse_logs:
+            _require_directory_entries(
+                import_root,
+                "task runner import root",
+                {"arbor"},
+            )
+        elif _ensure_preparation_directory_entries(
+            import_root,
+            "task runner import root",
+            permissions_enforced=filesystem_permissions_enforced,
+        ) != {"arbor"}:
+            raise TaskError(
+                "task runner import root must contain only the controlled alias: "
+                f"{import_root}"
+            )
         try:
-            alias_mode = package_alias.lstat().st_mode
+            alias_metadata = package_alias.lstat()
             alias_target = package_alias.resolve(strict=True)
         except OSError as error:
             raise TaskError("invalid task runner package alias") from error
-        if not stat.S_ISLNK(alias_mode) or alias_target != package_source:
+        if (
+            not stat.S_ISLNK(alias_metadata.st_mode)
+            or alias_metadata.st_nlink != 1
+            or alias_target != package_source
+        ):
             raise TaskError("task runner package alias does not bind workspace source")
+        if not reuse_logs:
+            alias_identity = (alias_metadata.st_dev, alias_metadata.st_ino)
+            _fsync_directory(import_root)
+            if _ensure_preparation_directory_entries(
+                import_root,
+                "task runner import root",
+                permissions_enforced=filesystem_permissions_enforced,
+            ) != {"arbor"}:
+                raise TaskError(
+                    "task runner import root must contain only the controlled alias: "
+                    f"{import_root}"
+                )
+            try:
+                synced_alias = package_alias.lstat()
+                synced_target = package_alias.resolve(strict=True)
+            except OSError as error:
+                raise TaskError("invalid task runner package alias") from error
+            if (
+                not stat.S_ISLNK(synced_alias.st_mode)
+                or synced_alias.st_nlink != 1
+                or (synced_alias.st_dev, synced_alias.st_ino) != alias_identity
+                or synced_target != package_source
+            ):
+                raise TaskError(
+                    "task runner package alias changed while synchronizing"
+                )
         _require_absent(runtime / "adapter.json", "task adapter claim")
         _ensure_restrictive_plain_file(
             runtime / "stdout.log",
             "task stdout log",
-            allow_existing=reuse_logs,
+            allow_existing=True,
             permissions_enforced=filesystem_permissions_enforced,
         )
         _ensure_restrictive_plain_file(
             runtime / "stderr.log",
             "task stderr log",
-            allow_existing=reuse_logs,
+            allow_existing=True,
             permissions_enforced=filesystem_permissions_enforced,
         )
         _require_absent(runtime / "final.json", "task final receipt")
@@ -2848,6 +3051,9 @@ class TaskService:
     def _launch_path(self, task_id: str) -> Path:
         return self._runtime_path(task_id) / "launch.json"
 
+    def _preparation_path(self, task_id: str) -> Path:
+        return self._runtime_path(task_id) / "preparation.json"
+
     def _final_path(self, task_id: str) -> Path:
         return self._runtime_path(task_id) / "final.json"
 
@@ -2888,6 +3094,17 @@ def _record_sha256(record: dict[str, object], hash_field: str) -> str:
         return json_sha256(payload)
     except (TypeError, UnicodeError) as error:
         raise TaskError("task execution record must be canonical UTF-8 JSON") from error
+
+
+def _preparation_paths(task_id: str) -> dict[str, str]:
+    prefix = f".aros/tasks/{task_id}"
+    return {
+        "home": f"{prefix}/home",
+        "tmp": f"{prefix}/tmp",
+        "runner_import": f"{prefix}/runner-import",
+        "stdout": f"{prefix}/stdout.log",
+        "stderr": f"{prefix}/stderr.log",
+    }
 
 
 def _request_file_mode(descriptor: int, mode: int) -> bool:
@@ -3459,8 +3676,10 @@ def _ensure_restrictive_plain_file(
             raise TaskError(f"unable to open {description}: {path}") from error
     except OSError as error:
         raise TaskError(f"unable to create {description}: {path}") from error
+    identity: tuple[int, int] | None = None
     try:
         metadata = os.fstat(descriptor)
+        identity = (metadata.st_dev, metadata.st_ino)
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
@@ -3469,16 +3688,44 @@ def _ensure_restrictive_plain_file(
                 and stat.S_IMODE(metadata.st_mode) != 0o600
             )
             or metadata.st_size != 0
-            or (metadata.st_dev, metadata.st_ino)
-            != _plain_file_identity(path, description)
+            or identity != _plain_file_identity(path, description)
         ):
             raise TaskError(f"{description} must be a restrictive plain file: {path}")
         os.fsync(descriptor)
+        synced = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(synced.st_mode)
+            or synced.st_nlink != 1
+            or (
+                permissions_enforced
+                and stat.S_IMODE(synced.st_mode) != 0o600
+            )
+            or synced.st_size != 0
+            or (synced.st_dev, synced.st_ino) != identity
+            or _plain_file_identity(path, description) != identity
+        ):
+            raise TaskError(f"{description} changed while synchronizing: {path}")
     except OSError as error:
         raise TaskError(f"unable to sync {description}: {path}") from error
     finally:
         os.close(descriptor)
     _fsync_directory(path.parent)
+    try:
+        published = path.lstat()
+    except OSError as error:
+        raise TaskError(f"unable to inspect {description}: {path}") from error
+    if (
+        identity is None
+        or not stat.S_ISREG(published.st_mode)
+        or published.st_nlink != 1
+        or (
+            permissions_enforced
+            and stat.S_IMODE(published.st_mode) != 0o600
+        )
+        or published.st_size != 0
+        or (published.st_dev, published.st_ino) != identity
+    ):
+        raise TaskError(f"{description} changed after synchronizing: {path}")
 
 
 def _ensure_plain_directory(path: Path, description: str) -> None:
@@ -3493,6 +3740,60 @@ def _ensure_plain_directory(path: Path, description: str) -> None:
     _require_plain_directory(path, description)
     if created:
         _fsync_directory(path.parent)
+
+
+def _ensure_preparation_directory_entries(
+    path: Path,
+    description: str,
+    *,
+    permissions_enforced: bool,
+) -> set[str]:
+    if type(permissions_enforced) is not bool:
+        raise TaskError("invalid task filesystem permission policy")
+    _ensure_plain_directory(path, description)
+    try:
+        before = path.lstat()
+        entries = {entry.name for entry in path.iterdir()}
+        after = path.lstat()
+    except OSError as error:
+        raise TaskError(f"unable to inspect {description}: {path}") from error
+    identity = (before.st_dev, before.st_ino)
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or (permissions_enforced and stat.S_IMODE(before.st_mode) != 0o700)
+        or not stat.S_ISDIR(after.st_mode)
+        or stat.S_ISLNK(after.st_mode)
+        or (after.st_dev, after.st_ino) != identity
+        or (permissions_enforced and stat.S_IMODE(after.st_mode) != 0o700)
+    ):
+        raise TaskError(f"{description} changed or has an invalid mode: {path}")
+    _fsync_directory(path.parent)
+    try:
+        synced_before = path.lstat()
+        synced_entries = {entry.name for entry in path.iterdir()}
+        synced_after = path.lstat()
+    except OSError as error:
+        raise TaskError(f"unable to inspect {description}: {path}") from error
+    if (
+        not stat.S_ISDIR(synced_before.st_mode)
+        or stat.S_ISLNK(synced_before.st_mode)
+        or (synced_before.st_dev, synced_before.st_ino) != identity
+        or (
+            permissions_enforced
+            and stat.S_IMODE(synced_before.st_mode) != 0o700
+        )
+        or synced_entries != entries
+        or not stat.S_ISDIR(synced_after.st_mode)
+        or stat.S_ISLNK(synced_after.st_mode)
+        or (synced_after.st_dev, synced_after.st_ino) != identity
+        or (
+            permissions_enforced
+            and stat.S_IMODE(synced_after.st_mode) != 0o700
+        )
+    ):
+        raise TaskError(f"{description} changed while synchronizing: {path}")
+    return entries
 
 
 def _require_directory_entries(

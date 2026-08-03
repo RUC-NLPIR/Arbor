@@ -1483,6 +1483,17 @@ def run(workspace: str | Path, task_id: str) -> int:
         service._prepare_execution_paths(runtime, reuse_logs=True)
         worktree = Path(str(ownership["worktree_path"]))
         environment = adapter_environment(runtime)
+        environment.update(
+            {
+                "AROS_TASK_ID": str(brief["task_id"]),
+                "AROS_TASK_BRIEF": str(
+                    service.root / "tasks" / task_id / "brief.json"
+                ),
+                "AROS_TASK_WORKTREE": str(worktree),
+                "AROS_TASK_BASE_COMMIT": str(brief["base_commit"]),
+                "AROS_TASK_BRIEF_SHA256": str(brief["brief_sha256"]),
+            }
+        )
         started_at = utc_now()
         started_monotonic = time.monotonic()
         stdout = _open_log(runtime / "stdout.log")

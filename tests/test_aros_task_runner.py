@@ -230,7 +230,24 @@ def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
         [sys.executable, "-c", code, *exact_arguments],
     )
     task_id = str(brief["task_id"])
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    expected_task_environment = {
+        "AROS_TASK_ID": task_id,
+        "AROS_TASK_BRIEF": str(tmp_path / "tasks" / task_id / "brief.json"),
+        "AROS_TASK_WORKTREE": str(worktree),
+        "AROS_TASK_BASE_COMMIT": str(brief["base_commit"]),
+        "AROS_TASK_BRIEF_SHA256": str(brief["brief_sha256"]),
+    }
+    ambient_task_environment = {
+        "AROS_TASK_ID": "wrong-task-id",
+        "AROS_TASK_BRIEF": "/wrong/brief.json",
+        "AROS_TASK_WORKTREE": "/wrong/worktree",
+        "AROS_TASK_BASE_COMMIT": "wrong-base-commit",
+        "AROS_TASK_BRIEF_SHA256": "wrong-brief-sha256",
+    }
     for key, value in injected.items():
+        monkeypatch.setenv(key, value)
+    for key, value in ambient_task_environment.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("OMP_NUM_THREADS", "7")
     monkeypatch.setenv("TZ", "Etc/UTC")
@@ -239,7 +256,6 @@ def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
     status = _wait_terminal(service, task_id)
 
     runtime = tmp_path / ".aros" / "tasks" / task_id
-    worktree = tmp_path / ".worktree" / "tasks" / task_id
     observation = json.loads(
         (worktree / "observation.json").read_text(encoding="utf-8")
     )
@@ -252,6 +268,9 @@ def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
     assert environment["OMP_NUM_THREADS"] == "7"
     assert environment["TZ"] == "Etc/UTC"
     assert environment.get("PATH") == os.environ.get("PATH")
+    assert {
+        key: environment[key] for key in expected_task_environment
+    } == expected_task_environment
     assert not set(injected).intersection(environment)
     assert not any(
         key.startswith(("GIT_", "PYTHON", "LD_", "DYLD_")) for key in environment

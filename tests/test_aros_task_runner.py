@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -160,6 +161,46 @@ def _exiting_leader_process_tree_code(descendant: str) -> str:
     )
 
 
+def _persistent_escaped_session_process_tree_code(
+    *,
+    keep_leader_alive: bool = False,
+    ignore_leader_stop_signals: bool = False,
+    wait_for_leader_release: bool = False,
+) -> str:
+    descendant = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "Path('escaped.ready').touch()\n"
+        "time.sleep(30)\n"
+    )
+    code = (
+        "import signal,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        + (
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+            "signal.signal(signal.SIGINT,signal.SIG_IGN)\n"
+            if ignore_leader_stop_signals
+            else ""
+        )
+        + f"child=subprocess.Popen([sys.executable,'-c',{descendant!r}],"
+        "start_new_session=True)\n"
+        "Path('escaped.pid').write_text(str(child.pid),encoding='utf-8')\n"
+        "deadline=time.monotonic()+5\n"
+        "while not Path('escaped.ready').exists() and time.monotonic()<deadline:\n"
+        "    time.sleep(0.01)\n"
+        "if not Path('escaped.ready').exists():\n"
+        "    raise SystemExit(2)\n"
+    )
+    if wait_for_leader_release:
+        code += (
+            "while not Path('leader.release').exists():\n"
+            "    time.sleep(0.01)\n"
+        )
+    elif keep_leader_alive:
+        code += "time.sleep(30)\n"
+    return code
+
+
 def _process_state(pid: int) -> str | None:
     try:
         raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
@@ -181,6 +222,68 @@ def _assert_processes_stop(*pids: int) -> None:
     while any(_process_is_running(pid) for pid in pids) and time.monotonic() < deadline:
         time.sleep(0.02)
     assert all(not _process_is_running(pid) for pid in pids)
+
+
+@contextmanager
+def _persistent_escaped_session_task(
+    root: Path,
+    *,
+    timeout_seconds: float,
+    key: str,
+    keep_leader_alive: bool = False,
+    ignore_leader_stop_signals: bool = False,
+    wait_for_leader_release: bool = False,
+) -> Iterator[tuple[TaskService, str, Path, Path, int, int, int]]:
+    service, brief = _create_committed_task(
+        root,
+        [
+            sys.executable,
+            "-c",
+            _persistent_escaped_session_process_tree_code(
+                keep_leader_alive=keep_leader_alive,
+                ignore_leader_stop_signals=ignore_leader_stop_signals,
+                wait_for_leader_release=wait_for_leader_release,
+            ),
+        ],
+        timeout_seconds=timeout_seconds,
+        key=key,
+    )
+    task_id = str(brief["task_id"])
+    service.start(task_id)
+    runtime = root / ".aros" / "tasks" / task_id
+    worktree = root / ".worktree" / "tasks" / task_id
+    ready_path = worktree / "escaped.ready"
+    deadline = time.monotonic() + 5
+    while not ready_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready_path.exists()
+    descendant_pid = int(
+        (worktree / "escaped.pid").read_text(encoding="utf-8")
+    )
+    execution = json.loads((runtime / "execution.json").read_text(encoding="utf-8"))
+    adapter = json.loads((runtime / "adapter.json").read_text(encoding="utf-8"))
+    runner_pid = int(execution["runner_pid"])
+    adapter_pid = int(adapter["adapter_pid"])
+    try:
+        yield (
+            service,
+            task_id,
+            runtime,
+            worktree,
+            runner_pid,
+            adapter_pid,
+            descendant_pid,
+        )
+    finally:
+        if wait_for_leader_release:
+            (worktree / "leader.release").touch(exist_ok=True)
+        if _process_is_running(adapter_pid):
+            os.killpg(adapter_pid, signal.SIGKILL)
+        if _process_is_running(runner_pid):
+            os.kill(runner_pid, signal.SIGKILL)
+        if _process_is_running(descendant_pid):
+            os.killpg(descendant_pid, signal.SIGKILL)
+        _assert_processes_stop(adapter_pid, runner_pid, descendant_pid)
 
 
 def _spawn_unreaped_zombie_session_leader() -> tuple[int, str]:
@@ -255,6 +358,29 @@ def test_process_liveness_rejects_unreaped_zombie() -> None:
         )
     finally:
         os.waitpid(child, 0)
+
+
+def test_exact_live_claimed_group_skips_process_group_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid = 4242
+    token = "linux-proc-start:123"
+    monkeypatch.setattr(
+        task_runner_module,
+        "_process_state_group_and_token",
+        lambda _pid: ("S", pid, token),
+    )
+
+    def reject_process_group_scan(_pgid: int) -> bool:
+        raise AssertionError("exact live leader must not scan /proc")
+
+    monkeypatch.setattr(
+        task_runner_module,
+        "_process_group_has_live_member",
+        reject_process_group_scan,
+    )
+
+    assert task_runner_module._claimed_group_is_live(pid, pid, token)
 
 
 def test_zombie_only_group_termination_delivers_no_signal() -> None:
@@ -1827,6 +1953,137 @@ def test_runner_waits_for_escaped_session_descendant_before_finalizing(
         if _process_is_running(descendant_pid):
             os.killpg(descendant_pid, signal.SIGKILL)
         _assert_processes_stop(descendant_pid)
+
+
+def test_persistent_escaped_session_after_normal_exit_fails_closed_as_lost(
+    tmp_path: Path,
+) -> None:
+    with _persistent_escaped_session_task(
+        tmp_path,
+        timeout_seconds=30,
+        key="persistent-escaped-session-normal-exit",
+    ) as task:
+        service, task_id, runtime, worktree, runner_pid, adapter_pid, descendant_pid = task
+
+        assert _wait_state(service, task_id, "lost", timeout=5)["state"] == "lost"
+        assert not (runtime / "final.json").exists()
+        assert service.start(task_id)["state"] == "lost"
+        with pytest.raises(TaskError, match="not terminal"):
+            service.collect(task_id)
+        with pytest.raises(TaskError, match="strict collection"):
+            service.prune(task_id)
+        assert worktree.is_dir()
+        assert not _process_is_running(runner_pid)
+        assert not _process_is_running(adapter_pid)
+        assert _process_is_running(descendant_pid)
+        assert os.getpgid(descendant_pid) == descendant_pid
+
+
+def test_timeout_with_persistent_escaped_session_fails_closed_as_lost(
+    tmp_path: Path,
+) -> None:
+    with _persistent_escaped_session_task(
+        tmp_path,
+        timeout_seconds=0.3,
+        key="persistent-escaped-session-timeout",
+        keep_leader_alive=True,
+    ) as task:
+        service, task_id, runtime, worktree, runner_pid, adapter_pid, descendant_pid = task
+
+        assert _wait_state(service, task_id, "lost", timeout=5)["state"] == "lost"
+        assert not (runtime / "final.json").exists()
+        assert service.start(task_id)["state"] == "lost"
+        with pytest.raises(TaskError, match="not terminal"):
+            service.collect(task_id)
+        with pytest.raises(TaskError, match="strict collection"):
+            service.prune(task_id)
+        assert worktree.is_dir()
+        assert not _process_is_running(runner_pid)
+        assert not _process_is_running(adapter_pid)
+        assert _process_is_running(descendant_pid)
+        assert os.getpgid(descendant_pid) == descendant_pid
+
+
+def test_attributed_stop_with_persistent_escaped_session_fails_closed_as_lost(
+    tmp_path: Path,
+) -> None:
+    with _persistent_escaped_session_task(
+        tmp_path,
+        timeout_seconds=30,
+        key="persistent-escaped-session-stop",
+        keep_leader_alive=True,
+        ignore_leader_stop_signals=True,
+    ) as task:
+        service, task_id, runtime, worktree, runner_pid, adapter_pid, descendant_pid = task
+        request = service.stop(
+            task_id,
+            actor="human",
+            reason="stop uncontained descendant",
+        )
+
+        assert _wait_state(service, task_id, "lost", timeout=5)["state"] == "lost"
+        assert not (runtime / "final.json").exists()
+        assert service.start(task_id)["state"] == "lost"
+        with pytest.raises(TaskError, match="not terminal"):
+            service.collect(task_id)
+        with pytest.raises(TaskError, match="strict collection"):
+            service.prune(task_id)
+        assert worktree.is_dir()
+        result = json.loads(
+            (runtime / "stop-result.json").read_text(encoding="utf-8")
+        )
+        assert request["actor"] == "human"
+        assert request["reason"] == "stop uncontained descendant"
+        assert result["delivered"] is True
+        assert result["signal_sequence"] == ["TERM", "KILL"]
+        assert not _process_is_running(runner_pid)
+        assert not _process_is_running(adapter_pid)
+        assert _process_is_running(descendant_pid)
+        assert os.getpgid(descendant_pid) == descendant_pid
+
+
+def test_runner_crash_with_adopted_escaped_session_never_creates_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _persistent_escaped_session_task(
+        tmp_path,
+        timeout_seconds=30,
+        key="adopted-escaped-session-runner-crash",
+        wait_for_leader_release=True,
+    ) as task:
+        service, task_id, runtime, worktree, runner_pid, adapter_pid, descendant_pid = task
+        leader_release = worktree / "leader.release"
+        leader_release.touch()
+        children_path = Path(f"/proc/{runner_pid}/task/{runner_pid}/children")
+        deadline = time.monotonic() + 1
+        runner_children: set[int] = set()
+        while time.monotonic() < deadline:
+            runner_children = {
+                int(value) for value in children_path.read_text(encoding="utf-8").split()
+            }
+            if descendant_pid in runner_children and adapter_pid not in runner_children:
+                break
+            time.sleep(0.01)
+
+        assert _process_is_running(runner_pid)
+        assert _process_state(adapter_pid) is None
+        assert descendant_pid in runner_children
+        assert adapter_pid not in runner_children
+        os.kill(runner_pid, signal.SIGKILL)
+        _assert_processes_stop(runner_pid)
+        monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+
+        assert _wait_state(service, task_id, "lost", timeout=5)["state"] == "lost"
+        assert not (runtime / "final.json").exists()
+        assert service.start(task_id)["state"] == "lost"
+        with pytest.raises(TaskError, match="not terminal"):
+            service.collect(task_id)
+        with pytest.raises(TaskError, match="strict collection"):
+            service.prune(task_id)
+        assert worktree.is_dir()
+        assert _process_is_running(descendant_pid)
+        assert os.getpgid(descendant_pid) == descendant_pid
 
 
 def test_runner_reaps_adopted_zombies_while_adapter_leader_is_live(

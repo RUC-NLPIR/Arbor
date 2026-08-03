@@ -886,6 +886,17 @@ def _adopted_children_are_live(runner_pid: int) -> bool:
     return has_live_child()
 
 
+def _wait_for_adopted_children_drain(
+    runner_pid: int,
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while _adopted_children_are_live(runner_pid):
+        if time.monotonic() >= deadline:
+            raise TaskError("adopted task descendants did not drain")
+        time.sleep(0.02)
+
+
 def _process_group_has_live_member(pgid: int) -> bool:
     if pgid <= 1:
         return False
@@ -908,6 +919,8 @@ def _claimed_group_is_live(pid: int, pgid: int, token: str) -> bool:
     identity = _process_state_group_and_token(pid)
     if identity is not None and (identity[1] != pgid or identity[2] != token):
         return False
+    if identity is not None and identity[0] not in {"Z", "X", "x"}:
+        return True
     if not _process_group_has_live_member(pgid):
         return False
     confirmed = _process_state_group_and_token(pid)
@@ -1975,10 +1988,11 @@ def run(workspace: str | Path, task_id: str) -> int:
         adapter_is_live = process.poll() is None
         if adapter_is_live:
             _reap_exited_adopted_children(runner_identity[0], process.pid)
-        elif not (
-            _claimed_group_is_live(*adapter_identity)
-            or _adopted_children_are_live(runner_identity[0])
-        ):
+        elif not _claimed_group_is_live(*adapter_identity):
+            _wait_for_adopted_children_drain(
+                runner_identity[0],
+                _GROUP_DRAIN_TIMEOUT_SECONDS,
+            )
             break
         if not stop_handled:
             with file_lock(lifecycle_lock):

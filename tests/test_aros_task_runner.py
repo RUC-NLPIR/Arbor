@@ -142,16 +142,35 @@ def _term_ignoring_process_tree_code() -> str:
     )
 
 
-def _process_is_running(pid: int) -> bool:
+def _exiting_leader_process_tree_code(descendant: str) -> str:
+    return (
+        "import subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        f"child=subprocess.Popen([sys.executable,'-c',{descendant!r}])\n"
+        "Path('descendant.pid').write_text(str(child.pid),encoding='utf-8')\n"
+        "deadline=time.monotonic()+5\n"
+        "while not Path('descendant.ready').exists() and time.monotonic()<deadline:\n"
+        "    time.sleep(0.01)\n"
+        "if not Path('descendant.ready').exists():\n"
+        "    raise SystemExit(2)\n"
+        "print('leader stdout',flush=True)\n"
+    )
+
+
+def _process_state(pid: int) -> str | None:
     try:
         raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except OSError:
-        return False
+        return None
     try:
-        state = raw.rsplit(")", 1)[1].split()[0]
+        return raw.rsplit(")", 1)[1].split()[0]
     except (IndexError, ValueError):
-        return False
-    return state != "Z"
+        return None
+
+
+def _process_is_running(pid: int) -> bool:
+    state = _process_state(pid)
+    return state is not None and state not in {"Z", "X", "x"}
 
 
 def _assert_processes_stop(*pids: int) -> None:
@@ -190,6 +209,35 @@ def _spawn_unreaped_zombie_session_leader() -> tuple[int, str]:
     return child, token
 
 
+def _spawn_zombie_leader_with_live_descendant() -> tuple[int, int, str]:
+    ready_read, ready_write = os.pipe()
+    leader = os.fork()
+    if leader == 0:
+        os.close(ready_read)
+        os.setsid()
+        descendant = os.fork()
+        if descendant == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            os.write(ready_write, str(os.getpid()).encode("ascii"))
+            os.close(ready_write)
+            time.sleep(30)
+            os._exit(0)
+        os.close(ready_write)
+        os._exit(0)
+    os.close(ready_write)
+    descendant = int(os.read(ready_read, 32).decode("ascii"))
+    os.close(ready_read)
+    deadline = time.monotonic() + 3
+    while _process_state(leader) != "Z" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _process_state(leader) == "Z"
+    token = process_start_token(leader)
+    assert token is not None
+    assert _process_is_running(descendant)
+    return leader, descendant, token
+
+
 def test_process_liveness_rejects_unreaped_zombie() -> None:
     child, token = _spawn_unreaped_zombie_session_leader()
     try:
@@ -204,6 +252,73 @@ def test_process_liveness_rejects_unreaped_zombie() -> None:
         )
     finally:
         os.waitpid(child, 0)
+
+
+def test_zombie_only_group_termination_delivers_no_signal() -> None:
+    leader, token = _spawn_unreaped_zombie_session_leader()
+    request = {
+        "host": socket.gethostname(),
+        "adapter_pid": leader,
+        "adapter_pgid": leader,
+        "adapter_start_token": token,
+        "signal": "TERM",
+    }
+    try:
+        assert task_runner_module._terminate_recorded_group(
+            request,
+            grace_seconds=0.05,
+        ) == []
+    finally:
+        os.waitpid(leader, 0)
+
+
+def test_zombie_leader_with_live_descendant_is_live_and_stoppable() -> None:
+    leader, descendant, token = _spawn_zombie_leader_with_live_descendant()
+    request = {
+        "host": socket.gethostname(),
+        "adapter_pid": leader,
+        "adapter_pgid": leader,
+        "adapter_start_token": token,
+        "signal": "TERM",
+    }
+    try:
+        assert task_runner_module.process_status_is_live(request)
+        assert task_runner_module._terminate_recorded_group(
+            request,
+            grace_seconds=0.05,
+        ) == ["TERM", "KILL"]
+        _assert_processes_stop(descendant)
+    finally:
+        if _process_is_running(descendant):
+            os.killpg(leader, signal.SIGKILL)
+        _assert_processes_stop(descendant)
+        os.waitpid(leader, 0)
+
+
+@pytest.mark.parametrize("mismatch", ("token", "pgid"))
+def test_group_termination_refuses_reused_leader_identity(mismatch: str) -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time;time.sleep(30)"],
+        start_new_session=True,
+    )
+    token = process_start_token(process.pid)
+    assert token is not None
+    adapter_identity = (
+        process.pid,
+        process.pid + 1 if mismatch == "pgid" else process.pid,
+        "linux-proc-start:0" if mismatch == "token" else token,
+    )
+    try:
+        assert task_runner_module._terminate_group(
+            process,
+            adapter_identity=adapter_identity,
+            grace_seconds=0.05,
+        ) == []
+        assert _process_is_running(process.pid)
+    finally:
+        if _process_is_running(process.pid):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
 
 
 def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
@@ -1371,6 +1486,81 @@ def test_stop_delivers_to_live_process_group_after_runner_and_tmux_loss(
             os.killpg(int(running["adapter_pgid"]), signal.SIGKILL)
 
 
+def test_stop_delivers_to_live_descendant_after_leader_is_reaped(
+    tmp_path: Path,
+) -> None:
+    descendant = (
+        "import signal,time;from pathlib import Path;"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+        "signal.signal(signal.SIGINT,signal.SIG_IGN);"
+        "Path('descendant.ready').touch();"
+        "time.sleep(30)"
+    )
+    code = (
+        "import subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        f"child=subprocess.Popen([sys.executable,'-c',{descendant!r}])\n"
+        "Path('descendant.pid').write_text(str(child.pid),encoding='utf-8')\n"
+        "deadline=time.monotonic()+5\n"
+        "while not Path('descendant.ready').exists() and time.monotonic()<deadline:\n"
+        "    time.sleep(0.01)\n"
+        "if not Path('descendant.ready').exists():\n"
+        "    raise SystemExit(2)\n"
+        "Path('leader.ready').touch()\n"
+        "while not Path('leader.exit').exists():\n"
+        "    time.sleep(0.01)\n"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", code],
+        timeout_seconds=30,
+        key="stop-after-reaped-leader",
+    )
+    task_id = str(brief["task_id"])
+    running = service.start(task_id)
+    if running["state"] != "running":
+        running = _wait_state(service, task_id, "running")
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    ready_path = worktree / "leader.ready"
+    deadline = time.monotonic() + 5
+    while not ready_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready_path.exists()
+    adapter_pid = int(running["adapter_pid"])
+    adapter_pgid = int(running["adapter_pgid"])
+    descendant_pid = int(
+        (worktree / "descendant.pid").read_text(encoding="utf-8")
+    )
+
+    try:
+        (worktree / "leader.exit").touch()
+        deadline = time.monotonic() + 5
+        while _process_state(adapter_pid) is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert _process_state(adapter_pid) is None
+        assert _process_is_running(descendant_pid)
+        assert service.status(task_id)["state"] == "running"
+
+        service.stop(task_id, actor="human", reason="stop reaped leader")
+        final_path = runtime / "final.json"
+        deadline = time.monotonic() + 5
+        while not final_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert final_path.exists()
+        terminal = service.status(task_id)
+        final = json.loads(final_path.read_text(encoding="utf-8"))
+        assert terminal["state"] == "cancelled"
+        assert final["stop"]["delivered"] is True
+        assert final["stop"]["signal_sequence"] == ["TERM", "KILL"]
+        assert final["signal_sequence"] == ["TERM", "KILL"]
+        _assert_processes_stop(adapter_pid, descendant_pid)
+    finally:
+        if _process_is_running(descendant_pid):
+            os.killpg(adapter_pgid, signal.SIGKILL)
+        _assert_processes_stop(descendant_pid)
+
+
 def test_timeout_terminates_term_ignoring_process_group_and_reaps_leader(
     tmp_path: Path,
 ) -> None:
@@ -1393,6 +1583,132 @@ def test_timeout_terminates_term_ignoring_process_group_and_reaps_leader(
     assert final["timeout"] == {"timeout_seconds": 0.3, "triggered": True}
     assert final["signal_sequence"] == ["TERM", "KILL"]
     _assert_processes_stop(int(final["adapter_pid"]), descendant_pid)
+
+
+def test_runner_waits_for_process_group_drain_before_finalizing_late_stdout(
+    tmp_path: Path,
+) -> None:
+    descendant = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "Path('descendant.ready').write_text('ready',encoding='utf-8')\n"
+        "while not Path('descendant.release').exists():\n"
+        "    time.sleep(0.01)\n"
+        "print('late descendant stdout',flush=True)\n"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", _exiting_leader_process_tree_code(descendant)],
+        timeout_seconds=5,
+        key="late-descendant-stdout",
+    )
+    task_id = str(brief["task_id"])
+    running = service.start(task_id)
+    if running["state"] != "running":
+        running = _wait_state(service, task_id, "running")
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    descendant_path = worktree / "descendant.pid"
+    deadline = time.monotonic() + 5
+    while not descendant_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    descendant_pid = int(descendant_path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 5
+    while (
+        _process_is_running(int(running["adapter_pid"]))
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.02)
+
+    assert not _process_is_running(int(running["adapter_pid"]))
+    assert _process_is_running(descendant_pid)
+    assert service.status(task_id)["state"] == "running"
+    assert not (runtime / "final.json").exists()
+    (worktree / "descendant.release").touch()
+
+    final_path = runtime / "final.json"
+    deadline = time.monotonic() + 5
+    while not final_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert final_path.exists()
+    terminal = service.status(task_id)
+    stdout = (runtime / "stdout.log").read_bytes()
+    final_bytes = final_path.read_bytes()
+    final = json.loads(final_bytes)
+    assert terminal["state"] == "completed"
+    assert final["exit_code"] == 0
+    assert stdout == b"leader stdout\nlate descendant stdout\n"
+    assert final["stdout"] == {
+        "path": f".aros/tasks/{task_id}/stdout.log",
+        "bytes": len(stdout),
+        "sha256": hashlib.sha256(stdout).hexdigest(),
+    }
+    _assert_processes_stop(descendant_pid)
+    time.sleep(0.2)
+    assert (runtime / "stdout.log").read_bytes() == stdout
+    assert final_path.read_bytes() == final_bytes
+
+
+def test_timeout_terminates_persistent_descendant_after_leader_exits(
+    tmp_path: Path,
+) -> None:
+    descendant = (
+        "import signal,time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "signal.signal(signal.SIGINT,signal.SIG_IGN)\n"
+        "Path('descendant.ready').write_text('ready',encoding='utf-8')\n"
+        "while not Path('descendant.release').exists():\n"
+        "    time.sleep(0.01)\n"
+        "time.sleep(30)\n"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", _exiting_leader_process_tree_code(descendant)],
+        timeout_seconds=2,
+        key="timeout-after-leader-exit",
+    )
+    task_id = str(brief["task_id"])
+
+    running = service.start(task_id)
+    if running["state"] != "running":
+        running = _wait_state(service, task_id, "running")
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    descendant_path = worktree / "descendant.pid"
+    deadline = time.monotonic() + 5
+    while not descendant_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    descendant_pid = int(descendant_path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 5
+    while (
+        _process_is_running(int(running["adapter_pid"]))
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.02)
+    assert not _process_is_running(int(running["adapter_pid"]))
+    assert _process_is_running(descendant_pid)
+    assert service.status(task_id)["state"] == "running"
+    assert not (runtime / "final.json").exists()
+    (worktree / "descendant.release").touch()
+
+    final_path = runtime / "final.json"
+    deadline = time.monotonic() + 5
+    while not final_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert final_path.exists()
+    terminal = service.status(task_id)
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    try:
+        assert terminal["state"] == "timed_out"
+        assert final["exit_code"] == 0
+        assert final["timeout"] == {"timeout_seconds": 2, "triggered": True}
+        assert final["signal_sequence"] == ["TERM", "KILL"]
+        _assert_processes_stop(int(final["adapter_pid"]), descendant_pid)
+    finally:
+        if _process_is_running(descendant_pid):
+            os.killpg(int(final["adapter_pgid"]), signal.SIGKILL)
+        _assert_processes_stop(descendant_pid)
 
 
 def test_stop_arriving_during_timeout_keeps_timeout_signal_authority(

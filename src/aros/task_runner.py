@@ -787,15 +787,47 @@ def lost_status(
     }
 
 
-def _process_state_and_token(pid: int) -> tuple[str, str] | None:
+def _process_state_group_and_token(pid: int) -> tuple[str, int, str] | None:
     if pid <= 1:
         return None
     try:
         raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         fields_after_name = raw.rsplit(")", 1)[1].split()
-        return fields_after_name[0], f"linux-proc-start:{fields_after_name[19]}"
+        return (
+            fields_after_name[0],
+            int(fields_after_name[2]),
+            f"linux-proc-start:{fields_after_name[19]}",
+        )
     except (OSError, IndexError, ValueError):
         return None
+
+
+def _process_group_has_live_member(pgid: int) -> bool:
+    if pgid <= 1:
+        return False
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return False
+    with entries:
+        for entry in entries:
+            if not entry.name.isdecimal():
+                continue
+            process = _process_state_group_and_token(int(entry.name))
+            if process is not None and process[0] not in {"Z", "X", "x"}:
+                if process[1] == pgid:
+                    return True
+    return False
+
+
+def _claimed_group_is_live(pid: int, pgid: int, token: str) -> bool:
+    identity = _process_state_group_and_token(pid)
+    if identity is not None and (identity[1] != pgid or identity[2] != token):
+        return False
+    if not _process_group_has_live_member(pgid):
+        return False
+    confirmed = _process_state_group_and_token(pid)
+    return confirmed is None or (confirmed[1] == pgid and confirmed[2] == token)
 
 
 def process_status_is_live(status: dict[str, object]) -> bool:
@@ -811,20 +843,7 @@ def process_status_is_live(status: dict[str, object]) -> bool:
         or not isinstance(token, str)
     ):
         return False
-    identity = _process_state_and_token(pid)
-    if identity is None or identity[0] in {"Z", "X", "x"} or identity[1] != token:
-        return False
-    try:
-        matching_group = os.getpgid(pid) == pgid
-    except (OSError, ProcessLookupError):
-        return False
-    confirmed = _process_state_and_token(pid)
-    return bool(
-        matching_group
-        and confirmed is not None
-        and confirmed[0] not in {"Z", "X", "x"}
-        and confirmed[1] == token
-    )
+    return _claimed_group_is_live(pid, pgid, token)
 
 
 def adapter_claim_is_live(adapter: dict[str, object]) -> bool:
@@ -1107,15 +1126,9 @@ def request_stop_locked(
         or type(pgid) is not int
         or pgid != pid
         or not isinstance(token, str)
-        or process_start_token(pid) != token
+        or not process_status_is_live(status)
     ):
         raise TaskError(f"task process identity changed; refusing stop: {task_id}")
-    try:
-        actual_pgid = os.getpgid(pid)
-    except OSError as error:
-        raise TaskError(f"task process is absent; refusing stop: {task_id}") from error
-    if actual_pgid != pgid:
-        raise TaskError(f"task process group changed; refusing stop: {task_id}")
     request: dict[str, object] = {
         "schema_version": 1,
         "task_id": task_id,
@@ -1182,23 +1195,27 @@ def _terminate_recorded_group(
         or type(pgid) is not int
         or pid != pgid
         or not isinstance(token, str)
-        or process_start_token(pid) != token
+        or not _claimed_group_is_live(pid, pgid, token)
     ):
         return []
-    try:
-        if os.getpgid(pid) != pgid:
-            return []
-    except OSError:
-        return []
+    adapter_identity = (pid, pgid, token)
     sequence: list[str] = []
     requested_name = str(request["signal"])
-    if _signal_group(pgid, _ALLOWED_SIGNALS[requested_name]):
+    if _signal_group(
+        pgid,
+        _ALLOWED_SIGNALS[requested_name],
+        adapter_identity=adapter_identity,
+    ):
         sequence.append(requested_name)
     deadline = time.monotonic() + grace_seconds
-    while _group_exists(pgid) and time.monotonic() < deadline:
+    while _claimed_group_is_live(*adapter_identity) and time.monotonic() < deadline:
         time.sleep(0.02)
-    if _group_exists(pgid) and requested_name != "KILL":
-        if _signal_group(pgid, signal.SIGKILL):
+    if _claimed_group_is_live(*adapter_identity) and requested_name != "KILL":
+        if _signal_group(
+            pgid,
+            signal.SIGKILL,
+            adapter_identity=adapter_identity,
+        ):
             sequence.append("KILL")
     return sequence
 
@@ -1338,17 +1355,20 @@ def _identity(pid: int) -> tuple[int, int, str]:
     return pid, pgid, token
 
 
-def _group_exists(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
+def _signal_group(
+    pgid: int,
+    signal_number: int,
+    *,
+    adapter_identity: tuple[int, int, str] | None = None,
+) -> bool:
+    group_is_live = (
+        _process_group_has_live_member(pgid)
+        if adapter_identity is None
+        else adapter_identity[1] == pgid
+        and _claimed_group_is_live(*adapter_identity)
+    )
+    if not group_is_live:
         return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _signal_group(pgid: int, signal_number: int) -> bool:
     try:
         os.killpg(pgid, signal_number)
     except ProcessLookupError:
@@ -1365,6 +1385,7 @@ def _terminate_group(
     *,
     first_name: str = "TERM",
     grace_seconds: float = 1.0,
+    adapter_identity: tuple[int, int, str] | None = None,
 ) -> list[str]:
     pgid = process.pid
     signals = {
@@ -1372,15 +1393,38 @@ def _terminate_group(
         "INT": signal.SIGINT,
         "KILL": signal.SIGKILL,
     }
+    if adapter_identity is not None and (
+        adapter_identity[0] != process.pid
+        or adapter_identity[1] != pgid
+        or not _claimed_group_is_live(*adapter_identity)
+    ):
+        process.poll()
+        return []
+    def group_is_live() -> bool:
+        if adapter_identity is None:
+            return _process_group_has_live_member(pgid)
+        return _claimed_group_is_live(*adapter_identity)
+
+    if not group_is_live():
+        process.poll()
+        return []
     sequence: list[str] = []
-    if _signal_group(pgid, signals[first_name]):
+    if _signal_group(
+        pgid,
+        signals[first_name],
+        adapter_identity=adapter_identity,
+    ):
         sequence.append(first_name)
     deadline = time.monotonic() + grace_seconds
-    while _group_exists(pgid) and time.monotonic() < deadline:
+    while group_is_live() and time.monotonic() < deadline:
         process.poll()
         time.sleep(0.02)
-    if _group_exists(pgid) and first_name != "KILL":
-        if _signal_group(pgid, signal.SIGKILL):
+    if group_is_live() and first_name != "KILL":
+        if _signal_group(
+            pgid,
+            signal.SIGKILL,
+            adapter_identity=adapter_identity,
+        ):
             sequence.append("KILL")
     try:
         process.wait(timeout=2)
@@ -1676,7 +1720,10 @@ def run(workspace: str | Path, task_id: str) -> int:
         raise TaskError("task adapter launch produced no process")
     adapter_setup_error = identity_error or claim_error or gate_error
     if adapter_setup_error is not None:
-        signal_sequence = _terminate_group(process)
+        signal_sequence = _terminate_group(
+            process,
+            adapter_identity=adapter_identity if claim_succeeded else None,
+        )
         stdout.close()
         stderr.close()
         if not claim_succeeded and _path_exists(service._adapter_path(task_id)):
@@ -1727,7 +1774,7 @@ def run(workspace: str | Path, task_id: str) -> int:
     stop_result: dict[str, object] | None = None
     stop_handled = False
     last_heartbeat = time.monotonic()
-    while process.poll() is None:
+    while process.poll() is None or _claimed_group_is_live(*adapter_identity):
         if not stop_handled:
             with file_lock(lifecycle_lock):
                 if _path_exists(service._stop_path(task_id)):
@@ -1754,18 +1801,13 @@ def run(workspace: str | Path, task_id: str) -> int:
                         stop_request["adapter_pid"] == adapter_identity[0]
                         and stop_request["adapter_pgid"] == adapter_identity[1]
                         and stop_request["adapter_start_token"] == adapter_identity[2]
-                        and process_start_token(process.pid) == adapter_identity[2]
+                        and process_status_is_live(stop_request)
                     )
-                    try:
-                        identity_matches = identity_matches and (
-                            os.getpgid(process.pid) == adapter_identity[1]
-                        )
-                    except OSError:
-                        identity_matches = False
                     stop_sequence = (
                         _terminate_group(
                             process,
                             first_name=str(stop_request["signal"]),
+                            adapter_identity=adapter_identity,
                         )
                         if identity_matches
                         else []
@@ -1788,7 +1830,10 @@ def run(workspace: str | Path, task_id: str) -> int:
             and time.monotonic() - started_monotonic >= timeout_seconds
         ):
             timeout_triggered = True
-            signal_sequence = _terminate_group(process)
+            signal_sequence = _terminate_group(
+                process,
+                adapter_identity=adapter_identity,
+            )
             break
         now = time.monotonic()
         if now - last_heartbeat >= 0.2:
@@ -1799,8 +1844,7 @@ def run(workspace: str | Path, task_id: str) -> int:
                 if not service._final_path(task_id).exists():
                     atomic_write_json(service._status_path(task_id), running)
             last_heartbeat = now
-        if process.poll() is None:
-            time.sleep(0.02)
+        time.sleep(0.02)
 
     exit_code = process.wait()
     if _path_exists(service._stop_path(task_id)) and stop_result is None:

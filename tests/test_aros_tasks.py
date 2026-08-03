@@ -751,6 +751,33 @@ def test_start_rejects_tampered_or_linked_preparation(
         assert outside.is_file()
 
 
+def test_start_recovers_interrupted_preparation_temp_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _brief, task_id, runtime = _create_committed_task(
+        tmp_path,
+        key="recover-preparation-temp-alias",
+    )
+    _publish_preparation_intent(service, task_id, runtime, monkeypatch)
+    preparation_path = runtime / "preparation.json"
+    digest = hashlib.sha256(os.fsencode(preparation_path.name)).hexdigest()
+    temporary = runtime / f".aros-json-{digest}.crash.tmp"
+    os.link(preparation_path, temporary, follow_symlinks=False)
+    identity = (preparation_path.stat().st_dev, preparation_path.stat().st_ino)
+    assert preparation_path.stat().st_nlink == 2
+    assert (temporary.stat().st_dev, temporary.stat().st_ino) == identity
+    carrier_calls = _fake_tmux_carrier(monkeypatch)
+
+    assert TaskService(tmp_path).start(task_id, actor="principal")["state"] == "lost"
+
+    assert not temporary.exists()
+    assert preparation_path.stat().st_nlink == 1
+    assert (preparation_path.stat().st_dev, preparation_path.stat().st_ino) == identity
+    assert (runtime / "launch.json").is_file()
+    assert len(carrier_calls) == 1
+
+
 @pytest.mark.parametrize("name", ("home", "tmp", "runner-import"))
 def test_start_rejects_permissive_directory_during_preparation_resume(
     tmp_path: Path,

@@ -2156,12 +2156,12 @@ class TaskService:
     ) -> dict[str, object]:
         task_id = str(brief["task_id"])
         path = self._preparation_path(task_id)
+        preparation = _read_object(path, "task preparation")
         _require_restrictive_plain_file(
             path,
             "task preparation",
             permissions_enforced=self._filesystem_permissions_enforced,
         )
-        preparation = _read_object(path, "task preparation")
         if (
             set(preparation) != _PREPARATION_FIELDS
             or type(preparation.get("schema_version")) is not int

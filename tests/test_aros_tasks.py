@@ -689,8 +689,11 @@ def test_git_subprocesses_do_not_load_ambient_dynamic_libraries(
     source = tmp_path / ".git" / "preload.c"
     library = tmp_path / ".git" / "preload.so"
     source.write_text(
+        "#define _GNU_SOURCE\n"
         "#include <fcntl.h>\n"
+        "#include <link.h>\n"
         "#include <unistd.h>\n"
+        "unsigned int la_version(unsigned int version) { return LAV_CURRENT; }\n"
         "__attribute__((constructor)) static void mark(void) {\n"
         f"  int fd = open({json.dumps(str(marker))}, O_WRONLY | O_CREAT, 0600);\n"
         "  if (fd >= 0) close(fd);\n"
@@ -704,6 +707,7 @@ def test_git_subprocesses_do_not_load_ambient_dynamic_libraries(
     )
     monkeypatch.setenv("LD_PRELOAD", str(library))
     monkeypatch.setenv("LD_LIBRARY_PATH", str(library.parent))
+    monkeypatch.setenv("LD_AUDIT", str(library))
     monkeypatch.setenv("DYLD_INSERT_LIBRARIES", str(library))
 
     status = service.start(task_id)

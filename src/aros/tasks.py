@@ -1653,8 +1653,7 @@ def _git_environment() -> dict[str, str]:
     return {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("GIT_", "PYTHON", "DYLD_"))
-        and key not in {"LD_PRELOAD", "LD_LIBRARY_PATH"}
+        if not key.startswith(("GIT_", "PYTHON", "LD_", "DYLD_"))
     }
 
 

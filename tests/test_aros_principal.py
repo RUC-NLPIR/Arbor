@@ -87,6 +87,21 @@ def test_build_principal_uses_native_agent_and_exact_default_tools(tmp_path: Pat
     assert "mission: understand the system" in agent.system_prompt
 
 
+def test_principal_prompt_states_the_trusted_local_task_boundary(tmp_path: Path):
+    agent = build_principal_agent(_ScriptedProvider(), tmp_path, "boot")
+    prompt = " ".join(agent.system_prompt.lower().split())
+
+    assert "trusted-local and application-scoped, not a security sandbox" in prompt
+    assert (
+        "network and shell capability flags are audit declarations and are not enforced"
+    ) in prompt
+    assert "secrets and untrusted adapters are unsupported" in prompt
+    assert (
+        "daemonizing or new-session descendants that do not drain fail closed as lost "
+        "with no terminal receipt"
+    ) in prompt
+
+
 def test_principal_shell_is_opt_in_bounded_and_foreground_only(tmp_path: Path):
     agent = build_principal_agent(
         _ScriptedProvider(),

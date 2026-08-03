@@ -18,8 +18,9 @@ The exposed command surface for the direct `aros` entry is:
 - Durable launch with `aros run start` requires a clean committed Git HEAD and `tmux`.
 - `aros task start` requires its immutable brief to be committed at a clean parent HEAD and requires `tmux`; collection records reviewed B-C-R pointers without merging or cherry-picking the child.
 - The default `isolated-linux` profile requires a supported Linux architecture (x86_64 or aarch64), exactly Landlock ABI 4, `libseccomp`, and `O_PATH` support; it fails closed instead of downgrading.
-- `trusted-local` is explicitly not a security sandbox and must be selected explicitly.
-- Child tasks currently run as `trusted-local` with application-level isolation and `capabilities_enforced=false`; brief capability flags are durable audit declarations, not an OS security boundary. Launch and final receipts record whether the filesystem enforces requested file modes. On a mode-normalizing filesystem, integrity checks remain active but `filesystem_permissions_enforced=false`, so untrusted adapters or secrets are out of scope.
+- Task adapters are trusted-local and application-scoped, not a security sandbox; the `trusted-local` profile must be selected explicitly. Network and shell capability flags are audit declarations and are not enforced (`capabilities_enforced=false`). Secrets and untrusted adapters are unsupported. Daemonizing or new-session descendants that do not drain fail closed as `lost` with no terminal receipt.
+- V1 terminal truth covers the exact PGID plus descendants reparented to the live subreaper. A new-session process that outlives runner death is not claimed contained and cannot justify a clean final receipt or prune. Delegated per-task cgroups belong to the shared Operations process core, not the Wave 2 security claim.
+- Launch and final receipts record whether the filesystem enforces requested file modes. On a mode-normalizing filesystem, integrity checks remain active but `filesystem_permissions_enforced=false`.
 
 ## Not yet implemented
 

@@ -22,6 +22,14 @@ from ...aros.workspace import (
 from ...core import AgentConfig, create_provider
 
 
+_TASK_TRUST_BOUNDARY = (
+    "Task adapters are trusted-local and application-scoped, not a security sandbox. "
+    "Network and shell capability flags are audit declarations and are not enforced. "
+    "Secrets and untrusted adapters are unsupported. Daemonizing or new-session "
+    "descendants that do not drain fail closed as lost with no terminal receipt."
+)
+
+
 aros_app = typer.Typer(
     name="aros",
     help="Operate the native Agent-principal research workspace.",
@@ -34,7 +42,7 @@ run_app = typer.Typer(
 )
 task_app = typer.Typer(
     name="task",
-    help="Manage durable child tasks.",
+    help="Manage durable child tasks. " + _TASK_TRUST_BOUNDARY,
     no_args_is_help=True,
 )
 aros_app.add_typer(run_app, name="run")
@@ -269,7 +277,11 @@ def run_stop_command(
     _print_json(receipt)
 
 
-@task_app.command("create", cls=_RequireCommandSeparator)
+@task_app.command(
+    "create",
+    cls=_RequireCommandSeparator,
+    help="Freeze one immutable task brief without starting it. " + _TASK_TRUST_BOUNDARY,
+)
 def task_create_command(
     adapter_argv: list[str] = typer.Argument(
         ...,
@@ -300,12 +312,12 @@ def task_create_command(
     network: bool = typer.Option(
         False,
         "--network",
-        help="Authorize network capability for the child.",
+        help="Network audit declaration; not enforced.",
     ),
     shell: bool = typer.Option(
         False,
         "--shell",
-        help="Authorize shell capability for the child.",
+        help="Shell audit declaration; not enforced.",
     ),
     deliverables: list[str] | None = typer.Option(
         None,

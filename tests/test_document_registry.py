@@ -192,7 +192,37 @@ def test_aros_public_guide_states_runtime_prerequisites() -> None:
     assert "supported Linux architecture (x86_64 or aarch64)" in text
     assert "exactly Landlock ABI 4" in text
     assert "`libseccomp`" in text
-    assert "`trusted-local` is explicitly not a security sandbox" in text
+    assert (
+        "Task adapters are trusted-local and application-scoped, not a security sandbox"
+        in text
+    )
+
+
+def test_task_docs_publish_the_exact_v1_containment_claim() -> None:
+    paths = (
+        _ROOT / "docs" / "aros" / "README.md",
+        _ROOT
+        / "docs"
+        / "superpowers"
+        / "specs"
+        / "2026-08-02-aros-v1-product-and-migration-design.md",
+        _ROOT / "docs" / "analysis" / "aros-wave2-child-substrate-smoke.md",
+    )
+
+    for path in paths:
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        assert (
+            "V1 terminal truth covers the exact PGID plus descendants reparented to "
+            "the live subreaper."
+        ) in text
+        assert (
+            "A new-session process that outlives runner death is not claimed contained "
+            "and cannot justify a clean final receipt or prune."
+        ) in text
+        assert (
+            "Delegated per-task cgroups belong to the shared Operations process core, "
+            "not the Wave 2 security claim."
+        ) in text
 
 
 def test_aros_migration_docs_match_the_ci_freeze_scope() -> None:

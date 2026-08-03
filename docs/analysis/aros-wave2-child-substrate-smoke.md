@@ -480,6 +480,17 @@ f4165bd  keep live execution-claim runners out of transient lost state
 ca4f138  use 64-bit task IDs with bounded collision retry
 ```
 
+Follow-up containment commits `ea51f60`, `2868b94`, `2a41f35`, `722bf4b`, and
+`c188484` establish the current boundary. Task adapters are trusted-local and
+application-scoped, not a security sandbox. Network and shell capability flags
+are audit declarations and are not enforced. Secrets and untrusted adapters are
+unsupported. Daemonizing or new-session descendants that do not drain fail
+closed as `lost` with no terminal receipt. V1 terminal truth covers the exact
+PGID plus descendants reparented to the live subreaper. A new-session process
+that outlives runner death is not claimed contained and cannot justify a clean
+final receipt or prune. Delegated per-task cgroups belong to the shared
+Operations process core, not the Wave 2 security claim.
+
 The current implementation also uses atomic create-once JSON publication with
 interrupted-alias recovery and durable absolute directory-chain fsync. Worktree
 ownership remains non-expiring; the create-once execution claim is the local

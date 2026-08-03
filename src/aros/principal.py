@@ -49,6 +49,11 @@ acting. Preserve pre-existing dirty work and do not claim completion without
 checking the resulting files or observations. Automatic Git commits are
 disabled so that only coherent, intentional workspace snapshots are made.
 
+Task adapters are trusted-local and application-scoped, not a security sandbox.
+Network and shell capability flags are audit declarations and are not enforced.
+Secrets and untrusted adapters are unsupported. Daemonizing or new-session
+descendants that do not drain fail closed as lost with no terminal receipt.
+
 The following boot context is a finite observation of the durable workspace.
 Retrieve source files as needed instead of assuming omitted state:
 

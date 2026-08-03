@@ -220,6 +220,38 @@ def test_task_create_defaults_are_bounded_and_human_attributed(
     ]
 
 
+@pytest.mark.parametrize(
+    ("args", "has_capability_options"),
+    [
+        pytest.param(["task", "--help"], False, id="task"),
+        pytest.param(["task", "create", "--help"], True, id="create"),
+    ],
+)
+def test_task_help_states_the_trusted_local_boundary(
+    args: list[str],
+    has_capability_options: bool,
+) -> None:
+    result = runner.invoke(aros_cmd.aros_app, args)
+
+    assert result.exit_code == 0, result.output
+    help_text = " ".join(result.output.lower().split())
+    claims = (
+        "trusted-local and application-scoped, not a security sandbox",
+        "network and shell capability flags are audit declarations and are not enforced",
+        "secrets and untrusted adapters are unsupported",
+        "daemonizing or new-session descendants that do not drain fail closed as lost "
+        "with no terminal receipt",
+    )
+    for claim in claims:
+        assert claim in help_text, args
+    if has_capability_options:
+        assert "network audit declaration;" in help_text
+        assert "shell audit declaration;" in help_text
+        assert help_text.count("not enforced") == 3
+        assert "authorize network capability" not in help_text
+        assert "authorize shell capability" not in help_text
+
+
 def test_task_create_requires_double_dash_before_adapter_argv(
     tmp_path: Path,
 ) -> None:

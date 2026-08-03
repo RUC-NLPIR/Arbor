@@ -250,6 +250,17 @@ liveness determines active versus stale; a dead holder without a final receipt
 becomes `lost` and is never relaunched automatically. Generic TTL, renewal, and
 distributed heartbeat leases belong to the Operations wave.
 
+Task adapters are trusted-local and application-scoped, not a security sandbox.
+Network and shell capability flags are audit declarations and are not enforced.
+Secrets and untrusted adapters are unsupported. Daemonizing or new-session
+descendants that do not drain fail closed as `lost` with no terminal receipt.
+
+V1 terminal truth covers the exact PGID plus descendants reparented to the live
+subreaper. A new-session process that outlives runner death is not claimed
+contained and cannot justify a clean final receipt or prune. Delegated per-task
+cgroups belong to the shared Operations process core, not the Wave 2 security
+claim.
+
 ### 8.3 Return and assimilation
 
 A child return records:

@@ -161,6 +161,29 @@ def test_task_tool_exposes_one_flat_action_based_system_call(tmp_path: Path) -> 
     }
 
 
+@pytest.mark.parametrize("surface", ["description", "schema"])
+def test_task_tool_publishes_the_trusted_local_task_boundary(
+    tmp_path: Path,
+    surface: str,
+) -> None:
+    tool = _task_tool()(cwd=str(tmp_path))
+    if surface == "description":
+        text = tool.description
+    else:
+        text = tool.input_schema.get("description", "")
+    text = " ".join(text.lower().split())
+
+    claims = (
+        "trusted-local and application-scoped, not a security sandbox",
+        "network and shell capability flags are audit declarations and are not enforced",
+        "secrets and untrusted adapters are unsupported",
+        "daemonizing or new-session descendants that do not drain fail closed as lost "
+        "with no terminal receipt",
+    )
+    for claim in claims:
+        assert claim in text, surface
+
+
 def test_create_freezes_default_brief_without_starting(tmp_path: Path) -> None:
     tool = _task_tool()(cwd=str(tmp_path))
 

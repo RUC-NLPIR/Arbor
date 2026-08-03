@@ -20,6 +20,12 @@ _ACTIONS = [
     "preserve",
     "prune",
 ]
+_TASK_TRUST_BOUNDARY = (
+    "Task adapters are trusted-local and application-scoped, not a security sandbox. "
+    "Network and shell capability flags are audit declarations and are not enforced. "
+    "Secrets and untrusted adapters are unsupported. Daemonizing or new-session "
+    "descendants that do not drain fail closed as lost with no terminal receipt."
+)
 
 
 class TaskTool(Tool):
@@ -30,10 +36,12 @@ class TaskTool(Tool):
         "Control durable child tasks. create freezes an immutable brief without "
         "launching it; start launches a previously created task. status/list inspect "
         "task state, message appends a mailbox record, stop requests termination, "
-        "and collect/preserve/prune manage final child material."
+        "and collect/preserve/prune manage final child material. "
+        + _TASK_TRUST_BOUNDARY
     )
     input_schema: dict[str, Any] = {
         "type": "object",
+        "description": _TASK_TRUST_BOUNDARY,
         "properties": {
             "action": {"type": "string", "enum": _ACTIONS},
             "task_id": {"type": "string"},

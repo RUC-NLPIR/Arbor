@@ -1765,8 +1765,8 @@ class TaskService:
                 "task record inventory conflict: runtime state has no versioned brief"
             )
         for task_id in sorted(versioned):
-            brief = self._load_brief(task_id)
             self._reconcile_staging_alias(task_id)
+            brief = self._load_brief(task_id)
             self._recover_prepared_records(brief)
         self._validate_inventory()
 
@@ -3492,7 +3492,7 @@ def _read_object(path: Path, description: str) -> dict[str, object]:
     try:
         value = read_json(path)
     except (OSError, ValueError) as error:
-        raise TaskError(f"unable to read {description}: {path}") from error
+        raise TaskError(f"unable to read {description}: {path}: {error}") from error
     if not isinstance(value, dict):
         raise TaskError(f"invalid {description}: {path}")
     return value

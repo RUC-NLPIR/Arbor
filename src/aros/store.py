@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -120,8 +121,52 @@ def final_identity(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_json(path: str | Path) -> Any:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    target = Path(path)
+    metadata = target.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"JSON path must be a regular file: {target}")
+    identity = (metadata.st_dev, metadata.st_ino)
+    if metadata.st_nlink > 1:
+        _remove_json_temp_aliases(target, identity)
+        metadata = target.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != identity
+        ):
+            raise ValueError(f"JSON path changed during recovery: {target}")
+    if metadata.st_nlink != 1:
+        raise ValueError(
+            f"JSON path must be a create-once single-link regular file: {target}"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError(f"JSON path must be a regular file: {target}")
+        if (opened.st_dev, opened.st_ino) != identity:
+            raise ValueError(f"JSON path changed while opening: {target}")
+        if opened.st_nlink != 1:
+            raise ValueError(
+                f"JSON path must be a create-once single-link regular file: {target}"
+            )
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as handle:
+            value = json.load(handle)
+    finally:
+        os.close(descriptor)
+
+    observed = target.lstat()
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or (observed.st_dev, observed.st_ino) != identity
+    ):
+        raise ValueError(f"JSON path changed while reading: {target}")
+    if observed.st_nlink != 1:
+        raise ValueError(
+            f"JSON path must be a create-once single-link regular file: {target}"
+        )
+    return value
 
 
 def atomic_write_json(path: str | Path, value: Any) -> None:
@@ -132,7 +177,7 @@ def atomic_write_json(path: str | Path, value: Any) -> None:
         json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
     fd, temporary = tempfile.mkstemp(
-        prefix=f".{target.name}.",
+        prefix=_json_temp_prefix(target),
         suffix=".tmp",
         dir=target.parent,
     )
@@ -152,12 +197,18 @@ def atomic_write_json(path: str | Path, value: Any) -> None:
 def create_json(path: str | Path, value: Any) -> bool:
     """Create an immutable JSON document, returning false if it exists."""
     target = Path(path)
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        return False
     _durable_mkdir(target.parent)
     payload = (
         json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
     fd, temporary = tempfile.mkstemp(
-        prefix=f".{target.name}.",
+        prefix=_json_temp_prefix(target),
         suffix=".tmp",
         dir=target.parent,
     )
@@ -204,6 +255,42 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _json_temp_prefix(target: Path) -> str:
+    digest = hashlib.sha256(os.fsencode(target.name)).hexdigest()
+    return f".aros-json-{digest}."
+
+
+def _remove_json_temp_aliases(
+    target: Path,
+    identity: tuple[int, int],
+) -> None:
+    prefix = _json_temp_prefix(target)
+    removed = False
+    for candidate in target.parent.iterdir():
+        if (
+            not candidate.name.startswith(prefix)
+            or not candidate.name.endswith(".tmp")
+            or len(candidate.name) <= len(prefix) + len(".tmp")
+        ):
+            continue
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != identity
+        ):
+            continue
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            continue
+        removed = True
+    if removed:
+        _fsync_directory(target.parent)
 
 
 def _durable_mkdir(path: Path) -> None:

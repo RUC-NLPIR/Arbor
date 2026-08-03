@@ -2027,6 +2027,9 @@ def test_immediate_post_link_crash_is_recoverable_and_preserves_staging(
     staged = list((tmp_path / "tasks" / ".staging").glob("TASK-*/brief.json"))
     assert len(targets) == len(staged) == 1
     task_id = targets[0].name
+    published = targets[0] / "brief.json"
+    assert published.stat().st_nlink == 2
+    assert staged[0].samefile(published)
 
     fresh = TaskService(tmp_path)
     result = fresh.status(task_id) if reader == "status" else fresh.list()
@@ -2036,7 +2039,7 @@ def test_immediate_post_link_crash_is_recoverable_and_preserves_staging(
     else:
         assert [status["task_id"] for status in result] == [task_id]  # type: ignore[union-attr]
     assert not staged[0].exists()
-    assert (targets[0] / "brief.json").stat().st_nlink == 1
+    assert published.stat().st_nlink == 1
 
 
 @pytest.mark.parametrize("kind", ("different_inode", "symlink"))

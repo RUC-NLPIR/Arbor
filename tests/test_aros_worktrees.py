@@ -108,6 +108,50 @@ def test_detached_checkout_is_exact_clean_and_hermetic(
     assert not marker.exists()
 
 
+def test_checkout_pins_lf_working_bytes_against_repository_core_eol(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _init_repository(root)
+    (root / ".gitattributes").write_text("eol.txt text\n", encoding="utf-8")
+    (root / "eol.txt").write_bytes(b"line-one\nline-two\n")
+    _git(root, "add", ".gitattributes", "eol.txt")
+    _git(root, "commit", "-qm", "add text materialization")
+    commit = _git(root, "rev-parse", "HEAD").stdout.strip()
+    _git(root, "config", "core.eol", "crlf")
+
+    checkout = create_detached_checkout(
+        bind_repository(root),
+        root / ".worktree" / "eval" / "eol" / "candidate",
+        commit,
+    )
+
+    assert (checkout.path / "eol.txt").read_bytes() == b"line-one\nline-two\n"
+
+
+def test_checkout_pins_symlink_materialization_against_repository_config(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _init_repository(root)
+    link = root / "tracked-link"
+    link.symlink_to("tracked.txt")
+    _git(root, "add", "tracked-link")
+    _git(root, "commit", "-qm", "add committed symlink")
+    commit = _git(root, "rev-parse", "HEAD").stdout.strip()
+    _git(root, "config", "core.symlinks", "false")
+
+    checkout = create_detached_checkout(
+        bind_repository(root),
+        root / ".worktree" / "eval" / "symlink" / "candidate",
+        commit,
+    )
+
+    checked_out_link = checkout.path / "tracked-link"
+    assert checked_out_link.is_symlink()
+    assert os.readlink(checked_out_link) == "tracked.txt"
+
+
 def test_checkout_rejects_hooks_filters_and_ambient_git_config(
     tmp_path: Path,
     monkeypatch,

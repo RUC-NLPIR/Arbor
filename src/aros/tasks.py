@@ -2794,13 +2794,7 @@ class TaskService:
         )
 
     def _safe_git_configs(self) -> tuple[str, ...]:
-        base = (
-            "core.hooksPath=/dev/null",
-            "core.fileMode=true",
-            "core.fsmonitor=false",
-            "core.autocrlf=false",
-            "core.attributesFile=/dev/null",
-        )
+        base = worktrees_module._BASE_CONFIGS
         result = self._pinned_git_result(
             "config",
             "--null",

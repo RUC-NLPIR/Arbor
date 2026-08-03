@@ -2063,6 +2063,8 @@ def test_start_git_commands_are_scrubbed_pinned_and_nondestructive(
     assert "--force" not in worktree_add_argv
     assert "prune" not in worktree_add_argv
     assert "core.hooksPath=/dev/null" in worktree_add_argv
+    assert "core.eol=lf" in worktree_add_argv
+    assert "core.symlinks=true" in worktree_add_argv
     forbidden = {"--force", "reset", "clean", "prune", "remove"}
     assert all(not forbidden.intersection(command) for command, _ in calls)
 

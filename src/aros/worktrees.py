@@ -24,6 +24,8 @@ _BASE_CONFIGS = (
     "core.fileMode=true",
     "core.fsmonitor=false",
     "core.autocrlf=false",
+    "core.eol=lf",
+    "core.symlinks=true",
     "core.attributesFile=/dev/null",
 )
 

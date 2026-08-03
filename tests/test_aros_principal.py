@@ -76,7 +76,9 @@ def test_build_principal_uses_native_agent_and_exact_default_tools(tmp_path: Pat
         "Write",
         "Inspect",
         "Run",
+        "Task",
     }
+    assert agent.tools["Task"].persist_results is False
     assert agent.config.auto_git is False
     assert agent.config.runtime_dir == str(tmp_path / ".aros" / "agent")
     assert (tmp_path / ".aros" / "agent").is_dir()
@@ -101,6 +103,7 @@ def test_principal_shell_is_opt_in_bounded_and_foreground_only(tmp_path: Path):
         "Write",
         "Inspect",
         "Run",
+        "Task",
         "Bash",
     }
     bash = agent.tools["Bash"]

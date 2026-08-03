@@ -23,6 +23,7 @@ from ..core.tools.file_write import FileWriteTool
 from ..core.tools.glob_tool import GlobTool
 from ..core.tools.grep import GrepTool
 from .run_tool import RunTool
+from .task_tool import TaskTool
 from .workspace import status_workspace
 
 
@@ -154,6 +155,7 @@ def build_principal_agent(
         FileWriteTool(**tool_kwargs),
         InspectTool(cwd=str(workspace_root), persist_results=False),
         RunTool(cwd=str(workspace_root), persist_results=False),
+        TaskTool(cwd=str(workspace_root), persist_results=False),
     ]
     if allow_shell:
         tools.append(

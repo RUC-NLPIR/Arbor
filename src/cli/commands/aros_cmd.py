@@ -12,6 +12,7 @@ from typer.core import TyperCommand
 
 from ...aros.principal import build_principal_agent, run_principal
 from ...aros.runs import RunService
+from ...aros.tasks import TaskService
 from ...aros.workspace import (
     DEFAULT_BOOT_MAX_CHARS,
     boot_workspace,
@@ -31,7 +32,13 @@ run_app = typer.Typer(
     help="Manage durable background experiments.",
     no_args_is_help=True,
 )
+task_app = typer.Typer(
+    name="task",
+    help="Manage durable child tasks.",
+    no_args_is_help=True,
+)
 aros_app.add_typer(run_app, name="run")
+aros_app.add_typer(task_app, name="task")
 
 
 def llm_defaults() -> dict[str, Any]:
@@ -54,11 +61,11 @@ def _fail(exc: Exception) -> None:
 
 
 class _RequireCommandSeparator(TyperCommand):
-    """Keep experiment argv separate from AROS's own CLI options."""
+    """Keep command argv separate from AROS's own CLI options."""
 
     def parse_args(self, ctx: Any, args: list[str]) -> list[str]:
         if "--help" not in args and "-h" not in args and "--" not in args:
-            ctx.fail("experiment command argv must follow --")
+            ctx.fail("command argv must follow --")
         return super().parse_args(ctx, args)
 
 
@@ -260,6 +267,187 @@ def run_stop_command(
     except (OSError, RuntimeError, ValueError) as exc:
         _fail(exc)
     _print_json(receipt)
+
+
+@task_app.command("create", cls=_RequireCommandSeparator)
+def task_create_command(
+    adapter_argv: list[str] = typer.Argument(
+        ...,
+        metavar="-- ADAPTER [ARGS]...",
+        help="Exact adapter argv. Place it after -- so AROS does not parse it.",
+    ),
+    objective: str = typer.Option(
+        ...,
+        "--objective",
+        help="Bounded objective frozen into the task brief.",
+    ),
+    mode: str = typer.Option(
+        ...,
+        "--mode",
+        help="Task access mode: read_only or write.",
+    ),
+    idempotency_key: str = typer.Option(
+        ...,
+        "--idempotency-key",
+        help="Stable key preventing duplicate task creation.",
+    ),
+    timeout_seconds: int = typer.Option(
+        3600,
+        "--timeout-seconds",
+        min=1,
+        help="Hard task timeout in seconds.",
+    ),
+    network: bool = typer.Option(
+        False,
+        "--network",
+        help="Authorize network capability for the child.",
+    ),
+    shell: bool = typer.Option(
+        False,
+        "--shell",
+        help="Authorize shell capability for the child.",
+    ),
+    deliverables: list[str] | None = typer.Option(
+        None,
+        "--deliverable",
+        help="Required deliverable; repeat for multiple values.",
+    ),
+    acceptance: list[str] | None = typer.Option(
+        None,
+        "--acceptance",
+        help="Acceptance check; repeat for multiple values.",
+    ),
+    actor: str = typer.Option("human", "--actor", help="Creation authority."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Freeze one immutable task brief without starting it."""
+    try:
+        brief = TaskService(_root(cwd)).create(
+            objective,
+            actor=actor,
+            mode=mode,
+            adapter_argv=list(adapter_argv),
+            capabilities={"network": network, "shell": shell},
+            deliverables=deliverables or [],
+            acceptance=acceptance or [],
+            timeout_seconds=timeout_seconds,
+            idempotency_key=idempotency_key,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(brief)
+
+
+@task_app.command("start")
+def task_start_command(
+    task_id: str = typer.Argument(..., help="Stable task identifier."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+    actor: str = typer.Option("human", "--actor", help="Launch authority."),
+) -> None:
+    """Launch one previously created task."""
+    try:
+        status = TaskService(_root(cwd)).start(task_id, actor=actor)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(status)
+
+
+@task_app.command("status")
+def task_status_command(
+    task_id: str = typer.Argument(..., help="Stable task identifier."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Inspect one durable task."""
+    try:
+        status = TaskService(_root(cwd)).status(task_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(status)
+
+
+@task_app.command("list")
+def task_list_command(
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """List durable tasks in stable task-ID order."""
+    try:
+        tasks = TaskService(_root(cwd)).list()
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(tasks)
+
+
+@task_app.command("message")
+def task_message_command(
+    task_id: str = typer.Argument(..., help="Stable task identifier."),
+    message: str = typer.Option(..., "--message", help="Mailbox message text."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+    actor: str = typer.Option("human", "--actor", help="Message authority."),
+) -> None:
+    """Append one attributed task mailbox message."""
+    try:
+        record = TaskService(_root(cwd)).message(task_id, message, actor)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(record)
+
+
+@task_app.command("stop")
+def task_stop_command(
+    task_id: str = typer.Argument(..., help="Stable task identifier."),
+    reason: str = typer.Option(..., "--reason", help="Required audit reason."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+    actor: str = typer.Option("human", "--actor", help="Stop authority."),
+) -> None:
+    """Request task termination with the implicit TERM signal."""
+    try:
+        receipt = TaskService(_root(cwd)).stop(
+            task_id,
+            actor=actor,
+            reason=reason,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(receipt)
+
+
+@task_app.command("collect")
+def task_collect_command(
+    task_id: str = typer.Argument(..., help="Stable task identifier."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Record reviewed child return pointers without assimilation."""
+    try:
+        result = TaskService(_root(cwd)).collect(task_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(result)
+
+
+@task_app.command("preserve")
+def task_preserve_command(
+    task_id: str = typer.Argument(..., help="Stable task identifier."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Inspect and preserve one owned child worktree."""
+    try:
+        result = TaskService(_root(cwd)).preserve(task_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(result)
+
+
+@task_app.command("prune")
+def task_prune_command(
+    task_id: str = typer.Argument(..., help="Stable task identifier."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Remove one clean collected child worktree."""
+    try:
+        result = TaskService(_root(cwd)).prune(task_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(result)
 
 
 @aros_app.command("start")

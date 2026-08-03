@@ -7,9 +7,13 @@ import math
 import os
 import re
 import secrets
+import shlex
+import shutil
+import socket
 import stat
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,6 +65,8 @@ _STATUS_FIELDS = {
     "updated_at",
 }
 _READY_STATUS_FIELDS = {*_STATUS_FIELDS, "ownership_sha256"}
+_TERMINAL_STATES = {"completed", "failed_process", "timed_out", "cancelled"}
+_LAUNCH_GRACE_SECONDS = 2.0
 _OWNERSHIP_FIELDS = {
     "schema_version",
     "task_id",
@@ -249,6 +255,167 @@ class TaskService:
         *,
         actor: str | None = None,
     ) -> dict[str, object]:
+        """Ensure ownership and request the task's sole adapter launch attempt."""
+        self._validate_task_id(task_id)
+        self._ensure_record_roots()
+        if _path_exists(self._launch_path(task_id)):
+            return self._existing_execution_status(task_id, actor)
+
+        self._ensure_worktree(task_id, actor=actor)
+        publication_lock = self._publication_lock_path()
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                self._reconcile_authoritative_briefs()
+                brief = self._load_brief(task_id)
+                ownership = self._load_ownership(brief)
+                if _path_exists(self._launch_path(task_id)):
+                    return self._existing_execution_status_locked(
+                        brief,
+                        ownership,
+                        actor,
+                    )
+                status = self._load_task_status(brief, ownership)
+                if status["state"] != "worktree_ready":
+                    raise TaskError(f"task is not ready for launch: {task_id}")
+                launch_actor = _validate_text(
+                    actor if actor is not None else ownership["actor"],
+                    "actor",
+                )
+                if launch_actor != ownership["actor"]:
+                    raise TaskError(f"task ownership actor conflict: {task_id}")
+                tmux = shutil.which("tmux")
+                if tmux is None:
+                    raise TaskError("tmux is required for durable child tasks")
+                runtime = self._runtime_path(task_id)
+                self._prepare_execution_paths(runtime)
+                launched_at = utc_now()
+                session_name = f"aros-task-{task_id.lower()}"
+                socket_name = _tmux_socket_name(self.root, task_id)
+                runner_invocation = [
+                    sys.executable,
+                    "-m",
+                    "arbor.aros.task_runner",
+                    "--workspace",
+                    str(self.root),
+                    "--task-id",
+                    task_id,
+                ]
+                launch: dict[str, object] = {
+                    "schema_version": 1,
+                    "task_id": task_id,
+                    "actor": launch_actor,
+                    "brief_sha256": brief["brief_sha256"],
+                    "ownership_sha256": ownership["ownership_sha256"],
+                    "base_commit": brief["base_commit"],
+                    "security_profile": "trusted-local",
+                    "isolation_scope": "application",
+                    "capabilities_enforced": False,
+                    "carrier": "tmux",
+                    "tmux_session": session_name,
+                    "tmux_socket": socket_name,
+                    "host": socket.gethostname(),
+                    "runner_version": 1,
+                    "runner_invocation": runner_invocation,
+                    "launched_at": launched_at,
+                }
+                launch["launch_sha256"] = _record_sha256(
+                    launch,
+                    "launch_sha256",
+                )
+                if not create_json(self._launch_path(task_id), launch):
+                    return self._existing_execution_status_locked(
+                        brief,
+                        ownership,
+                        actor,
+                    )
+                recorded_launch = self._load_launch(brief, ownership)
+                if recorded_launch != launch:
+                    raise TaskError(f"task launch differs after write: {task_id}")
+                from .task_runner import launched_status
+
+                atomic_write_json(
+                    self._status_path(task_id),
+                    launched_status(brief, ownership, recorded_launch),
+                )
+
+        try:
+            from .task_runner import runner_environment
+
+            result = subprocess.run(
+                [
+                    tmux,
+                    "-L",
+                    socket_name,
+                    "new-session",
+                    "-d",
+                    "-s",
+                    session_name,
+                    shlex.join(runner_invocation),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=runner_environment(runtime),
+            )
+        except subprocess.TimeoutExpired:
+            result = None
+        except OSError as error:
+            self._record_carrier_failure(task_id, str(error))
+            raise TaskError(f"tmux launch failed for task {task_id}: {error}") from error
+        if result is not None and result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip() or "unknown tmux error"
+            self._record_carrier_failure(task_id, detail)
+            raise TaskError(f"tmux launch failed for task {task_id}: {detail}")
+
+        deadline = time.monotonic() + _LAUNCH_GRACE_SECONDS
+        latest = self.status(task_id)
+        while latest["state"] == "launched" and time.monotonic() < deadline:
+            time.sleep(0.02)
+            latest = self.status(task_id)
+        return latest
+
+    def _existing_execution_status(
+        self,
+        task_id: str,
+        actor: str | None,
+    ) -> dict[str, object]:
+        publication_lock = self._publication_lock_path()
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                self._reconcile_authoritative_briefs()
+                brief = self._load_brief(task_id)
+                ownership = self._load_ownership(brief)
+                return self._existing_execution_status_locked(
+                    brief,
+                    ownership,
+                    actor,
+                )
+
+    def _existing_execution_status_locked(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        actor: str | None,
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        launch = self._load_launch(brief, ownership)
+        if actor is not None and _validate_text(actor, "actor") != launch["actor"]:
+            raise TaskError(f"task launch actor conflict: {task_id}")
+        return self._reconcile_execution(brief, ownership, launch)
+
+    def _ensure_worktree(
+        self,
+        task_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
         """Prepare one owned task worktree without launching its adapter."""
         self._validate_task_id(task_id)
         self._ensure_record_roots()
@@ -260,9 +427,9 @@ class TaskService:
             with file_lock(lifecycle_lock):
                 self._reconcile_authoritative_briefs()
                 brief = self._load_brief(task_id)
-                return self._start_locked(brief, actor)
+                return self._ensure_worktree_locked(brief, actor)
 
-    def _start_locked(
+    def _ensure_worktree_locked(
         self,
         brief: dict[str, object],
         actor: str | None,
@@ -273,6 +440,11 @@ class TaskService:
             actor if actor is not None else brief["actor"],
             "actor",
         )
+        if status["state"] not in {"prepared", "worktree_ready"}:
+            ownership = self._load_ownership(brief)
+            if actor is not None and ownership["actor"] != owner:
+                raise TaskError(f"task ownership actor conflict: {task_id}")
+            return status
         parent_head = self._require_startable_parent(brief)
         if status["state"] == "worktree_ready":
             ownership = self._load_ownership(brief)
@@ -328,6 +500,42 @@ class TaskService:
                 self._reconcile_authoritative_briefs()
                 return self._status_unlocked(task_id)
 
+    def stop(
+        self,
+        task_id: str,
+        *,
+        actor: str,
+        reason: str,
+        signal_name: str = "TERM",
+    ) -> dict[str, object]:
+        """Persist one attributed stop request for the task runner."""
+        self._validate_task_id(task_id)
+        self._ensure_record_roots()
+        publication_lock = self._publication_lock_path()
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                self._reconcile_authoritative_briefs()
+                from .task_runner import request_stop_locked
+
+                request = request_stop_locked(
+                    self,
+                    task_id,
+                    actor=actor,
+                    reason=reason,
+                    signal_name=signal_name,
+                )
+        from .task_runner import deliver_stop
+
+        _ensure_durable_lock_file(
+            self._stop_delivery_lock_path(task_id),
+            "task stop delivery lock",
+        )
+        deliver_stop(self, task_id)
+        return request
+
     def _status_unlocked(self, task_id: str) -> dict[str, object]:
         brief = self._load_brief(task_id)
         self._load_bound_idempotency_index(brief)
@@ -336,6 +544,9 @@ class TaskService:
             if _path_exists(self._ownership_path(task_id))
             else None
         )
+        if ownership is not None and _path_exists(self._launch_path(task_id)):
+            launch = self._load_launch(brief, ownership)
+            return self._reconcile_execution(brief, ownership, launch)
         return self._load_task_status(brief, ownership)
 
     def _load_task_status(
@@ -354,6 +565,19 @@ class TaskService:
         _require_plain_directory(runtime_directory, "task runtime directory")
         status = _read_object(runtime_directory / "status.json", "task status")
         state = status.get("state")
+        if state not in {"prepared", "worktree_ready"}:
+            from .task_runner import validate_execution_status
+
+            if ownership is None:
+                raise TaskError(
+                    f"invalid task status: launched task ownership is missing: {task_id}"
+                )
+            return validate_execution_status(
+                self,
+                brief,
+                ownership,
+                status,
+            )
         fields = _READY_STATUS_FIELDS if state == "worktree_ready" else _STATUS_FIELDS
         if set(status) != fields or type(status.get("schema_version")) is not int:
             raise TaskError(f"invalid task status schema: {task_id}")
@@ -361,8 +585,6 @@ class TaskService:
             raise TaskError(f"invalid task status schema version: {task_id}")
         if status["task_id"] != task_id:
             raise TaskError(f"task status identity mismatch: {task_id}")
-        if state not in {"prepared", "worktree_ready"}:
-            raise TaskError(f"invalid task status state: {task_id}")
         _validate_hash(status["brief_sha256"], "task status brief_sha256")
         if status["brief_sha256"] != brief["brief_sha256"]:
             raise TaskError(f"task status brief hash mismatch: {task_id}")
@@ -374,7 +596,7 @@ class TaskService:
                 raise TaskError(f"task status timestamp mismatch: {task_id}")
             if check_material:
                 self._require_no_unowned_worktree_material(brief)
-        else:
+        elif state == "worktree_ready":
             if ownership is None:
                 raise TaskError(f"worktree-ready task ownership is missing: {task_id}")
             _validate_hash(
@@ -522,6 +744,11 @@ class TaskService:
             if _path_exists(ownership_path)
             else None
         )
+        if ownership is not None and _path_exists(self._launch_path(task_id)):
+            launch = self._load_launch(brief, ownership)
+            self._reconcile_execution(brief, ownership, launch)
+            self._load_bound_idempotency_index(brief)
+            return
         if not _path_exists(status_path):
             if ownership is not None:
                 self._validate_new_checkout(
@@ -736,6 +963,152 @@ class TaskService:
             raise TaskError(f"task ownership hash mismatch: {task_id}")
         self._validate_owned_worktree(ownership)
         return ownership
+
+    def _load_launch(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+    ) -> dict[str, object]:
+        from .task_runner import load_launch
+
+        return load_launch(self, brief, ownership)
+
+    def _load_final(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        launch: dict[str, object],
+    ) -> dict[str, object]:
+        from .task_runner import load_final
+
+        return load_final(self, brief, ownership, launch)
+
+    def _reconcile_execution(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        launch: dict[str, object],
+    ) -> dict[str, object]:
+        from .task_runner import (
+            adapter_claim_is_live,
+            launched_status,
+            load_adapter_claim,
+            load_execution_claim,
+            lost_status,
+            process_status_is_live,
+            running_status_from,
+            running_status_from_claims,
+            terminal_status,
+        )
+
+        task_id = str(brief["task_id"])
+        final_path = self._final_path(task_id)
+        if _path_exists(final_path):
+            final = self._load_final(brief, ownership, launch)
+            terminal = terminal_status(brief, ownership, launch, final)
+            current = (
+                _read_object(self._status_path(task_id), "task status")
+                if _path_exists(self._status_path(task_id))
+                else None
+            )
+            if current != terminal:
+                atomic_write_json(self._status_path(task_id), terminal)
+            return self._load_task_status(brief, ownership)
+
+        raw_status = (
+            _read_object(self._status_path(task_id), "task status")
+            if _path_exists(self._status_path(task_id))
+            else None
+        )
+        if raw_status is not None and raw_status.get("state") in {
+            "launched",
+            "running",
+            "lost",
+        }:
+            status = self._load_task_status(brief, ownership)
+            if process_status_is_live(status):
+                running = running_status_from(status)
+                if running != status:
+                    atomic_write_json(self._status_path(task_id), running)
+                return running
+        elif raw_status is not None and raw_status.get("state") in _TERMINAL_STATES:
+            raise TaskError(f"terminal task is missing its final receipt: {task_id}")
+
+        if _path_exists(self._adapter_path(task_id)):
+            execution = load_execution_claim(self, brief, ownership, launch)
+            adapter = load_adapter_claim(
+                self,
+                brief,
+                ownership,
+                launch,
+                execution,
+            )
+            if adapter_claim_is_live(adapter):
+                running = running_status_from_claims(
+                    brief,
+                    ownership,
+                    launch,
+                    execution,
+                    adapter,
+                )
+                atomic_write_json(self._status_path(task_id), running)
+                return self._load_task_status(brief, ownership)
+
+        if _seconds_since(str(launch["launched_at"])) < _LAUNCH_GRACE_SECONDS:
+            launched = launched_status(brief, ownership, launch)
+            if raw_status != launched:
+                atomic_write_json(self._status_path(task_id), launched)
+            return launched
+
+        lost = lost_status(brief, ownership, launch, raw_status)
+        if raw_status != lost:
+            atomic_write_json(self._status_path(task_id), lost)
+        return lost
+
+    def _prepare_execution_paths(
+        self,
+        runtime: Path,
+        *,
+        reuse_logs: bool = False,
+    ) -> None:
+        _require_plain_directory(runtime, "task runtime directory")
+        _ensure_plain_directory(runtime / "home", "task adapter HOME")
+        _ensure_plain_directory(runtime / "tmp", "task adapter TMPDIR")
+        import_root = runtime / "runner-import"
+        _ensure_plain_directory(import_root, "task runner import root")
+        package_alias = import_root / "arbor"
+        package_source = Path(__file__).resolve().parent.parent
+        _require_plain_directory(package_source, "AROS Python package source")
+        if not _path_exists(package_alias):
+            try:
+                package_alias.symlink_to(package_source, target_is_directory=True)
+            except OSError as error:
+                raise TaskError("unable to create task runner package alias") from error
+            _fsync_directory(import_root)
+        try:
+            alias_mode = package_alias.lstat().st_mode
+            alias_target = package_alias.resolve(strict=True)
+        except OSError as error:
+            raise TaskError("invalid task runner package alias") from error
+        if not stat.S_ISLNK(alias_mode) or alias_target != package_source:
+            raise TaskError("task runner package alias does not bind workspace source")
+        _require_absent(runtime / "adapter.json", "task adapter claim")
+        _ensure_restrictive_plain_file(
+            runtime / "stdout.log",
+            "task stdout log",
+            allow_existing=reuse_logs,
+        )
+        _ensure_restrictive_plain_file(
+            runtime / "stderr.log",
+            "task stderr log",
+            allow_existing=reuse_logs,
+        )
+        _require_absent(runtime / "final.json", "task final receipt")
+
+    def _record_carrier_failure(self, task_id: str, detail: str) -> None:
+        from .task_runner import record_carrier_failure
+
+        record_carrier_failure(self, task_id, detail)
 
     def _require_startable_parent(
         self,
@@ -1613,15 +1986,91 @@ class TaskService:
     def _lifecycle_lock_path(self, task_id: str) -> Path:
         return self.root / ".aros" / "locks" / f"task-lifecycle-{task_id}.lock"
 
+    def _stop_delivery_lock_path(self, task_id: str) -> Path:
+        return self.root / ".aros" / "locks" / f"task-stop-delivery-{task_id}.lock"
+
     def _status_path(self, task_id: str) -> Path:
         return self.root / ".aros" / "tasks" / task_id / "status.json"
+
+    def _runtime_path(self, task_id: str) -> Path:
+        self._validate_task_id(task_id)
+        return self.root / ".aros" / "tasks" / task_id
 
     def _ownership_path(self, task_id: str) -> Path:
         return self.root / ".aros" / "tasks" / task_id / "ownership.json"
 
+    def _launch_path(self, task_id: str) -> Path:
+        return self._runtime_path(task_id) / "launch.json"
+
+    def _final_path(self, task_id: str) -> Path:
+        return self._runtime_path(task_id) / "final.json"
+
+    def _execution_path(self, task_id: str) -> Path:
+        return self._runtime_path(task_id) / "execution.json"
+
+    def _adapter_path(self, task_id: str) -> Path:
+        return self._runtime_path(task_id) / "adapter.json"
+
+    def _stop_path(self, task_id: str) -> Path:
+        return self._runtime_path(task_id) / "stop.json"
+
+    def _stop_result_path(self, task_id: str) -> Path:
+        return self._runtime_path(task_id) / "stop-result.json"
+
     def _idempotency_index_path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return self.root / ".aros" / "tasks" / "idempotency" / f"{digest}.json"
+
+
+def _record_sha256(record: dict[str, object], hash_field: str) -> str:
+    payload = dict(record)
+    payload.pop(hash_field, None)
+    try:
+        return json_sha256(payload)
+    except (TypeError, UnicodeError) as error:
+        raise TaskError("task execution record must be canonical UTF-8 JSON") from error
+
+
+def _tmux_socket_name(root: Path, task_id: str) -> str:
+    digest = hashlib.sha256(f"{root}\0{task_id}".encode("utf-8")).hexdigest()[:20]
+    return f"aros-task-{digest}"
+
+
+def _seconds_since(timestamp: str) -> float:
+    _validate_timestamp(timestamp, "task launch timestamp")
+    launched = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+        tzinfo=timezone.utc
+    )
+    return max(0.0, (datetime.now(timezone.utc) - launched).total_seconds())
+
+
+def _file_receipt(path: Path, relative: str) -> dict[str, object]:
+    _require_plain_file(path, "task output log")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise TaskError(f"unable to open task output log: {path}") from error
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise TaskError(f"task output log is not a restrictive plain file: {path}")
+        os.fsync(descriptor)
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                size += len(chunk)
+                digest.update(chunk)
+    except OSError as error:
+        raise TaskError(f"unable to read task output log: {path}") from error
+    finally:
+        os.close(descriptor)
+    return {"path": relative, "bytes": size, "sha256": digest.hexdigest()}
 
 
 def _normalize_request(
@@ -1965,6 +2414,49 @@ def _ensure_durable_lock_file(path: Path, description: str) -> None:
         os.close(descriptor)
     _fsync_directory(path.parent)
     _require_plain_file(path, description)
+
+
+def _ensure_restrictive_plain_file(
+    path: Path,
+    description: str,
+    *,
+    allow_existing: bool = False,
+) -> None:
+    _require_plain_directory(path.parent, f"{description} parent")
+    flags = (
+        os.O_WRONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        if not allow_existing:
+            raise TaskError(f"{description} must not exist before publication: {path}")
+        _require_plain_file(path, description)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise TaskError(f"unable to open {description}: {path}") from error
+    except OSError as error:
+        raise TaskError(f"unable to create {description}: {path}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size != 0
+            or (metadata.st_dev, metadata.st_ino)
+            != _plain_file_identity(path, description)
+        ):
+            raise TaskError(f"{description} must be a restrictive plain file: {path}")
+        os.fsync(descriptor)
+    except OSError as error:
+        raise TaskError(f"unable to sync {description}: {path}") from error
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
 
 
 def _ensure_plain_directory(path: Path, description: str) -> None:

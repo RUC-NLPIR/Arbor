@@ -127,7 +127,7 @@ def test_start_prepares_a_branch_attached_owned_worktree_without_execution(
     worktree = (tmp_path / ".worktree" / "tasks" / task_id).absolute()
     branch = f"aros/task/{task_id}"
 
-    status = service.start(task_id, actor="delegate-principal")
+    status = service._ensure_worktree(task_id, actor="delegate-principal")
 
     ownership_path = tmp_path / ".aros" / "tasks" / task_id / "ownership.json"
     ownership = json.loads(ownership_path.read_text(encoding="utf-8"))
@@ -195,7 +195,7 @@ def test_start_rejects_and_preserves_a_dirty_parent_without_allocating(
         _git(tmp_path, "add", "README.md")
 
     with pytest.raises(TaskError, match="clean|dirty"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert dirty.read_text(encoding="utf-8") == f"preserve {dirty_kind}\n"
     assert not (tmp_path / ".worktree" / "tasks" / task_id).exists()
@@ -211,7 +211,7 @@ def test_start_requires_the_brief_to_be_committed_at_current_head(
     task_id = str(brief["task_id"])
 
     with pytest.raises(TaskError, match="committed|clean"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert (tmp_path / "tasks" / task_id / "brief.json").is_file()
     assert not (tmp_path / ".worktree" / "tasks" / task_id).exists()
@@ -232,7 +232,7 @@ def test_start_compares_committed_and_working_brief_bytes_even_if_index_hides_ch
     assert _git(tmp_path, "status", "--porcelain") == ""
 
     with pytest.raises(TaskError, match="committed brief|bytes|mismatch"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert brief_path.read_bytes() == original + b" "
     assert not (tmp_path / ".worktree" / "tasks" / task_id).exists()
@@ -254,7 +254,7 @@ def test_start_rejects_parent_changes_hidden_by_index_flags(
     assert _git(tmp_path, "status", "--porcelain") == ""
 
     with pytest.raises(TaskError, match="clean|index|ambiguous"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert readme.read_text(encoding="utf-8") == "hidden parent change\n"
     assert not (tmp_path / ".worktree" / "tasks" / task_id).exists()
@@ -284,7 +284,7 @@ def test_start_requires_brief_base_commit_to_ancestor_current_head(
     _commit_brief(tmp_path, brief)
 
     with pytest.raises(TaskError, match="ancestor|base commit"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert not (tmp_path / ".worktree" / "tasks" / task_id).exists()
 
@@ -326,7 +326,7 @@ def test_start_ignores_git_replacement_refs_for_base_and_checkout_bytes(
         capture_output=True,
     ).stdout
 
-    service.start(task_id)
+    service._ensure_worktree(task_id)
 
     checkout = tmp_path / ".worktree" / "tasks" / task_id
     assert (checkout / "README.md").read_bytes() == exact
@@ -358,7 +358,7 @@ def test_start_rejects_and_preserves_a_preexisting_target_path(
         target.symlink_to(link_target, target_is_directory=True)
 
     with pytest.raises(TaskError, match="target|worktree|symlink|conflict"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert target.lstat()
     if kind == "directory":
@@ -390,7 +390,7 @@ def test_start_rejects_a_symlinked_worktree_root_without_following_it(
     alias.symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(TaskError, match="plain directory|symlink|contain"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert list(outside.iterdir()) == []
 
@@ -423,7 +423,7 @@ def test_start_rejects_and_preserves_conflicting_task_branch_refs(
         (other / "preserve.txt").write_text("dirty\n", encoding="utf-8")
 
     with pytest.raises(TaskError, match="branch|ref|checked out|conflict"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert _git_ref_exists(tmp_path, f"refs/heads/{existing}")
     if conflict == "checked_out":
@@ -445,7 +445,7 @@ def test_start_rejects_a_target_registered_to_another_worktree(
     preserve.write_text("registered and dirty\n", encoding="utf-8")
 
     with pytest.raises(TaskError, match="registered|target|worktree|conflict"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert preserve.read_text(encoding="utf-8") == "registered and dirty\n"
     assert str(target) in _git(tmp_path, "worktree", "list", "--porcelain")
@@ -474,7 +474,7 @@ def test_start_rejects_and_never_prunes_a_stale_worktree_registration(
     assert str(target) in before and "prunable" in before
 
     with pytest.raises(TaskError, match="stale|prunable|registered|worktree"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     after = _git(
         tmp_path,
@@ -521,7 +521,7 @@ def test_worktree_add_is_pinned_against_tasks_root_symlink_swap(
     monkeypatch.setattr(tasks_module.subprocess, "run", swap_before_worktree_add)
 
     with pytest.raises(TaskError):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert swapped
     assert list(outside.iterdir()) == []
@@ -569,7 +569,7 @@ def test_worktree_add_fails_closed_on_tasks_root_fd_or_identity_error(
     monkeypatch.setattr(tasks_module.os, "open", fail_or_swap_open)
 
     with pytest.raises(TaskError, match="directory|identity|worktree root"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert attempted
     assert not _git_ref_exists(tmp_path, f"refs/heads/aros/task/{task_id}")
@@ -603,7 +603,7 @@ def test_worktree_add_uses_exact_argv_in_directory_fd_launcher(
 
     monkeypatch.setattr(tasks_module.subprocess, "run", record_launcher)
 
-    status = service.start(task_id)
+    status = service._ensure_worktree(task_id)
 
     assert len(launches) == 1
     launcher, options = launches[0]
@@ -667,7 +667,7 @@ def test_worktree_launcher_does_not_import_ambient_sitecustomize(
     monkeypatch.setenv("PYTHONPATH", str(python_path))
     monkeypatch.setenv("PYTHONWARNINGS", "error")
 
-    status = service.start(task_id)
+    status = service._ensure_worktree(task_id)
 
     assert status["state"] == "worktree_ready"
     assert not marker.exists()
@@ -710,7 +710,7 @@ def test_git_subprocesses_do_not_load_ambient_dynamic_libraries(
     monkeypatch.setenv("LD_AUDIT", str(library))
     monkeypatch.setenv("DYLD_INSERT_LIBRARIES", str(library))
 
-    status = service.start(task_id)
+    status = service._ensure_worktree(task_id)
 
     assert status["state"] == "worktree_ready"
     assert not marker.exists()
@@ -726,7 +726,7 @@ def test_concurrent_and_repeated_start_reuses_one_owned_worktree(
     _commit_brief(tmp_path, brief)
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        statuses = list(pool.map(lambda _index: service.start(task_id), range(4)))
+        statuses = list(pool.map(lambda _index: service._ensure_worktree(task_id), range(4)))
 
     assert all(status == statuses[0] for status in statuses)
     ownership = json.loads(
@@ -748,7 +748,7 @@ def test_repeated_start_and_ready_readers_preserve_dirty_advanced_worktree(
     brief = _create(service, key="repeat-dirty-advanced")
     task_id = str(brief["task_id"])
     _commit_brief(tmp_path, brief)
-    first = service.start(task_id)
+    first = service._ensure_worktree(task_id)
     worktree = tmp_path / ".worktree" / "tasks" / task_id
     (worktree / "README.md").write_text("advanced child\n", encoding="utf-8")
     _git(worktree, "add", "README.md")
@@ -757,7 +757,7 @@ def test_repeated_start_and_ready_readers_preserve_dirty_advanced_worktree(
     untracked = worktree / "untracked-child.txt"
     untracked.write_text("preserve child dirt\n", encoding="utf-8")
 
-    second = service.start(task_id)
+    second = service._ensure_worktree(task_id)
 
     assert second == first
     assert service.status(task_id) == first
@@ -778,7 +778,7 @@ def test_ready_status_recovers_from_valid_create_once_ownership(
     brief = _create(service, key=f"ready-recovery-{status_state}")
     task_id = str(brief["task_id"])
     _commit_brief(tmp_path, brief)
-    ready = service.start(task_id)
+    ready = service._ensure_worktree(task_id)
     status_path = tmp_path / ".aros" / "tasks" / task_id / "status.json"
     if status_state == "missing":
         status_path.unlink()
@@ -808,7 +808,7 @@ def test_ready_task_fails_closed_if_create_once_ownership_is_missing(
     brief = _create(service, key=f"missing-ownership-{reader}")
     task_id = str(brief["task_id"])
     _commit_brief(tmp_path, brief)
-    service.start(task_id)
+    service._ensure_worktree(task_id)
     worktree = tmp_path / ".worktree" / "tasks" / task_id
     preserve = worktree / "preserve.txt"
     preserve.write_text("owned work\n", encoding="utf-8")
@@ -820,7 +820,7 @@ def test_ready_task_fails_closed_if_create_once_ownership_is_missing(
         elif reader == "list":
             service.list()
         else:
-            service.start(task_id)
+            service._ensure_worktree(task_id)
 
     assert preserve.read_text(encoding="utf-8") == "owned work\n"
 
@@ -835,7 +835,7 @@ def test_owned_task_fails_closed_on_tamper_without_touching_child_work(
     brief = _create(service, key=f"tampered-ownership-{reader}")
     task_id = str(brief["task_id"])
     _commit_brief(tmp_path, brief)
-    service.start(task_id)
+    service._ensure_worktree(task_id)
     worktree = tmp_path / ".worktree" / "tasks" / task_id
     preserve = worktree / "preserve-tamper.txt"
     preserve.write_text("never remove\n", encoding="utf-8")
@@ -850,7 +850,7 @@ def test_owned_task_fails_closed_on_tamper_without_touching_child_work(
         elif reader == "list":
             service.list()
         else:
-            service.start(task_id)
+            service._ensure_worktree(task_id)
 
     assert preserve.read_text(encoding="utf-8") == "never remove\n"
 
@@ -863,7 +863,7 @@ def test_owned_task_rejects_a_misregistered_worktree_without_cleanup(
     brief = _create(service, key="misregistered-owned-worktree")
     task_id = str(brief["task_id"])
     _commit_brief(tmp_path, brief)
-    service.start(task_id)
+    service._ensure_worktree(task_id)
     worktree = tmp_path / ".worktree" / "tasks" / task_id
     moved = tmp_path / ".worktree" / "tasks" / f"{task_id}-moved"
     _git(tmp_path, "worktree", "move", str(worktree), str(moved))
@@ -898,7 +898,7 @@ def test_partial_start_without_ownership_is_preserved_and_never_adopted(
 
     monkeypatch.setattr(tasks_module, "create_json", interrupt_ownership)
     with pytest.raises(InjectedInterruption):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
     monkeypatch.setattr(tasks_module, "create_json", original_create_json)
     worktree = tmp_path / ".worktree" / "tasks" / task_id
     preserve = worktree / "partial-work.txt"
@@ -906,7 +906,7 @@ def test_partial_start_without_ownership_is_preserved_and_never_adopted(
     assert not (tmp_path / ".aros" / "tasks" / task_id / "ownership.json").exists()
 
     with pytest.raises(TaskError, match="unowned|branch|worktree|conflict"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
     with pytest.raises(TaskError, match="unowned|branch|worktree|ownership"):
         service.status(task_id)
 
@@ -935,7 +935,7 @@ def test_partial_start_with_valid_ownership_recovers_worktree_ready(
 
     monkeypatch.setattr(tasks_module, "create_json", interrupt_after_ownership)
     with pytest.raises(InjectedInterruption):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
     monkeypatch.setattr(tasks_module, "create_json", original_create_json)
 
     ready = TaskService(tmp_path).status(task_id)
@@ -1005,7 +1005,7 @@ def test_start_never_promotes_a_racy_new_checkout(
     monkeypatch.setattr(tasks_module, "create_json", mutate_before_ownership)
 
     with pytest.raises(TaskError, match="checkout|base|clean|mode|index"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     monkeypatch.setattr(tasks_module, "create_json", original_create_json)
     assert injected
@@ -1044,7 +1044,7 @@ def test_ownership_recovery_rejects_a_dirty_partial_checkout(
     brief = _create(service, key=f"dirty-ownership-recovery-{status_state}")
     task_id = str(brief["task_id"])
     _commit_brief(tmp_path, brief)
-    service.start(task_id)
+    service._ensure_worktree(task_id)
     worktree = tmp_path / ".worktree" / "tasks" / task_id
     dirty = worktree / "partial-untracked.txt"
     dirty.write_text("preserve\n", encoding="utf-8")
@@ -1108,7 +1108,7 @@ def test_parent_head_race_preserves_unowned_partial_start_and_fails_closed(
     monkeypatch.setattr(tasks_module.subprocess, "run", move_head_before_worktree_add)
 
     with pytest.raises(TaskError, match="HEAD.*changed|stable"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     assert raced
     assert _git(tmp_path, "rev-parse", "HEAD") != original_head
@@ -1116,7 +1116,7 @@ def test_parent_head_race_preserves_unowned_partial_start_and_fails_closed(
     assert worktree.is_dir()
     assert not (tmp_path / ".aros" / "tasks" / task_id / "ownership.json").exists()
     with pytest.raises(TaskError, match="unowned|branch|worktree|conflict"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
     assert worktree.is_dir()
 
 
@@ -1167,7 +1167,7 @@ def test_start_disables_real_post_checkout_and_filter_commands(
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(hooks))
 
-    status = service.start(task_id)
+    status = service._ensure_worktree(task_id)
 
     checkout = tmp_path / ".worktree" / "tasks" / task_id
     assert status["state"] == "worktree_ready"
@@ -1193,7 +1193,7 @@ def test_start_fails_closed_if_checkout_bytes_differ_from_repository_blob(
     _commit_brief(tmp_path, brief)
 
     with pytest.raises(TaskError, match="checkout.*bytes|repository blob"):
-        service.start(task_id)
+        service._ensure_worktree(task_id)
 
     checkout = tmp_path / ".worktree" / "tasks" / task_id
     assert (checkout / "payload.txt").read_bytes() == b"repository bytes\r\n"
@@ -1228,7 +1228,7 @@ def test_start_supports_a_local_gitlink_without_reading_it_as_a_blob(
     task_id = str(brief["task_id"])
     _commit_brief(tmp_path, brief)
 
-    status = service.start(task_id)
+    status = service._ensure_worktree(task_id)
 
     assert status["state"] == "worktree_ready"
     tree_entry = _git(
@@ -1281,7 +1281,7 @@ def test_start_git_commands_are_scrubbed_pinned_and_nondestructive(
     monkeypatch.setenv("PYTHONWARNINGS", "error")
     monkeypatch.setattr(tasks_module.subprocess, "run", record_git)
 
-    service.start(task_id)
+    service._ensure_worktree(task_id)
 
     assert calls
     assert all(not any(key.startswith("GIT_") for key in env) for _, env in calls)

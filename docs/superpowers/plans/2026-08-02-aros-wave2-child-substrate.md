@@ -126,6 +126,7 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
   - message appends immutable ordered records under .aros/tasks/TASK-ID/messages;
   - child return lives at tasks/TASK-ID/return.json in child worktree;
   - return binds task ID, brief hash, base commit, child commit, changed files, evidence, deviations, uncertainty, follow-up;
+  - child commit is the artifact tip C; clean branch HEAD is one return-only commit R whose sole parent is C, avoiding a self-referential tracked return hash;
   - collect requires terminal process, clean committed child HEAD, strict return, and matching lineage;
   - collect writes parent tasks/TASK-ID/collected.json with return and diff/commit pointers;
   - collect never merges/cherry-picks or edits model/questions/ideas;

@@ -3170,6 +3170,40 @@ def test_existing_valid_collection_is_idempotent_after_child_becomes_dirty(
     assert dirty.is_file()
 
 
+def test_existing_collection_remains_readable_after_retained_branch_advances(
+    tmp_path: Path,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _returned, _child_commit, return_commit = _commit_child_return(
+        tmp_path,
+        brief,
+        ownership,
+    )
+    collected = service.collect(task_id)
+    collected_path = tmp_path / "tasks" / task_id / "collected.json"
+    collected_bytes = collected_path.read_bytes()
+    collected_inode = collected_path.stat().st_ino
+    worktree = Path(str(ownership["worktree_path"]))
+    later = worktree / "later-child-work.txt"
+    later.write_text("legitimate retained branch work\n", encoding="utf-8")
+    _git(worktree, "add", "later-child-work.txt")
+    _git(worktree, "commit", "-qm", "continue retained child work")
+    advanced_commit = _git(worktree, "rev-parse", "HEAD")
+
+    assert advanced_commit != return_commit
+    assert service.collect(task_id) == collected
+    assert collected_path.read_bytes() == collected_bytes
+    assert collected_path.stat().st_ino == collected_inode
+
+    with pytest.raises(TaskError, match="branch|collection|return|HEAD"):
+        service.prune(task_id)
+
+    assert worktree.is_dir()
+    assert later.read_text(encoding="utf-8") == "legitimate retained branch work\n"
+    assert _git(worktree, "rev-parse", "HEAD") == advanced_commit
+
+
 def test_preserve_is_an_idempotent_validated_noop_snapshot(tmp_path: Path) -> None:
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])

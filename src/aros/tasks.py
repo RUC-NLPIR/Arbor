@@ -730,14 +730,11 @@ class TaskService:
                 self._load_bound_idempotency_index(brief)
                 collected_path = self._collected_path(task_id)
                 if _path_exists(collected_path):
-                    pruned = _path_exists(self._pruned_path(task_id))
                     ownership = self._load_ownership(
                         brief,
-                        check_worktree=not pruned,
+                        check_worktree=False,
                     )
-                    if pruned:
-                        self._validated_pruned_status(brief, ownership)
-                    return self._load_collected_without_worktree(
+                    return self._load_historical_collection(
                         brief,
                         ownership,
                     )
@@ -830,17 +827,20 @@ class TaskService:
                 self._load_bound_idempotency_index(brief)
                 ownership = self._load_ownership(brief, check_worktree=False)
                 if _path_exists(self._pruned_path(task_id)):
-                    return self._validated_pruned_status(brief, ownership)
+                    receipt = self._validated_pruned_status(brief, ownership)
+                    self._require_collection_branch_tip(receipt)
+                    return receipt
                 if not _path_exists(self._collected_path(task_id)):
                     raise TaskError(
                         f"task must have a strict collection before prune: {task_id}"
                     )
 
                 if _path_exists(self._prune_path(task_id)):
-                    collected = self._load_collected_without_worktree(
+                    collected = self._load_historical_collection(
                         brief,
                         ownership,
                     )
+                    self._require_collection_branch_tip(collected)
                     intent = self._load_prune_intent(brief, ownership, collected)
                     state = self._worktree_removal_state(ownership)
                     if state == "absent":
@@ -873,7 +873,8 @@ class TaskService:
                 self._remove_task_worktree(target)
                 if self._worktree_removal_state(ownership) != "absent":
                     raise TaskError(f"task worktree remains after prune: {task_id}")
-                after = self._load_collected_without_worktree(brief, ownership)
+                after = self._load_historical_collection(brief, ownership)
+                self._require_collection_branch_tip(after)
                 if after != collected:
                     raise TaskError(f"task collection changed during prune: {task_id}")
                 return self._create_pruned_receipt(
@@ -883,7 +884,7 @@ class TaskService:
                     intent,
                 )
 
-    def _load_collected_without_worktree(
+    def _load_historical_collection(
         self,
         brief: dict[str, object],
         ownership: dict[str, object],
@@ -895,7 +896,7 @@ class TaskService:
         )
         status = self._load_task_status(brief, ownership, check_material=False)
         if status["state"] not in _TERMINAL_STATES:
-            raise TaskError(f"task is not terminal for prune: {task_id}")
+            raise TaskError(f"task is not terminal for collection: {task_id}")
         launch = self._load_launch(brief, ownership)
         final = self._load_final(brief, ownership, launch)
         branch_ref = f"refs/heads/{ownership['branch']}"
@@ -909,13 +910,6 @@ class TaskService:
             or _COMMIT.fullmatch(return_commit) is None
         ):
             raise TaskError(f"invalid task collection return commit: {task_id}")
-        branch_tip = self._safe_git_text(
-            "rev-parse",
-            "--verify",
-            f"{branch_ref}^{{commit}}",
-        )
-        if branch_tip != return_commit:
-            raise TaskError(f"task branch changed after collection: {task_id}")
         reviewed = self._load_reviewed_return(
             brief,
             ownership,
@@ -931,6 +925,21 @@ class TaskService:
             "return": reviewed["return"],
         }
         return self._load_collected(brief, snapshot)
+
+    def _require_collection_branch_tip(
+        self,
+        collected: dict[str, object],
+    ) -> None:
+        task_id = str(collected["task_id"])
+        branch_ref = str(collected["branch_ref"])
+        return_commit = str(collected["return_commit"])
+        branch_tip = self._safe_git_text(
+            "rev-parse",
+            "--verify",
+            f"{branch_ref}^{{commit}}",
+        )
+        if branch_tip != return_commit:
+            raise TaskError(f"task branch changed after collection: {task_id}")
 
     def _create_prune_intent(
         self,
@@ -1095,7 +1104,7 @@ class TaskService:
         brief: dict[str, object],
         ownership: dict[str, object],
     ) -> dict[str, object]:
-        collected = self._load_collected_without_worktree(brief, ownership)
+        collected = self._load_historical_collection(brief, ownership)
         intent = self._load_prune_intent(brief, ownership, collected)
         receipt = self._load_pruned_receipt(
             brief,
@@ -1668,10 +1677,11 @@ class TaskService:
         if _path_exists(self._prune_path(task_id)):
             ownership = self._load_ownership(brief, check_worktree=False)
             removal_state = self._worktree_removal_state(ownership)
-            collected = self._load_collected_without_worktree(
+            collected = self._load_historical_collection(
                 brief,
                 ownership,
             )
+            self._require_collection_branch_tip(collected)
             intent = self._load_prune_intent(brief, ownership, collected)
             if removal_state == "absent":
                 self._create_pruned_receipt(

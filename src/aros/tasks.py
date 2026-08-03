@@ -97,6 +97,12 @@ _DIRECTORY_FD_EXEC = (
     "os.set_inheritable(fd,False);"
     "os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
 )
+_TASK_RUNNER_BOOTSTRAP = (
+    "import runpy,sys;"
+    "controlled=sys.argv.pop(1);"
+    "sys.path.insert(0,controlled);"
+    "runpy.run_module('arbor.aros.task_runner',run_name='__main__')"
+)
 
 
 class TaskError(ValueError):
@@ -294,10 +300,13 @@ class TaskService:
                 launched_at = utc_now()
                 session_name = f"aros-task-{task_id.lower()}"
                 socket_name = _tmux_socket_name(self.root, task_id)
+                runner_cwd = runtime / "home"
                 runner_invocation = [
                     sys.executable,
-                    "-m",
-                    "arbor.aros.task_runner",
+                    "-I",
+                    "-c",
+                    _TASK_RUNNER_BOOTSTRAP,
+                    str(runtime / "runner-import"),
                     "--workspace",
                     str(self.root),
                     "--task-id",
@@ -318,6 +327,7 @@ class TaskService:
                     "tmux_socket": socket_name,
                     "host": socket.gethostname(),
                     "runner_version": 1,
+                    "runner_cwd": str(runner_cwd),
                     "runner_invocation": runner_invocation,
                     "launched_at": launched_at,
                 }
@@ -353,6 +363,8 @@ class TaskService:
                     "-d",
                     "-s",
                     session_name,
+                    "-c",
+                    str(runner_cwd),
                     shlex.join(runner_invocation),
                 ],
                 capture_output=True,
@@ -1072,14 +1084,25 @@ class TaskService:
         reuse_logs: bool = False,
     ) -> None:
         _require_plain_directory(runtime, "task runtime directory")
-        _ensure_plain_directory(runtime / "home", "task adapter HOME")
-        _ensure_plain_directory(runtime / "tmp", "task adapter TMPDIR")
+        home = runtime / "home"
+        temporary = runtime / "tmp"
         import_root = runtime / "runner-import"
-        _ensure_plain_directory(import_root, "task runner import root")
+        if reuse_logs:
+            _require_directory_entries(home, "task adapter HOME", set())
+            _require_directory_entries(temporary, "task adapter TMPDIR", set())
+            _require_directory_entries(
+                import_root,
+                "task runner import root",
+                {"arbor"},
+            )
+        else:
+            _create_plain_directory(home, "task adapter HOME")
+            _create_plain_directory(temporary, "task adapter TMPDIR")
+            _create_plain_directory(import_root, "task runner import root")
         package_alias = import_root / "arbor"
         package_source = Path(__file__).resolve().parent.parent
         _require_plain_directory(package_source, "AROS Python package source")
-        if not _path_exists(package_alias):
+        if not reuse_logs:
             try:
                 package_alias.symlink_to(package_source, target_is_directory=True)
             except OSError as error:
@@ -2471,6 +2494,20 @@ def _ensure_plain_directory(path: Path, description: str) -> None:
     _require_plain_directory(path, description)
     if created:
         _fsync_directory(path.parent)
+
+
+def _require_directory_entries(
+    path: Path,
+    description: str,
+    expected: set[str],
+) -> None:
+    _require_plain_directory(path, description)
+    try:
+        actual = {entry.name for entry in path.iterdir()}
+    except OSError as error:
+        raise TaskError(f"unable to inspect {description}: {path}") from error
+    if actual != expected:
+        raise TaskError(f"{description} must contain exactly {sorted(expected)}: {path}")
 
 
 def _create_plain_directory(path: Path, description: str) -> None:

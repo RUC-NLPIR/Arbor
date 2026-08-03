@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -150,6 +151,51 @@ def _assert_processes_stop(*pids: int) -> None:
     assert all(not _process_is_running(pid) for pid in pids)
 
 
+def _spawn_unreaped_zombie_session_leader() -> tuple[int, str]:
+    ready_read, ready_write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(ready_read)
+        os.setsid()
+        os.write(ready_write, b"1")
+        os.close(ready_write)
+        os._exit(0)
+    os.close(ready_write)
+    assert os.read(ready_read, 1) == b"1"
+    os.close(ready_read)
+    deadline = time.monotonic() + 3
+    state = ""
+    while time.monotonic() < deadline:
+        try:
+            raw = Path(f"/proc/{child}/stat").read_text(encoding="utf-8")
+            state = raw.rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            state = ""
+        if state == "Z":
+            break
+        time.sleep(0.01)
+    assert state == "Z"
+    token = process_start_token(child)
+    assert token is not None
+    return child, token
+
+
+def test_process_liveness_rejects_unreaped_zombie() -> None:
+    child, token = _spawn_unreaped_zombie_session_leader()
+    try:
+        assert os.getpgid(child) == child
+        assert not task_runner_module.process_status_is_live(
+            {
+                "host": socket.gethostname(),
+                "adapter_pid": child,
+                "adapter_pgid": child,
+                "adapter_start_token": token,
+            }
+        )
+    finally:
+        os.waitpid(child, 0)
+
+
 def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -227,10 +273,13 @@ def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
         ),
     }
     invocation = launch["runner_invocation"]
+    assert launch["runner_cwd"] == str(runtime / "home")
     assert invocation == [
         sys.executable,
-        "-m",
-        "arbor.aros.task_runner",
+        "-I",
+        "-c",
+        tasks_module._TASK_RUNNER_BOOTSTRAP,
+        str(runtime / "runner-import"),
         "--workspace",
         str(tmp_path),
         "--task-id",
@@ -277,6 +326,42 @@ def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
         assert stat.S_IMODE(metadata.st_mode) == 0o600
 
 
+def test_tmux_runner_cannot_be_shadowed_by_ambient_cwd_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path;Path('real-runner.txt').write_text('real\\n')",
+        ],
+        key="cwd-shadow-runner",
+    )
+    task_id = str(brief["task_id"])
+    malicious_cwd = tmp_path / ".git" / "malicious-cwd"
+    fake_runner = malicious_cwd / "arbor" / "aros" / "task_runner.py"
+    fake_runner.parent.mkdir(parents=True)
+    (malicious_cwd / "arbor" / "__init__.py").write_text("", encoding="utf-8")
+    (malicious_cwd / "arbor" / "aros" / "__init__.py").write_text("", encoding="utf-8")
+    shadow_marker = tmp_path / ".git" / "cwd-shadow-loaded"
+    fake_runner.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(shadow_marker)!r}).write_text('shadowed\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(malicious_cwd)
+
+    service.start(task_id)
+    terminal = _wait_terminal(service, task_id)
+
+    real_marker = tmp_path / ".worktree" / "tasks" / task_id / "real-runner.txt"
+    assert terminal["state"] == "completed"
+    assert real_marker.read_text(encoding="utf-8") == "real\n"
+    assert not shadow_marker.exists()
+
+
 def test_launch_without_process_or_final_becomes_lost_and_never_relaunches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -319,6 +404,69 @@ def test_launch_without_process_or_final_becomes_lost_and_never_relaunches(
     assert (runtime / "launch.json").is_file()
     assert not (runtime / "final.json").exists()
     assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "lost"
+
+
+def test_reconciliation_marks_claimed_unreaped_zombie_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        key="zombie-reconciliation",
+    )
+    task_id = str(brief["task_id"])
+    original_run = tasks_module.subprocess.run
+
+    def carrier_without_runner(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if isinstance(command, list) and "new-session" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    assert service.start(task_id)["state"] == "lost"
+    monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    ownership = json.loads((runtime / "ownership.json").read_text(encoding="utf-8"))
+    launch = json.loads((runtime / "launch.json").read_text(encoding="utf-8"))
+    child, child_token = _spawn_unreaped_zombie_session_leader()
+    try:
+        runner_token = process_start_token(os.getpid())
+        assert runner_token is not None
+        execution = task_runner_module.create_execution_claim(
+            service,
+            brief,
+            ownership,
+            launch,
+            (os.getpid(), os.getpgid(os.getpid()), runner_token),
+        )
+        assert execution is not None
+        adapter = task_runner_module.create_adapter_claim(
+            service,
+            brief,
+            ownership,
+            launch,
+            execution,
+            (child, child, child_token),
+            str(launch["launched_at"]),
+        )
+        running = task_runner_module.running_status_from_claims(
+            brief,
+            ownership,
+            launch,
+            execution,
+            adapter,
+        )
+        atomic_write_json(runtime / "status.json", running)
+
+        reconciled = service.status(task_id)
+
+        assert reconciled["state"] == "lost"
+        assert reconciled["reason"] == "process_absent_without_final_receipt"
+    finally:
+        os.waitpid(child, 0)
 
 
 def test_tmux_client_timeout_remains_uncertain_and_never_invents_final(
@@ -652,6 +800,36 @@ def test_preseeded_nonempty_log_is_rejected_before_launch(
         service.start(task_id)
 
     assert stdout.read_bytes() == b"forged pre-launch bytes\n"
+    assert not (runtime / "launch.json").exists()
+
+
+def test_preseeded_runner_home_is_rejected_before_tmux_launch(
+    tmp_path: Path,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "print('must not launch')"],
+        key="preseeded-runner-home",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    malicious = (
+        runtime
+        / "home"
+        / ".local"
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    malicious.mkdir(parents=True)
+    (malicious / "sitecustomize.py").write_text(
+        "raise RuntimeError('preseeded runner HOME')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskError, match="HOME|exist|empty|runner"):
+        service.start(task_id)
+
     assert not (runtime / "launch.json").exists()
 
 

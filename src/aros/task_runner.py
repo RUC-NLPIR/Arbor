@@ -27,6 +27,7 @@ from .store import (
 from .tasks import (
     TaskError,
     TaskService,
+    _TASK_RUNNER_BOOTSTRAP,
     _file_receipt,
     _path_exists,
     _read_object,
@@ -112,6 +113,7 @@ _LAUNCH_FIELDS = {
     "tmux_socket",
     "host",
     "runner_version",
+    "runner_cwd",
     "runner_invocation",
     "launched_at",
     "launch_sha256",
@@ -217,9 +219,7 @@ def adapter_environment(
 
 
 def runner_environment(runtime: Path) -> dict[str, str]:
-    environment = adapter_environment(runtime)
-    environment["PYTHONPATH"] = str(runtime / "runner-import")
-    return environment
+    return adapter_environment(runtime)
 
 
 def _timestamp_age(timestamp: object) -> float:
@@ -265,8 +265,10 @@ def load_launch(
         raise TaskError(f"invalid task launch execution profile: {task_id}")
     expected_invocation = [
         sys.executable,
-        "-m",
-        "arbor.aros.task_runner",
+        "-I",
+        "-c",
+        _TASK_RUNNER_BOOTSTRAP,
+        str(service._runtime_path(task_id) / "runner-import"),
         "--workspace",
         str(service.root),
         "--task-id",
@@ -275,6 +277,7 @@ def load_launch(
     if (
         launch["tmux_session"] != f"aros-task-{task_id.lower()}"
         or launch["tmux_socket"] != _tmux_socket_name(service.root, task_id)
+        or launch["runner_cwd"] != str(service._runtime_path(task_id) / "home")
         or launch["runner_invocation"] != expected_invocation
     ):
         raise TaskError(f"invalid task launch carrier binding: {task_id}")
@@ -725,6 +728,17 @@ def lost_status(
     }
 
 
+def _process_state_and_token(pid: int) -> tuple[str, str] | None:
+    if pid <= 1:
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields_after_name = raw.rsplit(")", 1)[1].split()
+        return fields_after_name[0], f"linux-proc-start:{fields_after_name[19]}"
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def process_status_is_live(status: dict[str, object]) -> bool:
     pid = status.get("adapter_pid")
     pgid = status.get("adapter_pgid")
@@ -736,13 +750,22 @@ def process_status_is_live(status: dict[str, object]) -> bool:
         or type(pgid) is not int
         or pgid <= 1
         or not isinstance(token, str)
-        or process_start_token(pid) != token
     ):
         return False
+    identity = _process_state_and_token(pid)
+    if identity is None or identity[0] in {"Z", "X", "x"} or identity[1] != token:
+        return False
     try:
-        return os.getpgid(pid) == pgid
+        matching_group = os.getpgid(pid) == pgid
     except (OSError, ProcessLookupError):
         return False
+    confirmed = _process_state_and_token(pid)
+    return bool(
+        matching_group
+        and confirmed is not None
+        and confirmed[0] not in {"Z", "X", "x"}
+        and confirmed[1] == token
+    )
 
 
 def adapter_claim_is_live(adapter: dict[str, object]) -> bool:

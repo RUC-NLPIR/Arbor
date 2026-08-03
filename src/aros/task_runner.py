@@ -1515,7 +1515,7 @@ def _running_status(
     }
 
 
-def _write_terminal(
+def _write_terminal_locked(
     *,
     service: TaskService,
     brief: dict[str, object],
@@ -1550,15 +1550,50 @@ def _write_terminal(
         runtime=runtime,
         error=error,
     )
-    lifecycle_lock = service._lifecycle_lock_path(task_id)
-    with file_lock(lifecycle_lock):
-        if not create_json(service._final_path(task_id), final):
-            recorded = service._load_final(brief, ownership, launch)
-        else:
-            recorded = service._load_final(brief, ownership, launch)
-        atomic_write_json(
-            service._status_path(task_id),
-            terminal_status(brief, ownership, launch, recorded),
+    if not create_json(service._final_path(task_id), final):
+        recorded = service._load_final(brief, ownership, launch)
+    else:
+        recorded = service._load_final(brief, ownership, launch)
+    atomic_write_json(
+        service._status_path(task_id),
+        terminal_status(brief, ownership, launch, recorded),
+    )
+
+
+def _write_terminal(
+    *,
+    service: TaskService,
+    brief: dict[str, object],
+    ownership: dict[str, object],
+    launch: dict[str, object],
+    state: str,
+    runner_identity: tuple[int | None, int | None, str | None],
+    adapter_identity: tuple[int | None, int | None, str | None],
+    started_at: str,
+    started_monotonic: float,
+    exit_code: int | None,
+    timeout_triggered: bool,
+    signal_sequence: list[str],
+    stop: dict[str, object] | None = None,
+    error: str | None = None,
+) -> None:
+    task_id = str(brief["task_id"])
+    with file_lock(service._lifecycle_lock_path(task_id)):
+        _write_terminal_locked(
+            service=service,
+            brief=brief,
+            ownership=ownership,
+            launch=launch,
+            state=state,
+            runner_identity=runner_identity,
+            adapter_identity=adapter_identity,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            exit_code=exit_code,
+            timeout_triggered=timeout_triggered,
+            signal_sequence=signal_sequence,
+            stop=stop,
+            error=error,
         )
 
 
@@ -1878,39 +1913,70 @@ def run(workspace: str | Path, task_id: str) -> int:
         time.sleep(0.02)
 
     exit_code = process.wait()
-    if _path_exists(service._stop_path(task_id)) and stop_result is None:
-        stop_result = deliver_stop(service, task_id)
-    if (
-        not timeout_triggered
-        and stop_result is not None
-        and stop_result["delivered"] is True
-    ):
-        signal_sequence = list(stop_result["signal_sequence"])
-    stdout.close()
-    stderr.close()
-    if timeout_triggered:
-        state = "timed_out"
-    elif stop_result is not None and stop_result["delivered"] is True:
-        state = "cancelled"
-    elif exit_code == 0:
-        state = "completed"
-    else:
-        state = "failed_process"
-    _write_terminal(
-        service=service,
-        brief=brief,
-        ownership=ownership,
-        launch=launch,
-        state=state,
-        runner_identity=runner_identity,
-        adapter_identity=adapter_identity,
-        started_at=started_at,
-        started_monotonic=started_monotonic,
-        exit_code=exit_code,
-        timeout_triggered=timeout_triggered,
-        signal_sequence=signal_sequence,
-        stop=stop_result,
-    )
+    while True:
+        needs_stop_delivery = False
+        with file_lock(lifecycle_lock):
+            if _path_exists(service._final_path(task_id)):
+                stdout.close()
+                stderr.close()
+                recorded = service._load_final(brief, ownership, launch)
+                atomic_write_json(
+                    service._status_path(task_id),
+                    terminal_status(brief, ownership, launch, recorded),
+                )
+                state = str(recorded["state"])
+                break
+            if _path_exists(service._stop_path(task_id)):
+                validate_stop_request(
+                    service,
+                    brief,
+                    ownership,
+                    launch,
+                )
+                if _path_exists(service._stop_result_path(task_id)):
+                    stop_result = validate_stop_result(
+                        service,
+                        brief,
+                        ownership,
+                        launch,
+                    )
+                else:
+                    needs_stop_delivery = True
+            if not needs_stop_delivery:
+                if (
+                    not timeout_triggered
+                    and stop_result is not None
+                    and stop_result["delivered"] is True
+                ):
+                    signal_sequence = list(stop_result["signal_sequence"])
+                stdout.close()
+                stderr.close()
+                if timeout_triggered:
+                    state = "timed_out"
+                elif stop_result is not None and stop_result["delivered"] is True:
+                    state = "cancelled"
+                elif exit_code == 0:
+                    state = "completed"
+                else:
+                    state = "failed_process"
+                _write_terminal_locked(
+                    service=service,
+                    brief=brief,
+                    ownership=ownership,
+                    launch=launch,
+                    state=state,
+                    runner_identity=runner_identity,
+                    adapter_identity=adapter_identity,
+                    started_at=started_at,
+                    started_monotonic=started_monotonic,
+                    exit_code=exit_code,
+                    timeout_triggered=timeout_triggered,
+                    signal_sequence=signal_sequence,
+                    stop=stop_result,
+                )
+                break
+        if needs_stop_delivery:
+            stop_result = deliver_stop(service, task_id)
     return 0 if state in {"completed", "timed_out", "cancelled"} else 1
 
 

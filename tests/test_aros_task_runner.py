@@ -12,8 +12,9 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from threading import Event
+from threading import Event, get_ident
 
 import pytest
 
@@ -2051,6 +2052,192 @@ def test_runner_waits_for_paused_external_stop_delivery(
     assert final["state"] == "cancelled"
     assert final["stop"]["delivered"] is True
     assert final["stop"]["signal_sequence"] == ["TERM"]
+
+
+def test_stop_publication_arbitrates_with_runner_finalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "Path('adapter.ready').touch()\n"
+        "while not Path('adapter.exit').exists():\n"
+        "    time.sleep(0.01)\n"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", code],
+        timeout_seconds=30,
+        key="stop-publication-final-race",
+    )
+    task_id = str(brief["task_id"])
+    original_run = tasks_module.subprocess.run
+
+    def carrier_without_runner(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if isinstance(command, list) and "new-session" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    assert service.start(task_id)["state"] == "lost"
+    monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
+
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    stop_publication_blocked = Event()
+    release_stop_publication = Event()
+    arm_runner_lifecycle_pause = Event()
+    runner_after_lifecycle_check = Event()
+    release_runner_after_check = Event()
+    runner_reaped_adapter = Event()
+    delivery_paused = Event()
+    release_delivery = Event()
+    runner_delivery_attempt = Event()
+    deliver_calls = 0
+    termination_calls = 0
+    adapter_pid: list[int] = []
+    runner_thread: list[int] = []
+    original_create_json = task_runner_module.create_json
+    original_file_lock = task_runner_module.file_lock
+    original_popen_wait = task_runner_module.subprocess.Popen.wait
+    original_deliver_stop = task_runner_module.deliver_stop
+    original_monotonic = time.monotonic
+
+    def controlled_monotonic() -> float:
+        if runner_thread and get_ident() == runner_thread[0]:
+            return 0.0
+        return original_monotonic()
+
+    @contextmanager
+    def pause_runner_after_lifecycle_check(path: Path) -> object:
+        with original_file_lock(path):
+            yield
+        if (
+            arm_runner_lifecycle_pause.is_set()
+            and not runner_after_lifecycle_check.is_set()
+            and runner_thread
+            and get_ident() == runner_thread[0]
+            and Path(path) == service._lifecycle_lock_path(task_id)
+        ):
+            runner_after_lifecycle_check.set()
+            assert release_runner_after_check.wait(timeout=5)
+
+    def pause_stop_publication(
+        path: Path,
+        value: dict[str, object],
+        *args: object,
+        **kwargs: object,
+    ) -> bool:
+        if Path(path) == runtime / "stop.json":
+            stop_publication_blocked.set()
+            assert release_stop_publication.wait(timeout=5)
+        return original_create_json(
+            path,
+            value,
+            *args,  # type: ignore[arg-type]
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    def observe_adapter_wait(
+        process: subprocess.Popen[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        result = original_popen_wait(
+            process,
+            *args,  # type: ignore[arg-type]
+            **kwargs,  # type: ignore[arg-type]
+        )
+        if adapter_pid and process.pid == adapter_pid[0]:
+            runner_reaped_adapter.set()
+        return result
+
+    def observe_deliver_stop(
+        delivery_service: TaskService,
+        delivery_task_id: str,
+    ) -> dict[str, object]:
+        nonlocal deliver_calls
+        deliver_calls += 1
+        if deliver_calls == 2:
+            runner_delivery_attempt.set()
+        return original_deliver_stop(delivery_service, delivery_task_id)
+
+    def pause_recorded_delivery(
+        _request: dict[str, object],
+        *,
+        record_signal_sequence: object = None,
+        **_kwargs: object,
+    ) -> list[str]:
+        nonlocal termination_calls
+        termination_calls += 1
+        delivery_paused.set()
+        assert release_delivery.wait(timeout=5)
+        sequence = ["TERM"]
+        if callable(record_signal_sequence):
+            record_signal_sequence(sequence)
+        return sequence
+
+    monkeypatch.setattr(task_runner_module, "create_json", pause_stop_publication)
+    monkeypatch.setattr(task_runner_module, "file_lock", pause_runner_after_lifecycle_check)
+    monkeypatch.setattr(task_runner_module.subprocess.Popen, "wait", observe_adapter_wait)
+    monkeypatch.setattr(task_runner_module, "deliver_stop", observe_deliver_stop)
+    monkeypatch.setattr(task_runner_module.time, "monotonic", controlled_monotonic)
+    monkeypatch.setattr(
+        task_runner_module,
+        "_terminate_recorded_group",
+        pause_recorded_delivery,
+    )
+    final_path = runtime / "final.json"
+
+    def run_with_controlled_clock() -> int:
+        runner_thread.append(get_ident())
+        return run_task(tmp_path, task_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        runner = pool.submit(run_with_controlled_clock)
+        running = _wait_state(service, task_id, "running")
+        adapter_pid.append(int(running["adapter_pid"]))
+        ready_path = worktree / "adapter.ready"
+        deadline = time.monotonic() + 5
+        while not ready_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready_path.exists()
+        arm_runner_lifecycle_pause.set()
+        assert runner_after_lifecycle_check.wait(timeout=5)
+        stopper = pool.submit(
+            service.stop,
+            task_id,
+            actor="human",
+            reason="publication arbitration",
+        )
+        try:
+            assert stop_publication_blocked.wait(timeout=5)
+            (worktree / "adapter.exit").touch()
+            release_runner_after_check.set()
+            assert runner_reaped_adapter.wait(timeout=5)
+            release_stop_publication.set()
+            assert delivery_paused.wait(timeout=5)
+            assert runner_delivery_attempt.wait(timeout=5)
+            assert not final_path.exists()
+        finally:
+            release_runner_after_check.set()
+            release_stop_publication.set()
+            release_delivery.set()
+        assert stopper.result(timeout=5)["reason"] == "publication arbitration"
+        assert runner.result(timeout=5) == 0
+
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    result = json.loads((runtime / "stop-result.json").read_text(encoding="utf-8"))
+    assert deliver_calls == 2
+    assert termination_calls == 1
+    assert result["delivered"] is True
+    assert result["signal_sequence"] == ["TERM"]
+    assert final["state"] == "cancelled"
+    assert final["stop"] == result
 
 
 def test_stop_arriving_during_timeout_keeps_timeout_signal_authority(

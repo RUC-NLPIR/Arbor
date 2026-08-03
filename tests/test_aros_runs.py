@@ -756,6 +756,59 @@ def test_bundle_runner_finalizes_missing_checkout_marker_without_spawn(
     assert str(bundle.apparatus.path) in registrations
 
 
+def test_bundle_runner_finalizes_symlink_loop_cwd_without_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repository, bundle = _create_test_execution_bundle(
+        tmp_path,
+        "EVAL-cwd-symlink-loop",
+        candidate_files={"work/.keep": ""},
+    )
+    service = RunService(tmp_path)
+    manifest = service.prepare_bundle(
+        bundle,
+        ["/usr/bin/python3", "-c", "pass"],
+        cwd="work",
+        timeout_seconds=10,
+        success_exit_codes=[0],
+        idempotency_key="bundle-cwd-symlink-loop",
+        actor="test-principal",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    cwd = bundle.candidate.path / "work"
+    preserved = bundle.candidate.path / "work-preserved"
+    cwd.rename(preserved)
+    cwd.symlink_to("work", target_is_directory=True)
+    spawned = False
+    real_popen = runner_module.subprocess.Popen
+
+    def observe_spawn(*args: object, **kwargs: object):
+        nonlocal spawned
+        if args and args[0] == manifest["argv"]:
+            spawned = True
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", observe_spawn)
+
+    assert runner_module.run(str(tmp_path), run_id) == 1
+
+    final = json.loads(
+        (tmp_path / "runs" / run_id / "final.json").read_text(encoding="utf-8")
+    )
+    assert final["state"] == "failed_process"
+    assert "process launch failed" in final["error"]
+    assert service.status(run_id, reconcile=False)["state"] == "failed_process"
+    assert spawned is False
+    assert cwd.is_symlink()
+    assert preserved.is_dir()
+    assert bundle.apparatus.path.is_dir()
+    assert bundle.temp.is_dir()
+    registrations = _git(tmp_path, "worktree", "list", "--porcelain")
+    assert str(bundle.candidate.path) in registrations
+    assert str(bundle.apparatus.path) in registrations
+
+
 @pytest.mark.parametrize(
     "drift",
     (

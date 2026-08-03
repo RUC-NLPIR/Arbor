@@ -285,8 +285,11 @@ def run(workspace: str, run_id: str) -> int:
                 root, manifest
             )
             bundle_binding = repository, bundle
-        cwd = (execution_root / str(manifest["cwd"])).resolve()
-        cwd.relative_to(execution_root)
+        try:
+            cwd = (execution_root / str(manifest["cwd"])).resolve()
+            cwd.relative_to(execution_root)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ValueError("manifest cwd is unavailable") from error
         if not cwd.is_dir():
             raise ValueError("manifest cwd is unavailable")
         profile = manifest.get("security_profile")

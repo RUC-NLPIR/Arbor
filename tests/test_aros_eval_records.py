@@ -465,6 +465,42 @@ def test_visible_manifest_accepts_normalized_direct_apparatus_entry() -> None:
 
 
 @pytest.mark.parametrize(
+    "payload",
+    (
+        "--config=../apparatus/undeclared.json",
+        "alias=payload\\undeclared.json",
+    ),
+)
+def test_visible_manifest_rejects_path_bearing_scorer_payload(
+    payload: str,
+) -> None:
+    manifest = _visible_manifest()
+    manifest["scorer_argv"] = [
+        "python",
+        "../apparatus/evaluation/score.py",
+        payload,
+    ]
+
+    with pytest.raises(ValueError):
+        parse_visible_manifest(manifest)
+
+
+def test_visible_manifest_accepts_nonpath_flags_and_scalars() -> None:
+    manifest = _visible_manifest()
+    manifest["scorer_argv"] = [
+        "python",
+        "../apparatus/evaluation/score.py",
+        "--mode=strict",
+        "quality",
+        "7",
+    ]
+
+    assert parse_visible_manifest(manifest)["scorer_argv"] == manifest[
+        "scorer_argv"
+    ]
+
+
+@pytest.mark.parametrize(
     "case",
     (
         "missing-field",
@@ -787,6 +823,90 @@ def test_build_measurement_receipt_rejects_oversized_run_final() -> None:
     run_final["arbitrary_extra"] = "x" * (1024 * 1024)
 
     with pytest.raises(ValueError):
+        build_measurement_receipt(
+            request,
+            execution,
+            run_link,
+            run_final,
+            "valid",
+            _measurement("valid"),
+            "removed",
+        )
+
+
+@pytest.mark.parametrize("container_kind", ("list", "dict"))
+def test_run_final_node_limit_preflights_shallow_container(
+    container_kind: str,
+) -> None:
+    request, execution, run_link, run_final = _lineage_records()
+    if container_kind == "list":
+        extra: object = [object()] * 10_001
+    else:
+        mapping: dict[str, object] = {"\ud800": None}
+        mapping.update((f"key-{index}", None) for index in range(10_000))
+        extra = mapping
+    run_final["arbitrary_extra"] = extra
+
+    with pytest.raises(ValueError, match="nodes"):
+        build_measurement_receipt(
+            request,
+            execution,
+            run_link,
+            run_final,
+            "valid",
+            _measurement("valid"),
+            "removed",
+        )
+
+
+@pytest.mark.parametrize("location", ("value", "key"))
+def test_run_final_string_limit_preflights_utf8_encoding(location: str) -> None:
+    request, execution, run_link, run_final = _lineage_records()
+    oversized = "x" * (1024 * 1024 + 1) + "\ud800"
+    run_final["arbitrary_extra"] = (
+        oversized if location == "value" else {oversized: None}
+    )
+
+    with pytest.raises(ValueError, match="characters"):
+        build_measurement_receipt(
+            request,
+            execution,
+            run_link,
+            run_final,
+            "valid",
+            _measurement("valid"),
+            "removed",
+        )
+
+
+def test_run_final_cumulative_utf8_limit_precedes_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, execution, run_link, run_final = _lineage_records()
+    run_final["arbitrary_extra"] = ["é" * 300_000, "é" * 300_000]
+    monkeypatch.setattr(
+        eval_records_module,
+        "_canonical_json_bytes",
+        lambda _value: pytest.fail("canonical serialization was reached"),
+    )
+
+    with pytest.raises(ValueError, match="UTF-8"):
+        build_measurement_receipt(
+            request,
+            execution,
+            run_link,
+            run_final,
+            "valid",
+            _measurement("valid"),
+            "removed",
+        )
+
+
+def test_run_final_integer_limit_precedes_serialization() -> None:
+    request, execution, run_link, run_final = _lineage_records()
+    run_final["arbitrary_extra"] = 1 << (4 * 1024 * 1024)
+
+    with pytest.raises(ValueError, match="integer"):
         build_measurement_receipt(
             request,
             execution,

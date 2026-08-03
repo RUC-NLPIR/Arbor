@@ -20,6 +20,7 @@ _MAX_METRIC_BYTES = 65_536
 _MAX_NUMBER_TOKEN = 128
 _MAX_RECORD_BYTES = 1024 * 1024
 _MAX_RECORD_DEPTH = 64
+_MAX_RECORD_INTEGER_BITS = _MAX_RECORD_BYTES * 3
 _MAX_RECORD_NODES = 10_000
 _SCORER_LAUNCHERS = {"python", "python3", "bash", "sh", sys.executable}
 _METRIC_FIELDS = {"schema_version", "metric", "sample_count"}
@@ -160,9 +161,24 @@ def _finite_number(value: object, field: str) -> int | float:
     return value
 
 
+def _bounded_utf8_size(value: str, description: str, remaining: int) -> int:
+    if len(value) > _MAX_RECORD_BYTES:
+        raise ValueError(f"{description} exceeds {_MAX_RECORD_BYTES} characters")
+    if len(value) > remaining:
+        raise ValueError(f"{description} exceeds the cumulative UTF-8 byte limit")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{description} must be valid UTF-8") from error
+    if size > remaining:
+        raise ValueError(f"{description} exceeds the cumulative UTF-8 byte limit")
+    return size
+
+
 def _bounded_canonical_sha256(value: object, description: str) -> str:
     stack = [(value, 0)]
     node_count = 0
+    utf8_bytes = 0
     while stack:
         item, depth = stack.pop()
         node_count += 1
@@ -172,23 +188,34 @@ def _bounded_canonical_sha256(value: object, description: str) -> str:
             raise ValueError(f"{description} exceeds depth {_MAX_RECORD_DEPTH}")
         item_type = type(item)
         if item_type is dict:
+            if node_count + len(stack) + len(item) > _MAX_RECORD_NODES:
+                raise ValueError(f"{description} exceeds {_MAX_RECORD_NODES} nodes")
             for key in item:
                 if type(key) is not str:
                     raise ValueError(f"{description} keys must be strings")
-                _utf8(key, f"{description} key")
-            if node_count + len(stack) + len(item) > _MAX_RECORD_NODES:
-                raise ValueError(f"{description} exceeds {_MAX_RECORD_NODES} nodes")
+                utf8_bytes += _bounded_utf8_size(
+                    key,
+                    f"{description} key",
+                    _MAX_RECORD_BYTES - utf8_bytes,
+                )
             stack.extend((child, depth + 1) for child in item.values())
         elif item_type is list:
             if node_count + len(stack) + len(item) > _MAX_RECORD_NODES:
                 raise ValueError(f"{description} exceeds {_MAX_RECORD_NODES} nodes")
             stack.extend((child, depth + 1) for child in item)
         elif item_type is str:
-            _utf8(item, description)
+            utf8_bytes += _bounded_utf8_size(
+                item,
+                description,
+                _MAX_RECORD_BYTES - utf8_bytes,
+            )
         elif item_type is float:
             if not math.isfinite(item):
                 raise ValueError(f"{description} contains a non-finite number")
-        elif item is not None and item_type not in {bool, int}:
+        elif item_type is int:
+            if item.bit_length() > _MAX_RECORD_INTEGER_BITS:
+                raise ValueError(f"{description} contains an oversized integer")
+        elif item is not None and item_type is not bool:
             raise ValueError(f"{description} contains a non-JSON value")
     try:
         payload = _canonical_json_bytes(value)
@@ -251,23 +278,23 @@ def parse_visible_manifest(value: object) -> dict[str, object]:
         posixpath.relpath(posixpath.join("apparatus", str(item["path"])), scorer_start)
         for item in apparatus_paths
     }
-    apparatus_root = posixpath.relpath("apparatus", scorer_start)
-    explicit_apparatus_arguments = {
-        argument
-        for argument in normalized_argv
-        if argument == apparatus_root
-        or argument.startswith(f"{apparatus_root}/")
-    }
-    if not explicit_apparatus_arguments.issubset(apparatus_arguments):
-        raise ValueError("scorer_argv references an undeclared apparatus path")
     direct_entry = normalized_argv[0] in apparatus_arguments
     launched_entry = (
         len(normalized_argv) > 1
         and scorer_argv[0] in _SCORER_LAUNCHERS
         and normalized_argv[1] in apparatus_arguments
     )
-    if not direct_entry and not launched_entry:
+    if direct_entry:
+        entry_index = 0
+    elif launched_entry:
+        entry_index = 1
+    else:
         raise ValueError("scorer_argv must execute one declared apparatus entry")
+    if any(
+        "/" in argument or "\\" in argument
+        for argument in scorer_argv[entry_index + 1 :]
+    ):
+        raise ValueError("scorer_argv arguments after the entry must not contain paths")
 
     inputs = _string_list(value["inputs"], "inputs")
     environment_ref = _utf8(value["environment_ref"], "environment_ref", nonempty=True)

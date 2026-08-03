@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import math
 import os
 import re
@@ -209,6 +210,7 @@ _ALLOWED_SIGNALS = {
     "KILL": signal.SIGKILL,
 }
 _GROUP_DRAIN_TIMEOUT_SECONDS = 2.0
+_PR_SET_CHILD_SUBREAPER = 36
 _PROCESS_START_TOKEN = re.compile(r"^linux-proc-start:[0-9]+$")
 _ADAPTER_LAUNCH_GATE = (
     "import os,sys;"
@@ -788,6 +790,30 @@ def lost_status(
     }
 
 
+def _enable_child_subreaper() -> None:
+    if not sys.platform.startswith("linux"):
+        raise TaskError("task child subreaper requires Linux")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = [
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        prctl.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+    except (AttributeError, OSError, TypeError) as error:
+        raise TaskError("unable to enable task child subreaper") from error
+    if result != 0:
+        error_number = ctypes.get_errno()
+        detail = os.strerror(error_number) if error_number else "prctl failed"
+        raise TaskError(f"unable to enable task child subreaper: {detail}")
+
+
 def _process_state_group_and_token(pid: int) -> tuple[str, int, str] | None:
     if pid <= 1:
         return None
@@ -801,6 +827,47 @@ def _process_state_group_and_token(pid: int) -> tuple[str, int, str] | None:
         )
     except (OSError, IndexError, ValueError):
         return None
+
+
+def _direct_child_pids(runner_pid: int) -> tuple[int, ...]:
+    path = Path(f"/proc/{runner_pid}/task/{runner_pid}/children")
+    try:
+        raw = path.read_text(encoding="utf-8")
+        children = tuple(int(value) for value in raw.split())
+    except (OSError, ValueError) as error:
+        raise TaskError(f"unable to read task runner children: {runner_pid}") from error
+    if any(pid <= 1 for pid in children):
+        raise TaskError(f"invalid task runner child process: {runner_pid}")
+    return children
+
+
+def _reap_exited_children() -> None:
+    while True:
+        try:
+            child_pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except InterruptedError:
+            continue
+        except OSError as error:
+            raise TaskError("unable to reap task child process") from error
+        if child_pid == 0:
+            return
+
+
+def _adopted_children_are_live(runner_pid: int) -> bool:
+    def has_live_child() -> bool:
+        for child_pid in _direct_child_pids(runner_pid):
+            process = _process_state_group_and_token(child_pid)
+            if process is not None and process[0] not in {"Z", "X", "x"}:
+                return True
+        return False
+
+    _reap_exited_children()
+    if has_live_child():
+        return True
+    _reap_exited_children()
+    return has_live_child()
 
 
 def _process_group_has_live_member(pgid: int) -> bool:
@@ -1688,6 +1755,7 @@ def run(workspace: str | Path, task_id: str) -> int:
             raise TaskError(
                 f"task adapter claim already exists before execution: {task_id}"
             )
+        _enable_child_subreaper()
         runner_identity = _identity(os.getpid())
         execution = create_execution_claim(
             service,
@@ -1887,7 +1955,11 @@ def run(workspace: str | Path, task_id: str) -> int:
     stop_result: dict[str, object] | None = None
     stop_handled = False
     last_heartbeat = time.monotonic()
-    while process.poll() is None or _claimed_group_is_live(*adapter_identity):
+    while (
+        process.poll() is None
+        or _claimed_group_is_live(*adapter_identity)
+        or _adopted_children_are_live(runner_identity[0])
+    ):
         if not stop_handled:
             with file_lock(lifecycle_lock):
                 if _path_exists(service._stop_path(task_id)):
@@ -1921,6 +1993,7 @@ def run(workspace: str | Path, task_id: str) -> int:
                     stop_handled = True
         if (
             stop_request is None
+            and not timeout_triggered
             and time.monotonic() - started_monotonic >= timeout_seconds
         ):
             timeout_sequence = _terminate_group(
@@ -1930,7 +2003,6 @@ def run(workspace: str | Path, task_id: str) -> int:
             if timeout_sequence:
                 timeout_triggered = True
                 signal_sequence = timeout_sequence
-                break
         now = time.monotonic()
         if now - last_heartbeat >= 0.2:
             heartbeat_at = utc_now()
@@ -1943,6 +2015,7 @@ def run(workspace: str | Path, task_id: str) -> int:
         time.sleep(0.02)
 
     exit_code = process.wait()
+    _reap_exited_children()
     while True:
         needs_stop_delivery = False
         with file_lock(lifecycle_lock):

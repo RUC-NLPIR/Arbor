@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -994,6 +996,67 @@ def test_runner_hard_death_before_gate_never_executes_adapter(
             os.killpg(adapter_pid, signal.SIGKILL)
 
 
+def test_subreaper_unavailable_fails_closed_before_adapter_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path;Path('subreaper-failure-marker').touch()",
+        ],
+        key="subreaper-unavailable",
+    )
+    task_id = str(brief["task_id"])
+    original_run = tasks_module.subprocess.run
+
+    def carrier_without_runner(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if isinstance(command, list) and "new-session" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    class FailingPrctl:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, *_args: object) -> int:
+            ctypes.set_errno(errno.EPERM)
+            return -1
+
+    class LibcWithoutSubreaper:
+        prctl = FailingPrctl()
+
+    def libc_without_subreaper(*_args: object, **_kwargs: object) -> object:
+        return LibcWithoutSubreaper()
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    assert service.start(task_id)["state"] == "lost"
+    monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
+    monkeypatch.setattr(ctypes, "CDLL", libc_without_subreaper)
+
+    runner = os.fork()
+    if runner == 0:
+        try:
+            run_task(tmp_path, task_id)
+        except TaskError:
+            os._exit(0)
+        os._exit(0)
+    waited, wait_status = os.waitpid(runner, 0)
+
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    marker = tmp_path / ".worktree" / "tasks" / task_id / "subreaper-failure-marker"
+    assert waited == runner
+    assert os.waitstatus_to_exitcode(wait_status) == 0
+    assert not marker.exists()
+    assert not (runtime / "adapter.json").exists()
+    assert not (runtime / "final.json").exists()
+    assert service.status(task_id)["state"] in {"failed_process", "lost"}
+
+
 def test_duplicate_runner_invocation_never_spawns_a_second_adapter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1669,6 +1732,101 @@ def test_timeout_terminates_term_ignoring_process_group_and_reaps_leader(
     assert final["timeout"] == {"timeout_seconds": 0.3, "triggered": True}
     assert final["signal_sequence"] == ["TERM", "KILL"]
     _assert_processes_stop(int(final["adapter_pid"]), descendant_pid)
+
+
+def test_runner_waits_for_escaped_session_descendant_before_finalizing(
+    tmp_path: Path,
+) -> None:
+    descendant = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "Path('escaped.ready').write_text('ready',encoding='utf-8')\n"
+        "while not Path('escaped.release').exists():\n"
+        "    time.sleep(0.01)\n"
+        "Path('escaped.marker').write_text('finished\\n',encoding='utf-8')\n"
+        "print('escaped stdout',flush=True)\n"
+    )
+    leader = (
+        "import subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        f"child=subprocess.Popen([sys.executable,'-c',{descendant!r}],"
+        "start_new_session=True)\n"
+        "Path('escaped.pid').write_text(str(child.pid),encoding='utf-8')\n"
+        "deadline=time.monotonic()+5\n"
+        "while not Path('escaped.ready').exists() and time.monotonic()<deadline:\n"
+        "    time.sleep(0.01)\n"
+        "if not Path('escaped.ready').exists():\n"
+        "    raise SystemExit(2)\n"
+        "print('leader stdout',flush=True)\n"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", leader],
+        key="escaped-session-descendant",
+    )
+    task_id = str(brief["task_id"])
+
+    service.start(task_id)
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    ready_path = worktree / "escaped.ready"
+    deadline = time.monotonic() + 5
+    while not ready_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready_path.exists()
+    descendant_pid = int((worktree / "escaped.pid").read_text(encoding="utf-8"))
+    execution = json.loads((runtime / "execution.json").read_text(encoding="utf-8"))
+    adapter = json.loads((runtime / "adapter.json").read_text(encoding="utf-8"))
+    runner_pid = int(execution["runner_pid"])
+    adapter_pid = int(adapter["adapter_pid"])
+    deadline = time.monotonic() + 5
+    while _process_is_running(adapter_pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    deadline = time.monotonic() + 1
+    while (
+        _process_is_running(runner_pid)
+        and not (runtime / "final.json").exists()
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.02)
+
+    release_path = worktree / "escaped.release"
+    marker_path = worktree / "escaped.marker"
+    try:
+        assert not _process_is_running(adapter_pid)
+        assert _process_is_running(descendant_pid)
+        assert _process_is_running(runner_pid)
+        assert service.status(task_id)["state"] == "running"
+        assert not marker_path.exists()
+        assert not (runtime / "final.json").exists()
+        release_path.touch()
+
+        terminal = _wait_terminal(service, task_id)
+        final_path = runtime / "final.json"
+        final_bytes = final_path.read_bytes()
+        stdout = (runtime / "stdout.log").read_bytes()
+        marker = marker_path.read_bytes()
+        final = json.loads(final_bytes)
+        assert terminal["state"] == "completed"
+        assert final["exit_code"] == 0
+        assert stdout == b"leader stdout\nescaped stdout\n"
+        assert marker == b"finished\n"
+        deadline = time.monotonic() + 5
+        while _process_state(descendant_pid) is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _process_state(descendant_pid) is None
+        time.sleep(0.2)
+        assert final_path.read_bytes() == final_bytes
+        assert (runtime / "stdout.log").read_bytes() == stdout
+        assert marker_path.read_bytes() == marker
+    finally:
+        release_path.touch(exist_ok=True)
+        deadline = time.monotonic() + 3
+        while _process_is_running(descendant_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if _process_is_running(descendant_pid):
+            os.killpg(descendant_pid, signal.SIGKILL)
+        _assert_processes_stop(descendant_pid)
 
 
 def test_runner_waits_for_process_group_drain_before_finalizing_late_stdout(

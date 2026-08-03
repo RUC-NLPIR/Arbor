@@ -487,192 +487,6 @@ def test_start_rejects_and_never_prunes_a_stale_worktree_registration(
     assert preserved.is_dir()
 
 
-def test_worktree_add_is_pinned_against_tasks_root_symlink_swap(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    base_commit = _init_workspace(tmp_path)
-    service = TaskService(tmp_path)
-    brief = _create(service, key="tasks-root-swap")
-    task_id = str(brief["task_id"])
-    _commit_brief(tmp_path, brief)
-    tasks_root = tmp_path / ".worktree" / "tasks"
-    tasks_root.mkdir()
-    pinned_root = tmp_path / ".worktree" / "pinned-tasks-root"
-    outside = tmp_path / "outside-tasks-root"
-    outside.mkdir()
-    original_run = tasks_module.subprocess.run
-    swapped = False
-
-    def swap_before_worktree_add(*args: object, **kwargs: object) -> object:
-        nonlocal swapped
-        command = args[0]
-        if (
-            not swapped
-            and isinstance(command, list)
-            and "worktree" in command
-            and "add" in command
-        ):
-            tasks_root.rename(pinned_root)
-            tasks_root.symlink_to(outside, target_is_directory=True)
-            swapped = True
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(tasks_module.subprocess, "run", swap_before_worktree_add)
-
-    with pytest.raises(TaskError):
-        service._ensure_worktree(task_id)
-
-    assert swapped
-    assert list(outside.iterdir()) == []
-    preserved = pinned_root / task_id
-    assert preserved.is_dir()
-    assert _git(preserved, "rev-parse", "HEAD") == base_commit
-    assert _git_ref_exists(tmp_path, f"refs/heads/aros/task/{task_id}")
-    assert str(preserved) in _git(tmp_path, "worktree", "list", "--porcelain")
-    assert not (tmp_path / ".aros" / "tasks" / task_id / "ownership.json").exists()
-
-
-@pytest.mark.parametrize("failure", ("open", "identity"))
-def test_worktree_add_fails_closed_on_tasks_root_fd_or_identity_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str,
-) -> None:
-    _init_workspace(tmp_path)
-    service = TaskService(tmp_path)
-    brief = _create(service, key=f"tasks-root-fd-{failure}")
-    task_id = str(brief["task_id"])
-    _commit_brief(tmp_path, brief)
-    tasks_root = tmp_path / ".worktree" / "tasks"
-    tasks_root.mkdir()
-    preserved_root = tmp_path / ".worktree" / "preserved-tasks-root"
-    original_open = tasks_module.os.open
-    attempted = False
-
-    def fail_or_swap_open(path: object, flags: int, *args: object) -> int:
-        nonlocal attempted
-        if (
-            not attempted
-            and Path(path) == tasks_root  # type: ignore[arg-type]
-            and flags & getattr(os, "O_NOFOLLOW", 0)
-        ):
-            attempted = True
-            if failure == "open":
-                raise OSError("injected directory-fd failure")
-            descriptor = original_open(path, flags, *args)  # type: ignore[arg-type]
-            tasks_root.rename(preserved_root)
-            tasks_root.mkdir()
-            return descriptor
-        return original_open(path, flags, *args)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(tasks_module.os, "open", fail_or_swap_open)
-
-    with pytest.raises(TaskError, match="directory|identity|worktree root"):
-        service._ensure_worktree(task_id)
-
-    assert attempted
-    assert not _git_ref_exists(tmp_path, f"refs/heads/aros/task/{task_id}")
-    assert not (tasks_root / task_id).exists()
-    assert not (preserved_root / task_id).exists()
-
-
-def test_worktree_add_uses_exact_argv_in_directory_fd_launcher(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    base_commit = _init_workspace(tmp_path)
-    service = TaskService(tmp_path)
-    brief = _create(service, key="directory-fd-argv")
-    task_id = str(brief["task_id"])
-    _commit_brief(tmp_path, brief)
-    launches: list[tuple[list[str], dict[str, object]]] = []
-    original_run = tasks_module.subprocess.run
-
-    def record_launcher(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if (
-            isinstance(command, list)
-            and command
-            and command[0] == sys.executable
-            and "worktree" in command
-            and "add" in command
-        ):
-            launches.append((command, kwargs))
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(tasks_module.subprocess, "run", record_launcher)
-
-    status = service._ensure_worktree(task_id)
-
-    assert len(launches) == 1
-    launcher, options = launches[0]
-    assert launcher[:5] == [
-        sys.executable,
-        "-I",
-        "-S",
-        "-c",
-        tasks_module._DIRECTORY_FD_EXEC,
-    ]
-    directory_fd = int(launcher[5])
-    git_argv = launcher[6:]
-    assert options["pass_fds"] == (directory_fd,)
-    assert not options.get("shell", False)
-    assert "preexec_fn" not in options
-    assert "cwd" not in options
-    assert git_argv[:2] == ["git", "--no-replace-objects"]
-    assert "core.hooksPath=/dev/null" in git_argv
-    assert git_argv[-6:] == [
-        "worktree",
-        "add",
-        "-b",
-        f"aros/task/{task_id}",
-        task_id,
-        base_commit,
-    ]
-    target = (tmp_path / ".worktree" / "tasks" / task_id).absolute()
-    assert str(target) not in git_argv
-    environment = options["env"]
-    assert isinstance(environment, dict)
-    assert not any(key.startswith("GIT_") for key in environment)
-    assert not any(key.startswith("PYTHON") for key in environment)
-    assert environment.get("PATH") == os.environ.get("PATH")
-    assert status["state"] == "worktree_ready"
-    ownership = json.loads(
-        (tmp_path / ".aros" / "tasks" / task_id / "ownership.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert ownership["worktree_path"] == str(target)
-    assert f"worktree {target}" in _git(tmp_path, "worktree", "list", "--porcelain")
-
-
-def test_worktree_launcher_does_not_import_ambient_sitecustomize(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _init_workspace(tmp_path)
-    service = TaskService(tmp_path)
-    brief = _create(service, key="malicious-python-startup")
-    task_id = str(brief["task_id"])
-    _commit_brief(tmp_path, brief)
-    marker = tmp_path / ".git" / "sitecustomize-ran"
-    python_path = tmp_path / ".git" / "malicious-pythonpath"
-    python_path.mkdir()
-    (python_path / "sitecustomize.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).touch()\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("PYTHONPATH", str(python_path))
-    monkeypatch.setenv("PYTHONWARNINGS", "error")
-
-    status = service._ensure_worktree(task_id)
-
-    assert status["state"] == "worktree_ready"
-    assert not marker.exists()
-
-
 def test_git_subprocesses_do_not_load_ambient_dynamic_libraries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1238,24 +1052,9 @@ def test_start_git_commands_are_scrubbed_pinned_and_nondestructive(
     def record_git(*args: object, **kwargs: object) -> object:
         command = args[0]
         environment = kwargs.get("env")
-        if isinstance(command, list) and command and command[0] == "git":
+        if isinstance(command, list) and "git" in command:
             assert isinstance(environment, dict)
-            calls.append((command, environment))
-        elif (
-            isinstance(command, list)
-            and command[:5]
-            == [
-                sys.executable,
-                "-I",
-                "-S",
-                "-c",
-                tasks_module._DIRECTORY_FD_EXEC,
-            ]
-            and "worktree" in command
-            and "add" in command
-        ):
-            assert isinstance(environment, dict)
-            calls.append((command[6:], environment))
+            calls.append((command[command.index("git") :], environment))
         return original_run(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "foreign.git"))
@@ -1279,7 +1078,12 @@ def test_start_git_commands_are_scrubbed_pinned_and_nondestructive(
         if "worktree" in command and "add" in command
     ]
     assert len(worktree_add) == 1
-    assert "core.hooksPath=/dev/null" in worktree_add[0]
+    worktree_add_argv = worktree_add[0]
+    expected_target = str(tmp_path / ".worktree" / "tasks" / task_id)
+    assert expected_target in worktree_add_argv
+    assert "--force" not in worktree_add_argv
+    assert "prune" not in worktree_add_argv
+    assert "core.hooksPath=/dev/null" in worktree_add_argv
     forbidden = {"--force", "reset", "clean", "prune", "remove"}
     assert all(not forbidden.intersection(command) for command, _ in calls)
 

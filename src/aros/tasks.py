@@ -92,11 +92,6 @@ _FILTER_CONFIG_KEY = re.compile(
     re.IGNORECASE,
 )
 _FILTER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_DIRECTORY_FD_EXEC = (
-    "import os,sys;fd=int(sys.argv[1]);os.fchdir(fd);"
-    "os.set_inheritable(fd,False);"
-    "os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
-)
 _TASK_RUNNER_BOOTSTRAP = (
     "import runpy,sys;"
     "controlled=sys.argv.pop(1);"
@@ -1266,81 +1261,13 @@ class TaskService:
                 raise TaskError(f"task branch ref conflict: {existing}")
 
     def _add_task_worktree(self, target: Path, branch: str, base_commit: str) -> None:
-        root = target.parent
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
+        result = self._safe_git_result(
+            "worktree", "add", "-b", branch, str(target), base_commit
         )
-        try:
-            directory_fd = os.open(root, flags)
-        except OSError as error:
-            raise TaskError(f"unable to open task worktree root: {root}") from error
-        try:
-            try:
-                metadata = os.fstat(directory_fd)
-            except OSError as error:
-                raise TaskError(f"unable to inspect task worktree root fd: {root}") from error
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise TaskError(f"task worktree root fd is not a directory: {root}")
-            identity = metadata.st_dev, metadata.st_ino
-            self._require_directory_fd_identity(root, directory_fd, identity)
-            command = self._pinned_git_command(
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                target.name,
-                base_commit,
-                configs=self._safe_git_configs(),
-            )
-            self._require_directory_fd_identity(root, directory_fd, identity)
-            launcher = [
-                sys.executable,
-                "-I",
-                "-S",
-                "-c",
-                _DIRECTORY_FD_EXEC,
-                str(directory_fd),
-                *command,
-            ]
-            try:
-                result = subprocess.run(
-                    launcher,
-                    capture_output=True,
-                    text=False,
-                    timeout=10,
-                    check=False,
-                    env=_git_environment(),
-                    pass_fds=(directory_fd,),
-                )
-            except (OSError, subprocess.TimeoutExpired) as error:
-                raise TaskError("Git worktree add launcher failed") from error
-            self._require_directory_fd_identity(root, directory_fd, identity)
-        finally:
-            os.close(directory_fd)
         if result.returncode != 0:
             raise TaskError(
                 f"unable to create task worktree: {_git_error(result)}"
             )
-
-    @staticmethod
-    def _require_directory_fd_identity(
-        path: Path,
-        directory_fd: int,
-        expected: tuple[int, int],
-    ) -> None:
-        try:
-            metadata = os.fstat(directory_fd)
-        except OSError as error:
-            raise TaskError(f"unable to inspect task worktree root fd: {path}") from error
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise TaskError(f"task worktree root fd is not a directory: {path}")
-        if (metadata.st_dev, metadata.st_ino) != expected:
-            raise TaskError(f"task worktree root fd identity changed: {path}")
-        if _plain_directory_identity(path, "task worktree root") != expected:
-            raise TaskError(f"task worktree root pathname identity changed: {path}")
 
     def _validate_new_checkout(
         self,

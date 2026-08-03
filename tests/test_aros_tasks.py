@@ -22,6 +22,7 @@ from typing import Callable
 import pytest
 
 import arbor.aros.tasks as tasks_module
+import arbor.aros.worktrees as worktrees_module
 from arbor.aros.store import atomic_write_json, create_json, json_sha256
 from arbor.aros.tasks import TaskError, TaskService
 from arbor.aros.workspace import init_workspace
@@ -68,6 +69,57 @@ def _request(*, key: str = "task-key") -> dict[str, object]:
         "timeout_seconds": 60,
         "idempotency_key": key,
     }
+
+
+def test_task_git_environment_delegates_to_shared_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        "PATH": "/controlled/bin",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    calls = 0
+
+    def shared_environment() -> dict[str, str]:
+        nonlocal calls
+        calls += 1
+        return dict(expected)
+
+    monkeypatch.setattr(worktrees_module, "_git_environment", shared_environment)
+
+    assert tasks_module._git_environment() == expected
+    assert calls == 1
+
+
+def test_task_worktree_registration_parser_delegates_to_shared_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered = tmp_path / "registered-worktree"
+    registered.mkdir()
+    expected = {
+        "worktree": str(registered),
+        "HEAD": "a" * 40,
+        "detached": True,
+    }
+    raw = b"opaque shared parser input"
+    observed: list[bytes] = []
+
+    def shared_parser(value: bytes) -> list[dict[str, object]]:
+        observed.append(value)
+        return [dict(expected)]
+
+    service = TaskService.__new__(TaskService)
+    monkeypatch.setattr(service, "_safe_git_bytes", lambda *_args, **_kwargs: raw)
+    monkeypatch.setattr(
+        worktrees_module,
+        "_parse_worktree_registrations",
+        shared_parser,
+    )
+
+    assert service._worktree_registrations() == [expected]
+    assert observed == [raw]
 
 
 def _normalized_permission_probe(*, device: int = 57) -> dict[str, object]:
@@ -1984,7 +2036,16 @@ def test_start_git_commands_are_scrubbed_pinned_and_nondestructive(
     service._ensure_worktree(task_id)
 
     assert calls
-    assert all(not any(key.startswith("GIT_") for key in env) for _, env in calls)
+    assert all(
+        {key for key in env if key.startswith("GIT_")}
+        == {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"}
+        for _, env in calls
+    )
+    assert all(
+        env["GIT_CONFIG_GLOBAL"] == os.devnull
+        and env["GIT_CONFIG_NOSYSTEM"] == "1"
+        for _, env in calls
+    )
     assert all(not any(key.startswith("PYTHON") for key in env) for _, env in calls)
     assert all(
         any(str(service._git_dir) in argument for argument in command)

@@ -19,6 +19,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import worktrees as worktrees_module
 from .receipts import content_receipt, digest_chunks, record_sha256
 from .store import (
     atomic_write_json,
@@ -2693,30 +2694,12 @@ class TaskService:
             "-z",
             "--expire=now",
         )
+        try:
+            parsed = worktrees_module._parse_worktree_registrations(raw)
+        except worktrees_module.WorktreeError as error:
+            raise TaskError(str(error)) from error
         registrations: list[dict[str, object]] = []
-        for raw_record in raw.split(b"\0\0"):
-            if not raw_record:
-                continue
-            record: dict[str, object] = {}
-            for field in raw_record.strip(b"\0").split(b"\0"):
-                key, separator, value = field.partition(b" ")
-                try:
-                    name = key.decode("ascii")
-                except UnicodeError as error:
-                    raise TaskError("invalid Git worktree registration") from error
-                if name in record:
-                    raise TaskError("ambiguous Git worktree registration")
-                if not separator:
-                    record[name] = True
-                elif name == "worktree":
-                    record[name] = os.fsdecode(value)
-                else:
-                    try:
-                        record[name] = value.decode("utf-8")
-                    except UnicodeError as error:
-                        raise TaskError("invalid Git worktree registration") from error
-            if not isinstance(record.get("worktree"), str):
-                raise TaskError("invalid Git worktree registration")
+        for record in parsed:
             if "prunable" in record:
                 if (
                     allowed_prunable is not None
@@ -3334,11 +3317,7 @@ def _normalize_request(
 
 
 def _git_environment() -> dict[str, str]:
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("GIT_", "PYTHON", "LD_", "DYLD_"))
-    }
+    return worktrees_module._git_environment()
 
 
 def _brief_sha256(brief: dict[str, object]) -> str:

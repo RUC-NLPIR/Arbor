@@ -9,7 +9,7 @@ commissioned.
 ## Current position
 
 - Branch: `aros-wave2-child` in `/workspace/Arbor/.worktree/aros-wave2-child`.
-- Code baseline immediately before this checkpoint: `5254cc159986d6c9eed79878356d9ab564979ab1`.
+- Code baseline immediately before this checkpoint: `757dc910b36c6727b2605292238dfa55eccfe57e`.
 - Wave 2 Tasks 1–6 are implemented, independently reviewed, and commissioned.
 - Registered evidence: `docs/analysis/aros-wave2-child-substrate-smoke.md`.
 - Real commissioning demonstrated concurrent read/write children, launcher-exit

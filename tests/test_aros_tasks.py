@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -68,6 +69,15 @@ def _request(*, key: str = "task-key") -> dict[str, object]:
     }
 
 
+def _normalized_permission_probe(*, device: int = 57) -> dict[str, object]:
+    return {
+        "requested_mode": 0o600,
+        "observed_mode": 0o666,
+        "device": device,
+        "enforced": False,
+    }
+
+
 def _create(
     service: TaskService,
     *,
@@ -75,6 +85,54 @@ def _create(
     objective: str = "bounded objective",
 ) -> dict[str, object]:
     return service.create(objective, **_request(key=key))  # type: ignore[arg-type]
+
+
+def test_service_probes_the_actual_aros_filesystem_permissions(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    runtime = tmp_path / ".aros"
+    entries_before = set(runtime.iterdir())
+
+    service = TaskService(tmp_path)
+
+    assert service._filesystem_permission_probe == {
+        "requested_mode": 0o600,
+        "observed_mode": 0o600,
+        "device": runtime.stat().st_dev,
+        "enforced": True,
+    }
+    assert service._filesystem_permissions_enforced is True
+    assert set(runtime.iterdir()) == entries_before
+
+
+def test_service_observes_filesystem_permissions_once_per_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    observed_roots: list[Path] = []
+    evidence = _normalized_permission_probe()
+
+    def normalized(root: Path) -> dict[str, object]:
+        observed_roots.append(root)
+        return dict(evidence)
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_probe_filesystem_permissions",
+        normalized,
+        raising=False,
+    )
+
+    first = TaskService(tmp_path)
+    second = TaskService(tmp_path)
+
+    assert observed_roots == [tmp_path / ".aros", tmp_path / ".aros"]
+    assert first._filesystem_permission_probe == evidence
+    assert second._filesystem_permission_probe == evidence
+    assert first._filesystem_permissions_enforced is False
+    assert second._filesystem_permissions_enforced is False
 
 
 def _request_from_brief(brief: dict[str, object]) -> dict[str, object]:
@@ -139,6 +197,10 @@ def _create_terminal_task(
         "security_profile": "trusted-local",
         "isolation_scope": "application",
         "capabilities_enforced": False,
+        "filesystem_permissions_enforced": (
+            service._filesystem_permissions_enforced
+        ),
+        "filesystem_permission_probe": service._filesystem_permission_probe,
         "carrier": "tmux",
         "tmux_session": f"aros-task-{task_id.lower()}",
         "tmux_socket": tasks_module._tmux_socket_name(root, task_id),
@@ -176,6 +238,10 @@ def _create_terminal_task(
         "security_profile": "trusted-local",
         "isolation_scope": "application",
         "capabilities_enforced": False,
+        "filesystem_permissions_enforced": launch[
+            "filesystem_permissions_enforced"
+        ],
+        "filesystem_permission_probe": launch["filesystem_permission_probe"],
         "host": launch["host"],
         "runner_pid": None,
         "runner_pgid": None,
@@ -2588,6 +2654,62 @@ def test_message_appends_a_strict_create_once_hash_chain(tmp_path: Path) -> None
     assert not ({"delivered", "acknowledged", "steered"} & set(second))
 
 
+def test_message_accepts_single_link_mode_normalization_when_unenforced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    evidence = _normalized_permission_probe(
+        device=(tmp_path / ".aros").stat().st_dev
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_probe_filesystem_permissions",
+        lambda _runtime: dict(evidence),
+    )
+    service = TaskService(tmp_path)
+    brief = _create(service, key="normalized-message")
+    task_id = str(brief["task_id"])
+    first = service.message(task_id, "first", "principal")
+    path = (
+        tmp_path
+        / ".aros"
+        / "tasks"
+        / task_id
+        / "messages"
+        / "00000000000000000001.json"
+    )
+    path.chmod(0o666)
+
+    second = service.message(task_id, "second", "principal")
+
+    assert first["message_sha256"] == second["previous_message_sha256"]
+    assert path.lstat().st_nlink == 1
+    assert stat.S_IMODE(path.lstat().st_mode) == 0o666
+
+
+def test_message_rejects_mode_drift_when_permissions_are_enforced(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service, key="strict-message-mode")
+    task_id = str(brief["task_id"])
+    service.message(task_id, "first", "principal")
+    path = (
+        tmp_path
+        / ".aros"
+        / "tasks"
+        / task_id
+        / "messages"
+        / "00000000000000000001.json"
+    )
+    path.chmod(0o666)
+
+    with pytest.raises(TaskError, match="message.*restrictive|permission|mode"):
+        service.message(task_id, "must not append", "principal")
+
+
 def test_concurrent_messages_are_contiguous_and_each_created_once(
     tmp_path: Path,
 ) -> None:
@@ -3335,6 +3457,68 @@ def test_prune_removes_only_the_clean_collected_worktree_and_keeps_git_history(
     assert _git(tmp_path, "cat-file", "-t", return_commit) == "commit"
     assert service.status(task_id) == pruned
     assert service.list() == [pruned]
+
+
+def test_prune_accepts_mode_normalized_intent_and_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = _normalized_permission_probe()
+    monkeypatch.setattr(
+        tasks_module,
+        "_probe_filesystem_permissions",
+        lambda runtime: {
+            **evidence,
+            "device": runtime.stat().st_dev,
+        },
+    )
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    service.collect(task_id)
+    original_create = tasks_module.create_json
+
+    def create_with_normalized_mode(path: Path, value: object) -> bool:
+        created = original_create(path, value)
+        target = Path(path)
+        if created and target.name in {"prune.json", "pruned.json"}:
+            target.chmod(0o666)
+        return created
+
+    monkeypatch.setattr(tasks_module, "create_json", create_with_normalized_mode)
+
+    pruned = service.prune(task_id)
+
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    for name in ("prune.json", "pruned.json"):
+        metadata = (runtime / name).lstat()
+        assert stat.S_ISREG(metadata.st_mode)
+        assert metadata.st_nlink == 1
+        assert stat.S_IMODE(metadata.st_mode) == 0o666
+    assert pruned["state"] == "pruned"
+    assert TaskService(tmp_path).status(task_id) == pruned
+
+
+def test_prune_rejects_mode_drift_when_permissions_are_enforced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    service.collect(task_id)
+
+    def fail_remove(_target: Path) -> None:
+        raise TaskError("injected remove failure")
+
+    monkeypatch.setattr(service, "_remove_task_worktree", fail_remove)
+    with pytest.raises(TaskError, match="injected"):
+        service.prune(task_id)
+    intent_path = tmp_path / ".aros" / "tasks" / task_id / "prune.json"
+    intent_path.chmod(0o666)
+
+    with pytest.raises(TaskError, match="prune intent.*restrictive|permission|mode"):
+        service.status(task_id)
 
 
 def test_prune_is_idempotent_after_success_without_removing_again(

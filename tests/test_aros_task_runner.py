@@ -82,6 +82,15 @@ def _create_committed_task(
     return service, brief
 
 
+def _normalized_permission_probe(runtime: Path) -> dict[str, object]:
+    return {
+        "requested_mode": 0o600,
+        "observed_mode": 0o666,
+        "device": runtime.stat().st_dev,
+        "enforced": False,
+    }
+
+
 def _wait_terminal(
     service: TaskService,
     task_id: str,
@@ -286,6 +295,13 @@ def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
         "security_profile": "trusted-local",
         "isolation_scope": "application",
         "capabilities_enforced": False,
+        "filesystem_permissions_enforced": True,
+        "filesystem_permission_probe": {
+            "requested_mode": 0o600,
+            "observed_mode": 0o600,
+            "device": runtime.stat().st_dev,
+            "enforced": True,
+        },
         "carrier": "tmux",
         "launch_sha256": json_sha256(
             {key: value for key, value in launch.items() if key != "launch_sha256"}
@@ -325,6 +341,10 @@ def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
     assert final["launch_sha256"] == launch["launch_sha256"]
     assert final["exit_code"] == 0
     assert final["state"] == "completed"
+    assert final["filesystem_permissions_enforced"] is True
+    assert final["filesystem_permission_probe"] == launch[
+        "filesystem_permission_probe"
+    ]
     assert final["final_sha256"] == json_sha256(
         {key: value for key, value in final.items() if key != "final_sha256"}
     )
@@ -343,6 +363,81 @@ def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
         metadata = (runtime / name).lstat()
         assert stat.S_ISREG(metadata.st_mode)
         assert stat.S_IMODE(metadata.st_mode) == 0o600
+
+
+def test_normalized_permissions_preserve_fresh_single_link_log_flow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tasks_module,
+        "_probe_filesystem_permissions",
+        _normalized_permission_probe,
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "print('normalized output')"],
+        key="normalized-permission-flow",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    original_run = tasks_module.subprocess.run
+
+    def normalize_before_tmux(
+        command: list[str],
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if "new-session" in command:
+            for name in ("launch.json", "stdout.log", "stderr.log"):
+                (runtime / name).chmod(0o666)
+        return original_run(command, *args, **kwargs)  # type: ignore[return-value]
+
+    monkeypatch.setattr(tasks_module.subprocess, "run", normalize_before_tmux)
+
+    service.start(task_id)
+    terminal = _wait_terminal(service, task_id)
+    assert terminal["state"] == "completed"
+    launch = json.loads((runtime / "launch.json").read_text(encoding="utf-8"))
+    final_path = runtime / "final.json"
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+
+    assert launch["filesystem_permissions_enforced"] is False
+    assert launch["filesystem_permission_probe"] == _normalized_permission_probe(
+        tmp_path / ".aros"
+    )
+    assert final["filesystem_permissions_enforced"] is False
+    assert final["filesystem_permission_probe"] == launch[
+        "filesystem_permission_probe"
+    ]
+    for name in ("launch.json", "stdout.log", "stderr.log"):
+        metadata = (runtime / name).lstat()
+        assert stat.S_ISREG(metadata.st_mode)
+        assert metadata.st_nlink == 1
+        assert stat.S_IMODE(metadata.st_mode) == 0o666
+
+    final_path.chmod(0o666)
+    assert TaskService(tmp_path).status(task_id)["state"] == "completed"
+
+
+@pytest.mark.parametrize("name", ("launch.json", "final.json", "stdout.log"))
+def test_enforced_permissions_reject_runtime_mode_drift(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "print('strict output')"],
+        key=f"strict-runtime-mode-{name}",
+    )
+    task_id = str(brief["task_id"])
+    service.start(task_id)
+    _wait_terminal(service, task_id)
+    path = tmp_path / ".aros" / "tasks" / task_id / name
+    path.chmod(0o666)
+
+    with pytest.raises(TaskError, match="permission|restrictive|mode"):
+        TaskService(tmp_path).status(task_id)
 
 
 def test_tmux_runner_cannot_be_shadowed_by_ambient_cwd_package(
@@ -954,6 +1049,45 @@ def test_preseeded_nonempty_log_is_rejected_before_launch(
     assert not (runtime / "launch.json").exists()
 
 
+@pytest.mark.parametrize("problem", ("symlink", "hardlink", "nonempty"))
+def test_normalized_permissions_still_reject_preexisting_log_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    problem: str,
+) -> None:
+    monkeypatch.setattr(
+        tasks_module,
+        "_probe_filesystem_permissions",
+        _normalized_permission_probe,
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "print('must not run')"],
+        key=f"normalized-preexisting-log-{problem}",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    stdout = runtime / "stdout.log"
+    outside = tmp_path / ".git" / f"outside-{problem}"
+    outside.write_bytes(b"preserve\n" if problem != "hardlink" else b"")
+    outside.chmod(0o666)
+    if problem == "symlink":
+        stdout.symlink_to(outside)
+    elif problem == "hardlink":
+        os.link(outside, stdout)
+    else:
+        stdout.write_bytes(b"forged pre-launch bytes\n")
+        stdout.chmod(0o666)
+
+    with pytest.raises(TaskError, match="exist|log|output|link|plain"):
+        service.start(task_id)
+
+    assert not (runtime / "launch.json").exists()
+    assert outside.read_bytes() == (b"preserve\n" if problem != "hardlink" else b"")
+    if problem == "hardlink":
+        assert stdout.stat().st_nlink == outside.stat().st_nlink == 2
+
+
 def test_preseeded_runner_home_is_rejected_before_tmux_launch(
     tmp_path: Path,
 ) -> None:
@@ -1043,6 +1177,46 @@ def test_rehashed_final_receipt_semantic_tamper_fails_closed(
     atomic_write_json(final_path, final)
 
     with pytest.raises(TaskError, match="exit|process|tim|receipt|state"):
+        TaskService(tmp_path).status(task_id)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("launch_boolean", "launch_probe_relation", "final_probe_copy"),
+)
+def test_rehashed_filesystem_permission_probe_tamper_fails_closed(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "print('permission-bound final')"],
+        key=f"permission-probe-tamper-{tamper}",
+    )
+    task_id = str(brief["task_id"])
+    service.start(task_id)
+    _wait_terminal(service, task_id)
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    if tamper.startswith("launch"):
+        path = runtime / "launch.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if tamper == "launch_boolean":
+            record["filesystem_permissions_enforced"] = False
+        else:
+            record["filesystem_permission_probe"]["observed_mode"] = 0o666
+        record["launch_sha256"] = json_sha256(
+            {key: value for key, value in record.items() if key != "launch_sha256"}
+        )
+    else:
+        path = runtime / "final.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["filesystem_permission_probe"]["device"] += 1
+        record["final_sha256"] = json_sha256(
+            {key: value for key, value in record.items() if key != "final_sha256"}
+        )
+    atomic_write_json(path, record)
+
+    with pytest.raises(TaskError, match="filesystem|permission|probe|lineage"):
         TaskService(tmp_path).status(task_id)
 
 

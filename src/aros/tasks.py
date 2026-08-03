@@ -190,6 +190,13 @@ class TaskService:
         self.root = resolved
         self._git_dir, self._git_common_dir = self._require_git_root()
         self._require_initialized_workspace()
+        self._filesystem_permission_probe = _validate_filesystem_permission_probe(
+            _probe_filesystem_permissions(self.root / ".aros"),
+            "workspace filesystem permission probe",
+        )
+        self._filesystem_permissions_enforced = (
+            self._filesystem_permission_probe["enforced"] is True
+        )
 
     def create(
         self,
@@ -382,6 +389,12 @@ class TaskService:
                     "security_profile": "trusted-local",
                     "isolation_scope": "application",
                     "capabilities_enforced": False,
+                    "filesystem_permissions_enforced": (
+                        self._filesystem_permissions_enforced
+                    ),
+                    "filesystem_permission_probe": dict(
+                        self._filesystem_permission_probe
+                    ),
                     "carrier": "tmux",
                     "tmux_session": session_name,
                     "tmux_socket": socket_name,
@@ -678,7 +691,11 @@ class TaskService:
                 raise TaskError(f"unrecognized task message entry: {path}")
             if path.name != f"{expected_sequence:020d}.json":
                 raise TaskError(f"task message sequence has a gap: {path}")
-            _require_restrictive_plain_file(path, "task message")
+            _require_restrictive_plain_file(
+                path,
+                "task message",
+                permissions_enforced=self._filesystem_permissions_enforced,
+            )
             record = _read_object(path, "task message")
             if (
                 set(record) != _MESSAGE_FIELDS
@@ -890,10 +907,6 @@ class TaskService:
         ownership: dict[str, object],
     ) -> dict[str, object]:
         task_id = str(brief["task_id"])
-        _require_restrictive_plain_file(
-            self._final_path(task_id),
-            "task final receipt",
-        )
         status = self._load_task_status(brief, ownership, check_material=False)
         if status["state"] not in _TERMINAL_STATES:
             raise TaskError(f"task is not terminal for collection: {task_id}")
@@ -975,7 +988,11 @@ class TaskService:
     ) -> dict[str, object]:
         task_id = str(brief["task_id"])
         path = self._prune_path(task_id)
-        _require_restrictive_plain_file(path, "task prune intent")
+        _require_restrictive_plain_file(
+            path,
+            "task prune intent",
+            permissions_enforced=self._filesystem_permissions_enforced,
+        )
         intent = _read_object(path, "task prune intent")
         if (
             set(intent) != _PRUNE_FIELDS
@@ -1056,7 +1073,11 @@ class TaskService:
     ) -> dict[str, object]:
         task_id = str(brief["task_id"])
         path = self._pruned_path(task_id)
-        _require_restrictive_plain_file(path, "task pruned receipt")
+        _require_restrictive_plain_file(
+            path,
+            "task pruned receipt",
+            permissions_enforced=self._filesystem_permissions_enforced,
+        )
         receipt = _read_object(path, "task pruned receipt")
         if (
             set(receipt) != _PRUNED_FIELDS
@@ -1150,11 +1171,6 @@ class TaskService:
         brief: dict[str, object],
     ) -> dict[str, object]:
         task_id = str(brief["task_id"])
-        if _path_exists(self._final_path(task_id)):
-            _require_restrictive_plain_file(
-                self._final_path(task_id),
-                "task final receipt",
-            )
         status = self._status_unlocked(task_id)
         if status["state"] not in _TERMINAL_STATES:
             raise TaskError(f"task is not terminal for collection: {task_id}")
@@ -2026,7 +2042,14 @@ class TaskService:
         runtime: Path,
         *,
         reuse_logs: bool = False,
+        filesystem_permissions_enforced: bool | None = None,
     ) -> None:
+        if filesystem_permissions_enforced is None:
+            filesystem_permissions_enforced = (
+                self._filesystem_permissions_enforced
+            )
+        if type(filesystem_permissions_enforced) is not bool:
+            raise TaskError("invalid task filesystem permission policy")
         _require_plain_directory(runtime, "task runtime directory")
         home = runtime / "home"
         temporary = runtime / "tmp"
@@ -2064,11 +2087,13 @@ class TaskService:
             runtime / "stdout.log",
             "task stdout log",
             allow_existing=reuse_logs,
+            permissions_enforced=filesystem_permissions_enforced,
         )
         _ensure_restrictive_plain_file(
             runtime / "stderr.log",
             "task stderr log",
             allow_existing=reuse_logs,
+            permissions_enforced=filesystem_permissions_enforced,
         )
         _require_absent(runtime / "final.json", "task final receipt")
 
@@ -2826,6 +2851,98 @@ def _record_sha256(record: dict[str, object], hash_field: str) -> str:
         raise TaskError("task execution record must be canonical UTF-8 JSON") from error
 
 
+def _probe_filesystem_permissions(runtime: Path) -> dict[str, object]:
+    _require_plain_directory(runtime, "AROS runtime directory")
+    path = runtime / f".task-permission-probe-{secrets.token_hex(16)}"
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise TaskError(f"unable to create filesystem permission probe: {path}") from error
+    try:
+        created = os.fstat(descriptor)
+    except OSError as error:
+        os.close(descriptor)
+        raise TaskError(f"unable to inspect filesystem permission probe: {path}") from error
+    try:
+        os.fchmod(descriptor, 0o600)
+        observed = os.fstat(descriptor)
+        pathname = path.lstat()
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_size != 0
+            or (observed.st_dev, observed.st_ino)
+            != (pathname.st_dev, pathname.st_ino)
+        ):
+            raise TaskError(f"invalid filesystem permission probe inode: {path}")
+        os.fsync(descriptor)
+        return {
+            "requested_mode": 0o600,
+            "observed_mode": stat.S_IMODE(observed.st_mode),
+            "device": observed.st_dev,
+            "enforced": stat.S_IMODE(observed.st_mode) == 0o600,
+        }
+    except OSError as error:
+        raise TaskError(f"unable to observe filesystem permissions: {path}") from error
+    finally:
+        cleanup_error: BaseException | None = None
+        try:
+            try:
+                current = path.lstat()
+            except FileNotFoundError:
+                current = None
+            if current is not None and (
+                current.st_dev,
+                current.st_ino,
+            ) == (created.st_dev, created.st_ino):
+                path.unlink()
+                _fsync_directory(runtime)
+        except BaseException as error:
+            cleanup_error = error
+        finally:
+            os.close(descriptor)
+        if cleanup_error is not None:
+            raise TaskError(
+                f"unable to remove filesystem permission probe: {path}"
+            ) from cleanup_error
+
+
+def _validate_filesystem_permission_probe(
+    value: object,
+    description: str,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "requested_mode",
+        "observed_mode",
+        "device",
+        "enforced",
+    }:
+        raise TaskError(f"invalid {description}")
+    requested_mode = value.get("requested_mode")
+    observed_mode = value.get("observed_mode")
+    device = value.get("device")
+    enforced = value.get("enforced")
+    if (
+        type(requested_mode) is not int
+        or requested_mode != 0o600
+        or type(observed_mode) is not int
+        or stat.S_IMODE(observed_mode) != observed_mode
+        or type(device) is not int
+        or device < 0
+        or type(enforced) is not bool
+        or enforced != (observed_mode == requested_mode)
+    ):
+        raise TaskError(f"invalid {description}")
+    return dict(value)
+
+
 def _tmux_socket_name(root: Path, task_id: str) -> str:
     digest = hashlib.sha256(f"{root}\0{task_id}".encode("utf-8")).hexdigest()[:20]
     return f"aros-task-{digest}"
@@ -2839,8 +2956,16 @@ def _seconds_since(timestamp: str) -> float:
     return max(0.0, (datetime.now(timezone.utc) - launched).total_seconds())
 
 
-def _file_receipt(path: Path, relative: str) -> dict[str, object]:
+def _file_receipt(
+    path: Path,
+    relative: str,
+    *,
+    permissions_enforced: bool,
+) -> dict[str, object]:
+    if type(permissions_enforced) is not bool:
+        raise TaskError("invalid task filesystem permission policy")
     _require_plain_file(path, "task output log")
+    identity = _plain_file_identity(path, "task output log")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -2853,14 +2978,27 @@ def _file_receipt(path: Path, relative: str) -> dict[str, object]:
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (
+                permissions_enforced
+                and stat.S_IMODE(metadata.st_mode) != 0o600
+            )
+            or (metadata.st_dev, metadata.st_ino) != identity
         ):
             raise TaskError(f"task output log is not a restrictive plain file: {path}")
+        expected_size = metadata.st_size
         os.fsync(descriptor)
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 size += len(chunk)
                 digest.update(chunk)
+        final_metadata = os.fstat(descriptor)
+        if (
+            size != expected_size
+            or final_metadata.st_size != expected_size
+            or (final_metadata.st_dev, final_metadata.st_ino) != identity
+            or _plain_file_identity(path, "task output log") != identity
+        ):
+            raise TaskError(f"task output log changed while reading: {path}")
     except OSError as error:
         raise TaskError(f"unable to read task output log: {path}") from error
     finally:
@@ -3179,13 +3317,22 @@ def _require_plain_file(path: Path, description: str) -> None:
         raise TaskError(f"{description} must be a plain file: {path}")
 
 
-def _require_restrictive_plain_file(path: Path, description: str) -> None:
+def _require_restrictive_plain_file(
+    path: Path,
+    description: str,
+    *,
+    permissions_enforced: bool = True,
+) -> None:
+    if type(permissions_enforced) is not bool:
+        raise TaskError("invalid task filesystem permission policy")
     _require_plain_file(path, description)
     try:
         metadata = path.lstat()
     except OSError as error:
         raise TaskError(f"unable to inspect {description}: {path}") from error
-    if metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
+    if metadata.st_nlink != 1 or (
+        permissions_enforced and stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
         raise TaskError(f"{description} must be a restrictive plain file: {path}")
 
 
@@ -3236,7 +3383,10 @@ def _ensure_restrictive_plain_file(
     description: str,
     *,
     allow_existing: bool = False,
+    permissions_enforced: bool,
 ) -> None:
+    if type(permissions_enforced) is not bool:
+        raise TaskError("invalid task filesystem permission policy")
     _require_plain_directory(path.parent, f"{description} parent")
     flags = (
         os.O_WRONLY
@@ -3260,7 +3410,10 @@ def _ensure_restrictive_plain_file(
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (
+                permissions_enforced
+                and stat.S_IMODE(metadata.st_mode) != 0o600
+            )
             or metadata.st_size != 0
             or (metadata.st_dev, metadata.st_ino)
             != _plain_file_identity(path, description)

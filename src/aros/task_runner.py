@@ -32,7 +32,9 @@ from .tasks import (
     _path_exists,
     _read_object,
     _record_sha256,
+    _require_restrictive_plain_file,
     _tmux_socket_name,
+    _validate_filesystem_permission_probe,
     _validate_hash,
     _validate_text,
     _validate_timestamp,
@@ -108,6 +110,8 @@ _LAUNCH_FIELDS = {
     "security_profile",
     "isolation_scope",
     "capabilities_enforced",
+    "filesystem_permissions_enforced",
+    "filesystem_permission_probe",
     "carrier",
     "tmux_session",
     "tmux_socket",
@@ -128,6 +132,8 @@ _FINAL_FIELDS = {
     "security_profile",
     "isolation_scope",
     "capabilities_enforced",
+    "filesystem_permissions_enforced",
+    "filesystem_permission_probe",
     "host",
     "runner_pid",
     "runner_pgid",
@@ -260,6 +266,21 @@ def load_launch(
         raise TaskError(f"task launch lineage mismatch: {task_id}")
     if launch["launch_sha256"] != _record_sha256(launch, "launch_sha256"):
         raise TaskError(f"task launch hash mismatch: {task_id}")
+    probe = _validate_filesystem_permission_probe(
+        launch["filesystem_permission_probe"],
+        "task launch filesystem permission probe",
+    )
+    permissions_enforced = launch["filesystem_permissions_enforced"]
+    if (
+        type(permissions_enforced) is not bool
+        or permissions_enforced is not probe["enforced"]
+    ):
+        raise TaskError(f"invalid task launch filesystem permission policy: {task_id}")
+    _require_restrictive_plain_file(
+        service._launch_path(task_id),
+        "task launch",
+        permissions_enforced=permissions_enforced,
+    )
     actor = _validate_text(launch["actor"], "task launch actor")
     if actor != launch["actor"] or actor != ownership["actor"]:
         raise TaskError(f"task launch actor mismatch: {task_id}")
@@ -468,7 +489,13 @@ def _validate_process_identity_fields(
             raise TaskError("invalid task adapter process-group identity")
 
 
-def _validate_file_receipt(path: Path, value: object, relative: str) -> None:
+def _validate_file_receipt(
+    path: Path,
+    value: object,
+    relative: str,
+    *,
+    permissions_enforced: bool,
+) -> None:
     if (
         not isinstance(value, dict)
         or set(value) != {"path", "bytes", "sha256"}
@@ -478,7 +505,11 @@ def _validate_file_receipt(path: Path, value: object, relative: str) -> None:
     ):
         raise TaskError(f"invalid task output receipt: {relative}")
     _validate_hash(value.get("sha256"), "task output receipt sha256")
-    if value != _file_receipt(path, relative):
+    if value != _file_receipt(
+        path,
+        relative,
+        permissions_enforced=permissions_enforced,
+    ):
         raise TaskError(f"task output receipt hash or size mismatch: {relative}")
 
 
@@ -494,6 +525,16 @@ def load_final(
         raise TaskError(f"invalid task final receipt schema: {task_id}")
     if final["schema_version"] != 1 or final["task_id"] != task_id:
         raise TaskError(f"task final receipt identity mismatch: {task_id}")
+    probe = _validate_filesystem_permission_probe(
+        final["filesystem_permission_probe"],
+        "task final filesystem permission probe",
+    )
+    permissions_enforced = final["filesystem_permissions_enforced"]
+    if (
+        type(permissions_enforced) is not bool
+        or permissions_enforced is not probe["enforced"]
+    ):
+        raise TaskError(f"invalid task final filesystem permission policy: {task_id}")
     for field in (
         "brief_sha256",
         "ownership_sha256",
@@ -508,11 +549,18 @@ def load_final(
         or final["security_profile"] != launch["security_profile"]
         or final["isolation_scope"] != launch["isolation_scope"]
         or final["capabilities_enforced"] != launch["capabilities_enforced"]
+        or permissions_enforced is not launch["filesystem_permissions_enforced"]
+        or probe != launch["filesystem_permission_probe"]
         or final["host"] != launch["host"]
     ):
         raise TaskError(f"task final receipt lineage mismatch: {task_id}")
     if final["final_sha256"] != _record_sha256(final, "final_sha256"):
         raise TaskError(f"task final receipt hash mismatch: {task_id}")
+    _require_restrictive_plain_file(
+        service._final_path(task_id),
+        "task final receipt",
+        permissions_enforced=permissions_enforced,
+    )
     if final["state"] not in _TERMINAL_STATES:
         raise TaskError(f"invalid task final state: {task_id}")
     _validate_process_identity_fields(final, allow_missing=True)
@@ -623,11 +671,13 @@ def load_final(
         runtime / "stdout.log",
         final["stdout"],
         f".aros/tasks/{task_id}/stdout.log",
+        permissions_enforced=permissions_enforced,
     )
     _validate_file_receipt(
         runtime / "stderr.log",
         final["stderr"],
         f".aros/tasks/{task_id}/stderr.log",
+        permissions_enforced=permissions_enforced,
     )
     return final
 
@@ -1191,6 +1241,9 @@ def _final_record(
     error: str | None,
 ) -> dict[str, object]:
     task_id = str(brief["task_id"])
+    permissions_enforced = launch["filesystem_permissions_enforced"]
+    if type(permissions_enforced) is not bool:
+        raise TaskError(f"invalid task filesystem permission policy: {task_id}")
     finished_at = utc_now()
     final: dict[str, object] = {
         "schema_version": 1,
@@ -1202,6 +1255,8 @@ def _final_record(
         "security_profile": launch["security_profile"],
         "isolation_scope": launch["isolation_scope"],
         "capabilities_enforced": launch["capabilities_enforced"],
+        "filesystem_permissions_enforced": permissions_enforced,
+        "filesystem_permission_probe": launch["filesystem_permission_probe"],
         "host": launch["host"],
         "runner_pid": runner_identity[0],
         "runner_pgid": runner_identity[1],
@@ -1222,10 +1277,12 @@ def _final_record(
         "stdout": _file_receipt(
             runtime / "stdout.log",
             f".aros/tasks/{task_id}/stdout.log",
+            permissions_enforced=permissions_enforced,
         ),
         "stderr": _file_receipt(
             runtime / "stderr.log",
             f".aros/tasks/{task_id}/stderr.log",
+            permissions_enforced=permissions_enforced,
         ),
         "error": error,
     }
@@ -1233,7 +1290,9 @@ def _final_record(
     return final
 
 
-def _open_log(path: Path) -> BinaryIO:
+def _open_log(path: Path, *, permissions_enforced: bool) -> BinaryIO:
+    if type(permissions_enforced) is not bool:
+        raise TaskError("invalid task filesystem permission policy")
     flags = (
         os.O_WRONLY
         | os.O_APPEND
@@ -1250,7 +1309,10 @@ def _open_log(path: Path) -> BinaryIO:
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (
+                permissions_enforced
+                and stat.S_IMODE(metadata.st_mode) != 0o600
+            )
             or metadata.st_size != 0
             or (metadata.st_dev, metadata.st_ino) != (pathname.st_dev, pathname.st_ino)
         ):
@@ -1480,7 +1542,14 @@ def run(workspace: str | Path, task_id: str) -> int:
         if execution is None:
             return 0
         runtime = service._runtime_path(task_id)
-        service._prepare_execution_paths(runtime, reuse_logs=True)
+        permissions_enforced = launch["filesystem_permissions_enforced"]
+        if type(permissions_enforced) is not bool:
+            raise TaskError(f"invalid task filesystem permission policy: {task_id}")
+        service._prepare_execution_paths(
+            runtime,
+            reuse_logs=True,
+            filesystem_permissions_enforced=permissions_enforced,
+        )
         worktree = Path(str(ownership["worktree_path"]))
         environment = adapter_environment(runtime)
         environment.update(
@@ -1496,8 +1565,14 @@ def run(workspace: str | Path, task_id: str) -> int:
         )
         started_at = utc_now()
         started_monotonic = time.monotonic()
-        stdout = _open_log(runtime / "stdout.log")
-        stderr = _open_log(runtime / "stderr.log")
+        stdout = _open_log(
+            runtime / "stdout.log",
+            permissions_enforced=permissions_enforced,
+        )
+        stderr = _open_log(
+            runtime / "stderr.log",
+            permissions_enforced=permissions_enforced,
+        )
         process: subprocess.Popen[bytes] | None = None
         launch_error: Exception | None = None
         identity_error: TaskError | None = None

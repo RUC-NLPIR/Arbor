@@ -2371,6 +2371,104 @@ def test_create_rejects_preexisting_task_directories_before_writing(
     assert not (runtime / "status.json").exists()
 
 
+def test_new_task_id_uses_a_64_bit_lowercase_hex_suffix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    token_sizes: list[int] = []
+
+    def token_hex(size: int) -> str:
+        token_sizes.append(size)
+        return "ab" * size
+
+    monkeypatch.setattr(tasks_module.secrets, "token_hex", token_hex)
+
+    task_id = service._new_task_id("  Keep Random Label  ")
+
+    assert token_sizes == [8]
+    assert re.fullmatch(
+        r"TASK-\d{8}-keep-random-label-[0-9a-f]{16}",
+        task_id,
+    )
+
+
+@pytest.mark.parametrize("kind", ("versioned", "runtime", "staging"))
+def test_create_retries_a_preexisting_candidate_without_changing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    first = "TASK-20260803-bounded-objective-0000000000000001"
+    second = "TASK-20260803-bounded-objective-0000000000000002"
+    if kind == "staging":
+        staging = tmp_path / "tasks" / ".staging"
+        staging.mkdir(parents=True)
+        conflict = staging / first
+        conflict_bytes = b"preserve conflicting task material\n"
+        conflict.write_bytes(conflict_bytes)
+    else:
+        monkeypatch.setattr(service, "_new_task_id", lambda _objective: first)
+        _create(service, key=f"preexisting-{kind}")
+        conflict = (
+            tmp_path / "tasks" / first / "brief.json"
+            if kind == "versioned"
+            else tmp_path / ".aros" / "tasks" / first / "status.json"
+        )
+        conflict_bytes = conflict.read_bytes()
+    task_ids = iter((first, second))
+    monkeypatch.setattr(service, "_new_task_id", lambda _objective: next(task_ids))
+
+    brief = _create(service)
+
+    assert brief["task_id"] == second
+    assert conflict.read_bytes() == conflict_bytes
+    assert (tmp_path / "tasks" / second / "brief.json").is_file()
+    assert (tmp_path / ".aros" / "tasks" / second / "status.json").is_file()
+
+
+def test_create_fails_closed_after_bounded_task_id_conflicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    task_ids = [
+        f"TASK-20260803-bounded-objective-{attempt:016x}"
+        for attempt in range(8)
+    ]
+    staging = tmp_path / "tasks" / ".staging"
+    staging.mkdir(parents=True)
+    conflicts = {
+        staging / task_id: f"conflict {task_id}\n".encode()
+        for task_id in task_ids
+    }
+    for path, content in conflicts.items():
+        path.write_bytes(content)
+    generated: list[str] = []
+    candidates = iter(task_ids)
+
+    def new_task_id(_objective: str) -> str:
+        candidate = next(candidates)
+        generated.append(candidate)
+        return candidate
+
+    monkeypatch.setattr(service, "_new_task_id", new_task_id)
+
+    with pytest.raises(TaskError, match="conflict|unique|allocate"):
+        _create(service)
+
+    assert generated == task_ids
+    assert all(path.read_bytes() == content for path, content in conflicts.items())
+    assert not list((tmp_path / "tasks").glob("TASK-*"))
+    runtime = tmp_path / ".aros" / "tasks"
+    assert not [path for path in runtime.iterdir() if path.name != "idempotency"]
+    assert not list((runtime / "idempotency").iterdir())
+
+
 @pytest.mark.parametrize("kind", ("versioned", "runtime"))
 def test_create_rejects_symlinked_task_directories_without_following_them(
     tmp_path: Path,

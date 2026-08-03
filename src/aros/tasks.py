@@ -293,13 +293,25 @@ class TaskService:
         self._require_git_root()
         if base_commit is None or _COMMIT.fullmatch(base_commit) is None:
             raise TaskError("child tasks require a committed 40-hex Git HEAD")
-        task_id = self._new_task_id(str(request["objective"]))
-        self._validate_task_id(task_id)
-        versioned_directory = self.root / "tasks" / task_id
-        runtime_directory = self.root / ".aros" / "tasks" / task_id
-        staging_directory = (
-            self.root / "tasks" / _TASK_STAGING_DIRECTORY / task_id
-        )
+        for _ in range(8):
+            task_id = self._new_task_id(str(request["objective"]))
+            self._validate_task_id(task_id)
+            versioned_directory = self.root / "tasks" / task_id
+            runtime_directory = self.root / ".aros" / "tasks" / task_id
+            staging_directory = (
+                self.root / "tasks" / _TASK_STAGING_DIRECTORY / task_id
+            )
+            if not any(
+                _path_exists(path)
+                for path in (
+                    versioned_directory,
+                    runtime_directory,
+                    staging_directory,
+                )
+            ):
+                break
+        else:
+            raise TaskError("task ID allocation exhausted after repeated conflicts")
         _require_absent(versioned_directory, "versioned task path")
         _require_absent(runtime_directory, "runtime task path")
         _require_absent(staging_directory, "versioned task staging path")
@@ -2783,7 +2795,7 @@ class TaskService:
     def _new_task_id(self, objective: str) -> str:
         date = datetime.now(timezone.utc).strftime("%Y%m%d")
         label = re.sub(r"[^a-z0-9]+", "-", objective.lower()).strip("-")[:32]
-        return f"TASK-{date}-{label or 'child'}-{secrets.token_hex(2)}"
+        return f"TASK-{date}-{label or 'child'}-{secrets.token_hex(8)}"
 
     def _validate_task_id(self, task_id: str) -> None:
         if not _valid_task_id(task_id):

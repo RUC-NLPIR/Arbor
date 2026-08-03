@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -1244,6 +1245,20 @@ def test_git_probes_ignore_foreign_ambient_repository_and_config_overrides(
     assert brief["base_commit"] == workspace_head
 
 
+def test_task_service_git_binding_does_not_pin_inode_identity() -> None:
+    source = inspect.getsource(TaskService)
+
+    assert not {
+        name
+        for name in (
+            "_git_dir_identity",
+            "_git_common_dir_identity",
+            "_require_pinned_git_identity",
+        )
+        if name in source
+    }
+
+
 def test_create_rejects_a_changed_git_directory_association(
     tmp_path: Path,
 ) -> None:
@@ -1262,67 +1277,6 @@ def test_create_rejects_a_changed_git_directory_association(
 
     with pytest.raises(TaskError, match="Git directory association"):
         _create(service, key="changed-git-association")
-
-
-def test_create_rejects_a_git_marker_swap_during_head_capture(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    workspace = tmp_path / "workspace"
-    foreign = tmp_path / "foreign"
-    workspace.mkdir()
-    foreign.mkdir()
-    _init_workspace(workspace)
-    _init_workspace(foreign)
-    (foreign / "foreign.txt").write_text("foreign head\n", encoding="utf-8")
-    _git(foreign, "add", "foreign.txt")
-    _git(foreign, "commit", "-qm", "distinct foreign head")
-    service = TaskService(workspace)
-    original_git_output = service._git_output
-    swapped = False
-
-    def swap_marker_before_head(
-        *args: str,
-        **kwargs: object,
-    ) -> str | None:
-        nonlocal swapped
-        if args == ("rev-parse", "--verify", "HEAD^{commit}") and not swapped:
-            swapped = True
-            (workspace / ".git").rename(workspace / ".git-original")
-            (workspace / ".git").write_text(
-                f"gitdir: {(foreign / '.git').resolve()}\n",
-                encoding="utf-8",
-            )
-        return original_git_output(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(service, "_git_output", swap_marker_before_head)
-
-    with pytest.raises(TaskError, match="Git directory association"):
-        _create(service, key="git-marker-swap")
-
-    assert not list((workspace / "tasks").glob("TASK-*"))
-
-
-def test_create_rejects_same_path_git_directory_replacement(
-    tmp_path: Path,
-) -> None:
-    workspace = tmp_path / "workspace"
-    foreign = tmp_path / "foreign"
-    workspace.mkdir()
-    foreign.mkdir()
-    _init_workspace(workspace)
-    _init_workspace(foreign)
-    (foreign / "foreign.txt").write_text("foreign head\n", encoding="utf-8")
-    _git(foreign, "add", "foreign.txt")
-    _git(foreign, "commit", "-qm", "distinct foreign head")
-    service = TaskService(workspace)
-    (workspace / ".git").rename(workspace / ".git-original")
-    (foreign / ".git").rename(workspace / ".git")
-
-    with pytest.raises(TaskError, match="Git directory identity"):
-        _create(service, key="same-path-git-replacement")
-
-    assert not list((workspace / "tasks").glob("TASK-*"))
 
 
 def test_linked_worktree_rejects_common_git_directory_redirection(

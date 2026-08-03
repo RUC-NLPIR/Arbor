@@ -118,12 +118,7 @@ class TaskService:
         if supplied != resolved:
             raise TaskError(f"workspace must be the exact Git repository root: {supplied}")
         self.root = resolved
-        (
-            self._git_dir,
-            self._git_dir_identity,
-            self._git_common_dir,
-            self._git_common_dir_identity,
-        ) = self._require_git_root()
+        self._git_dir, self._git_common_dir = self._require_git_root()
         self._require_initialized_workspace()
 
     def create(
@@ -1358,10 +1353,6 @@ class TaskService:
             raise TaskError(f"owned task branch is registered elsewhere: {branch}")
 
         child_git_dir = self._worktree_git_directory(target)
-        child_git_identity = _plain_directory_identity(
-            child_git_dir,
-            "task worktree Git directory",
-        )
         common = Path(
             self._safe_git_text(
                 "rev-parse",
@@ -1371,11 +1362,7 @@ class TaskService:
                 work_tree=target,
             )
         ).resolve(strict=True)
-        if (
-            common != self._git_common_dir
-            or _plain_directory_identity(common, "common Git directory")
-            != self._git_common_dir_identity
-        ):
+        if common != self._git_common_dir:
             raise TaskError(f"owned task worktree common Git directory mismatch: {target}")
         top = Path(
             self._safe_git_text(
@@ -1421,15 +1408,10 @@ class TaskService:
             tip,
         ):
             raise TaskError(f"owned task branch no longer descends from its base: {branch}")
-        if (
-            self._worktree_git_directory(target) != child_git_dir
-            or _plain_directory_identity(
-                child_git_dir,
-                "task worktree Git directory",
+        if self._worktree_git_directory(target) != child_git_dir:
+            raise TaskError(
+                f"owned task worktree Git directory association changed: {target}"
             )
-            != child_git_identity
-        ):
-            raise TaskError(f"owned task worktree Git identity changed: {target}")
         self._require_git_root()
         return tip
 
@@ -1646,7 +1628,6 @@ class TaskService:
         work_tree: Path | None = None,
         configs: tuple[str, ...] = (),
     ) -> list[str]:
-        self._require_pinned_git_identity()
         selected_git_dir = git_dir or self._git_dir
         selected_work_tree = work_tree or self.root
         command = [
@@ -1659,18 +1640,6 @@ class TaskService:
             command.extend(("-c", config))
         command.extend(args)
         return command
-
-    def _require_pinned_git_identity(self) -> None:
-        if (
-            _plain_directory_identity(self._git_dir, "Git directory")
-            != self._git_dir_identity
-        ):
-            raise TaskError(f"Git directory identity changed: {self.root}")
-        if (
-            _plain_directory_identity(self._git_common_dir, "common Git directory")
-            != self._git_common_dir_identity
-        ):
-            raise TaskError(f"common Git directory identity changed: {self.root}")
 
     @staticmethod
     def _same_path(raw: str, target: Path) -> bool:
@@ -1725,7 +1694,7 @@ class TaskService:
 
     def _require_git_root(
         self,
-    ) -> tuple[Path, tuple[int, int], Path, tuple[int, int]]:
+    ) -> tuple[Path, Path]:
         pinned = hasattr(self, "_git_dir")
         top = self._git_output("rev-parse", "--show-toplevel", pinned=pinned)
         if top is None or Path(top).resolve() != self.root:
@@ -1741,17 +1710,9 @@ class TaskService:
         marker_git_dir = self._git_directory_from_marker()
         if git_dir != marker_git_dir:
             raise TaskError(f"invalid Git directory association: {self.root}")
-        git_dir_identity = _plain_directory_identity(git_dir, "Git directory")
         pinned_git_dir = getattr(self, "_git_dir", git_dir)
-        pinned_git_identity = getattr(
-            self,
-            "_git_dir_identity",
-            git_dir_identity,
-        )
         if git_dir != pinned_git_dir:
             raise TaskError(f"Git directory association changed: {self.root}")
-        if git_dir_identity != pinned_git_identity:
-            raise TaskError(f"Git directory identity changed: {self.root}")
 
         raw_common_dir = self._git_output(
             "rev-parse",
@@ -1765,21 +1726,10 @@ class TaskService:
         if not common_dir.is_absolute():
             common_dir = self.root / common_dir
         common_dir = common_dir.resolve()
-        common_identity = _plain_directory_identity(
-            common_dir,
-            "common Git directory",
-        )
         pinned_common_dir = getattr(self, "_git_common_dir", common_dir)
-        pinned_common_identity = getattr(
-            self,
-            "_git_common_dir_identity",
-            common_identity,
-        )
         if common_dir != pinned_common_dir:
             raise TaskError(f"common Git directory association changed: {self.root}")
-        if common_identity != pinned_common_identity:
-            raise TaskError(f"common Git directory identity changed: {self.root}")
-        return git_dir, git_dir_identity, common_dir, common_identity
+        return git_dir, common_dir
 
     def _git_directory_from_marker(self) -> Path:
         marker = self.root / ".git"

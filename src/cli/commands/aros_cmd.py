@@ -281,6 +281,7 @@ def run_stop_command(
     "create",
     cls=_RequireCommandSeparator,
     help="Freeze one immutable task brief without starting it. " + _TASK_TRUST_BOUNDARY,
+    short_help="Freeze one immutable task brief without starting it.",
 )
 def task_create_command(
     adapter_argv: list[str] = typer.Argument(

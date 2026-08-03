@@ -234,7 +234,7 @@ def test_task_help_states_the_trusted_local_boundary(
     result = runner.invoke(aros_cmd.aros_app, args)
 
     assert result.exit_code == 0, result.output
-    help_text = " ".join(result.output.lower().split())
+    help_text = " ".join(result.output.replace("│", " ").lower().split())
     claims = (
         "trusted-local and application-scoped, not a security sandbox",
         "network and shell capability flags are audit declarations and are not enforced",
@@ -242,14 +242,19 @@ def test_task_help_states_the_trusted_local_boundary(
         "daemonizing or new-session descendants that do not drain fail closed as lost "
         "with no terminal receipt",
     )
-    for claim in claims:
-        assert claim in help_text, args
     if has_capability_options:
-        assert "network audit declaration;" in help_text
-        assert "shell audit declaration;" in help_text
-        assert help_text.count("not enforced") == 3
+        for claim in claims:
+            assert claim in help_text, args
+        assert "--network network audit declaration; not enforced." in help_text
+        assert "--shell shell audit declaration; not enforced." in help_text
         assert "authorize network capability" not in help_text
         assert "authorize shell capability" not in help_text
+    else:
+        group_help, command_help = help_text.split("commands", maxsplit=1)
+        for claim in claims:
+            assert claim in group_help
+            assert claim not in command_help
+        assert "create freeze one immutable task brief without starting it." in command_help
 
 
 def test_task_create_requires_double_dash_before_adapter_argv(

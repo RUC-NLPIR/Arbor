@@ -499,6 +499,70 @@ def test_concurrent_start_reattaches_without_a_second_tmux_launch(tmp_path: Path
     assert len(launch_events) == 1
 
 
+def test_repeated_start_reconciles_stale_launched_status_to_lost(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key="stale-repeated-start")
+    run_id = str(manifest["run_id"])
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
+    status.update(
+        {
+            "state": "launched",
+            "actor": "test-principal",
+            "carrier": "tmux",
+            "tmux_session": f"aros-{run_id.lower()}",
+            "host": "test-host",
+            "launch_receipt_sha256": "a" * 64,
+            "launched_at": manifest["created_at"],
+        }
+    )
+    atomic_write_json(runtime / "status.json", status)
+    monkeypatch.setattr("arbor.aros.runs._tmux_session_exists", lambda _name: False)
+
+    repeated = service.start(run_id)
+
+    assert repeated["state"] == "lost"
+    assert repeated["reason"] == "process_absent_without_final_receipt"
+
+
+def test_repeated_start_reconciles_existing_final_before_reattach(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key="completed-repeated-start")
+    run_id = str(manifest["run_id"])
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
+    status.update(
+        {
+            "state": "launched",
+            "launch_receipt_sha256": "a" * 64,
+        }
+    )
+    atomic_write_json(runtime / "status.json", status)
+    atomic_write_json(
+        tmp_path / "runs" / run_id / "final.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "completed",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "launch_receipt_sha256": "a" * 64,
+            "exit_code": 0,
+            "finished_at": manifest["created_at"],
+        },
+    )
+
+    repeated = service.start(run_id)
+
+    assert repeated["state"] == "completed"
+    assert repeated["final_ref"] == f"runs/{run_id}/final.json"
+    assert service.status(run_id, reconcile=False)["state"] == "completed"
+
+
 @pytest.mark.parametrize("operation", ("status", "reconcile"))
 def test_reconcile_waits_for_inflight_launch_lock(tmp_path, monkeypatch, operation):
     _init_clean_repo(tmp_path)

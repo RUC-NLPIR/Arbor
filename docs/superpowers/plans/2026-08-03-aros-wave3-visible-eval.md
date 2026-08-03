@@ -250,9 +250,10 @@ public `status`/`reconcile`. Add
 `test_stop_locked_does_not_reenter_run_flock`, which monkeypatches public
 `reconcile` to raise and proves stop uses the locked helper.
 
-Inside `_start_locked`, use `self.status(run_id, reconcile=False)`. Any method already
-holding the run lock calls `_reconcile_locked`, never recursively acquires a
-second file descriptor. Runner bootstrap stays a strict read.
+At the start of `_start_locked`, call `self._reconcile_locked(run_id)`. Only the
+post-tmux startup polling loop uses `self.status(run_id, reconcile=False)`. Any
+method already holding the run lock calls `_reconcile_locked`, never recursively
+acquires a second file descriptor. Runner bootstrap stays a strict read.
 
 - [ ] **Step 4: Verify GREEN and regressions**
 

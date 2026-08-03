@@ -213,7 +213,7 @@ class RunService:
         manifest: dict[str, object],
         actor: str | None,
     ) -> dict[str, object]:
-        status = self.status(run_id, reconcile=False)
+        status = self._reconcile_locked(run_id)
         if status["state"] != "prepared":
             return status
         self._validate_manifest_against_status(manifest, status)

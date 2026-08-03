@@ -405,6 +405,10 @@ worktrees remain registered.
 All commands used the installed `.venv` executables directly; no `uv` command
 was invoked.
 
+The receipts in this section are historical original-commissioning results for
+code baseline `e4db5f5602fca83dfd3003fc32fd36458feee06c`; they predate the
+post-commission hardening and subreaper containment work recorded below.
+
 ```bash
 .venv/bin/pytest -o addopts= -q \
   tests/test_aros_tasks.py \
@@ -494,8 +498,10 @@ Operations process core, not the Wave 2 security claim.
 The current implementation also uses atomic create-once JSON publication with
 interrupted-alias recovery and durable absolute directory-chain fsync. Worktree
 ownership remains non-expiring; the create-once execution claim is the local
-one-attempt execution lease. These changes were verified at code baseline
-`757dc910b36c6727b2605292238dfa55eccfe57e` before this evidence refresh:
+one-attempt execution lease. The following historical receipt covers the
+pre-containment Wave 2 hardening at code baseline
+`757dc910b36c6727b2605292238dfa55eccfe57e`; it does not verify the follow-up
+containment commits above:
 
 ```text
 Full pytest:                              1133 passed, 6 skipped in 205.58s
@@ -503,4 +509,46 @@ Architecture/public-entry/registry:       226 passed
 Maintained src/tests/scripts Ruff:        All checks passed
 Git diff-check:                           exit 0
 uv.lock comparison:                       unchanged
+```
+
+## Post-containment verification
+
+The following fresh receipts cover exact code baseline
+`254f754a122bcaea6852abc55480eff339cbe889`. They are the current verification
+evidence for the trusted-local live-subreaper boundary; the older receipts above
+remain historical commissioning and pre-containment evidence.
+
+```bash
+.venv/bin/python -m pytest -o addopts= -q
+
+.venv/bin/python -m pytest -o addopts= -q \
+  tests/test_aros_task_runner.py tests/test_aros_tasks.py
+
+.venv/bin/python -m pytest -o addopts= -q \
+  tests/test_aros_architecture_boundary.py \
+  tests/test_aros_public_entry.py \
+  tests/test_document_registry.py
+
+.venv/bin/python -m pytest -o addopts= -q \
+  tests/test_aros_task_tool.py \
+  tests/test_aros_task_cli.py \
+  tests/test_aros_principal.py
+
+.venv/bin/ruff check src tests scripts
+git diff --check
+git diff --quiet -- uv.lock
+git diff --quiet e4db5f5602fca83dfd3003fc32fd36458feee06c -- uv.lock
+```
+
+Receipts:
+
+```text
+Full suite:                              1175 passed, 6 skipped in 251.13s
+Task/runner:                             331 passed in 225.05s
+Architecture/public-entry/registry:      227 passed in 12.45s
+TaskTool/CLI/Principal:                   46 passed in 2.22s
+Maintained src/tests/scripts Ruff:       All checks passed
+Git diff-check:                          exit 0
+Working-tree uv.lock comparison:         unchanged
+Commissioning-baseline uv.lock comparison: unchanged
 ```

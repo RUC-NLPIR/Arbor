@@ -9,7 +9,7 @@ commissioned.
 ## Current position
 
 - Branch: `aros-wave2-child` in `/workspace/Arbor/.worktree/aros-wave2-child`.
-- Code baseline immediately before this checkpoint: `757dc910b36c6727b2605292238dfa55eccfe57e`.
+- Post-containment code baseline: `254f754a122bcaea6852abc55480eff339cbe889`.
 - Wave 2 Tasks 1–6 are implemented, independently reviewed, and commissioned.
 - Registered evidence: `docs/analysis/aros-wave2-child-substrate-smoke.md`.
 - Real commissioning demonstrated concurrent read/write children, launcher-exit
@@ -25,8 +25,21 @@ commissioned.
 - Worktree ownership is non-expiring and can be released only by explicit clean
   prune. The create-once execution claim is the local one-attempt execution
   lease; dead holders become `lost` and never transfer ownership or relaunch.
-- Final Wave 2 verification reached `1133 passed, 6 skipped`; architecture,
-  public-entry, registry, maintained Ruff, diff, and lock gates are green.
+- Task adapters are trusted-local and application-scoped, not a security
+  sandbox. Network and shell capability flags are audit declarations and are
+  not enforced. Secrets and untrusted adapters are unsupported. Daemonizing or
+  new-session descendants that do not drain fail closed as `lost` with no
+  terminal receipt.
+- V1 terminal truth covers the exact PGID plus descendants reparented to the
+  live subreaper. A new-session process that outlives runner death is not
+  claimed contained and cannot justify a clean final receipt or prune.
+  Delegated per-task cgroups belong to the shared Operations process core, not
+  the Wave 2 security claim.
+- Fresh verification at the exact post-containment baseline reached
+  `1175 passed, 6 skipped in 251.13s`; Task/runner reached `331 passed in 225.05s`,
+  architecture/public-entry/registry reached `227 passed in 12.45s`, and
+  TaskTool/CLI/Principal reached `46 passed in 2.22s`. Maintained Ruff, diff,
+  and working-tree/commissioning-baseline lock gates are green.
 
 ## Preserved operational evidence
 
@@ -43,7 +56,10 @@ consolidation.
 
 ## Next obligations
 
-1. Complete the final whole-wave re-review and merge Wave 2 while retaining all
+1. Complete the final whole-wave review and integration while retaining all
    negative and positive receipts.
-2. Continue Eval, Operations/shared process core, semantic K/M/G/Skills,
-   MCP/provider parity, and Arbor retirement waves.
+2. Consolidate Run/Task into the shared Operations process core, including
+   delegated per-task cgroups for runner-death containment, then continue Eval.
+3. Complete the still-open Phase 3 provider profiles, Principal lease, and
+   `child_done` event work, followed by semantic K/M/G/Skills, MCP/provider
+   parity, and Arbor retirement waves.

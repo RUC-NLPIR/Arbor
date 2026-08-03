@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -66,6 +67,75 @@ _STATUS_FIELDS = {
 }
 _READY_STATUS_FIELDS = {*_STATUS_FIELDS, "ownership_sha256"}
 _TERMINAL_STATES = {"completed", "failed_process", "timed_out", "cancelled"}
+_MESSAGE_FIELDS = {
+    "schema_version",
+    "task_id",
+    "sequence",
+    "actor",
+    "text",
+    "created_at",
+    "previous_message_sha256",
+    "message_sha256",
+}
+_MESSAGE_FILENAME = re.compile(r"^[0-9]{20}\.json$")
+_RETURN_FIELDS = {
+    "schema_version",
+    "task_id",
+    "brief_sha256",
+    "base_commit",
+    "child_commit",
+    "summary",
+    "work_performed",
+    "changed_files",
+    "evidence",
+    "deviations",
+    "uncertainty",
+    "follow_up",
+    "return_sha256",
+}
+_COLLECTED_FIELDS = {
+    "schema_version",
+    "task_id",
+    "brief_sha256",
+    "ownership_sha256",
+    "branch_ref",
+    "base_commit",
+    "child_commit",
+    "return_commit",
+    "final_state",
+    "final_sha256",
+    "return",
+    "collected_at",
+    "collected_sha256",
+}
+_PRUNE_FIELDS = {
+    "schema_version",
+    "task_id",
+    "brief_sha256",
+    "ownership_sha256",
+    "collected_sha256",
+    "branch_ref",
+    "return_commit",
+    "worktree_path",
+    "requested_at",
+    "prune_sha256",
+}
+_PRUNED_FIELDS = {
+    "schema_version",
+    "task_id",
+    "state",
+    "brief_sha256",
+    "ownership_sha256",
+    "collected_sha256",
+    "branch_ref",
+    "return_commit",
+    "final_state",
+    "final_sha256",
+    "worktree_path",
+    "removed_at",
+    "prune_sha256",
+    "pruned_sha256",
+}
 _LAUNCH_GRACE_SECONDS = 2.0
 _OWNERSHIP_FIELDS = {
     "schema_version",
@@ -538,9 +608,847 @@ class TaskService:
         deliver_stop(self, task_id)
         return request
 
+    def message(
+        self,
+        task_id: str,
+        message: str,
+        actor: str,
+    ) -> dict[str, object]:
+        """Append one immutable mailbox record without claiming delivery."""
+        self._validate_task_id(task_id)
+        text = _validate_text(message, "message")
+        canonical_actor = _validate_text(actor, "actor")
+        self._ensure_record_roots()
+        publication_lock = self._publication_lock_path()
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                self._reconcile_authoritative_briefs()
+                brief = self._load_brief(task_id)
+                self._load_bound_idempotency_index(brief)
+                messages = self._load_messages(brief)
+                directory = self._messages_path(task_id)
+                if not _path_exists(directory):
+                    _create_plain_directory(directory, "task message directory")
+                sequence = len(messages) + 1
+                record: dict[str, object] = {
+                    "schema_version": 1,
+                    "task_id": task_id,
+                    "sequence": sequence,
+                    "actor": canonical_actor,
+                    "text": text,
+                    "created_at": utc_now(),
+                    "previous_message_sha256": (
+                        messages[-1]["message_sha256"] if messages else None
+                    ),
+                }
+                record["message_sha256"] = _record_sha256(
+                    record,
+                    "message_sha256",
+                )
+                path = directory / f"{sequence:020d}.json"
+                if not create_json(path, record):
+                    raise TaskError(f"task message already exists: {path}")
+                recorded = self._load_messages(brief)
+                if len(recorded) != sequence or recorded[-1] != record:
+                    raise TaskError(f"task message differs after write: {task_id}")
+                return recorded[-1]
+
+    def _load_messages(
+        self,
+        brief: dict[str, object],
+    ) -> list[dict[str, object]]:
+        task_id = str(brief["task_id"])
+        directory = self._messages_path(task_id)
+        if not _path_exists(directory):
+            return []
+        _require_plain_directory(directory, "task message directory")
+        try:
+            paths = sorted(directory.iterdir(), key=lambda path: path.name)
+        except OSError as error:
+            raise TaskError(
+                f"unable to inspect task message directory: {directory}"
+            ) from error
+        messages: list[dict[str, object]] = []
+        previous: str | None = None
+        for expected_sequence, path in enumerate(paths, start=1):
+            if _MESSAGE_FILENAME.fullmatch(path.name) is None:
+                raise TaskError(f"unrecognized task message entry: {path}")
+            if path.name != f"{expected_sequence:020d}.json":
+                raise TaskError(f"task message sequence has a gap: {path}")
+            _require_restrictive_plain_file(path, "task message")
+            record = _read_object(path, "task message")
+            if (
+                set(record) != _MESSAGE_FIELDS
+                or type(record.get("schema_version")) is not int
+                or type(record.get("sequence")) is not int
+            ):
+                raise TaskError(f"invalid task message schema: {path}")
+            if record["schema_version"] != 1:
+                raise TaskError(f"invalid task message schema version: {path}")
+            if record["task_id"] != task_id:
+                raise TaskError(f"task message identity mismatch: {path}")
+            if record["sequence"] != expected_sequence:
+                raise TaskError(f"task message sequence mismatch: {path}")
+            actor = _validate_text(record["actor"], "task message actor")
+            text = _validate_text(record["text"], "task message text")
+            if actor != record["actor"] or text != record["text"]:
+                raise TaskError(f"task message text is not canonical: {path}")
+            _validate_timestamp(record["created_at"], "task message created_at")
+            prior = record["previous_message_sha256"]
+            if previous is None:
+                if prior is not None:
+                    raise TaskError(f"task message chain has an invalid origin: {path}")
+            else:
+                _validate_hash(prior, "task message previous_message_sha256")
+                if prior != previous:
+                    raise TaskError(f"task message chain mismatch: {path}")
+            _validate_hash(record["message_sha256"], "task message message_sha256")
+            if record["message_sha256"] != _record_sha256(
+                record,
+                "message_sha256",
+            ):
+                raise TaskError(f"task message hash mismatch: {path}")
+            previous = str(record["message_sha256"])
+            messages.append(record)
+        return messages
+
+    def collect(self, task_id: str) -> dict[str, object]:
+        """Record reviewed child commit pointers without assimilating them."""
+        self._validate_task_id(task_id)
+        self._ensure_record_roots()
+        publication_lock = self._publication_lock_path()
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                self._reconcile_authoritative_briefs()
+                brief = self._load_brief(task_id)
+                self._load_bound_idempotency_index(brief)
+                collected_path = self._collected_path(task_id)
+                if _path_exists(collected_path):
+                    pruned = _path_exists(self._pruned_path(task_id))
+                    ownership = self._load_ownership(
+                        brief,
+                        check_worktree=not pruned,
+                    )
+                    if pruned:
+                        self._validated_pruned_status(brief, ownership)
+                    return self._load_collected_without_worktree(
+                        brief,
+                        ownership,
+                    )
+                if _path_exists(self._pruned_path(task_id)):
+                    raise TaskError(f"pruned task is missing its collection: {task_id}")
+                snapshot = self._collection_snapshot(brief)
+                if snapshot.get("state") == "completed_no_return":
+                    if _path_exists(collected_path):
+                        raise TaskError(
+                            f"task collection conflicts with missing return: {task_id}"
+                        )
+                    if self._collection_snapshot(brief) != snapshot:
+                        raise TaskError(
+                            f"task collection changed before no-return result: {task_id}"
+                        )
+                    return snapshot
+                collected: dict[str, object] = {
+                    "schema_version": 1,
+                    "task_id": task_id,
+                    "brief_sha256": brief["brief_sha256"],
+                    "ownership_sha256": snapshot["ownership_sha256"],
+                    "branch_ref": snapshot["branch_ref"],
+                    "base_commit": brief["base_commit"],
+                    "child_commit": snapshot["child_commit"],
+                    "return_commit": snapshot["return_commit"],
+                    "final_state": snapshot["final_state"],
+                    "final_sha256": snapshot["final_sha256"],
+                    "return": snapshot["return"],
+                    "collected_at": utc_now(),
+                }
+                collected["collected_sha256"] = _record_sha256(
+                    collected,
+                    "collected_sha256",
+                )
+
+                if self._collection_snapshot(brief) != snapshot:
+                    raise TaskError(
+                        f"task collection changed before publication: {task_id}"
+                    )
+                if not create_json(collected_path, collected):
+                    return self._load_collected(brief, snapshot)
+                recorded = self._load_collected(brief, snapshot)
+                if recorded != collected:
+                    raise TaskError(f"task collection differs after write: {task_id}")
+                return recorded
+
+    def preserve(self, task_id: str) -> dict[str, object]:
+        """Return an owned-worktree snapshot without changing child material."""
+        self._validate_task_id(task_id)
+        self._ensure_record_roots()
+        publication_lock = self._publication_lock_path()
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                self._reconcile_authoritative_briefs()
+                brief = self._load_brief(task_id)
+                self._load_bound_idempotency_index(brief)
+                if _path_exists(self._pruned_path(task_id)):
+                    raise TaskError(f"task worktree is already pruned: {task_id}")
+                ownership = self._load_ownership(brief)
+                head_commit, clean = self._owned_worktree_snapshot(ownership)
+                return {
+                    "schema_version": 1,
+                    "task_id": task_id,
+                    "state": "preserved",
+                    "brief_sha256": brief["brief_sha256"],
+                    "ownership_sha256": ownership["ownership_sha256"],
+                    "actor": ownership["actor"],
+                    "worktree_path": ownership["worktree_path"],
+                    "branch_ref": f"refs/heads/{ownership['branch']}",
+                    "base_commit": brief["base_commit"],
+                    "head_commit": head_commit,
+                    "clean": clean,
+                }
+
+    def prune(self, task_id: str) -> dict[str, object]:
+        """Explicitly remove one clean collected worktree without deleting its branch."""
+        self._validate_task_id(task_id)
+        self._ensure_record_roots()
+        publication_lock = self._publication_lock_path()
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                self._reconcile_authoritative_briefs()
+                brief = self._load_brief(task_id)
+                self._load_bound_idempotency_index(brief)
+                ownership = self._load_ownership(brief, check_worktree=False)
+                if _path_exists(self._pruned_path(task_id)):
+                    return self._validated_pruned_status(brief, ownership)
+                if not _path_exists(self._collected_path(task_id)):
+                    raise TaskError(
+                        f"task must have a strict collection before prune: {task_id}"
+                    )
+
+                if _path_exists(self._prune_path(task_id)):
+                    collected = self._load_collected_without_worktree(
+                        brief,
+                        ownership,
+                    )
+                    intent = self._load_prune_intent(brief, ownership, collected)
+                    state = self._worktree_removal_state(ownership)
+                    if state == "absent":
+                        return self._create_pruned_receipt(
+                            brief,
+                            ownership,
+                            collected,
+                            intent,
+                        )
+                else:
+                    ownership = self._load_ownership(brief)
+                    snapshot = self._collection_snapshot(brief)
+                    collected = self._load_collected(brief, snapshot)
+                    intent = self._create_prune_intent(
+                        brief,
+                        ownership,
+                        collected,
+                    )
+
+                ownership = self._load_ownership(brief)
+                snapshot = self._collection_snapshot(brief)
+                current = self._load_collected(brief, snapshot)
+                if current != collected:
+                    raise TaskError(f"task collection changed before prune: {task_id}")
+                if self._load_prune_intent(brief, ownership, current) != intent:
+                    raise TaskError(
+                        f"task prune intent changed before removal: {task_id}"
+                    )
+                target = Path(str(ownership["worktree_path"]))
+                self._remove_task_worktree(target)
+                if self._worktree_removal_state(ownership) != "absent":
+                    raise TaskError(f"task worktree remains after prune: {task_id}")
+                after = self._load_collected_without_worktree(brief, ownership)
+                if after != collected:
+                    raise TaskError(f"task collection changed during prune: {task_id}")
+                return self._create_pruned_receipt(
+                    brief,
+                    ownership,
+                    after,
+                    intent,
+                )
+
+    def _load_collected_without_worktree(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        _require_restrictive_plain_file(
+            self._final_path(task_id),
+            "task final receipt",
+        )
+        status = self._load_task_status(brief, ownership, check_material=False)
+        if status["state"] not in _TERMINAL_STATES:
+            raise TaskError(f"task is not terminal for prune: {task_id}")
+        launch = self._load_launch(brief, ownership)
+        final = self._load_final(brief, ownership, launch)
+        branch_ref = f"refs/heads/{ownership['branch']}"
+        collected_raw = _read_object(
+            self._collected_path(task_id),
+            "task collection",
+        )
+        return_commit = collected_raw.get("return_commit")
+        if (
+            not isinstance(return_commit, str)
+            or _COMMIT.fullmatch(return_commit) is None
+        ):
+            raise TaskError(f"invalid task collection return commit: {task_id}")
+        branch_tip = self._safe_git_text(
+            "rev-parse",
+            "--verify",
+            f"{branch_ref}^{{commit}}",
+        )
+        if branch_tip != return_commit:
+            raise TaskError(f"task branch changed after collection: {task_id}")
+        reviewed = self._load_reviewed_return(
+            brief,
+            ownership,
+            return_commit=return_commit,
+        )
+        snapshot = {
+            "ownership_sha256": ownership["ownership_sha256"],
+            "branch_ref": branch_ref,
+            "child_commit": reviewed["child_commit"],
+            "return_commit": reviewed["return_commit"],
+            "final_state": final["state"],
+            "final_sha256": final["final_sha256"],
+            "return": reviewed["return"],
+        }
+        return self._load_collected(brief, snapshot)
+
+    def _create_prune_intent(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        collected: dict[str, object],
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        intent: dict[str, object] = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "brief_sha256": brief["brief_sha256"],
+            "ownership_sha256": ownership["ownership_sha256"],
+            "collected_sha256": collected["collected_sha256"],
+            "branch_ref": collected["branch_ref"],
+            "return_commit": collected["return_commit"],
+            "worktree_path": ownership["worktree_path"],
+            "requested_at": utc_now(),
+        }
+        intent["prune_sha256"] = _record_sha256(intent, "prune_sha256")
+        if not create_json(self._prune_path(task_id), intent):
+            return self._load_prune_intent(brief, ownership, collected)
+        recorded = self._load_prune_intent(brief, ownership, collected)
+        if recorded != intent:
+            raise TaskError(f"task prune intent differs after write: {task_id}")
+        return recorded
+
+    def _load_prune_intent(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        collected: dict[str, object],
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        path = self._prune_path(task_id)
+        _require_restrictive_plain_file(path, "task prune intent")
+        intent = _read_object(path, "task prune intent")
+        if (
+            set(intent) != _PRUNE_FIELDS
+            or type(intent.get("schema_version")) is not int
+        ):
+            raise TaskError(f"invalid task prune intent schema: {task_id}")
+        if intent["schema_version"] != 1 or intent["task_id"] != task_id:
+            raise TaskError(f"task prune intent identity mismatch: {task_id}")
+        for field in (
+            "brief_sha256",
+            "ownership_sha256",
+            "collected_sha256",
+            "prune_sha256",
+        ):
+            _validate_hash(intent[field], f"task prune intent {field}")
+        expected = {
+            "brief_sha256": brief["brief_sha256"],
+            "ownership_sha256": ownership["ownership_sha256"],
+            "collected_sha256": collected["collected_sha256"],
+            "branch_ref": collected["branch_ref"],
+            "return_commit": collected["return_commit"],
+            "worktree_path": ownership["worktree_path"],
+        }
+        if any(intent[field] != value for field, value in expected.items()):
+            raise TaskError(f"task prune intent binding mismatch: {task_id}")
+        _validate_timestamp(intent["requested_at"], "task prune requested_at")
+        if intent["prune_sha256"] != _record_sha256(intent, "prune_sha256"):
+            raise TaskError(f"task prune intent hash mismatch: {task_id}")
+        return intent
+
+    def _create_pruned_receipt(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        collected: dict[str, object],
+        intent: dict[str, object],
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        receipt: dict[str, object] = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "state": "pruned",
+            "brief_sha256": brief["brief_sha256"],
+            "ownership_sha256": ownership["ownership_sha256"],
+            "collected_sha256": collected["collected_sha256"],
+            "branch_ref": collected["branch_ref"],
+            "return_commit": collected["return_commit"],
+            "final_state": collected["final_state"],
+            "final_sha256": collected["final_sha256"],
+            "worktree_path": ownership["worktree_path"],
+            "removed_at": utc_now(),
+            "prune_sha256": intent["prune_sha256"],
+        }
+        receipt["pruned_sha256"] = _record_sha256(receipt, "pruned_sha256")
+        if not create_json(self._pruned_path(task_id), receipt):
+            return self._load_pruned_receipt(
+                brief,
+                ownership,
+                collected,
+                intent,
+            )
+        recorded = self._load_pruned_receipt(
+            brief,
+            ownership,
+            collected,
+            intent,
+        )
+        if recorded != receipt:
+            raise TaskError(f"task pruned receipt differs after write: {task_id}")
+        return recorded
+
+    def _load_pruned_receipt(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        collected: dict[str, object],
+        intent: dict[str, object],
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        path = self._pruned_path(task_id)
+        _require_restrictive_plain_file(path, "task pruned receipt")
+        receipt = _read_object(path, "task pruned receipt")
+        if (
+            set(receipt) != _PRUNED_FIELDS
+            or type(receipt.get("schema_version")) is not int
+        ):
+            raise TaskError(f"invalid task pruned receipt schema: {task_id}")
+        if (
+            receipt["schema_version"] != 1
+            or receipt["task_id"] != task_id
+            or receipt["state"] != "pruned"
+        ):
+            raise TaskError(f"task pruned receipt identity mismatch: {task_id}")
+        for field in (
+            "brief_sha256",
+            "ownership_sha256",
+            "collected_sha256",
+            "final_sha256",
+            "prune_sha256",
+            "pruned_sha256",
+        ):
+            _validate_hash(receipt[field], f"task pruned receipt {field}")
+        expected = {
+            "brief_sha256": brief["brief_sha256"],
+            "ownership_sha256": ownership["ownership_sha256"],
+            "collected_sha256": collected["collected_sha256"],
+            "branch_ref": collected["branch_ref"],
+            "return_commit": collected["return_commit"],
+            "final_state": collected["final_state"],
+            "final_sha256": collected["final_sha256"],
+            "worktree_path": ownership["worktree_path"],
+            "prune_sha256": intent["prune_sha256"],
+        }
+        if any(receipt[field] != value for field, value in expected.items()):
+            raise TaskError(f"task pruned receipt binding mismatch: {task_id}")
+        _validate_timestamp(receipt["removed_at"], "task pruned removed_at")
+        if receipt["pruned_sha256"] != _record_sha256(
+            receipt,
+            "pruned_sha256",
+        ):
+            raise TaskError(f"task pruned receipt hash mismatch: {task_id}")
+        return receipt
+
+    def _validated_pruned_status(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+    ) -> dict[str, object]:
+        collected = self._load_collected_without_worktree(brief, ownership)
+        intent = self._load_prune_intent(brief, ownership, collected)
+        receipt = self._load_pruned_receipt(
+            brief,
+            ownership,
+            collected,
+            intent,
+        )
+        if self._worktree_removal_state(ownership) != "absent":
+            raise TaskError(
+                f"pruned task worktree unexpectedly exists: {brief['task_id']}"
+            )
+        return receipt
+
+    def _worktree_removal_state(
+        self,
+        ownership: dict[str, object],
+    ) -> str:
+        target = Path(str(ownership["worktree_path"]))
+        branch_ref = f"refs/heads/{ownership['branch']}"
+        registrations = self._worktree_registrations()
+        path_matches = [
+            item
+            for item in registrations
+            if self._same_path(str(item["worktree"]), target)
+        ]
+        branch_matches = [
+            item for item in registrations if item.get("branch") == branch_ref
+        ]
+        exists = _path_exists(target)
+        if exists and len(path_matches) == 1 and path_matches == branch_matches:
+            return "present"
+        if not exists and not path_matches and not branch_matches:
+            return "absent"
+        raise TaskError(f"task worktree removal state is ambiguous: {target}")
+
+    def _remove_task_worktree(self, target: Path) -> None:
+        result = self._safe_git_result("worktree", "remove", str(target))
+        if result.returncode != 0:
+            raise TaskError(f"unable to prune task worktree: {_git_error(result)}")
+
+    def _collection_snapshot(
+        self,
+        brief: dict[str, object],
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        if _path_exists(self._final_path(task_id)):
+            _require_restrictive_plain_file(
+                self._final_path(task_id),
+                "task final receipt",
+            )
+        status = self._status_unlocked(task_id)
+        if status["state"] not in _TERMINAL_STATES:
+            raise TaskError(f"task is not terminal for collection: {task_id}")
+        ownership = self._load_ownership(brief)
+        launch = self._load_launch(brief, ownership)
+        final = self._load_final(brief, ownership, launch)
+        if status["state"] != final["state"]:
+            raise TaskError(f"task terminal state changed during collection: {task_id}")
+        return_commit = self._require_clean_owned_worktree(ownership)
+        relative = f"tasks/{task_id}/return.json"
+        if (
+            self._safe_git_result(
+                "cat-file",
+                "-e",
+                f"{return_commit}:{relative}",
+            ).returncode
+            != 0
+        ):
+            if final["state"] != "completed":
+                raise TaskError(
+                    f"terminal task requires a valid return for collection: {task_id}"
+                )
+            return {
+                "schema_version": 1,
+                "task_id": task_id,
+                "state": "completed_no_return",
+                "brief_sha256": brief["brief_sha256"],
+                "ownership_sha256": ownership["ownership_sha256"],
+                "branch_ref": f"refs/heads/{ownership['branch']}",
+                "base_commit": brief["base_commit"],
+                "head_commit": return_commit,
+                "final_state": final["state"],
+                "final_sha256": final["final_sha256"],
+            }
+        reviewed = self._load_reviewed_return(
+            brief,
+            ownership,
+            return_commit=return_commit,
+        )
+        return {
+            "ownership_sha256": ownership["ownership_sha256"],
+            "branch_ref": f"refs/heads/{ownership['branch']}",
+            "child_commit": reviewed["child_commit"],
+            "return_commit": reviewed["return_commit"],
+            "final_state": final["state"],
+            "final_sha256": final["final_sha256"],
+            "return": reviewed["return"],
+        }
+
+    def _load_reviewed_return(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        *,
+        return_commit: str | None = None,
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        if return_commit is None:
+            return_commit = self._require_clean_owned_worktree(ownership)
+        parent_line = self._safe_git_text(
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            return_commit,
+        ).split()
+        if len(parent_line) != 2 or parent_line[0] != return_commit:
+            raise TaskError(f"task return HEAD must have exactly one parent: {task_id}")
+        child_commit = parent_line[1]
+        if _COMMIT.fullmatch(child_commit) is None or not self._is_commit(child_commit):
+            raise TaskError(f"task child commit is invalid: {task_id}")
+        base_commit = str(brief["base_commit"])
+        if not self._safe_git_success(
+            "merge-base",
+            "--is-ancestor",
+            base_commit,
+            child_commit,
+        ):
+            raise TaskError(f"task child commit does not descend from base: {task_id}")
+
+        relative = f"tasks/{task_id}/return.json"
+        prior = self._safe_git_result("cat-file", "-e", f"{child_commit}:{relative}")
+        if prior.returncode == 0:
+            raise TaskError(f"task child commit already contains its return: {task_id}")
+        changed_in_return = self._safe_git_bytes(
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            child_commit,
+            return_commit,
+            "--",
+        )
+        if changed_in_return != relative.encode("utf-8") + b"\0":
+            raise TaskError(f"task return commit must change only {relative}")
+        if (
+            self._safe_git_text(
+                "cat-file",
+                "-t",
+                f"{return_commit}:{relative}",
+            )
+            != "blob"
+        ):
+            raise TaskError(f"task return path is not a Git blob: {task_id}")
+        blob = self._safe_git_bytes(
+            "cat-file",
+            "blob",
+            f"{return_commit}:{relative}",
+        )
+        try:
+            value = json.loads(blob.decode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise TaskError(f"unable to read task return blob: {task_id}") from error
+        if not isinstance(value, dict):
+            raise TaskError(f"invalid task return: {task_id}")
+        returned: dict[str, object] = value
+        self._validate_return(
+            returned,
+            brief,
+            child_commit=child_commit,
+        )
+        return {
+            "child_commit": child_commit,
+            "return_commit": return_commit,
+            "return": returned,
+        }
+
+    def _validate_return(
+        self,
+        returned: dict[str, object],
+        brief: dict[str, object],
+        *,
+        child_commit: str,
+    ) -> None:
+        task_id = str(brief["task_id"])
+        if (
+            set(returned) != _RETURN_FIELDS
+            or type(returned.get("schema_version")) is not int
+        ):
+            raise TaskError(f"invalid task return schema: {task_id}")
+        if returned["schema_version"] != 1 or returned["task_id"] != task_id:
+            raise TaskError(f"task return identity mismatch: {task_id}")
+        _validate_hash(returned["brief_sha256"], "task return brief_sha256")
+        if (
+            returned["brief_sha256"] != brief["brief_sha256"]
+            or returned["base_commit"] != brief["base_commit"]
+            or returned["child_commit"] != child_commit
+        ):
+            raise TaskError(f"task return lineage mismatch: {task_id}")
+        summary = _validate_text(returned["summary"], "task return summary")
+        if summary != returned["summary"]:
+            raise TaskError(f"task return summary is not canonical: {task_id}")
+        for field in (
+            "work_performed",
+            "changed_files",
+            "evidence",
+            "deviations",
+            "uncertainty",
+            "follow_up",
+        ):
+            _validate_string_list(returned[field], f"task return {field}")
+        changed_files = self._changed_files(
+            str(brief["base_commit"]),
+            child_commit,
+        )
+        if returned["changed_files"] != changed_files:
+            raise TaskError(f"task return changed_files mismatch: {task_id}")
+        _validate_hash(returned["return_sha256"], "task return return_sha256")
+        if returned["return_sha256"] != _record_sha256(
+            returned,
+            "return_sha256",
+        ):
+            raise TaskError(f"task return hash mismatch: {task_id}")
+
+    def _changed_files(self, base_commit: str, child_commit: str) -> list[str]:
+        raw = self._safe_git_bytes(
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            base_commit,
+            child_commit,
+            "--",
+        )
+        if raw and not raw.endswith(b"\0"):
+            raise TaskError("Git returned an ambiguous changed-files list")
+        encoded = [item for item in raw.split(b"\0") if item]
+        try:
+            return [item.decode("utf-8") for item in sorted(encoded)]
+        except UnicodeError as error:
+            raise TaskError("task changed files must be valid UTF-8") from error
+
+    def _require_clean_owned_worktree(
+        self,
+        ownership: dict[str, object],
+    ) -> str:
+        tip, clean = self._owned_worktree_snapshot(ownership)
+        if not clean:
+            raise TaskError(
+                f"task worktree is not completely clean: {ownership['worktree_path']}"
+            )
+        return tip
+
+    def _owned_worktree_snapshot(
+        self,
+        ownership: dict[str, object],
+    ) -> tuple[str, bool]:
+        target = Path(str(ownership["worktree_path"]))
+        tip = self._validate_worktree(
+            target,
+            str(ownership["branch"]),
+            str(ownership["base_commit"]),
+        )
+        child_git_dir = self._worktree_git_directory(target)
+        dirty = self._safe_git_bytes(
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--ignore-submodules=none",
+            git_dir=child_git_dir,
+            work_tree=target,
+        )
+        index_entries = self._safe_git_bytes(
+            "ls-files",
+            "-v",
+            "-z",
+            git_dir=child_git_dir,
+            work_tree=target,
+        )
+        ambiguous_index = any(
+            record[:1] == b"S" or record[:1].islower()
+            for record in index_entries.split(b"\0")
+            if record
+        )
+        if (
+            self._validate_worktree(
+                target,
+                str(ownership["branch"]),
+                str(ownership["base_commit"]),
+            )
+            != tip
+        ):
+            raise TaskError(
+                f"task worktree HEAD changed while checking clean: {target}"
+            )
+        return tip, not dirty and not ambiguous_index
+
+    def _load_collected(
+        self,
+        brief: dict[str, object],
+        snapshot: dict[str, object],
+    ) -> dict[str, object]:
+        task_id = str(brief["task_id"])
+        path = self._collected_path(task_id)
+        _require_single_link_plain_file(path, "task collection")
+        collected = _read_object(path, "task collection")
+        if (
+            set(collected) != _COLLECTED_FIELDS
+            or type(collected.get("schema_version")) is not int
+        ):
+            raise TaskError(f"invalid task collection schema: {task_id}")
+        if collected["schema_version"] != 1 or collected["task_id"] != task_id:
+            raise TaskError(f"task collection identity mismatch: {task_id}")
+        for field in (
+            "brief_sha256",
+            "ownership_sha256",
+            "final_sha256",
+            "collected_sha256",
+        ):
+            _validate_hash(collected[field], f"task collection {field}")
+        expected = {
+            "brief_sha256": brief["brief_sha256"],
+            "ownership_sha256": snapshot["ownership_sha256"],
+            "branch_ref": snapshot["branch_ref"],
+            "base_commit": brief["base_commit"],
+            "child_commit": snapshot["child_commit"],
+            "return_commit": snapshot["return_commit"],
+            "final_state": snapshot["final_state"],
+            "final_sha256": snapshot["final_sha256"],
+            "return": snapshot["return"],
+        }
+        if any(collected[field] != value for field, value in expected.items()):
+            raise TaskError(f"task collection binding conflict: {task_id}")
+        _validate_timestamp(collected["collected_at"], "task collection collected_at")
+        if collected["collected_sha256"] != _record_sha256(
+            collected,
+            "collected_sha256",
+        ):
+            raise TaskError(f"task collection hash mismatch: {task_id}")
+        return collected
+
     def _status_unlocked(self, task_id: str) -> dict[str, object]:
         brief = self._load_brief(task_id)
         self._load_bound_idempotency_index(brief)
+        if _path_exists(self._pruned_path(task_id)):
+            ownership = self._load_ownership(brief, check_worktree=False)
+            return self._validated_pruned_status(brief, ownership)
         ownership = (
             self._load_ownership(brief)
             if _path_exists(self._ownership_path(task_id))
@@ -741,6 +1649,28 @@ class TaskService:
         index_path = self._idempotency_index_path(key)
         if not _path_exists(index_path):
             create_json(index_path, _idempotency_index(brief, key_digest))
+        if _path_exists(self._pruned_path(task_id)):
+            ownership = self._load_ownership(brief, check_worktree=False)
+            self._validated_pruned_status(brief, ownership)
+            self._load_bound_idempotency_index(brief)
+            return
+        if _path_exists(self._prune_path(task_id)):
+            ownership = self._load_ownership(brief, check_worktree=False)
+            removal_state = self._worktree_removal_state(ownership)
+            collected = self._load_collected_without_worktree(
+                brief,
+                ownership,
+            )
+            intent = self._load_prune_intent(brief, ownership, collected)
+            if removal_state == "absent":
+                self._create_pruned_receipt(
+                    brief,
+                    ownership,
+                    collected,
+                    intent,
+                )
+                self._load_bound_idempotency_index(brief)
+                return
         ownership = (
             self._load_ownership(brief)
             if _path_exists(ownership_path)
@@ -922,6 +1852,8 @@ class TaskService:
     def _load_ownership(
         self,
         brief: dict[str, object],
+        *,
+        check_worktree: bool = True,
     ) -> dict[str, object]:
         task_id = str(brief["task_id"])
         ownership = _read_object(
@@ -963,7 +1895,8 @@ class TaskService:
         )
         if ownership["ownership_sha256"] != _ownership_sha256(ownership):
             raise TaskError(f"task ownership hash mismatch: {task_id}")
-        self._validate_owned_worktree(ownership)
+        if check_worktree:
+            self._validate_owned_worktree(ownership)
         return ownership
 
     def _load_launch(
@@ -1845,6 +2778,19 @@ class TaskService:
     def _stop_result_path(self, task_id: str) -> Path:
         return self._runtime_path(task_id) / "stop-result.json"
 
+    def _messages_path(self, task_id: str) -> Path:
+        return self._runtime_path(task_id) / "messages"
+
+    def _collected_path(self, task_id: str) -> Path:
+        self._validate_task_id(task_id)
+        return self.root / "tasks" / task_id / "collected.json"
+
+    def _prune_path(self, task_id: str) -> Path:
+        return self._runtime_path(task_id) / "prune.json"
+
+    def _pruned_path(self, task_id: str) -> Path:
+        return self._runtime_path(task_id) / "pruned.json"
+
     def _idempotency_index_path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return self.root / ".aros" / "tasks" / "idempotency" / f"{digest}.json"
@@ -2210,6 +3156,26 @@ def _require_plain_file(path: Path, description: str) -> None:
         raise TaskError(f"{description} must be a plain file, not a symlink: {path}")
     if not stat.S_ISREG(mode):
         raise TaskError(f"{description} must be a plain file: {path}")
+
+
+def _require_restrictive_plain_file(path: Path, description: str) -> None:
+    _require_plain_file(path, description)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise TaskError(f"unable to inspect {description}: {path}") from error
+    if metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise TaskError(f"{description} must be a restrictive plain file: {path}")
+
+
+def _require_single_link_plain_file(path: Path, description: str) -> None:
+    _require_plain_file(path, description)
+    try:
+        links = path.lstat().st_nlink
+    except OSError as error:
+        raise TaskError(f"unable to inspect {description}: {path}") from error
+    if links != 1:
+        raise TaskError(f"{description} must be a create-once plain file: {path}")
 
 
 def _ensure_durable_lock_file(path: Path, description: str) -> None:

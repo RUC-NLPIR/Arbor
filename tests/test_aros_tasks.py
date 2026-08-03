@@ -20,7 +20,7 @@ from typing import Callable
 import pytest
 
 import arbor.aros.tasks as tasks_module
-from arbor.aros.store import atomic_write_json, json_sha256
+from arbor.aros.store import atomic_write_json, create_json, json_sha256
 from arbor.aros.tasks import TaskError, TaskService
 from arbor.aros.workspace import init_workspace
 
@@ -105,6 +105,152 @@ def _commit_brief(root: Path, brief: dict[str, object]) -> str:
     _git(root, "add", f"tasks/{task_id}/brief.json")
     _git(root, "commit", "-qm", f"record {task_id}")
     return _git(root, "rev-parse", "HEAD")
+
+
+def _create_terminal_task(
+    root: Path,
+    *,
+    state: str = "completed",
+    mode: str = "write",
+) -> tuple[
+    TaskService,
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    _init_workspace(root)
+    service = TaskService(root)
+    request = _request()
+    request["mode"] = mode
+    brief = service.create("bounded objective", **request)  # type: ignore[arg-type]
+    _commit_brief(root, brief)
+    task_id = str(brief["task_id"])
+    service._ensure_worktree(task_id)
+    runtime = root / ".aros" / "tasks" / task_id
+    ownership = json.loads((runtime / "ownership.json").read_text(encoding="utf-8"))
+    timestamp = str(ownership["acquired_at"])
+    launch: dict[str, object] = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "actor": ownership["actor"],
+        "brief_sha256": brief["brief_sha256"],
+        "ownership_sha256": ownership["ownership_sha256"],
+        "base_commit": brief["base_commit"],
+        "security_profile": "trusted-local",
+        "isolation_scope": "application",
+        "capabilities_enforced": False,
+        "carrier": "tmux",
+        "tmux_session": f"aros-task-{task_id.lower()}",
+        "tmux_socket": tasks_module._tmux_socket_name(root, task_id),
+        "host": tasks_module.socket.gethostname(),
+        "runner_version": 1,
+        "runner_cwd": str(runtime / "home"),
+        "runner_invocation": [
+            sys.executable,
+            "-I",
+            "-c",
+            tasks_module._TASK_RUNNER_BOOTSTRAP,
+            str(runtime / "runner-import"),
+            "--workspace",
+            str(root),
+            "--task-id",
+            task_id,
+        ],
+        "launched_at": timestamp,
+    }
+    launch["launch_sha256"] = json_sha256(launch)
+    assert create_json(runtime / "launch.json", launch)
+    for name in ("stdout.log", "stderr.log"):
+        descriptor = os.open(
+            runtime / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        os.close(descriptor)
+    empty_sha256 = hashlib.sha256(b"").hexdigest()
+    final: dict[str, object] = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "state": state,
+        "brief_sha256": brief["brief_sha256"],
+        "ownership_sha256": ownership["ownership_sha256"],
+        "launch_sha256": launch["launch_sha256"],
+        "security_profile": "trusted-local",
+        "isolation_scope": "application",
+        "capabilities_enforced": False,
+        "host": launch["host"],
+        "runner_pid": None,
+        "runner_pgid": None,
+        "runner_start_token": None,
+        "adapter_pid": None,
+        "adapter_pgid": None,
+        "adapter_start_token": None,
+        "started_at": timestamp,
+        "finished_at": timestamp,
+        "duration_seconds": 0,
+        "exit_code": 0 if state in {"completed", "timed_out"} else 1,
+        "timeout": {
+            "timeout_seconds": brief["timeout_seconds"],
+            "triggered": state == "timed_out",
+        },
+        "stop": None,
+        "signal_sequence": ["TERM"] if state == "timed_out" else [],
+        "stdout": {
+            "path": f".aros/tasks/{task_id}/stdout.log",
+            "bytes": 0,
+            "sha256": empty_sha256,
+        },
+        "stderr": {
+            "path": f".aros/tasks/{task_id}/stderr.log",
+            "bytes": 0,
+            "sha256": empty_sha256,
+        },
+        "error": None,
+    }
+    final["final_sha256"] = json_sha256(final)
+    assert create_json(runtime / "final.json", final)
+    assert service.status(task_id)["state"] == state
+    return service, brief, ownership, final
+
+
+def _commit_child_return(
+    root: Path,
+    brief: dict[str, object],
+    ownership: dict[str, object],
+    *,
+    changed_files: list[str] | None = None,
+) -> tuple[dict[str, object], str, str]:
+    task_id = str(brief["task_id"])
+    worktree = Path(str(ownership["worktree_path"]))
+    changes = ["alpha.txt", "zeta.txt"] if changed_files is None else changed_files
+    for relative in reversed(changes):
+        path = worktree / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"artifact {relative}\n", encoding="utf-8")
+    if changes:
+        _git(worktree, "add", "--", *changes)
+        _git(worktree, "commit", "-qm", "produce child artifacts")
+    child_commit = _git(worktree, "rev-parse", "HEAD")
+    returned: dict[str, object] = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "brief_sha256": brief["brief_sha256"],
+        "base_commit": brief["base_commit"],
+        "child_commit": child_commit,
+        "summary": "Produced deterministic child artifacts.",
+        "work_performed": ["wrote exact artifact files"],
+        "changed_files": sorted(changes, key=lambda item: item.encode("utf-8")),
+        "evidence": ["child commit records the artifact bytes"],
+        "deviations": [],
+        "uncertainty": [],
+        "follow_up": ["principal should inspect before assimilation"],
+    }
+    returned["return_sha256"] = json_sha256(returned)
+    return_path = worktree / "tasks" / task_id / "return.json"
+    return_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(return_path, returned)
+    _git(worktree, "add", "--", f"tasks/{task_id}/return.json")
+    _git(worktree, "commit", "-qm", "record child return")
+    return_commit = _git(worktree, "rev-parse", "HEAD")
+    return returned, child_commit, return_commit
 
 
 @pytest.mark.parametrize("mode", ("read_only", "write"))
@@ -2393,3 +2539,915 @@ def test_list_is_sorted_and_rejects_unrecognized_task_entries(
     (tmp_path / "tasks" / "unrecognized").mkdir()
     with pytest.raises(TaskError, match="unrecognized task entry"):
         service.list()
+
+
+def test_message_appends_a_strict_create_once_hash_chain(tmp_path: Path) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service)
+    task_id = str(brief["task_id"])
+
+    first = service.message(task_id, "  inspect the failing seed  ", "  principal  ")
+    second = service.message(task_id, "record the exact output", "principal")
+
+    messages = tmp_path / ".aros" / "tasks" / task_id / "messages"
+    assert sorted(path.name for path in messages.iterdir()) == [
+        "00000000000000000001.json",
+        "00000000000000000002.json",
+    ]
+    assert first == json.loads(
+        (messages / "00000000000000000001.json").read_text(encoding="utf-8")
+    )
+    assert second == json.loads(
+        (messages / "00000000000000000002.json").read_text(encoding="utf-8")
+    )
+    assert set(first) == {
+        "schema_version",
+        "task_id",
+        "sequence",
+        "actor",
+        "text",
+        "created_at",
+        "previous_message_sha256",
+        "message_sha256",
+    }
+    assert first["schema_version"] == 1
+    assert first["task_id"] == task_id
+    assert first["sequence"] == 1
+    assert first["actor"] == "principal"
+    assert first["text"] == "inspect the failing seed"
+    assert first["previous_message_sha256"] is None
+    assert first["message_sha256"] == json_sha256(
+        {key: value for key, value in first.items() if key != "message_sha256"}
+    )
+    assert second["sequence"] == 2
+    assert second["previous_message_sha256"] == first["message_sha256"]
+    assert second["message_sha256"] == json_sha256(
+        {key: value for key, value in second.items() if key != "message_sha256"}
+    )
+    assert not ({"delivered", "acknowledged", "steered"} & set(second))
+
+
+def test_concurrent_messages_are_contiguous_and_each_created_once(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service)
+    task_id = str(brief["task_id"])
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        records = list(
+            pool.map(
+                lambda number: service.message(
+                    task_id,
+                    f"message {number}",
+                    f"actor-{number}",
+                ),
+                range(24),
+            )
+        )
+
+    ordered = sorted(records, key=lambda record: int(record["sequence"]))
+    assert [record["sequence"] for record in ordered] == list(range(1, 25))
+    assert {record["text"] for record in ordered} == {
+        f"message {number}" for number in range(24)
+    }
+    previous = None
+    for record in ordered:
+        assert record["previous_message_sha256"] == previous
+        previous = record["message_sha256"]
+    message_paths = sorted(
+        (tmp_path / ".aros" / "tasks" / task_id / "messages").iterdir()
+    )
+    assert [path.name for path in message_paths] == [
+        f"{sequence:020d}.json" for sequence in range(1, 25)
+    ]
+
+
+@pytest.mark.parametrize("problem", ("tamper", "gap", "symlink", "unknown"))
+def test_message_rejects_an_ambiguous_existing_chain_without_appending(
+    tmp_path: Path,
+    problem: str,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service)
+    task_id = str(brief["task_id"])
+    service.message(task_id, "first", "principal")
+    messages = tmp_path / ".aros" / "tasks" / task_id / "messages"
+    first = messages / "00000000000000000001.json"
+    if problem == "tamper":
+        record = json.loads(first.read_text(encoding="utf-8"))
+        record["text"] = "changed"
+        atomic_write_json(first, record)
+    elif problem == "gap":
+        first.rename(messages / "00000000000000000002.json")
+    elif problem == "symlink":
+        target = tmp_path / "message-target.json"
+        first.rename(target)
+        first.symlink_to(target)
+    else:
+        (messages / "README").write_text("unknown\n", encoding="utf-8")
+
+    with pytest.raises(TaskError, match="message"):
+        service.message(task_id, "must not append", "principal")
+
+    assert not (messages / "00000000000000000003.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("text", "actor"),
+    (("", "principal"), ("message", "  "), ("\ud800", "principal")),
+)
+def test_message_rejects_noncanonical_external_text_without_creating_a_mailbox(
+    tmp_path: Path,
+    text: str,
+    actor: str,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service)
+    task_id = str(brief["task_id"])
+
+    with pytest.raises(TaskError, match="message|actor|UTF-8"):
+        service.message(task_id, text, actor)
+
+    assert not (tmp_path / ".aros" / "tasks" / task_id / "messages").exists()
+
+
+def test_collect_records_the_reviewed_b_c_r_protocol_without_assimilation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    returned, child_commit, return_commit = _commit_child_return(
+        tmp_path,
+        brief,
+        ownership,
+    )
+    parent_head = _git(tmp_path, "rev-parse", "HEAD")
+    refs_before = _git(tmp_path, "show-ref")
+    semantic_before = {
+        path: (tmp_path / path).read_bytes() for path in ("AROS.md", "memory/NOW.md")
+    }
+    child_return_path = (
+        Path(str(ownership["worktree_path"])) / "tasks" / task_id / "return.json"
+    )
+    original_read_object = tasks_module._read_object
+
+    def reject_mutable_return(path: Path, description: str) -> dict[str, object]:
+        if path == child_return_path:
+            raise AssertionError("collect read mutable child return")
+        return original_read_object(path, description)
+
+    monkeypatch.setattr(tasks_module, "_read_object", reject_mutable_return)
+
+    collected = service.collect(task_id)
+
+    collected_path = tmp_path / "tasks" / task_id / "collected.json"
+    assert collected == json.loads(collected_path.read_text(encoding="utf-8"))
+    assert set(collected) == {
+        "schema_version",
+        "task_id",
+        "brief_sha256",
+        "ownership_sha256",
+        "branch_ref",
+        "base_commit",
+        "child_commit",
+        "return_commit",
+        "final_state",
+        "final_sha256",
+        "return",
+        "collected_at",
+        "collected_sha256",
+    }
+    assert collected["schema_version"] == 1
+    assert collected["task_id"] == task_id
+    assert collected["brief_sha256"] == brief["brief_sha256"]
+    assert collected["ownership_sha256"] == ownership["ownership_sha256"]
+    assert collected["branch_ref"] == f"refs/heads/{ownership['branch']}"
+    assert collected["base_commit"] == brief["base_commit"]
+    assert collected["child_commit"] == child_commit
+    assert collected["return_commit"] == return_commit
+    assert collected["final_state"] == "completed"
+    assert collected["final_sha256"] == final["final_sha256"]
+    assert collected["return"] == returned
+    assert collected["collected_sha256"] == json_sha256(
+        {key: value for key, value in collected.items() if key != "collected_sha256"}
+    )
+    assert "patch" not in collected
+    assert _git(tmp_path, "rev-parse", "HEAD") == parent_head
+    assert _git(tmp_path, "show-ref") == refs_before
+    assert not (tmp_path / "alpha.txt").exists()
+    assert not (tmp_path / "zeta.txt").exists()
+    assert {
+        path: (tmp_path / path).read_bytes() for path in semantic_before
+    } == semantic_before
+    first_identity = collected_path.stat().st_ino
+
+    assert service.collect(task_id) == collected
+    assert collected_path.stat().st_ino == first_identity
+
+
+def test_collect_derives_utf8_byte_sorted_changed_files_from_b_to_c(
+    tmp_path: Path,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    returned, _child_commit, _return_commit = _commit_child_return(
+        tmp_path,
+        brief,
+        ownership,
+        changed_files=["é.txt", "z.txt", "nested/a.txt"],
+    )
+
+    collected = service.collect(task_id)
+
+    assert returned["changed_files"] == ["nested/a.txt", "z.txt", "é.txt"]
+    assert collected["return"]["changed_files"] == returned["changed_files"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize("mutation", ("order", "extra", "missing"))
+def test_collect_rejects_return_changed_files_that_do_not_exactly_match_b_to_c(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    returned, child_commit, _return_commit = _commit_child_return(
+        tmp_path,
+        brief,
+        ownership,
+    )
+    worktree = Path(str(ownership["worktree_path"]))
+    _git(worktree, "reset", "--soft", child_commit)
+    if mutation == "order":
+        returned["changed_files"] = list(reversed(returned["changed_files"]))  # type: ignore[arg-type]
+    elif mutation == "extra":
+        returned["changed_files"] = [*returned["changed_files"], "return.json"]  # type: ignore[misc]
+    else:
+        returned["changed_files"] = returned["changed_files"][:1]  # type: ignore[index]
+    returned["return_sha256"] = json_sha256(
+        {key: value for key, value in returned.items() if key != "return_sha256"}
+    )
+    atomic_write_json(worktree / "tasks" / task_id / "return.json", returned)
+    _git(worktree, "add", "--", f"tasks/{task_id}/return.json")
+    _git(worktree, "commit", "-qm", "record invalid child return")
+
+    with pytest.raises(TaskError, match="changed_files"):
+        service.collect(task_id)
+
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+
+
+def test_collect_returns_deterministic_completed_no_return_without_inventing_one(
+    tmp_path: Path,
+) -> None:
+    service, brief, ownership, final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    worktree = Path(str(ownership["worktree_path"]))
+    (worktree / "artifact.txt").write_text("unreturned artifact\n", encoding="utf-8")
+    _git(worktree, "add", "artifact.txt")
+    _git(worktree, "commit", "-qm", "produce unreturned artifact")
+    head_commit = _git(worktree, "rev-parse", "HEAD")
+
+    result = service.collect(task_id)
+
+    assert result == {
+        "schema_version": 1,
+        "task_id": task_id,
+        "state": "completed_no_return",
+        "brief_sha256": brief["brief_sha256"],
+        "ownership_sha256": ownership["ownership_sha256"],
+        "branch_ref": f"refs/heads/{ownership['branch']}",
+        "base_commit": brief["base_commit"],
+        "head_commit": head_commit,
+        "final_state": "completed",
+        "final_sha256": final["final_sha256"],
+    }
+    assert service.collect(task_id) == result
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+    assert not (worktree / "tasks" / task_id / "return.json").exists()
+
+
+@pytest.mark.parametrize("state", ("failed_process", "timed_out"))
+def test_noncompleted_terminal_task_requires_a_valid_return(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    service, brief, _ownership, _final = _create_terminal_task(
+        tmp_path,
+        state=state,
+    )
+    task_id = str(brief["task_id"])
+
+    with pytest.raises(TaskError, match="return"):
+        service.collect(task_id)
+
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+
+
+@pytest.mark.parametrize("state", ("failed_process", "timed_out"))
+def test_noncompleted_terminal_task_can_collect_an_explicit_valid_return(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    service, brief, ownership, final = _create_terminal_task(
+        tmp_path,
+        state=state,
+    )
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+
+    collected = service.collect(task_id)
+
+    assert collected["final_state"] == state
+    assert collected["final_sha256"] == final["final_sha256"]
+
+
+def test_read_only_task_can_return_without_an_artifact_commit(tmp_path: Path) -> None:
+    service, brief, ownership, _final = _create_terminal_task(
+        tmp_path,
+        mode="read_only",
+    )
+    task_id = str(brief["task_id"])
+    returned, child_commit, return_commit = _commit_child_return(
+        tmp_path,
+        brief,
+        ownership,
+        changed_files=[],
+    )
+
+    collected = service.collect(task_id)
+
+    assert child_commit == brief["base_commit"]
+    assert returned["changed_files"] == []
+    assert collected["child_commit"] == child_commit
+    assert collected["return_commit"] == return_commit
+
+
+def test_collect_rejects_active_and_lost_process_states(tmp_path: Path) -> None:
+    active_root = tmp_path / "active"
+    _init_workspace(active_root)
+    active_service = TaskService(active_root)
+    active_brief = _create(active_service)
+    _commit_brief(active_root, active_brief)
+    active_service._ensure_worktree(str(active_brief["task_id"]))
+
+    with pytest.raises(TaskError, match="not terminal"):
+        active_service.collect(str(active_brief["task_id"]))
+
+    lost_root = tmp_path / "lost"
+    lost_service, lost_brief, _ownership, _final = _create_terminal_task(lost_root)
+    lost_id = str(lost_brief["task_id"])
+    runtime = lost_root / ".aros" / "tasks" / lost_id
+    (runtime / "final.json").unlink()
+    (runtime / "status.json").unlink()
+    launch_path = runtime / "launch.json"
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    launch["launched_at"] = "2000-01-01T00:00:00.000Z"
+    launch["launch_sha256"] = json_sha256(
+        {key: value for key, value in launch.items() if key != "launch_sha256"}
+    )
+    atomic_write_json(launch_path, launch)
+
+    with pytest.raises(TaskError, match="not terminal"):
+        lost_service.collect(lost_id)
+
+
+def test_collect_rejects_a_hardlinked_final_receipt_as_not_create_once(
+    tmp_path: Path,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    final_path = tmp_path / ".aros" / "tasks" / task_id / "final.json"
+    os.link(final_path, tmp_path / "final-alias.json")
+
+    with pytest.raises(TaskError, match="final.*restrictive|create-once"):
+        service.collect(task_id)
+
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("extra_field", "empty_summary", "wrong_list", "hash", "lineage"),
+)
+def test_collect_rejects_a_malformed_or_tampered_return_blob(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    returned, child_commit, _return_commit = _commit_child_return(
+        tmp_path,
+        brief,
+        ownership,
+    )
+    worktree = Path(str(ownership["worktree_path"]))
+    _git(worktree, "reset", "--soft", child_commit)
+    if mutation == "extra_field":
+        returned["unexpected"] = True
+    elif mutation == "empty_summary":
+        returned["summary"] = "  "
+    elif mutation == "wrong_list":
+        returned["evidence"] = "not-a-list"
+    elif mutation == "hash":
+        returned["return_sha256"] = "0" * 64
+    else:
+        returned["child_commit"] = str(brief["base_commit"])
+    if mutation != "hash":
+        returned["return_sha256"] = json_sha256(
+            {key: value for key, value in returned.items() if key != "return_sha256"}
+        )
+    atomic_write_json(worktree / "tasks" / task_id / "return.json", returned)
+    _git(worktree, "add", "--", f"tasks/{task_id}/return.json")
+    _git(worktree, "commit", "-qm", "record malformed child return")
+
+    with pytest.raises(TaskError, match="return"):
+        service.collect(task_id)
+
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+
+
+@pytest.mark.parametrize("topology", ("extra_path", "merge_commit"))
+def test_collect_rejects_a_non_return_only_or_multiparent_r(
+    tmp_path: Path,
+    topology: str,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _returned, child_commit, return_commit = _commit_child_return(
+        tmp_path,
+        brief,
+        ownership,
+    )
+    worktree = Path(str(ownership["worktree_path"]))
+    if topology == "extra_path":
+        _git(worktree, "reset", "--soft", child_commit)
+        (worktree / "extra.txt").write_text("not return metadata\n", encoding="utf-8")
+        _git(
+            worktree,
+            "add",
+            "--",
+            "extra.txt",
+            f"tasks/{task_id}/return.json",
+        )
+        _git(worktree, "commit", "-qm", "return plus extra path")
+    else:
+        branch = str(ownership["branch"])
+        _git(worktree, "checkout", "-qb", "return-side", child_commit)
+        (worktree / "side.txt").write_text("side\n", encoding="utf-8")
+        _git(worktree, "add", "side.txt")
+        _git(worktree, "commit", "-qm", "side parent")
+        _git(worktree, "checkout", "-q", branch)
+        assert _git(worktree, "rev-parse", "HEAD") == return_commit
+        _git(worktree, "merge", "--no-ff", "-qm", "multiparent return", "return-side")
+
+    with pytest.raises(TaskError, match="one parent|only"):
+        service.collect(task_id)
+
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+
+
+@pytest.mark.parametrize("material", ("modified", "staged", "untracked", "ignored"))
+def test_collect_rejects_and_preserves_all_dirty_child_material(
+    tmp_path: Path,
+    material: str,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    worktree = Path(str(ownership["worktree_path"]))
+    if material in {"modified", "staged"}:
+        dirty_path = worktree / "alpha.txt"
+        dirty_path.write_text("dirty tracked bytes\n", encoding="utf-8")
+        if material == "staged":
+            _git(worktree, "add", "alpha.txt")
+    elif material == "untracked":
+        dirty_path = worktree / "untracked.txt"
+        dirty_path.write_text("untracked bytes\n", encoding="utf-8")
+    else:
+        dirty_path = worktree / ".aros" / "ignored.txt"
+        dirty_path.parent.mkdir(parents=True, exist_ok=True)
+        dirty_path.write_text("ignored bytes\n", encoding="utf-8")
+
+    with pytest.raises(TaskError, match="clean"):
+        service.collect(task_id)
+
+    assert dirty_path.exists()
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+
+
+def test_collect_rechecks_terminal_head_and_clean_state_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    worktree = Path(str(ownership["worktree_path"]))
+    original_snapshot = service._collection_snapshot
+    calls = 0
+
+    def race(loaded_brief: dict[str, object]) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            (worktree / "raced.txt").write_text("raced bytes\n", encoding="utf-8")
+        return original_snapshot(loaded_brief)
+
+    monkeypatch.setattr(service, "_collection_snapshot", race)
+
+    with pytest.raises(TaskError, match="clean"):
+        service.collect(task_id)
+
+    assert calls == 2
+    assert (worktree / "raced.txt").exists()
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+
+
+@pytest.mark.parametrize("tamper", ("hash", "valid_conflict", "symlink"))
+def test_existing_collection_rejects_tamper_or_conflict(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    service.collect(task_id)
+    collected_path = tmp_path / "tasks" / task_id / "collected.json"
+    if tamper == "symlink":
+        target = tmp_path / "collected-target.json"
+        collected_path.rename(target)
+        collected_path.symlink_to(target)
+    else:
+        collected = json.loads(collected_path.read_text(encoding="utf-8"))
+        collected["child_commit"] = "0" * 40
+        if tamper == "valid_conflict":
+            collected["collected_sha256"] = json_sha256(
+                {
+                    key: value
+                    for key, value in collected.items()
+                    if key != "collected_sha256"
+                }
+            )
+        atomic_write_json(collected_path, collected)
+
+    with pytest.raises(TaskError, match="collection|symlink|plain file"):
+        service.collect(task_id)
+
+
+def test_existing_collection_rejects_a_hardlink_as_not_create_once(
+    tmp_path: Path,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    service.collect(task_id)
+    collected_path = tmp_path / "tasks" / task_id / "collected.json"
+    os.link(collected_path, tmp_path / "collected-alias.json")
+
+    with pytest.raises(TaskError, match="collection.*plain file|create-once"):
+        service.collect(task_id)
+
+
+def test_existing_valid_collection_is_idempotent_after_child_becomes_dirty(
+    tmp_path: Path,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    collected = service.collect(task_id)
+    worktree = Path(str(ownership["worktree_path"]))
+    dirty = worktree / "after-collection.txt"
+    dirty.write_text("preserve after collection\n", encoding="utf-8")
+
+    assert service.collect(task_id) == collected
+    with pytest.raises(TaskError, match="clean"):
+        service.prune(task_id)
+    assert dirty.is_file()
+
+
+def test_preserve_is_an_idempotent_validated_noop_snapshot(tmp_path: Path) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _returned, _child_commit, return_commit = _commit_child_return(
+        tmp_path,
+        brief,
+        ownership,
+    )
+    service.collect(task_id)
+    worktree = Path(str(ownership["worktree_path"]))
+    parent_head = _git(tmp_path, "rev-parse", "HEAD")
+    refs_before = _git(tmp_path, "show-ref")
+    child_status = _git(worktree, "status", "--porcelain=v1", "--ignored")
+    status_bytes = (tmp_path / ".aros" / "tasks" / task_id / "status.json").read_bytes()
+
+    preserved = service.preserve(task_id)
+
+    assert preserved == {
+        "schema_version": 1,
+        "task_id": task_id,
+        "state": "preserved",
+        "brief_sha256": brief["brief_sha256"],
+        "ownership_sha256": ownership["ownership_sha256"],
+        "actor": ownership["actor"],
+        "worktree_path": str(worktree),
+        "branch_ref": f"refs/heads/{ownership['branch']}",
+        "base_commit": brief["base_commit"],
+        "head_commit": return_commit,
+        "clean": True,
+    }
+    assert service.preserve(task_id) == preserved
+    assert worktree.is_dir()
+    assert _git(worktree, "status", "--porcelain=v1", "--ignored") == child_status
+    assert _git(tmp_path, "rev-parse", "HEAD") == parent_head
+    assert _git(tmp_path, "show-ref") == refs_before
+    assert (
+        tmp_path / ".aros" / "tasks" / task_id / "status.json"
+    ).read_bytes() == status_bytes
+    assert not (tmp_path / ".aros" / "tasks" / task_id / "preserved.json").exists()
+
+
+@pytest.mark.parametrize("material", ("tracked", "untracked", "ignored"))
+def test_preserve_reports_dirty_without_editing_or_removing_it(
+    tmp_path: Path,
+    material: str,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    worktree = Path(str(ownership["worktree_path"]))
+    if material == "tracked":
+        path = worktree / "alpha.txt"
+    elif material == "untracked":
+        path = worktree / "untracked-preserved.txt"
+    else:
+        path = worktree / ".aros" / "ignored-preserved.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{material} must survive\n", encoding="utf-8")
+    before = path.read_bytes()
+
+    preserved = service.preserve(task_id)
+
+    assert preserved["state"] == "preserved"
+    assert preserved["clean"] is False
+    assert path.read_bytes() == before
+    assert worktree.is_dir()
+
+
+def test_prune_removes_only_the_clean_collected_worktree_and_keeps_git_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _returned, child_commit, return_commit = _commit_child_return(
+        tmp_path,
+        brief,
+        ownership,
+    )
+    collected = service.collect(task_id)
+    worktree = Path(str(ownership["worktree_path"]))
+    original_git = service._safe_git_result
+    mutation_calls: list[tuple[str, ...]] = []
+
+    def inspect_git(*args: str, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if args[:2] == ("worktree", "remove") or "delete" in args:
+            mutation_calls.append(args)
+        return original_git(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_safe_git_result", inspect_git)
+
+    pruned = service.prune(task_id)
+
+    assert set(pruned) == {
+        "schema_version",
+        "task_id",
+        "state",
+        "brief_sha256",
+        "ownership_sha256",
+        "collected_sha256",
+        "branch_ref",
+        "return_commit",
+        "final_state",
+        "final_sha256",
+        "worktree_path",
+        "removed_at",
+        "prune_sha256",
+        "pruned_sha256",
+    }
+    assert pruned["schema_version"] == 1
+    assert pruned["task_id"] == task_id
+    assert pruned["state"] == "pruned"
+    assert pruned["brief_sha256"] == brief["brief_sha256"]
+    assert pruned["ownership_sha256"] == ownership["ownership_sha256"]
+    assert pruned["collected_sha256"] == collected["collected_sha256"]
+    assert pruned["branch_ref"] == f"refs/heads/{ownership['branch']}"
+    assert pruned["return_commit"] == return_commit
+    assert pruned["final_state"] == final["state"]
+    assert pruned["final_sha256"] == final["final_sha256"]
+    assert pruned["worktree_path"] == str(worktree)
+    assert pruned["pruned_sha256"] == json_sha256(
+        {key: value for key, value in pruned.items() if key != "pruned_sha256"}
+    )
+    assert mutation_calls == [("worktree", "remove", str(worktree))]
+    assert not worktree.exists()
+    branch_ref = f"refs/heads/{ownership['branch']}"
+    assert _git(tmp_path, "rev-parse", branch_ref) == return_commit
+    assert _git(tmp_path, "cat-file", "-t", child_commit) == "commit"
+    assert _git(tmp_path, "cat-file", "-t", return_commit) == "commit"
+    assert service.status(task_id) == pruned
+    assert service.list() == [pruned]
+
+
+def test_prune_is_idempotent_after_success_without_removing_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    service.collect(task_id)
+    first = service.prune(task_id)
+    receipt_path = tmp_path / ".aros" / "tasks" / task_id / "pruned.json"
+    receipt_inode = receipt_path.stat().st_ino
+    calls: list[tuple[str, ...]] = []
+    original_git = TaskService._safe_git_result
+
+    def inspect_git(
+        self: TaskService,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args[:2] == ("worktree", "remove"):
+            calls.append(args)
+        return original_git(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(TaskService, "_safe_git_result", inspect_git)
+
+    assert TaskService(tmp_path).prune(task_id) == first
+    assert receipt_path.stat().st_ino == receipt_inode
+    assert calls == []
+
+
+def test_existing_collection_remains_idempotently_readable_after_prune(
+    tmp_path: Path,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    collected = service.collect(task_id)
+    service.prune(task_id)
+
+    assert TaskService(tmp_path).collect(task_id) == collected
+
+
+def test_prune_recovers_a_crash_after_git_removed_the_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    service.collect(task_id)
+    worktree = Path(str(ownership["worktree_path"]))
+    original_create = tasks_module.create_json
+
+    class InjectedCrash(RuntimeError):
+        pass
+
+    def crash_before_receipt(path: Path, value: object) -> bool:
+        if Path(path).name == "pruned.json":
+            raise InjectedCrash
+        return original_create(path, value)
+
+    monkeypatch.setattr(tasks_module, "create_json", crash_before_receipt)
+    with pytest.raises(InjectedCrash):
+        service.prune(task_id)
+    monkeypatch.setattr(tasks_module, "create_json", original_create)
+
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    assert (runtime / "prune.json").is_file()
+    assert not (runtime / "pruned.json").exists()
+    assert not worktree.exists()
+
+    recovered = TaskService(tmp_path).prune(task_id)
+
+    assert recovered["state"] == "pruned"
+    assert TaskService(tmp_path).status(task_id) == recovered
+    assert not worktree.exists()
+
+
+def test_status_rejects_a_tampered_persisted_prune_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    service.collect(task_id)
+
+    def fail_remove(_target: Path) -> None:
+        raise TaskError("injected remove failure")
+
+    monkeypatch.setattr(service, "_remove_task_worktree", fail_remove)
+    with pytest.raises(TaskError, match="injected"):
+        service.prune(task_id)
+    intent_path = tmp_path / ".aros" / "tasks" / task_id / "prune.json"
+    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    intent["prune_sha256"] = "0" * 64
+    atomic_write_json(intent_path, intent)
+
+    with pytest.raises(TaskError, match="prune intent"):
+        service.status(task_id)
+
+
+@pytest.mark.parametrize("material", ("modified", "staged", "untracked", "ignored"))
+def test_prune_rejects_and_preserves_every_kind_of_dirty_material(
+    tmp_path: Path,
+    material: str,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    service.collect(task_id)
+    worktree = Path(str(ownership["worktree_path"]))
+    if material in {"modified", "staged"}:
+        path = worktree / "alpha.txt"
+        path.write_text("dirty before prune\n", encoding="utf-8")
+        if material == "staged":
+            _git(worktree, "add", "alpha.txt")
+    elif material == "untracked":
+        path = worktree / "untracked-before-prune.txt"
+        path.write_text("untracked before prune\n", encoding="utf-8")
+    else:
+        path = worktree / ".aros" / "ignored-before-prune.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ignored before prune\n", encoding="utf-8")
+
+    with pytest.raises(TaskError, match="clean"):
+        service.prune(task_id)
+
+    assert path.exists()
+    assert worktree.is_dir()
+    assert not (tmp_path / ".aros" / "tasks" / task_id / "pruned.json").exists()
+
+
+def test_prune_requires_collection_and_an_unchanged_return_head(
+    tmp_path: Path,
+) -> None:
+    uncollected_root = tmp_path / "uncollected"
+    service, brief, ownership, _final = _create_terminal_task(uncollected_root)
+    task_id = str(brief["task_id"])
+    _commit_child_return(uncollected_root, brief, ownership)
+    worktree = Path(str(ownership["worktree_path"]))
+
+    with pytest.raises(TaskError, match="collect"):
+        service.prune(task_id)
+    assert worktree.is_dir()
+
+    moved_root = tmp_path / "advanced"
+    service, brief, ownership, _final = _create_terminal_task(moved_root)
+    task_id = str(brief["task_id"])
+    _commit_child_return(moved_root, brief, ownership)
+    service.collect(task_id)
+    worktree = Path(str(ownership["worktree_path"]))
+    (worktree / "advanced.txt").write_text("advance branch\n", encoding="utf-8")
+    _git(worktree, "add", "advanced.txt")
+    _git(worktree, "commit", "-qm", "advance after collection")
+
+    with pytest.raises(TaskError, match="collection|return|HEAD|branch"):
+        service.prune(task_id)
+    assert worktree.is_dir()
+
+
+@pytest.mark.parametrize("problem", ("half_missing", "moved", "symlink"))
+def test_prune_rejects_half_missing_moved_or_symlinked_ownership(
+    tmp_path: Path,
+    problem: str,
+) -> None:
+    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    task_id = str(brief["task_id"])
+    _commit_child_return(tmp_path, brief, ownership)
+    service.collect(task_id)
+    worktree = Path(str(ownership["worktree_path"]))
+    if problem == "half_missing":
+        _git(tmp_path, "worktree", "remove", str(worktree))
+        preserved = None
+    else:
+        preserved = tmp_path / f"preserved-{problem}"
+        worktree.rename(preserved)
+        if problem == "symlink":
+            worktree.symlink_to(preserved, target_is_directory=True)
+
+    with pytest.raises(TaskError, match="worktree|symlink|prune"):
+        service.prune(task_id)
+
+    if preserved is not None:
+        assert preserved.is_dir()
+    assert not (tmp_path / ".aros" / "tasks" / task_id / "pruned.json").exists()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import sys
 from itertools import product
 
 import pytest
@@ -412,6 +413,54 @@ def test_visible_manifest_accepts_direct_declared_apparatus_entry() -> None:
 
     assert parse_visible_manifest(manifest)["scorer_argv"] == [
         "../apparatus/evaluation/score.py"
+    ]
+
+
+def test_visible_manifest_rejects_untrusted_launcher() -> None:
+    manifest = _visible_manifest()
+    manifest["scorer_argv"] = [
+        "./untrusted.py",
+        "../apparatus/evaluation/score.py",
+    ]
+
+    with pytest.raises(ValueError):
+        parse_visible_manifest(manifest)
+
+
+def test_visible_manifest_rejects_normalized_undeclared_apparatus_path() -> None:
+    manifest = _visible_manifest()
+    manifest["scorer_argv"] = [
+        "python",
+        "../apparatus/evaluation/score.py",
+        "./../apparatus/undeclared.py",
+    ]
+
+    with pytest.raises(ValueError):
+        parse_visible_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    ("python", "python3", "bash", "sh", sys.executable),
+)
+def test_visible_manifest_accepts_fixed_launcher(launcher: str) -> None:
+    manifest = _visible_manifest()
+    manifest["scorer_argv"] = [
+        launcher,
+        "../apparatus/evaluation/score.py",
+    ]
+
+    assert parse_visible_manifest(manifest)["scorer_argv"] == manifest[
+        "scorer_argv"
+    ]
+
+
+def test_visible_manifest_accepts_normalized_direct_apparatus_entry() -> None:
+    manifest = _visible_manifest()
+    manifest["scorer_argv"] = ["./../apparatus/evaluation/score.py"]
+
+    assert parse_visible_manifest(manifest)["scorer_argv"] == [
+        "./../apparatus/evaluation/score.py"
     ]
 
 

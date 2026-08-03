@@ -7,6 +7,7 @@ import json
 import math
 import posixpath
 import re
+import sys
 from datetime import datetime
 from pathlib import PurePosixPath
 
@@ -20,6 +21,7 @@ _MAX_NUMBER_TOKEN = 128
 _MAX_RECORD_BYTES = 1024 * 1024
 _MAX_RECORD_DEPTH = 64
 _MAX_RECORD_NODES = 10_000
+_SCORER_LAUNCHERS = {"python", "python3", "bash", "sh", sys.executable}
 _METRIC_FIELDS = {"schema_version", "metric", "sample_count"}
 
 
@@ -239,6 +241,12 @@ def parse_visible_manifest(value: object) -> dict[str, object]:
         scorer_argv.append(argument)
     scorer_cwd = _relative_path(value["scorer_cwd"], "scorer_cwd", allow_dot=True)
     scorer_start = posixpath.join("candidate", scorer_cwd)
+    normalized_argv = [
+        posixpath.normpath(argument)
+        if "/" in argument or argument.startswith(".")
+        else argument
+        for argument in scorer_argv
+    ]
     apparatus_arguments = {
         posixpath.relpath(posixpath.join("apparatus", str(item["path"])), scorer_start)
         for item in apparatus_paths
@@ -246,17 +254,17 @@ def parse_visible_manifest(value: object) -> dict[str, object]:
     apparatus_root = posixpath.relpath("apparatus", scorer_start)
     explicit_apparatus_arguments = {
         argument
-        for argument in scorer_argv
+        for argument in normalized_argv
         if argument == apparatus_root
         or argument.startswith(f"{apparatus_root}/")
     }
     if not explicit_apparatus_arguments.issubset(apparatus_arguments):
         raise ValueError("scorer_argv references an undeclared apparatus path")
-    direct_entry = scorer_argv[0] in apparatus_arguments
+    direct_entry = normalized_argv[0] in apparatus_arguments
     launched_entry = (
-        len(scorer_argv) > 1
-        and scorer_argv[0] not in explicit_apparatus_arguments
-        and scorer_argv[1] in apparatus_arguments
+        len(normalized_argv) > 1
+        and scorer_argv[0] in _SCORER_LAUNCHERS
+        and normalized_argv[1] in apparatus_arguments
     )
     if not direct_entry and not launched_entry:
         raise ValueError("scorer_argv must execute one declared apparatus entry")

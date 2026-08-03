@@ -1349,7 +1349,6 @@ class TaskService:
         base_commit: str,
     ) -> None:
         self._require_new_checkout_metadata(target, branch, base_commit)
-        self._verify_checkout_bytes(target, base_commit, strict=True)
         self._require_new_checkout_metadata(target, branch, base_commit)
 
     def _require_new_checkout_metadata(
@@ -1507,77 +1506,6 @@ class TaskService:
             raise TaskError(f"owned task worktree Git identity changed: {target}")
         self._require_git_root()
         return tip
-
-    def _verify_checkout_bytes(
-        self,
-        target: Path,
-        commit: str,
-        *,
-        strict: bool = False,
-    ) -> None:
-        entries = self._safe_git_bytes(
-            "ls-tree",
-            "-r",
-            "-z",
-            "--full-tree",
-            commit,
-        )
-        for record in entries.split(b"\0"):
-            if not record:
-                continue
-            header, separator, raw_path = record.partition(b"\t")
-            if not separator:
-                raise TaskError("invalid Git tree entry while verifying checkout")
-            try:
-                mode, kind, object_id = header.split(b" ", 2)
-            except ValueError as error:
-                raise TaskError(
-                    "invalid Git tree entry while verifying checkout"
-                ) from error
-            relative = Path(os.fsdecode(raw_path))
-            if relative.is_absolute() or ".." in relative.parts:
-                raise TaskError("unsafe Git tree path while verifying checkout")
-            path = target / relative
-            if kind == b"commit" and mode == b"160000":
-                continue
-            if kind == b"blob" and mode in {b"100644", b"100755"}:
-                blob = self._safe_git_bytes(
-                    "cat-file",
-                    "blob",
-                    os.fsdecode(object_id),
-                )
-                actual = _read_plain_bytes(path, "task checkout file")
-                if strict:
-                    metadata = path.lstat()
-                    if metadata.st_nlink != 1:
-                        raise TaskError(
-                            f"new task checkout file has unsafe hardlinks: {relative}"
-                        )
-                    expected_executable = mode == b"100755"
-                    actual_executable = bool(metadata.st_mode & 0o111)
-                    if actual_executable != expected_executable:
-                        raise TaskError(
-                            f"new task checkout executable mode mismatch: {relative}"
-                        )
-            elif kind == b"blob" and mode == b"120000":
-                blob = self._safe_git_bytes(
-                    "cat-file",
-                    "blob",
-                    os.fsdecode(object_id),
-                )
-                try:
-                    metadata = path.lstat()
-                    actual = os.fsencode(os.readlink(path))
-                except OSError as error:
-                    raise TaskError(f"unable to verify checkout symlink: {path}") from error
-                if not stat.S_ISLNK(metadata.st_mode):
-                    raise TaskError(f"task checkout entry is not a symlink: {path}")
-            else:
-                raise TaskError("unsupported Git tree entry while verifying checkout")
-            if actual != blob:
-                raise TaskError(
-                    f"task checkout bytes differ from repository blob: {relative}"
-                )
 
     def _worktree_git_directory(self, target: Path) -> Path:
         marker = target / ".git"

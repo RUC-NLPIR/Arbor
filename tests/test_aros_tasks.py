@@ -951,7 +951,7 @@ def test_partial_start_with_valid_ownership_recovers_worktree_ready(
 
 @pytest.mark.parametrize(
     "mutation",
-    ("commit", "untracked", "staged", "ignored", "mode", "hardlink"),
+    ("commit", "untracked", "staged", "ignored", "mode"),
 )
 def test_start_never_promotes_a_racy_new_checkout(
     tmp_path: Path,
@@ -995,11 +995,6 @@ def test_start_never_promotes_a_racy_new_checkout(
                 ignored.write_text("preserve\n", encoding="utf-8")
             elif mutation == "mode":
                 (worktree / "README.md").chmod(0o755)
-            else:
-                os.link(
-                    worktree / "README.md",
-                    tmp_path / ".git" / "race-hardlink",
-                )
         return original_create_json(path, value)
 
     monkeypatch.setattr(tasks_module, "create_json", mutate_before_ownership)
@@ -1029,9 +1024,6 @@ def test_start_never_promotes_a_racy_new_checkout(
         assert (worktree / ".worktree" / "race-ignored.txt").is_file()
     elif mutation == "mode":
         assert (worktree / "README.md").stat().st_mode & 0o111
-    else:
-        assert (tmp_path / ".git" / "race-hardlink").is_file()
-        assert (worktree / "README.md").stat().st_nlink == 2
 
 
 @pytest.mark.parametrize("status_state", ("missing", "prepared"))
@@ -1176,68 +1168,28 @@ def test_start_disables_real_post_checkout_and_filter_commands(
     assert all(not marker.exists() for marker in markers.values())
 
 
-def test_start_fails_closed_if_checkout_bytes_differ_from_repository_blob(
-    tmp_path: Path,
-) -> None:
+def test_start_accepts_clean_git_native_eol_checkout(tmp_path: Path) -> None:
     _init_workspace(tmp_path)
-    (tmp_path / "payload.txt").write_bytes(b"repository bytes\n")
+    tracked = tmp_path / "native-eol.txt"
+    tracked.write_bytes(b"line-one\nline-two\n")
     (tmp_path / ".gitattributes").write_text(
-        "payload.txt eol=crlf\n",
+        "native-eol.txt text eol=crlf\n",
         encoding="utf-8",
     )
-    _git(tmp_path, "add", ".gitattributes", "payload.txt")
-    _git(tmp_path, "commit", "-qm", "require checkout conversion")
+    _git(tmp_path, "add", ".gitattributes", "native-eol.txt")
+    _git(tmp_path, "commit", "-qm", "add Git-native EOL checkout")
     service = TaskService(tmp_path)
-    brief = _create(service, key="checkout-byte-mismatch")
-    task_id = str(brief["task_id"])
-    _commit_brief(tmp_path, brief)
-
-    with pytest.raises(TaskError, match="checkout.*bytes|repository blob"):
-        service._ensure_worktree(task_id)
-
-    checkout = tmp_path / ".worktree" / "tasks" / task_id
-    assert (checkout / "payload.txt").read_bytes() == b"repository bytes\r\n"
-    assert not (tmp_path / ".aros" / "tasks" / task_id / "ownership.json").exists()
-
-
-def test_start_supports_a_local_gitlink_without_reading_it_as_a_blob(
-    tmp_path: Path,
-) -> None:
-    _init_workspace(tmp_path)
-    source = tmp_path / ".git" / "local-submodule-source"
-    subprocess.run(["git", "init", "-q", str(source)], check=True)
-    _git(source, "config", "user.email", "aros@example.invalid")
-    _git(source, "config", "user.name", "AROS test")
-    (source / "data.txt").write_text("local submodule\n", encoding="utf-8")
-    _git(source, "add", "data.txt")
-    _git(source, "commit", "-qm", "local submodule state")
-    _git(
-        tmp_path,
-        "-c",
-        "protocol.file.allow=always",
-        "submodule",
-        "add",
-        "-q",
-        str(source),
-        "vendor/submodule",
-    )
-    _git(tmp_path, "commit", "-qam", "add local gitlink")
-    base_commit = _git(tmp_path, "rev-parse", "HEAD")
-    service = TaskService(tmp_path)
-    brief = _create(service, key="local-gitlink")
+    brief = _create(service, key="git-native-eol")
     task_id = str(brief["task_id"])
     _commit_brief(tmp_path, brief)
 
     status = service._ensure_worktree(task_id)
 
+    child = tmp_path / ".worktree" / "tasks" / task_id
+    checked_out = child / "native-eol.txt"
     assert status["state"] == "worktree_ready"
-    tree_entry = _git(
-        tmp_path,
-        "ls-tree",
-        base_commit,
-        "vendor/submodule",
-    )
-    assert tree_entry.startswith("160000 commit ")
+    assert checked_out.read_bytes() == b"line-one\r\nline-two\r\n"
+    assert _git(child, "status", "--porcelain=v1", "--untracked-files=all") == ""
 
 
 def test_start_git_commands_are_scrubbed_pinned_and_nondestructive(

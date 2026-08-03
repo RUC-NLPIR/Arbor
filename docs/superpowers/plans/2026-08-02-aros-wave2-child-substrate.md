@@ -97,6 +97,7 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
   - tmux is carrier only;
   - runner executes exact adapter argv in task worktree with scrubbed environment;
   - runner injects exact AROS_TASK_ID, AROS_TASK_BRIEF, AROS_TASK_WORKTREE, AROS_TASK_BASE_COMMIT, and AROS_TASK_BRIEF_SHA256 bindings; ambient values cannot override them;
+  - launch/final record whether the workspace filesystem enforces mode 0600; trusted-local may proceed with false while preserving O_EXCL/no-follow/single-link/fd-bound integrity, but protected execution must fail closed;
   - runtime records PID, PGID, start token, host, started_at, heartbeat;
   - timeout and attributed stop terminate/reap process group;
   - Principal/CLI exit does not terminate child;

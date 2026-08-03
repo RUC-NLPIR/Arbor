@@ -96,6 +96,7 @@ git -c user.name="AROS Agent" -c user.email="aros@local.invalid" \
   - public start composes an internal ensure-worktree step with the task's sole launch attempt; ensure-worktree is not a separate public system call;
   - tmux is carrier only;
   - runner executes exact adapter argv in task worktree with scrubbed environment;
+  - runner injects exact AROS_TASK_ID, AROS_TASK_BRIEF, AROS_TASK_WORKTREE, AROS_TASK_BASE_COMMIT, and AROS_TASK_BRIEF_SHA256 bindings; ambient values cannot override them;
   - runtime records PID, PGID, start token, host, started_at, heartbeat;
   - timeout and attributed stop terminate/reap process group;
   - Principal/CLI exit does not terminate child;

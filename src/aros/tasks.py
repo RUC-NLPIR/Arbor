@@ -2902,6 +2902,7 @@ def _probe_filesystem_permissions(runtime: Path) -> dict[str, object]:
         return {
             "requested_mode": 0o600,
             "observed_mode": stat.S_IMODE(observed.st_mode),
+            "mode_request_supported": mode_supported,
             "device": observed.st_dev,
             "enforced": mode_supported and stat.S_IMODE(observed.st_mode) == 0o600,
         }
@@ -2937,12 +2938,14 @@ def _validate_filesystem_permission_probe(
     if not isinstance(value, dict) or set(value) != {
         "requested_mode",
         "observed_mode",
+        "mode_request_supported",
         "device",
         "enforced",
     }:
         raise TaskError(f"invalid {description}")
     requested_mode = value.get("requested_mode")
     observed_mode = value.get("observed_mode")
+    mode_request_supported = value.get("mode_request_supported")
     device = value.get("device")
     enforced = value.get("enforced")
     if (
@@ -2950,10 +2953,12 @@ def _validate_filesystem_permission_probe(
         or requested_mode != 0o600
         or type(observed_mode) is not int
         or stat.S_IMODE(observed_mode) != observed_mode
+        or type(mode_request_supported) is not bool
         or type(device) is not int
         or device < 0
         or type(enforced) is not bool
-        or enforced != (observed_mode == requested_mode)
+        or enforced
+        != (mode_request_supported and observed_mode == requested_mode)
     ):
         raise TaskError(f"invalid {description}")
     return dict(value)

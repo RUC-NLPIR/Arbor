@@ -73,6 +73,7 @@ def _normalized_permission_probe(*, device: int = 57) -> dict[str, object]:
     return {
         "requested_mode": 0o600,
         "observed_mode": 0o666,
+        "mode_request_supported": False,
         "device": device,
         "enforced": False,
     }
@@ -99,6 +100,7 @@ def test_service_probes_the_actual_aros_filesystem_permissions(
     assert service._filesystem_permission_probe == {
         "requested_mode": 0o600,
         "observed_mode": 0o600,
+        "mode_request_supported": True,
         "device": runtime.stat().st_dev,
         "enforced": True,
     }
@@ -166,34 +168,38 @@ def test_permission_probe_observes_mode_when_fchmod_is_unsupported(
     assert evidence == {
         "requested_mode": 0o600,
         "observed_mode": 0o666,
+        "mode_request_supported": False,
         "device": runtime.stat().st_dev,
         "enforced": False,
     }
     assert set(runtime.iterdir()) == entries_before
 
 
-def test_permission_probe_never_enforces_when_fchmod_is_unsupported(
+def test_service_create_accepts_unsupported_fchmod_with_unchanged_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _init_workspace(tmp_path)
     runtime = tmp_path / ".aros"
-    entries_before = set(runtime.iterdir())
 
     def unsupported(_descriptor: int, _mode: int) -> None:
         raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
 
     monkeypatch.setattr(tasks_module.os, "fchmod", unsupported)
 
-    evidence = tasks_module._probe_filesystem_permissions(runtime)
+    service = TaskService(tmp_path)
+    brief = _create(service, key="unsupported-unchanged-mode")
 
-    assert evidence == {
+    assert service._filesystem_permission_probe == {
         "requested_mode": 0o600,
         "observed_mode": 0o600,
+        "mode_request_supported": False,
         "device": runtime.stat().st_dev,
         "enforced": False,
     }
-    assert set(runtime.iterdir()) == entries_before
+    assert service._filesystem_permissions_enforced is False
+    assert service.status(str(brief["task_id"]))["state"] == "prepared"
+    assert not list(runtime.glob(".task-permission-probe-*"))
 
 
 def test_permission_probe_rejects_other_fchmod_errors(

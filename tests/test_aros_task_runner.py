@@ -86,6 +86,7 @@ def _normalized_permission_probe(runtime: Path) -> dict[str, object]:
     return {
         "requested_mode": 0o600,
         "observed_mode": 0o666,
+        "mode_request_supported": False,
         "device": runtime.stat().st_dev,
         "enforced": False,
     }
@@ -299,6 +300,7 @@ def test_public_start_launches_exact_argv_in_owned_worktree_with_scrubbed_env(
         "filesystem_permission_probe": {
             "requested_mode": 0o600,
             "observed_mode": 0o600,
+            "mode_request_supported": True,
             "device": runtime.stat().st_dev,
             "enforced": True,
         },
@@ -1182,7 +1184,12 @@ def test_rehashed_final_receipt_semantic_tamper_fails_closed(
 
 @pytest.mark.parametrize(
     "tamper",
-    ("launch_boolean", "launch_probe_relation", "final_probe_copy"),
+    (
+        "launch_boolean",
+        "launch_probe_relation",
+        "launch_support_relation",
+        "final_probe_copy",
+    ),
 )
 def test_rehashed_filesystem_permission_probe_tamper_fails_closed(
     tmp_path: Path,
@@ -1202,8 +1209,10 @@ def test_rehashed_filesystem_permission_probe_tamper_fails_closed(
         record = json.loads(path.read_text(encoding="utf-8"))
         if tamper == "launch_boolean":
             record["filesystem_permissions_enforced"] = False
-        else:
+        elif tamper == "launch_probe_relation":
             record["filesystem_permission_probe"]["observed_mode"] = 0o666
+        else:
+            record["filesystem_permission_probe"]["mode_request_supported"] = False
         record["launch_sha256"] = json_sha256(
             {key: value for key, value in record.items() if key != "launch_sha256"}
         )

@@ -460,3 +460,36 @@ maintained all-source gate and exited 1 on two pre-existing F401 findings:
 `examples/subscribe_demo.py` imports `arbor.events.types` as `ev`, and
 `skills/arbor-agent-tools/scripts/arbor_state.py` imports `shlex`. Both paths
 are byte-unchanged from B and were deliberately not modified by this task.
+
+## Post-commission hardening and final Wave 2 gate
+
+Whole-wave review after the real smoke found operational races that the smoke's
+short-lived adapters did not exercise: a normal leader could exit before its
+same-PGID descendants, zombie-only groups could be misattributed as stopped,
+timeout and stop publication could race finalization, and status could report
+`lost` while the exact execution-claim runner was still alive finalizing. The
+following reviewed commits close those gaps without changing the scientific or
+collection semantics demonstrated above:
+
+```text
+a53600b  finalize only after non-zombie process-group drain
+8c3a44b  wait for killed groups and serialize one stop delivery
+d1ef6ff  resolve timeout/natural-exit and stop-result races
+16b35ac  arbitrate stop publication against final receipts
+f4165bd  keep live execution-claim runners out of transient lost state
+ca4f138  use 64-bit task IDs with bounded collision retry
+```
+
+The current implementation also uses atomic create-once JSON publication with
+interrupted-alias recovery and durable absolute directory-chain fsync. Worktree
+ownership remains non-expiring; the create-once execution claim is the local
+one-attempt execution lease. These changes were verified at code baseline
+`5254cc1d` before this evidence refresh:
+
+```text
+Full pytest:                              1133 passed, 6 skipped in 202.62s
+Architecture/public-entry/registry:       226 passed
+Maintained src/tests/scripts Ruff:        All checks passed
+Git diff-check:                           exit 0
+uv.lock comparison:                       unchanged
+```

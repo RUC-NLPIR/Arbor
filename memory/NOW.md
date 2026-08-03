@@ -9,7 +9,7 @@ commissioned.
 ## Current position
 
 - Branch: `aros-wave2-child` in `/workspace/Arbor/.worktree/aros-wave2-child`.
-- Code baseline immediately before this checkpoint: `f4165bdc358666e2270ae26b5cd75fce2b51a787`.
+- Code baseline immediately before this checkpoint: `5254cc1d`.
 - Wave 2 Tasks 1–6 are implemented, independently reviewed, and commissioned.
 - Registered evidence: `docs/analysis/aros-wave2-child-substrate-smoke.md`.
 - Real commissioning demonstrated concurrent read/write children, launcher-exit
@@ -25,6 +25,8 @@ commissioned.
 - Worktree ownership is non-expiring and can be released only by explicit clean
   prune. The create-once execution claim is the local one-attempt execution
   lease; dead holders become `lost` and never transfer ownership or relaunch.
+- Final Wave 2 verification reached `1133 passed, 6 skipped`; architecture,
+  public-entry, registry, maintained Ruff, diff, and lock gates are green.
 
 ## Preserved operational evidence
 
@@ -41,7 +43,7 @@ consolidation.
 
 ## Next obligations
 
-1. Run the final Wave 2 full gate and whole-wave review on the current code.
-2. Merge Wave 2 only after that review and keep all negative/positive receipts.
-3. Continue Eval, Operations/shared process core, semantic K/M/G/Skills,
+1. Complete the final whole-wave re-review and merge Wave 2 while retaining all
+   negative and positive receipts.
+2. Continue Eval, Operations/shared process core, semantic K/M/G/Skills,
    MCP/provider parity, and Arbor retirement waves.

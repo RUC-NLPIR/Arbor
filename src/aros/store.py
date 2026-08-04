@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import stat
 import tempfile
@@ -170,6 +171,7 @@ def _read_json(path: str | Path, *, strict: bool) -> Any:
                     handle,
                     object_pairs_hook=_unique_json_object,
                     parse_constant=_reject_json_constant,
+                    parse_float=_strict_json_float,
                 )
             else:
                 value = json.load(handle)
@@ -194,6 +196,7 @@ def _strict_json_loads(raw: str | bytes | bytearray) -> Any:
         raw,
         object_pairs_hook=_unique_json_object,
         parse_constant=_reject_json_constant,
+        parse_float=_strict_json_float,
     )
 
 
@@ -208,6 +211,13 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _reject_json_constant(value: str) -> Any:
     raise ValueError(f"JSON contains non-finite number: {value}")
+
+
+def _strict_json_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"JSON contains non-finite number: {value}")
+    return number
 
 
 def atomic_write_json(path: str | Path, value: Any) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import stat
 import threading
@@ -366,6 +367,18 @@ def test_read_json_strict_rejects_ambiguous_json_without_weakening_secure_read(
     alias.symlink_to(target.name)
     with pytest.raises(ValueError, match="regular"):
         store_module.read_json_strict(alias)
+
+
+def test_read_json_strict_rejects_overflowing_float_without_changing_default(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "record.json"
+    target.write_bytes(b'{"value":1e400}\n')
+
+    default_value = read_json(target)
+    assert math.isinf(default_value["value"])
+    with pytest.raises(ValueError, match="non-finite"):
+        store_module.read_json_strict(target)
 
 
 def test_read_json_rejects_path_replaced_during_read(

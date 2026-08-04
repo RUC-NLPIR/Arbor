@@ -351,6 +351,35 @@ def test_register_rejects_duplicate_manifest_json_keys(tmp_path: Path) -> None:
     assert not (root / ".aros" / "evaluators").exists()
 
 
+def test_register_strict_json_rejects_overflowing_float_before_manifest_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, _manifest_commit = _init_evaluator_repository(root)
+    manifest_path = root / "eval" / "suites" / "quality" / "1" / "manifest.json"
+    raw = manifest_path.read_text(encoding="utf-8")
+    assert '"timeout_seconds": 300' in raw
+    manifest_path.write_text(
+        raw.replace('"timeout_seconds": 300', '"timeout_seconds": 1e400'),
+        encoding="utf-8",
+    )
+    _git(root, "add", "eval/suites/quality/1/manifest.json")
+    _git(root, "commit", "-qm", "add overflowing JSON float")
+
+    def forbidden_manifest_parse(_value: object) -> object:
+        raise AssertionError("strict JSON must reject before manifest parsing")
+
+    monkeypatch.setattr(eval_module, "parse_visible_manifest", forbidden_manifest_parse)
+    with pytest.raises(EvalError, match="non-finite"):
+        EvalService(root).register(
+            "eval/suites/quality/1/manifest.json",
+            actor="principal",
+        )
+
+    assert not (root / ".aros" / "evaluators").exists()
+
+
 def test_eval_id_is_full_idempotency_digest_and_request_is_create_once(
     tmp_path: Path,
 ) -> None:

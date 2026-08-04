@@ -10,8 +10,11 @@ commissioned.
 
 - Branch: `aros-wave3-eval` in
   `/workspace/Arbor/.worktree/aros-wave3-eval`.
-- Commissioned visible-Eval code baseline:
-  `d5cbc7ec4ddd4b677e55df341912394d32e55846`.
+- Current code baseline:
+  `a9b30e4d2754845b4e35e1540796d7aff6447145`.
+- Visible Eval remains commissioned at code baseline
+  `d5cbc7ec4ddd4b677e55df341912394d32e55846`; its post-hardening evidence
+  checkpoint is `25db6fe7f6e24a703e2319783d2466fe59a98f4e`.
 - Wave 3 visible evaluation is implemented and commissioned through the direct
   `aros eval register|run|status|observe|audit` surface. Registered evidence:
   `docs/analysis/aros-wave3-visible-eval-smoke.md`.
@@ -37,14 +40,15 @@ commissioned.
   attempt remains factual `failed_process/not_available` evidence and was not
   retried. The commissioned descriptor uses fixed `python3`; no isolation
   policy was weakened.
-- Fresh post-hardening verification reached `427 passed` in the exact
-  visible-Eval module gate and `1599 passed, 6 skipped` in the whole suite.
-  Ruff, registry, diff, and `uv.lock` gates are clean. Sequential
-  post-hardening spec and quality/security reviews approved with no remaining
-  Critical or Important findings.
-- Wave 2 child-task evidence remains current. Task adapters are trusted-local,
-  application-scoped, and not a security sandbox; their exact containment and
-  filesystem-permission limits are unchanged.
+- Fresh current-baseline verification reached
+  `1621 passed, 6 skipped in 355.56s` in the whole suite. Maintained Ruff,
+  registry, diff, and `uv.lock` gates are clean; reviewed Task carrier
+  hardening is current through `a9b30e4`.
+- Wave 2 child-task evidence remains current. Exact carrier probing and the
+  per-task OFD guardian close the reviewed Task startup-loss intervals without
+  retry; Task adapters remain trusted-local, application-scoped, and not a
+  security sandbox. Their containment and filesystem-permission limits are
+  unchanged.
 - Protected registration/admission, disclosure budgets, migration adapters,
   MCP parity, and Arbor retirement remain unavailable.
 

@@ -649,3 +649,66 @@ Git diff-check:                            exit 0
 Working-tree uv.lock comparison:           unchanged
 Commissioning-baseline uv.lock comparison: unchanged
 ```
+
+## Post-visible Task carrier startup verification
+
+After visible Eval commissioning, repeated full-suite runs exposed a Task
+startup race that isolated reruns did not reproduce. One run let
+`test_rehashed_filesystem_permission_probe_tamper_fails_closed[final_probe_copy]`
+observe terminal `lost` before `final.json` appeared; an earlier run let
+`test_public_stop_rejects_non_term_signal` observe `lost` before `running`.
+A deterministic delayed-runner reproduction then observed
+`lost -> running -> completed` while the exact tmux session was live. These
+were operational projection failures, not adapter or scientific failures.
+
+Current code baseline `a9b30e4d2754845b4e35e1540796d7aff6447145`
+closes both sides of the startup interval without authorizing retry:
+
+- reconciliation probes only the launch-bound local carrier with
+  `tmux -L SOCKET has-session -t =SESSION`; a probe error is not treated as
+  absence;
+- a durable per-task carrier-launch `flock` covers pre-carrier publication,
+  while a small isolated guardian inherits the same open-file-description and
+  holds it across tmux client completion even if the starter is `SIGKILL`ed;
+- the guardian marks the lock FD close-on-exec, tmux receives no lock FD, and
+  anonymous temporary files prevent a forked tmux server from retaining output
+  pipes or the launch lock;
+- caller SIGINT is blocked after the per-task guard and before preparation,
+  launch, or status publication, remains blocked through definitive outcome
+  publication, and is re-raised only after restoring the exact prior mask;
+- a nonzero or signaled tmux client cannot overwrite a valid final, a valid
+  execution claim, or the exact live session; absent rc 7 and spawn errors
+  still publish `failed_process` while the launch guard is held;
+- guardian diagnostics use replacement decoding, so invalid UTF-8 remains
+  bounded factual failure detail instead of producing `lost`;
+- same-task replay never launches again, while different tasks retain
+  independent launch locks and can enter tmux concurrently.
+
+Deterministic gates covered the pre-carrier interval, starter `SIGKILL`, lock-FD
+non-leak to a long-lived fake server, all SIGINT publication windows, rc 0,
+absent nonzero and signaled-client outcomes, invalid UTF-8, failure publication
+under the guard, exact-session recovery, no retry, and cross-task parallelism.
+The reviewed implementation was checkpointed in order at:
+
+```text
+3452fbf  keep live task carriers launched
+2e9fe76  defer guardian spawn interrupts
+9869af4  defer carrier interrupts through publication
+a9b30e4  resolve guarded carrier outcomes
+```
+
+The guardian intentionally has no former 10-second tmux-client timeout. A hung
+tmux command retains `launched` and its per-task lock so the uncertain attempt
+remains diagnosable; it is not killed, declared absent, or retried
+automatically.
+
+Fresh current-baseline receipts were:
+
+```text
+Complete Task/runner/TaskTool/CLI gates:  exit 0 in prior fresh runs
+Full suite:                              1621 passed, 6 skipped in 355.56s
+Maintained src/tests/scripts Ruff:       All checks passed
+Git diff-check:                          exit 0
+Working-tree uv.lock comparison:         unchanged
+Commissioning-baseline uv.lock comparison: unchanged
+```

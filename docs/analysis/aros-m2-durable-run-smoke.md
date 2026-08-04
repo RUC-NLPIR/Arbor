@@ -133,21 +133,25 @@ The change sequence is recorded by these commits:
 | `05aa41d` | carrier failure preserves an already sealed Runner final |
 | `a9ee500` | loser-path event writer projects the create-once final winner |
 
-Fresh implementation gates reached `92 passed` for `tests/test_aros_runs.py`
-and `383 passed in 64.98s` for `tests/test_aros_runs.py`,
+Before the final create-once loser-race regression, implementation gates
+reached `92 passed` for `tests/test_aros_runs.py` and `383 passed in 64.98s`
+for `tests/test_aros_runs.py`,
 `tests/test_aros_eval.py` and `tests/test_aros_eval_records.py`. The focused
 missing-status Eval audit gate reached `2 passed`; Ruff and both Git diff gates
 were clean. No `uv` command was invoked and no commissioning receipt was
 rewritten.
 
 Documentation commissioning on the `c6b80ee` implementation baseline then
-reached `231 passed (exit 0)` for the architecture/public-entry/registry gate.
+reached `231 passed (exit 0)` for its architecture/public-entry/registry gate.
+After the final carrier-race evidence, the current tree reached `93 passed in
+21.17s` for Run, `384 passed in 63.98s` for the Run/Eval/Eval-records gate, and
+`244 passed (exit 0)` for the final documentation/architecture gate.
 The final exact unqualified `/workspace/Arbor/.venv/bin/python -m pytest`
 command reached `1641 passed, 6 skipped in 350.36s (0:05:50)`. Full
 `ruff check src tests scripts` reported `All checks passed!`; both
-`git diff --check` and `git diff --exit-code -- uv.lock` exited 0. The working
-diff contained only the four commissioned documentation files, so these checks
-did not rewrite an operational or measurement receipt.
+`git diff --check` and `git diff --exit-code -- uv.lock` exited 0. The full gate
+ran on the clean `a9ee500` code/test/evidence tree; subsequent evidence-only
+documentation commits did not rewrite an operational or measurement receipt.
 
 ## Exit result
 

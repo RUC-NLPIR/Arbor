@@ -53,9 +53,9 @@ commissioned.
 - Eval audit observes Run status with reconciliation disabled. Missing mutable
   status is an independent issue and does not prevent immutable final/log
   validation; audit does not reconstruct status, final, measurement or retry.
-- Fresh current-branch gates reached `92 passed` for Run, `383 passed in
-  64.98s` for the Run/Eval/Eval-records combination, `231 passed (exit 0)` for
-  architecture/public-entry/registry, and `1641 passed, 6 skipped in
+- Fresh current-branch gates reached `93 passed in 21.17s` for Run, `384 passed
+  in 63.98s` for the Run/Eval/Eval-records combination, `244 passed (exit 0)`
+  for the final documentation/architecture gate, and `1641 passed, 6 skipped in
   350.36s (0:05:50)` for the final exact unqualified full pytest command. Full
   Ruff reported `All checks passed!`; diff-check and the `uv.lock` comparison
   both exited 0. No `uv` command ran and no commissioning receipt changed.

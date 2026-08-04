@@ -75,9 +75,11 @@ def test_build_principal_uses_native_agent_and_exact_default_tools(tmp_path: Pat
         "Edit",
         "Write",
         "Inspect",
+        "Eval",
         "Run",
         "Task",
     }
+    assert agent.tools["Eval"].persist_results is False
     assert agent.tools["Task"].persist_results is False
     assert agent.config.auto_git is False
     assert agent.config.runtime_dir == str(tmp_path / ".aros" / "agent")
@@ -117,6 +119,7 @@ def test_principal_shell_is_opt_in_bounded_and_foreground_only(tmp_path: Path):
         "Edit",
         "Write",
         "Inspect",
+        "Eval",
         "Run",
         "Task",
         "Bash",
@@ -128,6 +131,19 @@ def test_principal_shell_is_opt_in_bounded_and_foreground_only(tmp_path: Path):
         bash.execute(command="printf should-not-run", run_in_background=True)
     )
     assert result.startswith("BLOCKED:")
+
+
+def test_principal_eval_tool_states_measurement_interpretation_and_no_retry(
+    tmp_path: Path,
+) -> None:
+    agent = build_principal_agent(_ScriptedProvider(), tmp_path, "boot")
+    description = " ".join(agent.tools["Eval"].description.lower().split())
+
+    assert "apparatus produces factual measurements" in description
+    assert "principal interprets" in description
+    assert "lost evaluations are never retried" in description
+    for unavailable in ("admit", "protected", "administrator", "mcp"):
+        assert unavailable not in description
 
 
 def test_inspect_returns_workspace_status_as_json(tmp_path: Path, monkeypatch):

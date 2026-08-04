@@ -22,6 +22,7 @@ from ..core.tools.file_read import FileReadTool
 from ..core.tools.file_write import FileWriteTool
 from ..core.tools.glob_tool import GlobTool
 from ..core.tools.grep import GrepTool
+from .eval_tool import EvalTool
 from .run_tool import RunTool
 from .task_tool import TaskTool
 from .workspace import status_workspace
@@ -159,6 +160,7 @@ def build_principal_agent(
         FileEditTool(**tool_kwargs),
         FileWriteTool(**tool_kwargs),
         InspectTool(cwd=str(workspace_root), persist_results=False),
+        EvalTool(cwd=str(workspace_root), persist_results=False),
         RunTool(cwd=str(workspace_root), persist_results=False),
         TaskTool(cwd=str(workspace_root), persist_results=False),
     ]

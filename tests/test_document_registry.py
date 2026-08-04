@@ -181,12 +181,13 @@ def test_aros_public_docs_use_direct_entry() -> None:
         "aros start",
         "aros run start|status|list|tail|stop",
         "aros task create|start|status|list|message|stop|collect|preserve|prune",
+        "aros eval register|run|status|observe|audit",
     ):
         assert command in text
     assert "`arbor aros` is a temporary forwarding compatibility route" in text
     assert "## Not yet implemented" in text
     for unavailable_capability in (
-        "deterministic/protected evaluation",
+        "protected evaluation registration and admission",
         "migration adapters",
         "MCP parity",
         "Arbor retirement",
@@ -194,6 +195,23 @@ def test_aros_public_docs_use_direct_entry() -> None:
         assert unavailable_capability in text
     assert "capabilities_enforced=false" in text
     assert "filesystem_permissions_enforced=false" in text
+
+
+def test_registered_public_guide_separates_visible_eval_from_protected_admission(
+) -> None:
+    by_id = {document["id"]: document for document in _load_registry()["documents"]}
+    guide = (_ROOT / by_id["aros-public-guide"]["path"]).read_text(
+        encoding="utf-8"
+    )
+    available, unavailable = guide.split("## Not yet implemented", maxsplit=1)
+
+    assert "`aros eval register|run|status|observe|audit`" in available
+    assert "apparatus produces factual measurements" in available
+    assert "Principal interprets them" in available
+    assert "lost evaluation is never retried" in available
+    assert "protected evaluation registration and admission" not in available
+    assert "protected evaluation registration and admission" in unavailable
+    assert "aros eval admit" not in guide
 
 
 def test_aros_public_guide_states_runtime_prerequisites() -> None:

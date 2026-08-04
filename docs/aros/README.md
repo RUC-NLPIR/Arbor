@@ -12,6 +12,7 @@ The exposed command surface for the direct `aros` entry is:
 - `aros start`
 - `aros run start|status|list|tail|stop`
 - `aros task create|start|status|list|message|stop|collect|preserve|prune`
+- `aros eval register|run|status|observe|audit`
 
 ### Runtime requirements
 
@@ -21,10 +22,11 @@ The exposed command surface for the direct `aros` entry is:
 - Task adapters are trusted-local and application-scoped, not a security sandbox; the `trusted-local` profile must be selected explicitly. Network and shell capability flags are audit declarations and are not enforced (`capabilities_enforced=false`). Secrets and untrusted adapters are unsupported. Daemonizing or new-session descendants that do not drain fail closed as `lost` with no terminal receipt.
 - V1 terminal truth covers the exact PGID plus descendants reparented to the live subreaper. A new-session process that outlives runner death is not claimed contained and cannot justify a clean final receipt or prune. Delegated per-task cgroups belong to the shared Operations process core, not the Wave 2 security claim.
 - Launch and final receipts record whether the filesystem enforces requested file modes. On a mode-normalizing filesystem, integrity checks remain active but `filesystem_permissions_enforced=false`.
+- Visible evaluation binds exact candidate and apparatus commits and executes through the durable Run service. The apparatus produces factual measurements, the Principal interprets them, and a lost evaluation is never retried with the same idempotency key; a new attempt requires a new Principal action and key.
 
 ## Not yet implemented
 
-- deterministic/protected evaluation
+- protected evaluation registration and admission
 - migration adapters
 - MCP parity
 - Arbor retirement

@@ -10,6 +10,7 @@ from typing import Any
 import typer
 from typer.core import TyperCommand
 
+from ...aros.eval import EvalService, ExistingEvaluation
 from ...aros.principal import build_principal_agent, run_principal
 from ...aros.runs import RunService
 from ...aros.tasks import TaskService
@@ -28,6 +29,10 @@ _TASK_TRUST_BOUNDARY = (
     "Secrets and untrusted adapters are unsupported. Daemonizing or new-session "
     "descendants that do not drain fail closed as lost with no terminal receipt."
 )
+_EVAL_MEASUREMENT_BOUNDARY = (
+    "Visible evaluation apparatus produces factual measurements; the Principal "
+    "interprets them. Lost evaluations are never retried."
+)
 
 
 aros_app = typer.Typer(
@@ -45,8 +50,14 @@ task_app = typer.Typer(
     help="Manage durable child tasks. " + _TASK_TRUST_BOUNDARY,
     no_args_is_help=True,
 )
+eval_app = typer.Typer(
+    name="eval",
+    help=_EVAL_MEASUREMENT_BOUNDARY,
+    no_args_is_help=True,
+)
 aros_app.add_typer(run_app, name="run")
 aros_app.add_typer(task_app, name="task")
+aros_app.add_typer(eval_app, name="eval")
 
 
 def llm_defaults() -> dict[str, Any]:
@@ -275,6 +286,108 @@ def run_stop_command(
     except (OSError, RuntimeError, ValueError) as exc:
         _fail(exc)
     _print_json(receipt)
+
+
+@eval_app.command("register")
+def eval_register_command(
+    manifest: str = typer.Option(
+        ...,
+        "--manifest",
+        help="Tracked visible evaluator manifest.",
+    ),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+    actor: str = typer.Option("human", "--actor", help="Registration authority."),
+) -> None:
+    """Register one tracked visible evaluator apparatus."""
+    try:
+        descriptor = EvalService(_root(cwd)).register(manifest, actor=actor)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(descriptor)
+
+
+@eval_app.command("run")
+def eval_run_command(
+    evaluator_id: str = typer.Argument(..., help="Registered evaluator ID."),
+    version: str = typer.Argument(..., help="Registered evaluator version."),
+    candidate_commit: str = typer.Argument(..., help="Exact candidate Git commit."),
+    idempotency_key: str = typer.Option(
+        ...,
+        "--idempotency-key",
+        help="One-attempt evaluation request key.",
+    ),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+    actor: str = typer.Option("human", "--actor", help="Evaluation authority."),
+) -> None:
+    """Run one visible evaluation through the registered apparatus."""
+    try:
+        result = EvalService(_root(cwd)).run(
+            evaluator_id,
+            version,
+            candidate_commit,
+            actor=actor,
+            idempotency_key=idempotency_key,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    if isinstance(result, ExistingEvaluation):
+        result = result.status
+    _print_json(result)
+
+
+@eval_app.command("status")
+def eval_status_command(
+    eval_id: str = typer.Argument(..., help="Stable evaluation identifier."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Inspect factual evaluation and referenced process state."""
+    try:
+        status = EvalService(_root(cwd)).status(eval_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(status)
+
+
+@eval_app.command("observe")
+def eval_observe_command(
+    eval_id: str = typer.Argument(..., help="Stable evaluation identifier."),
+    stream: str = typer.Option(
+        "stdout",
+        "--stream",
+        help="Visible stream: stdout or stderr.",
+    ),
+    max_bytes: int = typer.Option(
+        65_536,
+        "--max-bytes",
+        min=1,
+        max=65_536,
+        help="Maximum visible stream bytes to print.",
+    ),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Print one bounded visible evaluation stream verbatim."""
+    try:
+        output = EvalService(_root(cwd)).observe(
+            eval_id,
+            stream=stream,
+            max_bytes=max_bytes,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    typer.echo(output, nl=False)
+
+
+@eval_app.command("audit")
+def eval_audit_command(
+    eval_id: str = typer.Argument(..., help="Stable evaluation identifier."),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Validate visible evaluation lineage without repair or interpretation."""
+    try:
+        audit = EvalService(_root(cwd)).audit(eval_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(audit)
 
 
 @task_app.command(

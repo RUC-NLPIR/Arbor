@@ -149,6 +149,19 @@ def test_registry_contains_current_wave3_eval_design() -> None:
     }
 
 
+def test_registry_contains_current_wave3_visible_eval_smoke() -> None:
+    by_id = {document["id"]: document for document in _load_registry()["documents"]}
+
+    assert by_id["aros-wave3-visible-eval-smoke"] == {
+        "id": "aros-wave3-visible-eval-smoke",
+        "title": "AROS Wave 3 Visible Evaluation Smoke Evidence",
+        "path": "docs/analysis/aros-wave3-visible-eval-smoke.md",
+        "status": "current",
+        "authority": "informative",
+        "agent_visibility": "on_demand",
+    }
+
+
 def test_registry_contains_current_public_aros_guide() -> None:
     by_id = {document["id"]: document for document in _load_registry()["documents"]}
 

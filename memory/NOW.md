@@ -8,77 +8,54 @@ commissioned.
 
 ## Current position
 
-- Branch: `aros-wave2-child` in `/workspace/Arbor/.worktree/aros-wave2-child`.
-- Current post-status-fix code baseline: `68b6ddddb1d1998b6b03380118129f0906ee8255`.
-- Wave 2 Tasks 1–6 are implemented, independently reviewed, and commissioned.
-- Registered evidence: `docs/analysis/aros-wave2-child-substrate-smoke.md`.
-- Real commissioning demonstrated concurrent read/write children, launcher-exit
-  survival, ordered messages, B-C-R returns, explicit rejection without
-  assimilation, dirty preservation, clean prune, and retained task branches.
-- The first two task launches remain preserved at `worktree_ready` because they
-  exposed that the workspace FUSE mount cannot express mode `0600`. The Task
-  runner now records this filesystem capability explicitly for trusted-local
-  execution; those original tasks were not retried.
-- Generic create-once JSON publication now writes complete temp content before
-  atomic no-replace publication, recovers exact interrupted aliases, and fsyncs
-  existing/relative directory chains.
-- Worktree ownership is non-expiring and can be released only by explicit clean
-  prune. The create-once execution claim is the local one-attempt execution
-  lease; dead holders become `lost` and never transfer ownership or relaunch.
-- Interrupted prune recovery is intent-bound and targeted: at the removal
-  midpoint it may complete only the exact prunable worktree registration bound
-  by the persisted prune intent. It rejects unrelated prunable registrations
-  and never invokes global `git worktree prune`.
-- Replaceable Run status snapshots receive at most three strict read attempts;
-  the default immutable `read_json` contract is unchanged. The pre-fix timeout
-  stress reproduced the strict-read race at iteration 43, the deterministic
-  replacement-during-read regression was RED, and the fixed stress passed
-  100/100 iterations.
-- Non-blocking shared-core caveat: runner bootstrap strict read remains; actual
-  unresolved issue is launch vs unlocked reconcile transition and must be
-  solved by serialization or immutable prelaunch transition validation, not
-  retry.
-- Task adapters are trusted-local and application-scoped, not a security
-  sandbox. Network and shell capability flags are audit declarations and are
-  not enforced. Secrets and untrusted adapters are unsupported. Daemonizing or
-  new-session descendants that do not drain fail closed as `lost` with no
-  terminal receipt.
-- V1 terminal truth covers the exact PGID plus descendants reparented to the
-  live subreaper. A new-session process that outlives runner death is not
-  claimed contained and cannot justify a clean final receipt or prune.
-  Delegated per-task cgroups belong to the shared Operations process core, not
-  the Wave 2 security claim.
-- The `254f754a122bcaea6852abc55480eff339cbe889` post-containment receipts
-  remain valid for that code but are superseded for current verification.
-- The `114da5959ae39be4b6977550ab291f9045d23679` final-Wave 2 receipts remain
-  valid as prior pre-status-fix evidence and are superseded for current code
-  verification.
-- Fresh verification at the exact current baseline reached
-  `1178 passed, 6 skipped in 259.42s`; the affected five-suite gate reached `259 passed`,
-  architecture/public-entry/registry reached `227 passed in 9.72s`, and the
-  strict transient/persistent/immutable targeted gate reached
-  `3 passed in 0.71s`. Maintained Ruff, diff, and
-  working-tree/commissioning-baseline lock gates are green.
+- Branch: `aros-wave3-eval` in
+  `/workspace/Arbor/.worktree/aros-wave3-eval`.
+- Commissioned visible-Eval code baseline:
+  `265aee93808d533d51005790e242c0222612ed10`.
+- Wave 3 visible evaluation is implemented and commissioned through the direct
+  `aros eval register|run|status|observe|audit` surface. Registered evidence:
+  `docs/analysis/aros-wave3-visible-eval-smoke.md`.
+- Eval composes the durable Run service and separate exact candidate/apparatus
+  checkouts. It owns no second process, tmux, final-process, or recovery stack.
+- Real commissioning produced a `valid` scalar measurement from distinct exact
+  candidate/apparatus commits, proved clean removal, and proved direct factual
+  status, bounded observe, and lineage audit.
+- External candidate dirt changed a completed process result to
+  `measurement_state=invalid_eval`; both checkouts were preserved until the
+  injected bytes were recorded, restored, and removed by the clean-only helper.
+- Killing only the foreground Eval broker made the request permanently `lost`
+  while the linked Run remained independently observable. Same-key replay
+  created no Run; a new key created exactly one new Eval/Run. Explicitly stopped
+  Runs became `cancelled`, and no measurement receipt was reconstructed.
+- A schema-valid absolute virtual-environment launcher failed under
+  `isolated-linux` because its outside-bundle `pyvenv.cfg` was unreadable. That
+  attempt remains factual `failed_process/not_available` evidence and was not
+  retried. The commissioned descriptor uses fixed `python3`; no isolation
+  policy was weakened.
+- Fresh verification reached `422 passed` in the exact visible-Eval module
+  gate and `1594 passed, 6 skipped` in the whole suite. Ruff, registry, diff,
+  and `uv.lock` gates are clean. Independent spec and quality/security reviews
+  approved with no remaining Critical or Important findings.
+- Wave 2 child-task evidence remains current. Task adapters are trusted-local,
+  application-scoped, and not a security sandbox; their exact containment and
+  filesystem-permission limits are unchanged.
+- Protected registration/admission, disclosure budgets, migration adapters,
+  MCP parity, and Arbor retirement remain unavailable.
 
 ## Preserved operational evidence
 
-Two independent isolated-linux RunService inspections attempted to observe the
-original task worktrees and reached factual `failed_process` because process
-launch raised `Exception occurred in preexec_fn`:
-
-- `runs/RUN-20260803-075733-check-inspect-task-worktree-8849/`
-- `runs/RUN-20260803-075735-check-write-task-worktree-b583/`
-
-These failures are process evidence, not scientific negatives. Their manifests
-and final receipts are retained for the later shared Run/Task process-core
-consolidation.
+- The ignored commissioning repository retains exact v1 failure, v2 success,
+  dirty, and lost Run records. All commissioning execution bundles were removed
+  only through clean validation; no unexpected dirty material was discarded.
+- The two original Wave 2 task-worktree inspection failures and their receipts
+  remain historical process evidence for shared Run/Task process-core work, not
+  scientific negative results.
 
 ## Next obligations
 
-1. Complete the final whole-wave review and integration while retaining all
-   negative and positive receipts.
+1. Implement and commission protected registration/admission as a separate
+   Gate C-D change; do not infer it from visible evidence.
 2. Consolidate Run/Task into the shared Operations process core, including
-   delegated per-task cgroups for runner-death containment, then continue Eval.
-3. Complete the still-open Phase 3 provider profiles, Principal lease, and
-   `child_done` event work, followed by semantic K/M/G/Skills, MCP/provider
-   parity, and Arbor retirement waves.
+   delegated per-task cgroups for runner-death containment.
+3. Complete provider profiles, Principal lease, `child_done`, semantic
+   K/M/G/Skills, MCP/provider parity, migration, and Arbor retirement waves.

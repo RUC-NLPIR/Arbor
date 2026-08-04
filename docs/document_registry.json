@@ -88,6 +88,14 @@
       "status": "current",
       "authority": "informative",
       "agent_visibility": "on_demand"
+    },
+    {
+      "id": "aros-wave3-visible-eval-smoke",
+      "title": "AROS Wave 3 Visible Evaluation Smoke Evidence",
+      "path": "docs/analysis/aros-wave3-visible-eval-smoke.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
     }
   ]
 }

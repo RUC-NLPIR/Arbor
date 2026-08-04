@@ -42,6 +42,20 @@ def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
     )
 
 
+def _git_bytes(root: Path, *args: str) -> bytes:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("GIT_", "LD_", "DYLD_"))
+    }
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        env=environment,
+    ).stdout
+
+
 def _init_repository(root: Path) -> tuple[str, str]:
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     _git(root, "config", "user.email", "aros@example.invalid")
@@ -52,6 +66,21 @@ def _init_repository(root: Path) -> tuple[str, str]:
     commit = _git(root, "rev-parse", "HEAD").stdout.strip()
     tree = _git(root, "show", "-s", "--format=%T", commit).stdout.strip()
     return commit, tree
+
+
+def _binding_for_checkout(
+    root: Path,
+    checkout: Path,
+    commit: str,
+) -> CheckoutBinding:
+    return CheckoutBinding(
+        path=checkout,
+        git_dir=Path(
+            _git(checkout, "rev-parse", "--absolute-git-dir").stdout.strip()
+        ).resolve(strict=True),
+        commit=commit,
+        tree=_git(root, "show", "-s", "--format=%T", commit).stdout.strip(),
+    )
 
 
 def test_detached_checkout_is_exact_clean_and_hermetic(
@@ -150,6 +179,116 @@ def test_checkout_pins_symlink_materialization_against_repository_config(
     checked_out_link = checkout.path / "tracked-link"
     assert checked_out_link.is_symlink()
     assert os.readlink(checked_out_link) == "tracked.txt"
+
+
+def test_checkout_rejects_eol_converted_raw_bytes_and_preserves_registration(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _init_repository(root)
+    (root / ".gitattributes").write_text(
+        "*.txt text eol=crlf\n",
+        encoding="utf-8",
+    )
+    (root / "converted.txt").write_bytes(b"committed lf bytes\n")
+    _git(root, "add", ".gitattributes", "converted.txt")
+    _git(root, "commit", "-qm", "add explicit CRLF checkout")
+    commit = _git(root, "rev-parse", "HEAD").stdout.strip()
+    assert _git_bytes(root, "show", f"{commit}:converted.txt") == b"committed lf bytes\n"
+    repository = bind_repository(root)
+    checkout_path = root / ".worktree" / "eval" / "eol-conversion" / "candidate"
+
+    with pytest.raises(WorktreeError, match="raw tracked bytes"):
+        create_detached_checkout(repository, checkout_path, commit)
+
+    converted = checkout_path / "converted.txt"
+    assert converted.read_bytes() == b"committed lf bytes\r\n"
+    registrations = _git(root, "worktree", "list", "--porcelain").stdout
+    assert str(checkout_path) in registrations
+    checkout = _binding_for_checkout(root, checkout_path, commit)
+    with pytest.raises(WorktreeError, match="raw tracked bytes"):
+        validate_detached_checkout(repository, checkout)
+    assert converted.read_bytes() == b"committed lf bytes\r\n"
+    assert _git(root, "worktree", "list", "--porcelain").stdout == registrations
+
+
+def test_checkout_rejects_ident_expansion_and_preserves_registration(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _init_repository(root)
+    (root / ".gitattributes").write_text("ident.txt ident\n", encoding="utf-8")
+    (root / "ident.txt").write_bytes(b"$Id$\n")
+    _git(root, "add", ".gitattributes", "ident.txt")
+    _git(root, "commit", "-qm", "add ident checkout")
+    commit = _git(root, "rev-parse", "HEAD").stdout.strip()
+    assert _git_bytes(root, "show", f"{commit}:ident.txt") == b"$Id$\n"
+    repository = bind_repository(root)
+    checkout_path = root / ".worktree" / "eval" / "ident-expansion" / "candidate"
+
+    with pytest.raises(WorktreeError, match="raw tracked bytes"):
+        create_detached_checkout(repository, checkout_path, commit)
+
+    expanded = (checkout_path / "ident.txt").read_bytes()
+    assert expanded.startswith(b"$Id: ") and expanded.endswith(b" $\n")
+    registrations = _git(root, "worktree", "list", "--porcelain").stdout
+    assert str(checkout_path) in registrations
+    checkout = _binding_for_checkout(root, checkout_path, commit)
+    with pytest.raises(WorktreeError, match="raw tracked bytes"):
+        validate_detached_checkout(repository, checkout)
+    assert (checkout_path / "ident.txt").read_bytes() == expanded
+    assert _git(root, "worktree", "list", "--porcelain").stdout == registrations
+
+
+@pytest.mark.parametrize("executable", (False, True))
+def test_checkout_raw_blob_validation_accepts_exact_regular_file(
+    tmp_path: Path,
+    executable: bool,
+) -> None:
+    root = tmp_path / "repository"
+    _init_repository(root)
+    payload = b"\x00exact raw regular bytes\r\n$Id$\n"
+    tracked = root / "exact.bin"
+    tracked.write_bytes(payload)
+    if executable:
+        tracked.chmod(0o755)
+    _git(root, "add", "exact.bin")
+    _git(root, "commit", "-qm", "add exact regular blob")
+    commit = _git(root, "rev-parse", "HEAD").stdout.strip()
+    repository = bind_repository(root)
+
+    checkout = create_detached_checkout(
+        repository,
+        root / ".worktree" / "eval" / f"regular-{executable}" / "candidate",
+        commit,
+    )
+
+    checked_out = checkout.path / "exact.bin"
+    assert checked_out.read_bytes() == payload
+    assert bool(checked_out.stat().st_mode & 0o111) is executable
+    assert validate_detached_checkout(repository, checkout) is None
+
+
+def test_checkout_raw_blob_validation_accepts_exact_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "repository"
+    _init_repository(root)
+    link = root / "exact-link"
+    link.symlink_to("tracked.txt")
+    _git(root, "add", "exact-link")
+    _git(root, "commit", "-qm", "add exact symlink blob")
+    commit = _git(root, "rev-parse", "HEAD").stdout.strip()
+    repository = bind_repository(root)
+
+    checkout = create_detached_checkout(
+        repository,
+        root / ".worktree" / "eval" / "exact-symlink" / "candidate",
+        commit,
+    )
+
+    checked_out = checkout.path / "exact-link"
+    assert checked_out.is_symlink()
+    assert os.readlink(checked_out) == "tracked.txt"
+    assert validate_detached_checkout(repository, checkout) is None
 
 
 def test_checkout_rejects_hooks_filters_and_ambient_git_config(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -155,6 +156,7 @@ def validate_detached_checkout(
         work_tree=checkout.path,
     )
     _validate_checkout_authority(repo, checkout)
+    _verify_raw_tracked_bytes(repo, checkout)
     if not _checkout_is_clean(repo, checkout):
         raise WorktreeError(f"checkout is not exactly clean: {checkout.path}")
 
@@ -210,6 +212,8 @@ def validate_execution_bundle(
             work_tree=checkout.path,
         )
     _validate_execution_bundle_authority(repo, bundle)
+    for checkout in (bundle.candidate, bundle.apparatus):
+        _verify_raw_tracked_bytes(repo, checkout)
     candidate_clean = _checkout_is_clean(repo, bundle.candidate)
     apparatus_clean = _checkout_is_clean(repo, bundle.apparatus)
     if not candidate_clean or not apparatus_clean:
@@ -442,6 +446,155 @@ def _validate_checkout_authority(
     )
     if head != checkout.commit or tree != checkout.tree:
         raise WorktreeError(f"checkout commit or tree mismatch: {checkout.path}")
+
+
+def _verify_raw_tracked_bytes(
+    repo: RepositoryBinding,
+    checkout: CheckoutBinding,
+) -> None:
+    object_format = _git_text(
+        repo,
+        "rev-parse",
+        "--show-object-format",
+        git_dir=checkout.git_dir,
+        work_tree=checkout.path,
+    )
+    if object_format == "sha1":
+        oid_length = 40
+    elif object_format == "sha256":
+        oid_length = 64
+    else:
+        raise WorktreeError(f"unsupported Git object format: {object_format}")
+    raw = _git_bytes(
+        repo,
+        "ls-files",
+        "--stage",
+        "-z",
+        git_dir=checkout.git_dir,
+        work_tree=checkout.path,
+    )
+    if raw and not raw.endswith(b"\0"):
+        raise WorktreeError("Git returned an ambiguous staged-file list")
+    records = raw[:-1].split(b"\0") if raw else ()
+    seen: set[bytes] = set()
+    for record in records:
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or not raw_path or len(fields) != 3:
+            raise WorktreeError("invalid Git staged-file entry")
+        mode, expected_oid, stage = fields
+        if stage != b"0" or raw_path in seen:
+            raise WorktreeError("ambiguous Git staged-file entry")
+        seen.add(raw_path)
+        if mode not in {b"100644", b"100755", b"120000"}:
+            raise WorktreeError(f"unsupported Git staged-file mode: {mode!r}")
+        if (
+            len(expected_oid) != oid_length
+            or any(byte not in b"0123456789abcdef" for byte in expected_oid)
+            or expected_oid == b"0" * oid_length
+        ):
+            raise WorktreeError("invalid Git staged-file object ID")
+        components = raw_path.split(b"/")
+        if raw_path.startswith(b"/") or any(
+            component in {b"", b".", b".."} for component in components
+        ):
+            raise WorktreeError("unsafe Git staged-file path")
+        path = checkout.path.joinpath(
+            *(os.fsdecode(component) for component in components)
+        )
+        if mode == b"120000":
+            actual_oid = _raw_symlink_blob_oid(path, object_format)
+        else:
+            actual_oid = _raw_regular_blob_oid(
+                path,
+                object_format,
+                executable=mode == b"100755",
+            )
+        if actual_oid.encode("ascii") != expected_oid:
+            raise WorktreeError(f"checkout raw tracked bytes differ from index blob: {path}")
+
+
+def _raw_regular_blob_oid(
+    path: Path,
+    object_format: str,
+    *,
+    executable: bool,
+) -> str:
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise WorktreeError(f"unable to inspect raw tracked bytes: {path}") from error
+    if not stat.S_ISREG(before.st_mode) or bool(before.st_mode & 0o111) is not executable:
+        raise WorktreeError(f"invalid raw tracked regular file: {path}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise WorktreeError(f"unable to open raw tracked bytes: {path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_size != before.st_size
+        ):
+            raise WorktreeError(f"raw tracked file changed while opening: {path}")
+        digest = hashlib.new(object_format)
+        digest.update(b"blob " + str(opened.st_size).encode("ascii") + b"\0")
+        byte_count = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            digest.update(chunk)
+        after_descriptor = os.fstat(descriptor)
+    except OSError as error:
+        raise WorktreeError(f"unable to read raw tracked bytes: {path}") from error
+    finally:
+        os.close(descriptor)
+    try:
+        after_path = path.lstat()
+    except OSError as error:
+        raise WorktreeError(f"unable to revalidate raw tracked bytes: {path}") from error
+    identity = (before.st_dev, before.st_ino, before.st_size)
+    if (
+        byte_count != before.st_size
+        or not stat.S_ISREG(after_descriptor.st_mode)
+        or not stat.S_ISREG(after_path.st_mode)
+        or (after_descriptor.st_dev, after_descriptor.st_ino, after_descriptor.st_size)
+        != identity
+        or (after_path.st_dev, after_path.st_ino, after_path.st_size) != identity
+        or bool(after_path.st_mode & 0o111) is not executable
+    ):
+        raise WorktreeError(f"raw tracked file changed while reading: {path}")
+    return digest.hexdigest()
+
+
+def _raw_symlink_blob_oid(path: Path, object_format: str) -> str:
+    try:
+        before = path.lstat()
+        target = os.readlink(os.fsencode(path))
+        after = path.lstat()
+    except OSError as error:
+        raise WorktreeError(f"unable to read raw tracked symlink: {path}") from error
+    if (
+        not stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISLNK(after.st_mode)
+        or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        or before.st_size != after.st_size
+        or len(target) != before.st_size
+    ):
+        raise WorktreeError(f"raw tracked symlink changed while reading: {path}")
+    digest = hashlib.new(object_format)
+    digest.update(b"blob " + str(len(target)).encode("ascii") + b"\0")
+    digest.update(target)
+    return digest.hexdigest()
 
 
 def _checkout_is_clean(

@@ -7,8 +7,9 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import pytest
 
@@ -203,6 +204,9 @@ def test_process_seam_has_exact_function_signatures() -> None:
     assert spawn["cwd"].default is inspect.Parameter.empty
     for name in ("stdin", "stdout", "stderr", "env"):
         assert spawn[name].default is None
+    for name in ("stdin", "stdout", "stderr"):
+        assert spawn[name].annotation == int | IO[bytes] | None
+    assert spawn["pass_fds"].annotation == Sequence[int]
     assert spawn["pass_fds"].default == ()
     assert spawn["preexec_fn"].default is None
     assert spawn["parent_death"].default is None
@@ -215,7 +219,7 @@ def test_process_seam_has_exact_function_signatures() -> None:
     terminate_signature = inspect.signature(processes.terminate_and_reap)
     terminate = terminate_signature.parameters
     assert list(terminate) == ["handle", "grace_seconds"]
-    assert terminate["grace_seconds"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert terminate["grace_seconds"].kind is inspect.Parameter.KEYWORD_ONLY
     assert terminate["grace_seconds"].default == 1.0
     assert terminate_signature.return_annotation == tuple[int, tuple[str, ...]]
 
@@ -471,7 +475,10 @@ def test_terminate_and_reap_escalates_term_to_kill_and_reaps_leader(
     assert handle.process.stdout is not None
     assert handle.process.stdout.readline() == b"ready\n"
 
-    exit_code, sequence = processes.terminate_and_reap(handle, 0.05)
+    exit_code, sequence = processes.terminate_and_reap(
+        handle,
+        grace_seconds=0.05,
+    )
 
     assert exit_code == handle.process.returncode == -signal.SIGKILL
     assert sequence == ("TERM", "KILL")

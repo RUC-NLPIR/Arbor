@@ -384,7 +384,7 @@ def run(workspace: str, run_id: str) -> int:
             timeout_hit = True
             exit_code, timeout_signals = processes.terminate_and_reap(
                 handle,
-                1,
+                grace_seconds=1,
             )
             timeout_signal_sequence = list(timeout_signals)
         now = time.monotonic()

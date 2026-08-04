@@ -5,13 +5,11 @@ import os as _os
 import signal as _signal
 import subprocess as _subprocess
 from collections.abc import Callable as _Callable
-from collections.abc import Iterable as _Iterable
 from collections.abc import Mapping as _Mapping
 from collections.abc import Sequence as _Sequence
 from dataclasses import dataclass as _dataclass
 from pathlib import Path as _Path
 from typing import IO as _IO
-from typing import Any as _Any
 
 __all__ = [
     "ProcessIdentity",
@@ -119,11 +117,11 @@ def spawn_process(
     argv: _Sequence[str],
     *,
     cwd: _Path,
-    stdin: int | _IO[_Any] | None = None,
-    stdout: int | _IO[_Any] | None = None,
-    stderr: int | _IO[_Any] | None = None,
+    stdin: int | _IO[bytes] | None = None,
+    stdout: int | _IO[bytes] | None = None,
+    stderr: int | _IO[bytes] | None = None,
     env: _Mapping[str, str] | None = None,
-    pass_fds: _Iterable[int] = (),
+    pass_fds: _Sequence[int] = (),
     preexec_fn: _Callable[[], None] | None = None,
     parent_death: ParentDeathSetup | None = None,
 ) -> ProcessHandle:
@@ -199,6 +197,7 @@ def reap_leader(
 
 def terminate_and_reap(
     handle: ProcessHandle,
+    *,
     grace_seconds: float = 1.0,
 ) -> tuple[int, tuple[str, ...]]:
     if handle.process.poll() is not None:

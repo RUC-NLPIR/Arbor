@@ -65,10 +65,7 @@ class ExecutionLease:
                 return
             descriptor = self.lock_fd
             self.lock_fd = -1
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+        os.close(descriptor)
 
 
 class EvalService:
@@ -692,10 +689,7 @@ def _require_linux_claim_runtime() -> None:
 
 
 def _release_execution_lock(descriptor: int) -> None:
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
+    os.close(descriptor)
 
 
 def _require_clean_registration(repo: _worktrees.RepositoryBinding) -> None:

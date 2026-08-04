@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import select
 import shlex
 import subprocess
 import sys
@@ -760,6 +761,109 @@ def test_execution_lease_close_is_an_atomic_one_shot(
 
 
 @requires_linux_claims
+def test_execution_lease_lock_remains_contended_until_fd_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    key = "close-linearization"
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        key,
+    )
+    assert isinstance(lease, eval_module.ExecutionLease)
+    lease_fd = lease.lock_fd
+    lock_path = (
+        root
+        / ".aros"
+        / "locks"
+        / f"{lease.request['eval_id']}-execution.lock"
+    )
+    ready_reader, ready_writer = os.pipe()
+    probe_reader, probe_writer = os.pipe()
+    outcome_reader, outcome_writer = os.pipe()
+    release_reader, release_writer = os.pipe()
+    holder_pid = os.fork()
+    if holder_pid == 0:
+        try:
+            os.close(ready_reader)
+            os.close(probe_writer)
+            os.close(outcome_reader)
+            os.close(release_writer)
+            os.close(lease_fd)
+            lock_fd = os.open(lock_path, os.O_RDWR)
+            os.write(ready_writer, b"1")
+            os.read(probe_reader, 1)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.write(outcome_writer, b"B")
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                os.write(outcome_writer, b"A")
+            else:
+                os.write(outcome_writer, b"A")
+            os.read(release_reader, 1)
+            os.close(lock_fd)
+        except BaseException:
+            os._exit(91)
+        os._exit(0)
+    os.close(ready_writer)
+    os.close(probe_reader)
+    os.close(outcome_writer)
+    os.close(release_reader)
+    assert os.read(ready_reader, 1) == b"1"
+    real_close = eval_module.os.close
+    close_entered = threading.Event()
+    allow_close = threading.Event()
+
+    def pause_lease_close(descriptor: int) -> None:
+        if descriptor == lease_fd:
+            close_entered.set()
+            assert allow_close.wait(timeout=5)
+        real_close(descriptor)
+
+    monkeypatch.setattr(eval_module.os, "close", pause_lease_close)
+    close_future = None
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        close_future = pool.submit(lease.close)
+        assert close_entered.wait(timeout=5)
+        os.write(probe_writer, b"1")
+        assert os.read(outcome_reader, 1) == b"B"
+        allow_close.set()
+        close_future.result(timeout=5)
+        assert os.read(outcome_reader, 1) == b"A"
+        replay = service._begin_execution(
+            "quality",
+            "1",
+            candidate_commit,
+            "principal",
+            key,
+        )
+        assert isinstance(replay, eval_module.ExistingEvaluation)
+        assert replay.status["evaluation_state"] == "lost"
+    finally:
+        allow_close.set()
+        if close_future is not None:
+            close_future.result(timeout=5)
+        pool.shutdown(wait=True)
+        os.write(release_writer, b"1")
+        os.close(release_writer)
+        os.close(probe_writer)
+        os.close(outcome_reader)
+        os.close(ready_reader)
+        _, holder_status = os.waitpid(holder_pid, 0)
+
+    assert os.waitstatus_to_exitcode(holder_status) == 0
+
+
+@requires_linux_claims
 def test_existing_released_claim_returns_lost_before_bundle_or_run_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1000,6 +1104,127 @@ def test_cross_process_winner_and_follower_observe_one_live_claim(
     )
     assert isinstance(replay, eval_module.ExistingEvaluation)
     assert replay.status["evaluation_state"] == "lost"
+
+
+@requires_linux_claims
+def test_cross_process_follower_waits_through_request_to_claim_window(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    key = "cross-process-request-claim-window"
+    request_ready_reader, request_ready_writer = os.pipe()
+    request_release_reader, request_release_writer = os.pipe()
+    claim_ready_reader, claim_ready_writer = os.pipe()
+    winner_finish_reader, winner_finish_writer = os.pipe()
+    follower_started_reader, follower_started_writer = os.pipe()
+    follower_result_reader, follower_result_writer = os.pipe()
+    winner_pid = os.fork()
+    if winner_pid == 0:
+        try:
+            real_create_json = eval_module.create_json
+
+            def pause_after_request(path: str | Path, value: object) -> bool:
+                created = real_create_json(path, value)
+                if Path(path).name == "request.json" and created:
+                    os.write(request_ready_writer, b"1")
+                    os.read(request_release_reader, 1)
+                return created
+
+            eval_module.create_json = pause_after_request
+            winner = EvalService(root)._begin_execution(
+                "quality",
+                "1",
+                candidate_commit,
+                "principal",
+                key,
+            )
+            if not isinstance(winner, eval_module.ExecutionLease):
+                os._exit(92)
+            os.write(claim_ready_writer, b"1")
+            os.read(winner_finish_reader, 1)
+            winner.close()
+        except BaseException:
+            os._exit(91)
+        os._exit(0)
+    assert os.read(request_ready_reader, 1) == b"1"
+    follower_pid = os.fork()
+    if follower_pid == 0:
+        try:
+            real_flock = eval_module.fcntl.flock
+            signalled_flock = False
+
+            def signal_idempotency_flock(descriptor: int, operation: int) -> object:
+                nonlocal signalled_flock
+                if not signalled_flock and operation == fcntl.LOCK_EX:
+                    signalled_flock = True
+                    os.write(follower_started_writer, b"F")
+                return real_flock(descriptor, operation)
+
+            eval_module.fcntl.flock = signal_idempotency_flock
+            os.write(follower_started_writer, b"S")
+            follower = EvalService(root)._begin_execution(
+                "quality",
+                "1",
+                candidate_commit,
+                "principal",
+                key,
+            )
+            outcome = (
+                b"R"
+                if isinstance(follower, eval_module.ExistingEvaluation)
+                and follower.status["evaluation_state"] == "running"
+                else b"X"
+            )
+            os.write(follower_result_writer, outcome)
+        except BaseException:
+            os.write(follower_result_writer, b"E")
+            os._exit(91)
+        os._exit(0)
+    assert os.read(follower_started_reader, 1) == b"S"
+    try:
+        flock_ready, _, _ = select.select([follower_started_reader], [], [], 5)
+        assert flock_ready == [follower_started_reader]
+        assert os.read(follower_started_reader, 1) == b"F"
+        ready, _, _ = select.select([follower_result_reader], [], [], 0.25)
+        assert ready == []
+        os.write(request_release_writer, b"1")
+        assert os.read(claim_ready_reader, 1) == b"1"
+        assert os.read(follower_result_reader, 1) == b"R"
+        key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        evaluation_root = root / ".aros" / "evaluations" / f"EVAL-{key_digest}"
+        assert sorted(path.name for path in evaluation_root.iterdir()) == [
+            "execution.json",
+            "request.json",
+        ]
+    finally:
+        for descriptor in (request_release_writer, winner_finish_writer):
+            try:
+                os.write(descriptor, b"1")
+            except OSError:
+                pass
+        _, follower_status = os.waitpid(follower_pid, 0)
+        _, winner_status = os.waitpid(winner_pid, 0)
+        for descriptor in (
+            request_ready_reader,
+            request_ready_writer,
+            request_release_reader,
+            request_release_writer,
+            claim_ready_reader,
+            claim_ready_writer,
+            winner_finish_reader,
+            winner_finish_writer,
+            follower_started_reader,
+            follower_started_writer,
+            follower_result_reader,
+            follower_result_writer,
+        ):
+            os.close(descriptor)
+
+    assert os.waitstatus_to_exitcode(follower_status) == 0
+    assert os.waitstatus_to_exitcode(winner_status) == 0
 
 
 @requires_linux_claims

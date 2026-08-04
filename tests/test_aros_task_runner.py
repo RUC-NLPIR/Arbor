@@ -7,7 +7,9 @@ import errno
 import hashlib
 import json
 import os
+import shlex
 import signal
+import shutil
 import socket
 import stat
 import subprocess
@@ -127,6 +129,35 @@ def _wait_state(
             pytest.fail(f"task reached {status['state']} before {expected}: {status}")
         time.sleep(0.02)
     pytest.fail(f"task did not reach {expected}: {service.status(task_id)}")
+
+
+def _fake_absent_tmux_carrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[list[str]]:
+    original_run = tasks_module.subprocess.run
+    carrier_calls: list[list[str]] = []
+
+    def run_carrier(
+        _service: TaskService,
+        _lock_descriptor: int,
+        command: list[str],
+        _environment: dict[str, str],
+    ) -> tuple[subprocess.CompletedProcess[str], None]:
+        carrier_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", ""), None
+
+    def absent_carrier(
+        command: list[str],
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if "has-session" in command:
+            return subprocess.CompletedProcess(command, 1, "", "")
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(TaskService, "_run_carrier_guardian", run_carrier)
+    monkeypatch.setattr(tasks_module.subprocess, "run", absent_carrier)
+    return carrier_calls
 
 
 def _term_ignoring_process_tree_code() -> str:
@@ -704,19 +735,24 @@ def test_normalized_permissions_preserve_fresh_single_link_log_flow(
     )
     task_id = str(brief["task_id"])
     runtime = tmp_path / ".aros" / "tasks" / task_id
-    original_run = tasks_module.subprocess.run
+    original_guardian = TaskService._run_carrier_guardian
 
     def normalize_before_tmux(
+        task_service: TaskService,
+        lock_descriptor: int,
         command: list[str],
-        *args: object,
-        **kwargs: object,
-    ) -> subprocess.CompletedProcess[str]:
-        if "new-session" in command:
-            for name in ("launch.json", "stdout.log", "stderr.log"):
-                (runtime / name).chmod(0o666)
-        return original_run(command, *args, **kwargs)  # type: ignore[return-value]
+        environment: dict[str, str],
+    ) -> tuple[subprocess.CompletedProcess[str], KeyboardInterrupt | None]:
+        for name in ("launch.json", "stdout.log", "stderr.log"):
+            (runtime / name).chmod(0o666)
+        return original_guardian(
+            task_service,
+            lock_descriptor,
+            command,
+            environment,
+        )
 
-    monkeypatch.setattr(tasks_module.subprocess, "run", normalize_before_tmux)
+    monkeypatch.setattr(TaskService, "_run_carrier_guardian", normalize_before_tmux)
 
     service.start(task_id)
     terminal = _wait_terminal(service, task_id)
@@ -814,18 +850,8 @@ def test_launch_without_process_or_final_becomes_lost_and_never_relaunches(
         key="lost-once",
     )
     task_id = str(brief["task_id"])
-    original_run = tasks_module.subprocess.run
-    carrier_calls: list[list[str]] = []
-
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            carrier_calls.append(command)
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    carrier_calls = _fake_absent_tmux_carrier(monkeypatch)
 
     first = service.start(task_id)
     status_path = tmp_path / ".aros" / "tasks" / task_id / "status.json"
@@ -843,6 +869,682 @@ def test_launch_without_process_or_final_becomes_lost_and_never_relaunches(
     assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "lost"
 
 
+def test_live_tmux_carrier_stays_launched_until_runner_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "print('carrier released')"],
+        key="live-carrier-before-runner-claim",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    runner_release = tmp_path / ".git" / "release-task-runner"
+    real_tmux = shutil.which("tmux")
+    assert real_tmux is not None
+    fake_tmux = tmp_path / ".git" / "delayed-runner-tmux"
+    carrier_launches = tmp_path / ".git" / "delayed-runner-launches"
+    delay_prefix = (
+        f"while [ ! -e {shlex.quote(str(runner_release))} ]; "
+        "do sleep 0.01; done; exec "
+    )
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "if 'new-session' in args:\n"
+        f"    marker = Path({str(carrier_launches)!r})\n"
+        "    marker.write_text((marker.read_text() if marker.exists() else '') + '1')\n"
+        f"    args[-1] = {delay_prefix!r} + args[-1]\n"
+        f"os.execv({real_tmux!r}, [{real_tmux!r}, *args])\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: str(fake_tmux))
+    launch: dict[str, object] | None = None
+    try:
+        first = service.start(task_id)
+        launch = json.loads((runtime / "launch.json").read_text(encoding="utf-8"))
+        carrier = subprocess.run(
+            [
+                real_tmux,
+                "-L",
+                str(launch["tmux_socket"]),
+                "has-session",
+                "-t",
+                f"={launch['tmux_session']}",
+            ],
+            capture_output=True,
+            check=False,
+            env=task_runner_module.runner_environment(runtime),
+        )
+        carrier_was_live = carrier.returncode == 0
+        before_claim = [service.status(task_id) for _ in range(3)]
+
+        ownership = json.loads(
+            (runtime / "ownership.json").read_text(encoding="utf-8")
+        )
+        atomic_write_json(
+            runtime / "status.json",
+            lost_status(brief, ownership, launch, before_claim[-1]),
+        )
+        repaired = service.status(task_id)
+        replay = service.start(task_id)
+
+        runner_release.touch()
+        deadline = time.monotonic() + 5
+        while not (runtime / "execution.json").is_file() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert (runtime / "execution.json").is_file()
+        terminal = _wait_terminal(service, task_id)
+    finally:
+        runner_release.touch(exist_ok=True)
+        if launch is not None:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                carrier = subprocess.run(
+                    [
+                        real_tmux,
+                        "-L",
+                        str(launch["tmux_socket"]),
+                        "has-session",
+                        "-t",
+                        f"={launch['tmux_session']}",
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+                if carrier.returncode != 0:
+                    break
+                time.sleep(0.02)
+
+    assert carrier_was_live
+    assert first["state"] == "launched"
+    assert [status["state"] for status in before_claim] == ["launched"] * 3
+    assert repaired["state"] == "launched"
+    assert replay["state"] == "launched"
+    assert carrier_launches.read_text(encoding="utf-8") == "1"
+    assert terminal["state"] == "completed"
+    assert (runtime / "execution.json").is_file()
+    assert (runtime / "final.json").is_file()
+
+
+def test_carrier_launch_lock_keeps_pre_session_start_nonterminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "print('pre-carrier release')"],
+        key="carrier-launch-before-session",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    real_tmux = shutil.which("tmux")
+    assert real_tmux is not None
+    fake_tmux = tmp_path / ".git" / "pre-carrier-tmux"
+    launch_entered = tmp_path / ".git" / "pre-carrier-entered"
+    release_launch = tmp_path / ".git" / "release-pre-carrier"
+    carrier_launches = tmp_path / ".git" / "pre-carrier-launches"
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "if 'new-session' in sys.argv:\n"
+        f"    marker = Path({str(carrier_launches)!r})\n"
+        "    marker.write_text((marker.read_text() if marker.exists() else '') + '1')\n"
+        f"    Path({str(launch_entered)!r}).touch()\n"
+        f"    while not Path({str(release_launch)!r}).exists():\n"
+        "        time.sleep(0.01)\n"
+        f"os.execv({real_tmux!r}, [{real_tmux!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: str(fake_tmux))
+    launch: dict[str, object] | None = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            starter = pool.submit(service.start, task_id)
+            deadline = time.monotonic() + 5
+            while not launch_entered.is_file() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert launch_entered.is_file()
+            launch = json.loads(
+                (runtime / "launch.json").read_text(encoding="utf-8")
+            )
+            carrier_before_release = subprocess.run(
+                [
+                    real_tmux,
+                    "-L",
+                    str(launch["tmux_socket"]),
+                    "has-session",
+                    "-t",
+                    f"={launch['tmux_session']}",
+                ],
+                capture_output=True,
+                check=False,
+                env=task_runner_module.runner_environment(runtime),
+            )
+            before_carrier = [service.status(task_id) for _ in range(3)]
+            replay = service.start(task_id)
+            release_launch.touch()
+            first = starter.result(timeout=10)
+        terminal = _wait_terminal(service, task_id)
+    finally:
+        release_launch.touch(exist_ok=True)
+
+    assert carrier_before_release.returncode == 1
+    assert [status["state"] for status in before_carrier] == ["launched"] * 3
+    assert replay["state"] == "launched"
+    assert first["state"] != "lost"
+    assert carrier_launches.read_text(encoding="utf-8") == "1"
+    assert terminal["state"] == "completed"
+    assert (runtime / "execution.json").is_file()
+    assert (runtime / "final.json").is_file()
+
+
+def test_guardian_keeps_launch_live_after_starter_sigkill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code = (
+        "from pathlib import Path\n"
+        "path = Path('adapter-count')\n"
+        "path.write_text((path.read_text() if path.exists() else '') + '1')\n"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", code],
+        key="guardian-survives-starter-sigkill",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    real_tmux = shutil.which("tmux")
+    assert real_tmux is not None
+    fake_tmux = tmp_path / ".git" / "barrier-tmux"
+    client_started = tmp_path / ".git" / "tmux-client-started"
+    release_client = tmp_path / ".git" / "release-tmux-client"
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "if 'new-session' in sys.argv:\n"
+        f"    Path({str(client_started)!r}).write_text(str(os.getpid()))\n"
+        f"    while not Path({str(release_client)!r}).exists():\n"
+        "        time.sleep(0.01)\n"
+        f"os.execv({real_tmux!r}, [{real_tmux!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: str(fake_tmux))
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+
+    starter_pid = os.fork()
+    if starter_pid == 0:
+        try:
+            service.start(task_id)
+        except BaseException:
+            os._exit(2)
+        os._exit(0)
+
+    starter_reaped = False
+    launch: dict[str, object] | None = None
+    try:
+        deadline = time.monotonic() + 5
+        while not client_started.is_file() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert client_started.is_file()
+        launch = json.loads((runtime / "launch.json").read_text(encoding="utf-8"))
+        before_kill = subprocess.run(
+            [
+                real_tmux,
+                "-L",
+                str(launch["tmux_socket"]),
+                "has-session",
+                "-t",
+                f"={launch['tmux_session']}",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        os.kill(starter_pid, signal.SIGKILL)
+        waited, wait_status = os.waitpid(starter_pid, 0)
+        starter_reaped = True
+        after_kill = [TaskService(tmp_path).status(task_id) for _ in range(3)]
+
+        release_client.touch()
+        deadline = time.monotonic() + 5
+        while not (runtime / "execution.json").is_file() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert (runtime / "execution.json").is_file()
+        terminal = _wait_terminal(TaskService(tmp_path), task_id)
+    finally:
+        release_client.touch(exist_ok=True)
+        if not starter_reaped:
+            try:
+                os.kill(starter_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(starter_pid, 0)
+        if launch is not None:
+            subprocess.run(
+                [
+                    real_tmux,
+                    "-L",
+                    str(launch["tmux_socket"]),
+                    "kill-session",
+                    "-t",
+                    f"={launch['tmux_session']}",
+                ],
+                capture_output=True,
+                check=False,
+            )
+
+    assert before_kill.returncode == 1
+    assert waited == starter_pid
+    assert os.waitstatus_to_exitcode(wait_status) == -signal.SIGKILL
+    assert [status["state"] for status in after_kill] == ["launched"] * 3
+    assert terminal["state"] == "completed"
+    assert (worktree / "adapter-count").read_text(encoding="utf-8") == "1"
+
+
+def test_guardian_does_not_leak_launch_lock_to_tmux_server(tmp_path: Path) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key="guardian-lock-fd-nonleak",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    lock_path = service._carrier_launch_lock_path(task_id)
+    fake_tmux = tmp_path / ".git" / "forking-tmux-client"
+    server_report = tmp_path / ".git" / "fake-tmux-server-report"
+    server_pid_path = tmp_path / ".git" / "fake-tmux-server-pid"
+    release_server = tmp_path / ".git" / "release-fake-tmux-server"
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"lock_path = {str(lock_path)!r}\n"
+        f"report = Path({str(server_report)!r})\n"
+        f"pid_path = Path({str(server_pid_path)!r})\n"
+        f"release = Path({str(release_server)!r})\n"
+        "server = os.fork()\n"
+        "if server == 0:\n"
+        "    pid_path.write_text(str(os.getpid()))\n"
+        "    targets = []\n"
+        "    for entry in Path('/proc/self/fd').iterdir():\n"
+        "        try:\n"
+        "            targets.append(os.readlink(entry))\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "    report.write_text('leaked' if lock_path in targets else 'clean')\n"
+        "    while not release.exists():\n"
+        "        time.sleep(0.01)\n"
+        "    os._exit(0)\n"
+        "deadline = time.monotonic() + 5\n"
+        "while not report.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.01)\n"
+        "raise SystemExit(0 if report.exists() else 2)\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+    server_pid: int | None = None
+    try:
+        with service._carrier_launch_guard(task_id) as lock_descriptor:
+            result, interrupted = service._run_carrier_guardian(
+                lock_descriptor,
+                [str(fake_tmux)],
+                task_runner_module.runner_environment(runtime),
+            )
+        server_pid = int(server_pid_path.read_text(encoding="utf-8"))
+
+        assert result.returncode == 0
+        assert interrupted is None
+        assert server_report.read_text(encoding="utf-8") == "clean"
+        assert _process_is_running(server_pid)
+        assert service._carrier_launch_is_active(task_id) is False
+    finally:
+        release_server.touch(exist_ok=True)
+        if server_pid is not None:
+            deadline = time.monotonic() + 5
+            while _process_is_running(server_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if _process_is_running(server_pid):
+                os.kill(server_pid, signal.SIGKILL)
+
+
+def test_guardian_does_not_kill_client_at_removed_ten_second_timeout(
+    tmp_path: Path,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key="guardian-no-client-timeout",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    fake_tmux = tmp_path / ".git" / "blocked-tmux-client"
+    client_started = tmp_path / ".git" / "blocked-client-started"
+    release_client = tmp_path / ".git" / "release-blocked-client"
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"Path({str(client_started)!r}).touch()\n"
+        f"while not Path({str(release_client)!r}).exists():\n"
+        "    time.sleep(0.01)\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+
+    try:
+        with service._carrier_launch_guard(task_id) as lock_descriptor:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                guardian = pool.submit(
+                    service._run_carrier_guardian,
+                    lock_descriptor,
+                    [str(fake_tmux)],
+                    task_runner_module.runner_environment(runtime),
+                )
+                deadline = time.monotonic() + 5
+                while not client_started.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                assert client_started.is_file()
+                old_timeout = time.monotonic() + 10.2
+                while time.monotonic() < old_timeout:
+                    time.sleep(0.05)
+                still_running = not guardian.done()
+                launch_still_active = service._carrier_launch_is_active(task_id)
+                release_client.touch()
+                result, interrupted = guardian.result(timeout=5)
+        released_after_result = not service._carrier_launch_is_active(task_id)
+    finally:
+        release_client.touch(exist_ok=True)
+
+    assert still_running
+    assert launch_still_active
+    assert result.returncode == 0
+    assert interrupted is None
+    assert released_after_result
+
+
+def test_guardian_forwards_tmux_exit_and_exec_results(tmp_path: Path) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key="guardian-result-forwarding",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    environment = task_runner_module.runner_environment(runtime)
+    commands = (
+        (
+            [
+                sys.executable,
+                "-c",
+                "import sys;print('ok-out');sys.stderr.write('ok-err')",
+            ],
+            0,
+            "ok-out\n",
+            "ok-err",
+        ),
+        (
+            [
+                sys.executable,
+                "-c",
+                "import sys;print('bad-out');sys.stderr.write('bad-err');sys.exit(7)",
+            ],
+            7,
+            "bad-out\n",
+            "bad-err",
+        ),
+        (["/definitely/missing/aros-tmux"], 127, "", "tmux exec failed:"),
+    )
+
+    observed: list[tuple[int, str, str, KeyboardInterrupt | None]] = []
+    for command, _returncode, _stdout, _stderr in commands:
+        with service._carrier_launch_guard(task_id) as lock_descriptor:
+            result, interrupted = service._run_carrier_guardian(
+                lock_descriptor,
+                command,
+                environment,
+            )
+        observed.append(
+            (result.returncode, result.stdout, result.stderr, interrupted)
+        )
+
+    for actual, expected in zip(observed, commands, strict=True):
+        returncode, stdout, stderr, interrupted = actual
+        _command, expected_returncode, expected_stdout, expected_stderr = expected
+        assert returncode == expected_returncode
+        assert stdout == expected_stdout
+        assert expected_stderr in stderr
+        assert interrupted is None
+    assert service._carrier_launch_is_active(task_id) is False
+
+
+@pytest.mark.parametrize("failure", ("nonzero", "oserror"))
+def test_carrier_failure_is_recorded_before_launch_lock_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key=f"carrier-failure-lock-{failure}",
+    )
+    task_id = str(brief["task_id"])
+    record_entered = Event()
+    release_record = Event()
+    guardian_calls: list[list[str]] = []
+    original_run = tasks_module.subprocess.run
+    original_record = TaskService._record_carrier_failure
+
+    def fail_guardian(
+        _service: TaskService,
+        _lock_descriptor: int,
+        command: list[str],
+        _environment: dict[str, str],
+    ) -> tuple[subprocess.CompletedProcess[str], None]:
+        guardian_calls.append(command)
+        if failure == "oserror":
+            raise OSError("injected guardian spawn failure")
+        return subprocess.CompletedProcess(command, 7, "", "tmux failed"), None
+
+    def pause_failure_record(
+        task_service: TaskService,
+        failed_task_id: str,
+        detail: str,
+    ) -> None:
+        record_entered.set()
+        assert release_record.wait(timeout=5)
+        original_record(task_service, failed_task_id, detail)
+
+    def absent_carrier(
+        command: list[str],
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if "has-session" in command:
+            return subprocess.CompletedProcess(command, 1, "", "")
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: "/fake/tmux")
+    monkeypatch.setattr(TaskService, "_run_carrier_guardian", fail_guardian)
+    monkeypatch.setattr(TaskService, "_record_carrier_failure", pause_failure_record)
+    monkeypatch.setattr(tasks_module.subprocess, "run", absent_carrier)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            starter = pool.submit(service.start, task_id)
+            assert record_entered.wait(timeout=5)
+            during_record = [service.status(task_id) for _ in range(3)]
+            replay = service.start(task_id)
+            release_record.set()
+            with pytest.raises(TaskError, match="tmux launch failed"):
+                starter.result(timeout=5)
+    finally:
+        release_record.set()
+
+    terminal = service.status(task_id)
+    assert [status["state"] for status in during_record] == ["launched"] * 3
+    assert replay["state"] == "launched"
+    assert terminal["state"] == "failed_process"
+    assert len(guardian_calls) == 1
+
+
+def test_carrier_launch_lock_probe_does_not_create_or_accept_stale_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key="absent-carrier-launch-lock",
+    )
+    task_id = str(brief["task_id"])
+    lock_path = service._carrier_launch_lock_path(task_id)
+
+    assert not lock_path.exists()
+    assert service._carrier_launch_is_active(task_id) is False
+    assert not lock_path.exists()
+
+    tasks_module._ensure_durable_lock_file(lock_path, "test carrier launch lock")
+    assert service._carrier_launch_is_active(task_id) is False
+
+    original_open = tasks_module.os.open
+
+    def fail_lock_open(path: object, *args: object, **kwargs: object) -> int:
+        if Path(path) == lock_path:  # type: ignore[arg-type]
+            raise OSError("injected carrier launch lock observation failure")
+        return original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tasks_module.os, "open", fail_lock_open)
+    with pytest.raises(TaskError, match="carrier launch lock"):
+        service._carrier_launch_is_active(task_id)
+
+
+@pytest.mark.parametrize("wrong_identity", ("socket", "session"))
+def test_carrier_probe_ignores_live_wrong_tmux_identity(
+    tmp_path: Path,
+    wrong_identity: str,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key=f"wrong-carrier-{wrong_identity}",
+    )
+    task_id = str(brief["task_id"])
+    expected_socket = tasks_module._tmux_socket_name(tmp_path, task_id)
+    expected_session = f"aros-task-{task_id.lower()}"
+    live_socket = (
+        f"{expected_socket}-wrong" if wrong_identity == "socket" else expected_socket
+    )
+    live_session = (
+        f"{expected_session}-wrong"
+        if wrong_identity == "session"
+        else expected_session
+    )
+    tmux = shutil.which("tmux")
+    assert tmux is not None
+    created = subprocess.run(
+        [
+            tmux,
+            "-L",
+            live_socket,
+            "new-session",
+            "-d",
+            "-s",
+            live_session,
+            "sleep 30",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    assert created.returncode == 0, created.stderr
+    launch = {
+        "task_id": task_id,
+        "host": socket.gethostname(),
+        "tmux_socket": expected_socket,
+        "tmux_session": expected_session,
+    }
+
+    try:
+        assert service._carrier_is_live(launch) is False
+    finally:
+        subprocess.run(
+            [
+                tmux,
+                "-L",
+                live_socket,
+                "kill-session",
+                "-t",
+                f"={live_session}",
+            ],
+            capture_output=True,
+            check=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("different-host", "oserror", "timeout", "unknown-status"),
+)
+def test_carrier_probe_observation_failure_is_not_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key=f"carrier-observation-{failure}",
+    )
+    task_id = str(brief["task_id"])
+    launch = {
+        "task_id": task_id,
+        "host": (
+            "definitely-not-the-local-host"
+            if failure == "different-host"
+            else socket.gethostname()
+        ),
+        "tmux_socket": tasks_module._tmux_socket_name(tmp_path, task_id),
+        "tmux_session": f"aros-task-{task_id.lower()}",
+    }
+
+    def fail_carrier_observation(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if failure == "oserror":
+            raise OSError("injected carrier observation failure")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, 3)
+        return subprocess.CompletedProcess(command, 2, "", "unexpected status")
+
+    monkeypatch.setattr(tasks_module.subprocess, "run", fail_carrier_observation)
+
+    with pytest.raises(TaskError, match="carrier|tmux|inspect"):
+        service._carrier_is_live(launch)
+
+
 def test_reconciliation_marks_claimed_unreaped_zombie_lost(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -855,14 +1557,8 @@ def test_reconciliation_marks_claimed_unreaped_zombie_lost(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     runtime = tmp_path / ".aros" / "tasks" / task_id
@@ -927,14 +1623,8 @@ def test_reconciliation_keeps_dead_adapter_running_while_runner_finalizes(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
@@ -991,35 +1681,6 @@ def test_reconciliation_keeps_dead_adapter_running_while_runner_finalizes(
     assert terminal["exit_code"] == 0
 
 
-def test_tmux_client_timeout_remains_uncertain_and_never_invents_final(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service, brief = _create_committed_task(
-        tmp_path,
-        [sys.executable, "-c", "print('uncertain carrier')"],
-        key="tmux-client-timeout",
-    )
-    task_id = str(brief["task_id"])
-    original_run = tasks_module.subprocess.run
-
-    def timeout_tmux_client(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            raise subprocess.TimeoutExpired(command, 10)
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", timeout_tmux_client)
-
-    status = service.start(task_id)
-
-    runtime = tmp_path / ".aros" / "tasks" / task_id
-    assert status["state"] == "lost"
-    assert (runtime / "launch.json").is_file()
-    assert not (runtime / "final.json").exists()
-
-
 def test_adapter_launch_failure_does_not_deadlock_finalization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1032,14 +1693,8 @@ def test_adapter_launch_failure_does_not_deadlock_finalization(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
 
@@ -1083,14 +1738,8 @@ def test_adapter_claim_failure_closes_gate_and_reaps_unclaimed_child(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     original_popen = task_runner_module.subprocess.Popen
@@ -1144,14 +1793,8 @@ def test_runner_hard_death_before_gate_never_executes_adapter(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     entered_read, entered_write = os.pipe()
@@ -1215,12 +1858,6 @@ def test_subreaper_unavailable_fails_closed_before_adapter_gate(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     class FailingPrctl:
         argtypes: object = None
         restype: object = None
@@ -1236,7 +1873,7 @@ def test_subreaper_unavailable_fails_closed_before_adapter_gate(
         return LibcWithoutSubreaper()
 
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     monkeypatch.setattr(ctypes, "CDLL", libc_without_subreaper)
@@ -1277,14 +1914,8 @@ def test_duplicate_runner_invocation_never_spawns_a_second_adapter(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
 
@@ -1314,14 +1945,8 @@ def test_preexisting_adapter_claim_prevents_popen(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     runtime = tmp_path / ".aros" / "tasks" / task_id
@@ -1444,18 +2069,9 @@ def test_late_runner_final_repairs_lost_without_a_second_launch(
     )
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
-    carrier_calls = 0
-
-    def lose_first_carrier(*args: object, **kwargs: object) -> object:
-        nonlocal carrier_calls
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            carrier_calls += 1
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", lose_first_carrier)
+    carrier_calls = _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
 
@@ -1463,7 +2079,7 @@ def test_late_runner_final_repairs_lost_without_a_second_launch(
     repaired = service.status(task_id)
 
     assert repaired["state"] == "completed"
-    assert carrier_calls == 1
+    assert len(carrier_calls) == 1
     final = json.loads(
         (tmp_path / ".aros" / "tasks" / task_id / "final.json").read_text(
             encoding="utf-8"
@@ -2455,14 +3071,8 @@ def test_timeout_waits_for_claimed_group_drain_after_kill(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
@@ -2549,14 +3159,8 @@ def test_timeout_deadline_natural_group_drain_preserves_leader_exit(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
@@ -2619,14 +3223,8 @@ def test_concurrent_stop_delivery_signals_process_group_once(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
@@ -2700,14 +3298,8 @@ def test_runner_waits_for_paused_external_stop_delivery(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
@@ -2797,14 +3389,8 @@ def test_stop_publication_arbitrates_with_runner_finalization(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
@@ -2979,14 +3565,8 @@ def test_stop_arriving_during_timeout_keeps_timeout_signal_authority(
     task_id = str(brief["task_id"])
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)
@@ -3267,14 +3847,8 @@ def test_stop_race_is_not_cancelled_when_no_signal_was_delivered(
     release_path = worktree / "adapter.release"
     original_run = tasks_module.subprocess.run
 
-    def carrier_without_runner(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        if isinstance(command, list) and "new-session" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
-
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.subprocess, "run", carrier_without_runner)
+    _fake_absent_tmux_carrier(monkeypatch)
     assert service.start(task_id)["state"] == "lost"
     monkeypatch.setattr(tasks_module.subprocess, "run", original_run)
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 2.0)

@@ -310,14 +310,23 @@ def _fake_tmux_carrier(
     original_run = tasks_module.subprocess.run
     carrier_calls: list[list[str]] = []
 
+    def run_carrier(
+        _service: TaskService,
+        _lock_descriptor: int,
+        command: list[str],
+        _environment: dict[str, str],
+    ) -> tuple[subprocess.CompletedProcess[str], None]:
+        carrier_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", ""), None
+
     def run(command: list[str], *args: object, **kwargs: object) -> object:
-        if "new-session" in command:
-            carrier_calls.append(command)
-            return subprocess.CompletedProcess(command, 0, "", "")
+        if "has-session" in command:
+            return subprocess.CompletedProcess(command, 1, "", "")
         return original_run(command, *args, **kwargs)
 
     monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: "/fake/tmux")
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(TaskService, "_run_carrier_guardian", run_carrier)
     monkeypatch.setattr(tasks_module.subprocess, "run", run)
     return carrier_calls
 
@@ -1120,6 +1129,62 @@ def test_concurrent_starts_share_one_preparation_and_launch(
     assert len(list(runtime.glob("preparation.json"))) == 1
     assert len(list(runtime.glob("launch.json"))) == 1
     assert len(carrier_calls) == 1
+
+
+def test_different_task_carrier_launches_do_not_hold_global_publication_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _first, first_id, _runtime = _create_committed_task(
+        tmp_path,
+        key="parallel-carrier-one",
+    )
+    second = _create(service, key="parallel-carrier-two", objective="second task")
+    second_id = str(second["task_id"])
+    _commit_brief(tmp_path, second)
+    both_entered = Event()
+    release_carriers = Event()
+    carrier_calls: list[list[str]] = []
+    original_run = tasks_module.subprocess.run
+    def pause_carriers(
+        _service: TaskService,
+        _lock_descriptor: int,
+        command: list[str],
+        _environment: dict[str, str],
+    ) -> tuple[subprocess.CompletedProcess[str], None]:
+        carrier_calls.append(command)
+        if len(carrier_calls) == 2:
+            both_entered.set()
+        assert release_carriers.wait(timeout=5)
+        return subprocess.CompletedProcess(command, 0, "", ""), None
+
+    def absent_carrier(
+        command: list[str],
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if "has-session" in command:
+            return subprocess.CompletedProcess(command, 1, "", "")
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: "/fake/tmux")
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(TaskService, "_run_carrier_guardian", pause_carriers)
+    monkeypatch.setattr(tasks_module.subprocess, "run", absent_carrier)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            starts = [
+                pool.submit(service.start, task_id, actor="principal")
+                for task_id in (first_id, second_id)
+            ]
+            assert both_entered.wait(timeout=5)
+            release_carriers.set()
+            statuses = [start.result(timeout=10) for start in starts]
+    finally:
+        release_carriers.set()
+
+    assert [status["state"] for status in statuses] == ["lost", "lost"]
+    assert len(carrier_calls) == 2
 
 
 def test_launch_evidence_prevents_automatic_carrier_retry(

@@ -142,9 +142,9 @@ def _fake_absent_tmux_carrier(
         _lock_descriptor: int,
         command: list[str],
         _environment: dict[str, str],
-    ) -> tuple[subprocess.CompletedProcess[str], None]:
+    ) -> subprocess.CompletedProcess[str]:
         carrier_calls.append(command)
-        return subprocess.CompletedProcess(command, 0, "", ""), None
+        return subprocess.CompletedProcess(command, 0, "", "")
 
     def absent_carrier(
         command: list[str],
@@ -742,7 +742,7 @@ def test_normalized_permissions_preserve_fresh_single_link_log_flow(
         lock_descriptor: int,
         command: list[str],
         environment: dict[str, str],
-    ) -> tuple[subprocess.CompletedProcess[str], KeyboardInterrupt | None]:
+    ) -> subprocess.CompletedProcess[str]:
         for name in ("launch.json", "stdout.log", "stderr.log"):
             (runtime / name).chmod(0o666)
         return original_guardian(
@@ -1205,7 +1205,7 @@ def test_guardian_does_not_leak_launch_lock_to_tmux_server(tmp_path: Path) -> No
     server_pid: int | None = None
     try:
         with service._carrier_launch_guard(task_id) as lock_descriptor:
-            result, interrupted = service._run_carrier_guardian(
+            result = service._run_carrier_guardian(
                 lock_descriptor,
                 [str(fake_tmux)],
                 task_runner_module.runner_environment(runtime),
@@ -1213,7 +1213,6 @@ def test_guardian_does_not_leak_launch_lock_to_tmux_server(tmp_path: Path) -> No
         server_pid = int(server_pid_path.read_text(encoding="utf-8"))
 
         assert result.returncode == 0
-        assert interrupted is None
         assert server_report.read_text(encoding="utf-8") == "clean"
         assert _process_is_running(server_pid)
         assert service._carrier_launch_is_active(task_id) is False
@@ -1270,7 +1269,7 @@ def test_guardian_does_not_kill_client_at_removed_ten_second_timeout(
                 still_running = not guardian.done()
                 launch_still_active = service._carrier_launch_is_active(task_id)
                 release_client.touch()
-                result, interrupted = guardian.result(timeout=5)
+                result = guardian.result(timeout=5)
         released_after_result = not service._carrier_launch_is_active(task_id)
     finally:
         release_client.touch(exist_ok=True)
@@ -1278,7 +1277,6 @@ def test_guardian_does_not_kill_client_at_removed_ten_second_timeout(
     assert still_running
     assert launch_still_active
     assert result.returncode == 0
-    assert interrupted is None
     assert released_after_result
 
 
@@ -1315,25 +1313,24 @@ def test_guardian_forwards_tmux_exit_and_exec_results(tmp_path: Path) -> None:
         (["/definitely/missing/aros-tmux"], 127, "", "tmux exec failed:"),
     )
 
-    observed: list[tuple[int, str, str, KeyboardInterrupt | None]] = []
+    observed: list[tuple[int, str, str]] = []
     for command, _returncode, _stdout, _stderr in commands:
         with service._carrier_launch_guard(task_id) as lock_descriptor:
-            result, interrupted = service._run_carrier_guardian(
+            result = service._run_carrier_guardian(
                 lock_descriptor,
                 command,
                 environment,
             )
         observed.append(
-            (result.returncode, result.stdout, result.stderr, interrupted)
+            (result.returncode, result.stdout, result.stderr)
         )
 
     for actual, expected in zip(observed, commands, strict=True):
-        returncode, stdout, stderr, interrupted = actual
+        returncode, stdout, stderr = actual
         _command, expected_returncode, expected_stdout, expected_stderr = expected
         assert returncode == expected_returncode
         assert stdout == expected_stdout
         assert expected_stderr in stderr
-        assert interrupted is None
     assert service._carrier_launch_is_active(task_id) is False
 
 
@@ -1360,11 +1357,11 @@ def test_carrier_failure_is_recorded_before_launch_lock_release(
         _lock_descriptor: int,
         command: list[str],
         _environment: dict[str, str],
-    ) -> tuple[subprocess.CompletedProcess[str], None]:
+    ) -> subprocess.CompletedProcess[str]:
         guardian_calls.append(command)
         if failure == "oserror":
             raise OSError("injected guardian spawn failure")
-        return subprocess.CompletedProcess(command, 7, "", "tmux failed"), None
+        return subprocess.CompletedProcess(command, 7, "", "tmux failed")
 
     def pause_failure_record(
         task_service: TaskService,
@@ -1532,6 +1529,136 @@ def test_pending_sigint_during_guardian_spawn_error_records_failure(
     assert mask_calls == [signal.SIG_BLOCK, signal.SIG_SETMASK]
     assert terminal["state"] == "failed_process"
     assert (tmp_path / ".aros" / "tasks" / task_id / "final.json").is_file()
+
+
+def test_pending_sigint_after_guardian_result_waits_for_failure_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key="guardian-result-pending-sigint-failure",
+    )
+    task_id = str(brief["task_id"])
+    original_record = TaskService._record_carrier_failure
+    original_pthread_sigmask = signal.pthread_sigmask
+    record_entered = Event()
+    release_record = Event()
+    pending_sigint = False
+    record_mask_blocked: list[bool] = []
+    mask_calls: list[int] = []
+
+    def completed_guardian(
+        _service: TaskService,
+        _lock_descriptor: int,
+        command: list[str],
+        _environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 7, "", "tmux failed")
+
+    def arm_sigint_before_record(
+        task_service: TaskService,
+        failed_task_id: str,
+        detail: str,
+    ) -> None:
+        nonlocal pending_sigint
+        blocked = original_pthread_sigmask(signal.SIG_BLOCK, set())
+        record_mask_blocked.append(signal.SIGINT in blocked)
+        pending_sigint = True
+        record_entered.set()
+        assert release_record.wait(timeout=5)
+        original_record(task_service, failed_task_id, detail)
+
+    def deliver_pending_sigint(how: int, mask: object) -> set[signal.Signals]:
+        result = original_pthread_sigmask(how, mask)  # type: ignore[arg-type]
+        mask_calls.append(how)
+        if how == signal.SIG_SETMASK and pending_sigint:
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: "/fake/tmux")
+    monkeypatch.setattr(TaskService, "_run_carrier_guardian", completed_guardian)
+    monkeypatch.setattr(TaskService, "_record_carrier_failure", arm_sigint_before_record)
+    monkeypatch.setattr(signal, "pthread_sigmask", deliver_pending_sigint)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            starter = pool.submit(service.start, task_id)
+            assert record_entered.wait(timeout=5)
+            during_publication = [service.status(task_id) for _ in range(3)]
+            release_record.set()
+            with pytest.raises(KeyboardInterrupt):
+                starter.result(timeout=5)
+    finally:
+        release_record.set()
+
+    terminal = service.status(task_id)
+    assert record_mask_blocked == [True]
+    assert mask_calls == [signal.SIG_BLOCK, signal.SIG_SETMASK]
+    assert [status["state"] for status in during_publication] == ["launched"] * 3
+    assert terminal["state"] == "failed_process"
+
+
+def test_pending_sigint_after_successful_guardian_result_keeps_carrier_live(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "import time;time.sleep(30)"],
+        timeout_seconds=30,
+        key="guardian-result-pending-sigint-success",
+    )
+    task_id = str(brief["task_id"])
+    original_guardian = TaskService._run_carrier_guardian
+    original_pthread_sigmask = signal.pthread_sigmask
+    pending_sigint = False
+    result_mask_blocked: list[bool] = []
+
+    def arm_sigint_after_result(
+        task_service: TaskService,
+        lock_descriptor: int,
+        command: list[str],
+        environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal pending_sigint
+        result = original_guardian(
+            task_service,
+            lock_descriptor,
+            command,
+            environment,
+        )
+        blocked = original_pthread_sigmask(signal.SIG_BLOCK, set())
+        result_mask_blocked.append(signal.SIGINT in blocked)
+        pending_sigint = True
+        return result
+
+    def deliver_pending_sigint(how: int, mask: object) -> set[signal.Signals]:
+        result = original_pthread_sigmask(how, mask)  # type: ignore[arg-type]
+        if how == signal.SIG_SETMASK and pending_sigint:
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(TaskService, "_run_carrier_guardian", arm_sigint_after_result)
+    monkeypatch.setattr(signal, "pthread_sigmask", deliver_pending_sigint)
+    terminal: dict[str, object] | None = None
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            service.start(task_id)
+        active = service.status(task_id)
+    finally:
+        observed = service.status(task_id)
+        if observed["state"] == "launched":
+            observed = _wait_state(service, task_id, "running")
+        if observed["state"] == "running":
+            service.stop(task_id, actor="cleanup", reason="test cleanup")
+            terminal = _wait_terminal(service, task_id)
+
+    assert result_mask_blocked == [True]
+    assert active["state"] in {"launched", "running"}
+    assert terminal is not None
+    assert terminal["state"] == "cancelled"
 
 
 def test_carrier_launch_lock_probe_does_not_create_or_accept_stale_lock(

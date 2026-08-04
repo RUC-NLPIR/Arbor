@@ -565,50 +565,53 @@ class TaskService:
                                 )
 
                 if not existing_launch:
+                    old_mask = signal.pthread_sigmask(
+                        signal.SIG_BLOCK,
+                        {signal.SIGINT},
+                    )
                     try:
-                        from .task_runner import runner_environment
+                        try:
+                            from .task_runner import runner_environment
 
-                        result, pending_interrupt = self._run_carrier_guardian(
-                            carrier_launch_fd,
-                            [
-                                tmux,
-                                "-L",
-                                socket_name,
-                                "new-session",
-                                "-d",
-                                "-s",
-                                session_name,
-                                "-c",
-                                str(runner_cwd),
-                                shlex.join(runner_invocation),
-                            ],
-                            runner_environment(runtime),
-                        )
-                    except OSError as error:
-                        carrier_error = error
-                        delivered_interrupt = getattr(
-                            error,
-                            "_aros_pending_interrupt",
-                            None,
-                        )
-                        if isinstance(delivered_interrupt, KeyboardInterrupt):
-                            pending_interrupt = delivered_interrupt
+                            result = self._run_carrier_guardian(
+                                carrier_launch_fd,
+                                [
+                                    tmux,
+                                    "-L",
+                                    socket_name,
+                                    "new-session",
+                                    "-d",
+                                    "-s",
+                                    session_name,
+                                    "-c",
+                                    str(runner_cwd),
+                                    shlex.join(runner_invocation),
+                                ],
+                                runner_environment(runtime),
+                            )
+                        except OSError as error:
+                            carrier_error = error
 
-                    if carrier_error is not None:
-                        carrier_failure_detail = str(carrier_error)
-                        self._record_carrier_failure(
-                            task_id,
-                            carrier_failure_detail,
-                        )
-                    elif result is not None and result.returncode != 0:
-                        carrier_failure_detail = (
-                            (result.stderr or result.stdout).strip()
-                            or "unknown tmux error"
-                        )
-                        self._record_carrier_failure(
-                            task_id,
-                            carrier_failure_detail,
-                        )
+                        if carrier_error is not None:
+                            carrier_failure_detail = str(carrier_error)
+                            self._record_carrier_failure(
+                                task_id,
+                                carrier_failure_detail,
+                            )
+                        elif result is not None and result.returncode != 0:
+                            carrier_failure_detail = (
+                                (result.stderr or result.stdout).strip()
+                                or "unknown tmux error"
+                            )
+                            self._record_carrier_failure(
+                                task_id,
+                                carrier_failure_detail,
+                            )
+                    finally:
+                        try:
+                            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+                        except KeyboardInterrupt as error:
+                            pending_interrupt = error
 
         if existing_launch:
             return self._existing_execution_status(task_id, actor)
@@ -2340,7 +2343,7 @@ class TaskService:
         lock_descriptor: int,
         command: list[str],
         environment: dict[str, str],
-    ) -> tuple[subprocess.CompletedProcess[str], KeyboardInterrupt | None]:
+    ) -> subprocess.CompletedProcess[str]:
         guardian_command = [
             sys.executable,
             "-I",
@@ -2349,48 +2352,23 @@ class TaskService:
             str(lock_descriptor),
             *command,
         ]
-        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
-        try:
-            guardian = subprocess.Popen(
-                guardian_command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                close_fds=True,
-                pass_fds=(lock_descriptor,),
-                start_new_session=True,
-                env=environment,
-            )
-        except OSError as error:
-            try:
-                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-            except KeyboardInterrupt as interrupt:
-                error._aros_pending_interrupt = interrupt  # type: ignore[attr-defined]
-            raise
-        except BaseException:
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-            raise
-        interrupted: KeyboardInterrupt | None = None
-        try:
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-        except KeyboardInterrupt as error:
-            interrupted = error
-        while True:
-            try:
-                stdout, stderr = guardian.communicate()
-                break
-            except KeyboardInterrupt as error:
-                if interrupted is None:
-                    interrupted = error
-        return (
-            subprocess.CompletedProcess(
-                command,
-                guardian.returncode,
-                stdout,
-                stderr,
-            ),
-            interrupted,
+        guardian = subprocess.Popen(
+            guardian_command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            close_fds=True,
+            pass_fds=(lock_descriptor,),
+            start_new_session=True,
+            env=environment,
+        )
+        stdout, stderr = guardian.communicate()
+        return subprocess.CompletedProcess(
+            command,
+            guardian.returncode,
+            stdout,
+            stderr,
         )
 
     def _carrier_is_live(self, launch: dict[str, object]) -> bool:

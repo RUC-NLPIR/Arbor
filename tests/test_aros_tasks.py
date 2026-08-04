@@ -315,9 +315,9 @@ def _fake_tmux_carrier(
         _lock_descriptor: int,
         command: list[str],
         _environment: dict[str, str],
-    ) -> tuple[subprocess.CompletedProcess[str], None]:
+    ) -> subprocess.CompletedProcess[str]:
         carrier_calls.append(command)
-        return subprocess.CompletedProcess(command, 0, "", ""), None
+        return subprocess.CompletedProcess(command, 0, "", "")
 
     def run(command: list[str], *args: object, **kwargs: object) -> object:
         if "has-session" in command:
@@ -1151,12 +1151,12 @@ def test_different_task_carrier_launches_do_not_hold_global_publication_lock(
         _lock_descriptor: int,
         command: list[str],
         _environment: dict[str, str],
-    ) -> tuple[subprocess.CompletedProcess[str], None]:
+    ) -> subprocess.CompletedProcess[str]:
         carrier_calls.append(command)
         if len(carrier_calls) == 2:
             both_entered.set()
         assert release_carriers.wait(timeout=5)
-        return subprocess.CompletedProcess(command, 0, "", ""), None
+        return subprocess.CompletedProcess(command, 0, "", "")
 
     def absent_carrier(
         command: list[str],

@@ -153,6 +153,18 @@ command reached `1641 passed, 6 skipped in 350.36s (0:05:50)`. Full
 ran on the clean `a9ee500` code/test/evidence tree; subsequent evidence-only
 documentation commits did not rewrite an operational or measurement receipt.
 
+After fast-forward integration at `main@56c5375`, the full repository gate
+again reached `1641 passed, 6 skipped in 326.85s (0:05:26)`. A direct
+`python -m arbor.cli.aros_app` smoke then launched
+`RUN-20260804-153546-projection-smoke-7f4b` through the public `aros` command
+surface and observed `completed`. The smoke unlinked only its mutable
+`status.json`; `aros run status` rebuilt the exact 16-field projection while
+the final remained byte-identical at SHA-256
+`d831ac9dd3054e1e9b3707bae6a192d0b1263b9eee352d7368453c2f9a0d862d`.
+Replaying the same idempotency key returned the same Run ID and final hash.
+The isolated `/tmp/aros-run-projection-smoke-*` repository was removed after
+verification; no process, worktree or registration was retained.
+
 ## Exit result
 
 M2 proves that a real AROS Principal or CLI can launch a process that survives

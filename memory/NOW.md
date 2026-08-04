@@ -8,8 +8,7 @@ commissioned.
 
 ## Current position
 
-- Branch: `aros-run-terminal-projection` in
-  `/workspace/Arbor/.worktree/aros-run-terminal-projection`.
+- Integrated implementation baseline: `main@56c5375` in `/workspace/Arbor`.
 - Current implementation baselines are deliberately separated: immutable Run
   terminal projection is `01a72f07ed6bc88fa6d7bd5fbe1527d985ffe558`;
   read-only Eval audit compatibility is
@@ -59,6 +58,12 @@ commissioned.
   350.36s (0:05:50)` for the final exact unqualified full pytest command. Full
   Ruff reported `All checks passed!`; diff-check and the `uv.lock` comparison
   both exited 0. No `uv` command ran and no commissioning receipt changed.
+- Post-merge main verification reached `1641 passed, 6 skipped in 326.85s`.
+  Direct CLI recovery smoke completed
+  `RUN-20260804-153546-projection-smoke-7f4b`, rebuilt a deleted mutable status
+  as the exact 16-field projection, preserved final SHA-256
+  `d831ac9dd3054e1e9b3707bae6a192d0b1263b9eee352d7368453c2f9a0d862d`, and
+  replayed the same idempotency key without another Run.
 - Wave 2 child-task evidence remains current. Exact carrier probing and the
   per-task OFD guardian close the reviewed Task startup-loss intervals without
   retry; Task adapters remain trusted-local, application-scoped, and not a
@@ -82,10 +87,9 @@ commissioned.
 
 ## Next obligations
 
-1. Integrate the immutable Run projection and Eval audit repair.
-2. Implement and commission protected registration/admission as a separate
+1. Implement and commission protected registration/admission as a separate
    Gate C-D change; do not infer it from visible evidence.
-3. Consolidate Run/Task into the shared Operations process core, including
+2. Consolidate Run/Task into the shared Operations process core, including
    delegated per-task cgroups for runner-death containment.
-4. Complete provider profiles, Principal lease, `child_done`, semantic
+3. Complete provider profiles, Principal lease, `child_done`, semantic
    K/M/G/Skills, MCP/provider parity, migration, and Arbor retirement waves.

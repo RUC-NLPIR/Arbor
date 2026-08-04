@@ -86,6 +86,67 @@ stopped manifest    8142afb173deaab5a93c5b61447dd1f6ec53e4b029a327ee3a7da1e4a144
 stopped final       db5646420321f95fc060fe94ba36e8b23a71a3120b153ffb62d8f21a4e372daa
 ```
 
+## Immutable terminal projection repair
+
+The 2026-08-04 repair found that terminal validation had treated mutable
+`.aros/runs/<id>/status.json` as a co-authority: otherwise valid immutable
+final and output evidence could be invalidated by a missing, stale or forged
+status, and Eval audit needed a special validation bypass. Terminal authority
+is now the Run manifest, create-once prelaunch receipt and immutable final.
+Mutable status is only a reconstructible operational projection.
+
+For a terminal Run with valid immutable lineage, `status`, `start` and
+`reconcile` deterministically repair all tested mutable projections: missing,
+stale `launched`, stale `lost`, and forged terminal status. The exact
+16-field projection is derived from manifest + prelaunch + final:
+
+```text
+schema_version, run_id, state, manifest_sha256,
+actor, carrier, tmux_session, host, launch_receipt_sha256, launched_at,
+started_at, exit_code, finished_at, heartbeat_at, final_ref, updated_at
+```
+
+The launch-failure path also derives its terminal final and status from the
+manifest and prelaunch receipt. Forged mutable actor, host and launch-hash
+fields cannot enter that projection. Conversely, invalid immutable manifest,
+prelaunch or final evidence fails closed before any status rewrite.
+
+`read_validated_final`, `read_verified_output` and `verify_output` no longer
+depend on mutable status and do not recreate it. Eval audit keeps its separate
+status observation at `reconcile=False`: a missing status is reported against
+its own reference, while immutable final, stdout and stderr remain in
+`checked_refs` and validate independently. The regression snapshots every
+remaining file's relative path, inode and bytes, proves the status remains
+absent, and therefore proves audit does not rebuild status, final, measurement
+receipt or an Eval retry.
+
+The change sequence is recorded by these commits:
+
+| Commit | Evidence/change |
+| --- | --- |
+| `a614ec3` | scope and ordering checkpoint for the terminal projection repair |
+| `2a87d0d` | tests exposing mutable terminal-status co-authority |
+| `30d5872` | tests for direct repair of missing/stale/forged projections |
+| `57be2c7` | tests separating launch actor authority from mutable status |
+| `01a72f0` | Run terminal projection derived from immutable receipts |
+| `c6b80ee` | read-only Eval audit kept independent of missing Run status |
+
+Fresh implementation gates reached `92 passed` for `tests/test_aros_runs.py`
+and `383 passed in 64.98s` for `tests/test_aros_runs.py`,
+`tests/test_aros_eval.py` and `tests/test_aros_eval_records.py`. The focused
+missing-status Eval audit gate reached `2 passed`; Ruff and both Git diff gates
+were clean. No `uv` command was invoked and no commissioning receipt was
+rewritten.
+
+Documentation commissioning on the `c6b80ee` implementation baseline then
+reached `231 passed in 10.10s` for the architecture/public-entry/registry gate.
+The exact unqualified `/workspace/Arbor/.venv/bin/python -m pytest` command
+reached `1640 passed, 6 skipped in 359.32s (0:05:59)`. Full
+`ruff check src tests scripts` reported `All checks passed!`; both
+`git diff --check` and `git diff --exit-code -- uv.lock` exited 0. The working
+diff contained only the four commissioned documentation files, so these checks
+did not rewrite an operational or measurement receipt.
+
 ## Exit result
 
 M2 proves that a real AROS Principal or CLI can launch a process that survives

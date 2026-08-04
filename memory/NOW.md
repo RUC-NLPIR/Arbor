@@ -8,10 +8,15 @@ commissioned.
 
 ## Current position
 
-- Branch: `aros-wave3-eval` in
-  `/workspace/Arbor/.worktree/aros-wave3-eval`.
-- Current code baseline:
-  `a9b30e4d2754845b4e35e1540796d7aff6447145`.
+- Branch: `aros-run-terminal-projection` in
+  `/workspace/Arbor/.worktree/aros-run-terminal-projection`.
+- Current implementation baselines are deliberately separated: immutable Run
+  terminal projection is `01a72f07ed6bc88fa6d7bd5fbe1527d985ffe558`;
+  read-only Eval audit compatibility is
+  `c6b80ee2a5b8df183d1c92b51d525b43d246a47c`.
+- The guarded Task carrier work is merged on `main` at
+  `904f7ae2786ce7f57c9d987c7d6c4608f7d37dc2`; this branch descends from that
+  baseline.
 - Visible Eval remains commissioned at code baseline
   `d5cbc7ec4ddd4b677e55df341912394d32e55846`; its post-hardening evidence
   checkpoint is `25db6fe7f6e24a703e2319783d2466fe59a98f4e`.
@@ -40,10 +45,19 @@ commissioned.
   attempt remains factual `failed_process/not_available` evidence and was not
   retried. The commissioned descriptor uses fixed `python3`; no isolation
   policy was weakened.
-- Fresh current-baseline verification reached
-  `1626 passed, 6 skipped in 361.54s` in the whole suite. Maintained Ruff,
-  registry, diff, and `uv.lock` gates are clean; reviewed Task carrier
-  hardening is current through `a9b30e4`.
+- Run terminal reads now use manifest + create-once prelaunch + immutable final
+  as authority. Mutable terminal status is a deterministic 16-field
+  projection repaired by `status`, `start`, or `reconcile`; immutable
+  final/output readers do not require or recreate it.
+- Eval audit observes Run status with reconciliation disabled. Missing mutable
+  status is an independent issue and does not prevent immutable final/log
+  validation; audit does not reconstruct status, final, measurement or retry.
+- Fresh current-branch gates reached `92 passed` for Run, `383 passed in
+  64.98s` for the Run/Eval/Eval-records combination, `231 passed in 10.10s`
+  for architecture/public-entry/registry, and `1640 passed, 6 skipped in
+  359.32s (0:05:59)` for the exact unqualified full pytest command. Full Ruff
+  reported `All checks passed!`; diff-check and the `uv.lock` comparison both
+  exited 0. No `uv` command ran and no commissioning receipt changed.
 - Wave 2 child-task evidence remains current. Exact carrier probing and the
   per-task OFD guardian close the reviewed Task startup-loss intervals without
   retry; Task adapters remain trusted-local, application-scoped, and not a
@@ -51,6 +65,8 @@ commissioned.
   unchanged.
 - Protected registration/admission, disclosure budgets, migration adapters,
   MCP parity, and Arbor retirement remain unavailable.
+- This repair does not commission all Phase 3 exits, Phase 4, or the complete
+  AROS target.
 
 ## Preserved operational evidence
 
@@ -63,9 +79,11 @@ commissioned.
 
 ## Next obligations
 
-1. Implement and commission protected registration/admission as a separate
+1. Integrate the immutable Run projection and Eval audit repair, then register
+   the Phase 3 sequence deviation in current implementation context.
+2. Implement and commission protected registration/admission as a separate
    Gate C-D change; do not infer it from visible evidence.
-2. Consolidate Run/Task into the shared Operations process core, including
+3. Consolidate Run/Task into the shared Operations process core, including
    delegated per-task cgroups for runner-death containment.
-3. Complete provider profiles, Principal lease, `child_done`, semantic
+4. Complete provider profiles, Principal lease, `child_done`, semantic
    K/M/G/Skills, MCP/provider parity, migration, and Arbor retirement waves.

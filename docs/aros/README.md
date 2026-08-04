@@ -27,9 +27,12 @@ The exposed command surface for the direct `aros` entry is:
 ## Not yet implemented
 
 - protected evaluation registration and admission
-- migration adapters
-- MCP parity
-- Arbor retirement
+- shared Operations events, budgets, checkpoints, search, audit, skills, and
+  Principal lease
+- provider child profiles/adapters, `child_done`, and positive assimilation
+- semantic K/M/G plus one-way migration adapters
+- MCP parity and provider parity
+- distribution and namespace transition, including Arbor retirement
 
 ## Compatibility
 

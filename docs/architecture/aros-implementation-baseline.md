@@ -50,12 +50,22 @@ AROS 只保留四个不可约部分：
 2. Bootable workspace：无 transcript 的新 Agent 可恢复 mission、current thesis、active work 与主要 uncertainty。
 3. Durable run：终止 Principal 不终止 experiment，recovery 不发明 final state。
 4. Capability isolation：隔离不可用时 fail closed，不静默降级。
-5. Deterministic evaluation：exact-commit clean rerun，worker prose 不能设置 primary metric。
-6. Child task substrate：write-heavy child 使用独立 `.worktree/`，dirty work 永不被强制清理。
+5. Mechanical child task substrate：write-heavy child 使用独立 `.worktree/`，dirty work 永不被强制清理。
+6. Deterministic evaluation：exact-commit clean rerun，worker prose 不能设置 primary metric。
 7. Migration/adapters：同一 kernel 服务 native CLI 与 MCP；旧数据只单向导入。
 8. Commissioning：完成 fresh boot、long-run restart、independent admission、isolated child、assimilation 与 provider switch 后，才切换默认路径并退役重复模块。
 
 每个 gate 都需要命令输出、状态文件、receipt 或测试作为证据；仅有代码路径或 mock 不能证明端到端能力。
+
+### 当前 sequence deviation
+
+Phase 3 仍缺 Principal lease、provider child profiles/adapters、`child_done`
+与 positive assimilation 等 exit 项。为避免在这些 exit 项完成前重复实现 process
+和 event primitives，当前 refinement 暂时把 Protected Eval 与 Operations 放在
+这些剩余项之前。
+
+这是实施顺序偏差，不是目标降级：它不提前声明 Phase 3 或 Phase 4 完成，也不构成
+AROS commissioning 完成。上述缺口仍必须按 Design Book 的原目标实现、验证并登记。
 
 ## Commissioning 前非目标
 

@@ -838,6 +838,28 @@ class EvalService:
             or json_sha256(portable) != run_link["bundle_sha256"]
         ):
             raise EvalError("linked Run lineage is invalid")
+        state = status.get("state")
+        allowed_states = {
+            "prepared",
+            "launched",
+            "running",
+            "completed",
+            "failed_process",
+            "timed_out",
+            "cancelled",
+            "lost",
+        }
+        if state not in allowed_states:
+            raise EvalError("linked Run state is invalid")
+        if state in {"completed", "failed_process", "timed_out", "cancelled"}:
+            if status.get("final_ref") != f"runs/{run_id}/final.json":
+                raise EvalError("linked terminal Run final reference is invalid")
+            try:
+                final = runs.read_validated_final(run_id)
+            except ValueError as error:
+                raise EvalError("linked terminal Run final is invalid") from error
+            if final.get("state") != state:
+                raise EvalError("linked Run status and final state differ")
         return status
 
     def _lost_evaluation(

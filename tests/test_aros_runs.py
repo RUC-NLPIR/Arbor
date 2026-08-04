@@ -100,24 +100,9 @@ def _mark_runner_launched(
     manifest: dict[str, object],
 ) -> str:
     run_id = str(manifest["run_id"])
-    launched_at = str(manifest["created_at"])
-    session_name = f"aros-{run_id.lower()}"
-    prelaunch: dict[str, object] = {
-        "schema_version": 1,
-        "receipt_id": f"{run_id}-prelaunch",
-        "kind": "run_prelaunch",
-        "run_id": run_id,
-        "actor": manifest["actor"],
-        "created_at": launched_at,
-        "base_commit": manifest["base_commit"],
-        "manifest_sha256": manifest["manifest_sha256"],
-        "carrier": "tmux",
-        "tmux_session": session_name,
-        "host": "test-host",
-        "runner_version": 1,
-        "runner_invocation": [sys.executable, "-m", "arbor.aros.runner"],
-    }
-    prelaunch["receipt_sha256"] = record_sha256(prelaunch, "receipt_sha256")
+    prelaunch = _test_prelaunch_receipt(root, manifest)
+    launched_at = str(prelaunch["created_at"])
+    session_name = str(prelaunch["tmux_session"])
     atomic_write_json(
         root / ".aros" / "receipts" / f"{run_id}-prelaunch.json",
         prelaunch,
@@ -126,10 +111,10 @@ def _mark_runner_launched(
     launched.update(
         {
             "state": "launched",
-            "actor": manifest["actor"],
+            "actor": prelaunch["actor"],
             "carrier": "tmux",
             "tmux_session": session_name,
-            "host": "test-host",
+            "host": prelaunch["host"],
             "launch_receipt_sha256": prelaunch["receipt_sha256"],
             "launched_at": launched_at,
             "updated_at": launched_at,
@@ -140,6 +125,39 @@ def _mark_runner_launched(
         launched,
     )
     return run_id
+
+
+def _test_prelaunch_receipt(
+    root: Path,
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    run_id = str(manifest["run_id"])
+    launched_at = str(manifest["created_at"])
+    prelaunch: dict[str, object] = {
+        "schema_version": 1,
+        "receipt_id": f"{run_id}-prelaunch",
+        "kind": "run_prelaunch",
+        "run_id": run_id,
+        "actor": manifest["actor"],
+        "created_at": launched_at,
+        "base_commit": manifest["base_commit"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "carrier": "tmux",
+        "tmux_session": f"aros-{run_id.lower()}",
+        "host": runs_module.socket.gethostname(),
+        "runner_version": 1,
+        "runner_invocation": [
+            sys.executable,
+            "-m",
+            "arbor.aros.runner",
+            "--workspace",
+            str(root),
+            "--run-id",
+            run_id,
+        ],
+    }
+    prelaunch["receipt_sha256"] = record_sha256(prelaunch, "receipt_sha256")
+    return prelaunch
 
 
 def _prepare(
@@ -522,6 +540,46 @@ def test_read_verified_output_rejects_invalid_final_semantics(
 
     with pytest.raises(RunError, match="final|lineage|timestamp"):
         service.read_verified_output(run_id, "stdout")
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    ("runner_invocation", "actor", "host", "status-mismatch"),
+)
+def test_validated_final_rejects_forged_prelaunch_provenance(
+    tmp_path: Path,
+    forgery: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "print('provenance')"],
+        key=f"forged-final-{forgery}",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    receipt_path = tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json"
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    final_path = tmp_path / "runs" / run_id / "final.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    if forgery == "status-mismatch":
+        status["actor"] = "forged-status-actor"
+    else:
+        if forgery == "runner_invocation":
+            receipt[forgery] = ["/forged/runner", run_id]
+        else:
+            receipt[forgery] = f"forged-{forgery}"
+        receipt["receipt_sha256"] = record_sha256(receipt, "receipt_sha256")
+        status["launch_receipt_sha256"] = receipt["receipt_sha256"]
+        final["launch_receipt_sha256"] = receipt["receipt_sha256"]
+    atomic_write_json(receipt_path, receipt)
+    atomic_write_json(status_path, status)
+    atomic_write_json(final_path, final)
+
+    with pytest.raises(RunError, match="prelaunch|status.*lineage"):
+        service.read_validated_final(run_id)
 
 
 def test_prepare_defaults_to_isolated_linux_and_freezes_capability_policy(
@@ -1086,6 +1144,48 @@ def test_start_rejects_manifest_tamper_and_unrelated_dirty_work(tmp_path: Path) 
     (tmp_path / "unrelated.txt").write_text("dirty", encoding="utf-8")
     with pytest.raises(RunError, match="clean Git"):
         service.start(run_id)
+
+
+@pytest.mark.parametrize("forged_field", ("runner_invocation", "actor", "host"))
+def test_start_rejects_forged_self_hashed_prelaunch_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forged_field: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        key=f"forged-prelaunch-{forged_field}",
+    )
+    run_id = str(manifest["run_id"])
+    receipt = _test_prelaunch_receipt(tmp_path, manifest)
+    if forged_field == "runner_invocation":
+        receipt[forged_field] = ["/forged/runner", run_id]
+    else:
+        receipt[forged_field] = f"forged-{forged_field}"
+    receipt["receipt_sha256"] = record_sha256(receipt, "receipt_sha256")
+    atomic_write_json(
+        tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json",
+        receipt,
+    )
+    real_run = runs_module.subprocess.run
+    tmux_calls = 0
+
+    def reject_tmux(command: list[str], **kwargs: object):
+        nonlocal tmux_calls
+        if command[0] == "/test/tmux":
+            tmux_calls += 1
+            return subprocess.CompletedProcess(command, 1, "", "must not launch")
+        return real_run(command, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runs_module.shutil, "which", lambda _name: "/test/tmux")
+    monkeypatch.setattr(runs_module.subprocess, "run", reject_tmux)
+
+    with pytest.raises(RunError, match="prelaunch"):
+        service.start(run_id)
+
+    assert tmux_calls == 0
+    assert service.status(run_id, reconcile=False)["state"] == "prepared"
 
 
 def test_real_tmux_run_survives_client_and_writes_final_receipts(tmp_path: Path) -> None:

@@ -199,9 +199,17 @@ def _terminal_receipt(
         "manifest_sha256": manifest["manifest_sha256"],
         "carrier": "tmux",
         "tmux_session": f"aros-{run_id.lower()}",
-        "host": "test-host",
+        "host": eval_module.socket.gethostname(),
         "runner_version": 1,
-        "runner_invocation": [sys.executable, "-m", "arbor.aros.runner"],
+        "runner_invocation": [
+            sys.executable,
+            "-m",
+            "arbor.aros.runner",
+            "--workspace",
+            str(root),
+            "--run-id",
+            run_id,
+        ],
     }
     prelaunch["receipt_sha256"] = record_sha256(prelaunch, "receipt_sha256")
     atomic_write_json(
@@ -219,7 +227,7 @@ def _terminal_receipt(
             "finalized_at": execution["claimed_at"],
             "duration_seconds": 0.0,
             "resource_usage": {"wall_seconds": 0.0},
-            "host": "test-host",
+            "host": prelaunch["host"],
             "actual_environment_sha256": "0" * 64,
             "launch_receipt_sha256": prelaunch["receipt_sha256"],
             "stdout": {
@@ -242,6 +250,10 @@ def _terminal_receipt(
             "run_id": run_id,
             "state": "completed",
             "manifest_sha256": manifest["manifest_sha256"],
+            "actor": prelaunch["actor"],
+            "carrier": "tmux",
+            "tmux_session": prelaunch["tmux_session"],
+            "host": prelaunch["host"],
             "launch_receipt_sha256": prelaunch["receipt_sha256"],
             "launched_at": execution["claimed_at"],
             "finished_at": execution["claimed_at"],
@@ -326,9 +338,17 @@ def _install_terminal_run(
             "manifest_sha256": manifest["manifest_sha256"],
             "carrier": "tmux",
             "tmux_session": f"aros-{run_id.lower()}",
-            "host": "test-host",
+            "host": eval_module.socket.gethostname(),
             "runner_version": 1,
-            "runner_invocation": [sys.executable, "-m", "arbor.aros.runner"],
+            "runner_invocation": [
+                sys.executable,
+                "-m",
+                "arbor.aros.runner",
+                "--workspace",
+                str(root),
+                "--run-id",
+                run_id,
+            ],
         }
         prelaunch["receipt_sha256"] = record_sha256(
             prelaunch,
@@ -368,6 +388,10 @@ def _install_terminal_run(
             {
                 "state": state,
                 "exit_code": final["exit_code"],
+                "actor": prelaunch["actor"],
+                "carrier": "tmux",
+                "tmux_session": prelaunch["tmux_session"],
+                "host": prelaunch["host"],
                 "finished_at": final["finished_at"],
                 "final_ref": f"runs/{run_id}/final.json",
                 "launch_receipt_sha256": prelaunch["receipt_sha256"],
@@ -2656,6 +2680,91 @@ def test_receipt_replay_requires_full_run_link_lineage(
 
 
 @requires_linux_claims
+@pytest.mark.parametrize("tamper", ("bogus", "completed-no-final"))
+def test_linked_run_status_rejects_bogus_or_terminal_without_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    key = f"visible-linked-status-{tamper}"
+
+    def crash_before_start(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("injected pre-start crash")
+
+    monkeypatch.setattr(RunService, "start", crash_before_start)
+    with pytest.raises(RuntimeError, match="pre-start"):
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key=key,
+        )
+    eval_id = "EVAL-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+    evaluation_root = root / ".aros" / "evaluations" / eval_id
+    request = json.loads((evaluation_root / "request.json").read_text(encoding="utf-8"))
+    run_link = json.loads((evaluation_root / "run.json").read_text(encoding="utf-8"))
+    run_id = str(run_link["run_id"])
+    status_path = root / ".aros" / "runs" / run_id / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["state"] = "bogus" if tamper == "bogus" else "completed"
+    if tamper == "completed-no-final":
+        status["final_ref"] = f"runs/{run_id}/final.json"
+        status["finished_at"] = status["updated_at"]
+    atomic_write_json(status_path, status)
+
+    with pytest.raises(EvalError, match="linked Run|lineage|state|final"):
+        service._linked_run_status(request, run_link)
+
+
+@requires_linux_claims
+def test_linked_run_status_rejects_wrong_final_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.5,"sample_count":5}\n',
+    )
+
+    def crash_before_measurement(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("injected pre-measurement crash")
+
+    monkeypatch.setattr(
+        service,
+        "_publish_visible_receipt",
+        crash_before_measurement,
+    )
+    key = "visible-linked-wrong-final-state"
+    with pytest.raises(RuntimeError, match="pre-measurement"):
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key=key,
+        )
+    eval_id = "EVAL-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+    evaluation_root = root / ".aros" / "evaluations" / eval_id
+    request = json.loads((evaluation_root / "request.json").read_text(encoding="utf-8"))
+    run_link = json.loads((evaluation_root / "run.json").read_text(encoding="utf-8"))
+    run_id = str(run_link["run_id"])
+    status_path = root / ".aros" / "runs" / run_id / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["state"] = "failed_process"
+    atomic_write_json(status_path, status)
+
+    with pytest.raises(EvalError, match="linked Run|lineage|state|final"):
+        service._linked_run_status(request, run_link)
+
+
+@requires_linux_claims
 @pytest.mark.parametrize(
     ("run_state", "measurement_state"),
     (("completed", "invalid_eval"), ("failed_process", "not_available")),
@@ -2958,16 +3067,91 @@ def test_corrupt_run_final_never_reads_output_cleans_or_receipts(
     assert not receipt_path.exists()
     assert (root / ".worktree" / "eval" / eval_id).is_dir()
 
-    replay = service.run(
-        "quality",
-        "1",
-        candidate_commit,
-        actor="principal",
-        idempotency_key=key,
+    with pytest.raises(EvalError, match="linked terminal Run final"):
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key=key,
+        )
+    assert not receipt_path.exists()
+
+
+@requires_linux_claims
+def test_forged_prelaunch_provenance_never_publishes_measurement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.9,"sample_count":9}\n',
     )
-    assert isinstance(replay, eval_module.ExistingEvaluation)
-    assert replay.status["evaluation_state"] == "lost"
-    assert replay.status["referenced_process_state"] == "completed"
+    terminal_start = RunService.start
+
+    def forge_after_final(
+        run_service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        status = terminal_start(run_service, run_id, actor=actor)
+        prelaunch_path = root / ".aros" / "receipts" / f"{run_id}-prelaunch.json"
+        status_path = root / ".aros" / "runs" / run_id / "status.json"
+        final_path = root / "runs" / run_id / "final.json"
+        prelaunch = json.loads(prelaunch_path.read_text(encoding="utf-8"))
+        persisted_status = json.loads(status_path.read_text(encoding="utf-8"))
+        final = json.loads(final_path.read_text(encoding="utf-8"))
+        prelaunch["runner_invocation"] = ["/forged/runner", run_id]
+        prelaunch["receipt_sha256"] = record_sha256(
+            prelaunch,
+            "receipt_sha256",
+        )
+        persisted_status["launch_receipt_sha256"] = prelaunch["receipt_sha256"]
+        final["launch_receipt_sha256"] = prelaunch["receipt_sha256"]
+        atomic_write_json(prelaunch_path, prelaunch)
+        atomic_write_json(status_path, persisted_status)
+        atomic_write_json(final_path, final)
+        return status
+
+    monkeypatch.setattr(RunService, "start", forge_after_final)
+
+    def forbidden_after_forgery(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("forged prelaunch must stop before output or cleanup")
+
+    monkeypatch.setattr(RunService, "read_verified_output", forbidden_after_forgery)
+    monkeypatch.setattr(
+        worktrees_module,
+        "remove_clean_execution_bundle",
+        forbidden_after_forgery,
+    )
+    key = "visible-forged-prelaunch-provenance"
+    with pytest.raises(EvalError, match="Run final"):
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key=key,
+        )
+
+    eval_id = "EVAL-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+    receipt_path = root / "eval" / "evaluations" / eval_id / "receipt.json"
+    assert not receipt_path.exists()
+    assert (root / ".worktree" / "eval" / eval_id).is_dir()
+
+    with pytest.raises(EvalError, match="linked terminal Run final"):
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key=key,
+        )
     assert not receipt_path.exists()
 
 

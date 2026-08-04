@@ -421,15 +421,8 @@ class RunService:
         launch_actor = _validate_text(actor or str(manifest["actor"]), "actor")
         launched_at = _utc_now()
         session_name = f"aros-{run_id.lower()}"
-        runner_argv = [
-            sys.executable,
-            "-m",
-            "arbor.aros.runner",
-            "--workspace",
-            str(self.root),
-            "--run-id",
-            run_id,
-        ]
+        launch_host = socket.gethostname()
+        runner_argv = _runner_invocation(self.root, run_id)
 
         receipt: dict[str, object] = {
             "schema_version": 1,
@@ -442,22 +435,23 @@ class RunService:
             "manifest_sha256": manifest["manifest_sha256"],
             "carrier": "tmux",
             "tmux_session": session_name,
-            "host": socket.gethostname(),
+            "host": launch_host,
             "runner_version": 1,
             "runner_invocation": runner_argv,
         }
         receipt["receipt_sha256"] = _receipt_sha256(receipt)
         receipt_path = self._receipts_path() / f"{run_id}-prelaunch.json"
         if not create_json(receipt_path, receipt):
-            receipt = _read_object(receipt_path, "prelaunch receipt")
-            recorded_receipt_hash = receipt.get("receipt_sha256")
-            if (
-                not isinstance(recorded_receipt_hash, str)
-                or recorded_receipt_hash != _receipt_sha256(receipt)
-                or receipt.get("manifest_sha256") != manifest.get("manifest_sha256")
-            ):
-                raise RunError(f"invalid existing prelaunch receipt: {run_id}")
-            launched_at = str(receipt["created_at"])
+            receipt = _read_strict_object(receipt_path, "prelaunch receipt")
+        _validate_prelaunch_receipt(
+            receipt,
+            manifest,
+            expected_actor=launch_actor,
+            expected_host=launch_host,
+            expected_session=session_name,
+            expected_invocation=runner_argv,
+        )
+        launched_at = str(receipt["created_at"])
         launch_receipt_sha256 = str(receipt["receipt_sha256"])
         self._write_event(
             event_id=f"EVT-{run_id}-launch-requested",
@@ -476,7 +470,7 @@ class RunService:
             "actor": launch_actor,
             "carrier": "tmux",
             "tmux_session": session_name,
-            "host": socket.gethostname(),
+            "host": launch_host,
             "launch_receipt_sha256": launch_receipt_sha256,
             "launched_at": launched_at,
             "updated_at": launched_at,
@@ -751,30 +745,21 @@ class RunService:
             or status.get("final_ref") != f"runs/{run_id}/final.json"
         ):
             raise RunError(f"final and status lineage mismatch: {run_id}")
-        invocation = prelaunch.get("runner_invocation")
-        if (
-            set(prelaunch) != _PRELAUNCH_FIELDS
-            or prelaunch.get("schema_version") != 1
-            or prelaunch.get("receipt_id") != f"{run_id}-prelaunch"
-            or prelaunch.get("kind") != "run_prelaunch"
-            or prelaunch.get("run_id") != run_id
-            or not isinstance(prelaunch.get("actor"), str)
-            or not prelaunch["actor"]
-            or not _valid_utc_timestamp(prelaunch.get("created_at"))
-            or prelaunch.get("base_commit") != manifest.get("base_commit")
-            or prelaunch.get("manifest_sha256") != manifest.get("manifest_sha256")
-            or prelaunch.get("carrier") != "tmux"
-            or prelaunch.get("tmux_session") != f"aros-{run_id.lower()}"
-            or not isinstance(prelaunch.get("host"), str)
-            or not prelaunch["host"]
-            or prelaunch.get("runner_version") != 1
-            or not isinstance(invocation, list)
-            or not invocation
-            or any(not isinstance(item, str) or not item for item in invocation)
-            or prelaunch.get("receipt_sha256") != _receipt_sha256(prelaunch)
-            or prelaunch.get("receipt_sha256") != launch_sha256
-        ):
-            raise RunError(f"invalid prelaunch receipt lineage: {run_id}")
+        expected_actor = status.get("actor")
+        expected_host = status.get("host")
+        if not isinstance(expected_actor, str) or not isinstance(expected_host, str):
+            raise RunError(f"invalid launch provenance in status: {run_id}")
+        _validate_prelaunch_receipt(
+            prelaunch,
+            manifest,
+            expected_actor=expected_actor,
+            expected_host=expected_host,
+            expected_session=f"aros-{run_id.lower()}",
+            expected_invocation=_runner_invocation(self.root, run_id),
+            status=status,
+        )
+        if "host" in final and final["host"] != expected_host:
+            raise RunError(f"final and launch host mismatch: {run_id}")
         return final
 
     def stop(
@@ -1283,6 +1268,66 @@ class RunService:
 
 def _receipt_sha256(receipt: dict[str, object]) -> str:
     return record_sha256(receipt, "receipt_sha256")
+
+
+def _runner_invocation(root: Path, run_id: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "arbor.aros.runner",
+        "--workspace",
+        str(root),
+        "--run-id",
+        run_id,
+    ]
+
+
+def _validate_prelaunch_receipt(
+    receipt: dict[str, object],
+    manifest: dict[str, object],
+    *,
+    expected_actor: str,
+    expected_host: str,
+    expected_session: str,
+    expected_invocation: list[str],
+    status: dict[str, object] | None = None,
+) -> None:
+    run_id = str(manifest["run_id"])
+    receipt_sha256 = receipt.get("receipt_sha256")
+    if (
+        set(receipt) != _PRELAUNCH_FIELDS
+        or type(receipt.get("schema_version")) is not int
+        or receipt.get("schema_version") != 1
+        or receipt.get("receipt_id") != f"{run_id}-prelaunch"
+        or receipt.get("kind") != "run_prelaunch"
+        or receipt.get("run_id") != run_id
+        or receipt.get("actor") != expected_actor
+        or not _valid_utc_timestamp(receipt.get("created_at"))
+        or receipt.get("base_commit") != manifest.get("base_commit")
+        or receipt.get("manifest_sha256") != manifest.get("manifest_sha256")
+        or receipt.get("carrier") != "tmux"
+        or receipt.get("tmux_session") != expected_session
+        or receipt.get("host") != expected_host
+        or type(receipt.get("runner_version")) is not int
+        or receipt.get("runner_version") != 1
+        or receipt.get("runner_invocation") != expected_invocation
+        or not isinstance(receipt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
+        or receipt_sha256 != _receipt_sha256(receipt)
+    ):
+        raise RunError(f"invalid prelaunch receipt: {run_id}")
+    if status is not None and (
+        status.get("schema_version") != 1
+        or status.get("run_id") != run_id
+        or status.get("manifest_sha256") != manifest.get("manifest_sha256")
+        or status.get("actor") != expected_actor
+        or status.get("host") != expected_host
+        or status.get("carrier") != "tmux"
+        or status.get("tmux_session") != expected_session
+        or status.get("launch_receipt_sha256") != receipt_sha256
+        or status.get("launched_at") != receipt.get("created_at")
+    ):
+        raise RunError(f"prelaunch and status lineage mismatch: {run_id}")
 
 
 def _request_sha256(manifest: dict[str, object]) -> str:

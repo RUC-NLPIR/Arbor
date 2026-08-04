@@ -368,6 +368,7 @@ def _install_terminal_run(
                 "finished_at": manifest["created_at"],
                 "finalized_at": manifest["created_at"],
                 "resource_usage": {"wall_seconds": 0.0},
+                "host": prelaunch["host"],
                 "launch_receipt_sha256": prelaunch["receipt_sha256"],
                 "stdout": {
                     "path": f".aros/runs/{run_id}/stdout.log",
@@ -3079,9 +3080,20 @@ def test_corrupt_run_final_never_reads_output_cleans_or_receipts(
 
 
 @requires_linux_claims
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "runner-invocation",
+        "empty-actor",
+        "empty-host",
+        "missing-final-host",
+        "empty-final-host",
+    ),
+)
 def test_forged_prelaunch_provenance_never_publishes_measurement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
 ) -> None:
     root = tmp_path / "repository"
     service, _manifest, candidate_commit = _registered_visible_run_service(root)
@@ -3106,13 +3118,26 @@ def test_forged_prelaunch_provenance_never_publishes_measurement(
         prelaunch = json.loads(prelaunch_path.read_text(encoding="utf-8"))
         persisted_status = json.loads(status_path.read_text(encoding="utf-8"))
         final = json.loads(final_path.read_text(encoding="utf-8"))
-        prelaunch["runner_invocation"] = ["/forged/runner", run_id]
-        prelaunch["receipt_sha256"] = record_sha256(
-            prelaunch,
-            "receipt_sha256",
-        )
-        persisted_status["launch_receipt_sha256"] = prelaunch["receipt_sha256"]
-        final["launch_receipt_sha256"] = prelaunch["receipt_sha256"]
+        if tamper == "runner-invocation":
+            prelaunch["runner_invocation"] = ["/forged/runner", run_id]
+        elif tamper == "empty-actor":
+            prelaunch["actor"] = ""
+            persisted_status["actor"] = ""
+        elif tamper == "empty-host":
+            prelaunch["host"] = ""
+            persisted_status["host"] = ""
+            final.pop("host", None)
+        elif tamper == "missing-final-host":
+            final.pop("host", None)
+        else:
+            final["host"] = ""
+        if tamper in {"runner-invocation", "empty-actor", "empty-host"}:
+            prelaunch["receipt_sha256"] = record_sha256(
+                prelaunch,
+                "receipt_sha256",
+            )
+            persisted_status["launch_receipt_sha256"] = prelaunch["receipt_sha256"]
+            final["launch_receipt_sha256"] = prelaunch["receipt_sha256"]
         atomic_write_json(prelaunch_path, prelaunch)
         atomic_write_json(status_path, persisted_status)
         atomic_write_json(final_path, final)
@@ -3129,7 +3154,7 @@ def test_forged_prelaunch_provenance_never_publishes_measurement(
         "remove_clean_execution_bundle",
         forbidden_after_forgery,
     )
-    key = "visible-forged-prelaunch-provenance"
+    key = f"visible-forged-prelaunch-provenance-{tamper}"
     with pytest.raises(EvalError, match="Run final"):
         service.run(
             "quality",

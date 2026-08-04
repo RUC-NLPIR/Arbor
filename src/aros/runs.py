@@ -699,9 +699,8 @@ class RunService:
             or duration != resource_usage["wall_seconds"]
         ):
             raise RunError(f"invalid final duration: {run_id}")
-        if "host" in final and (
-            not isinstance(final["host"], str) or not final["host"]
-        ):
+        final_host = final.get("host")
+        if not isinstance(final_host, str) or not final_host:
             raise RunError(f"invalid final host: {run_id}")
         if "actual_environment_sha256" in final and (
             not isinstance(final["actual_environment_sha256"], str)
@@ -747,7 +746,12 @@ class RunService:
             raise RunError(f"final and status lineage mismatch: {run_id}")
         expected_actor = status.get("actor")
         expected_host = status.get("host")
-        if not isinstance(expected_actor, str) or not isinstance(expected_host, str):
+        if (
+            not isinstance(expected_actor, str)
+            or not expected_actor
+            or not isinstance(expected_host, str)
+            or not expected_host
+        ):
             raise RunError(f"invalid launch provenance in status: {run_id}")
         _validate_prelaunch_receipt(
             prelaunch,
@@ -758,7 +762,7 @@ class RunService:
             expected_invocation=_runner_invocation(self.root, run_id),
             status=status,
         )
-        if "host" in final and final["host"] != expected_host:
+        if final_host != expected_host:
             raise RunError(f"final and launch host mismatch: {run_id}")
         return final
 
@@ -998,6 +1002,7 @@ class RunService:
                 "finished_at": finished_at,
                 "finalized_at": finished_at,
                 "resource_usage": {"wall_seconds": 0.0},
+                "host": status["host"],
                 "error": f"carrier launch failed: {detail}",
                 "launch_receipt_sha256": status["launch_receipt_sha256"],
                 "stdout": _empty_output(f".aros/runs/{run_id}/stdout.log"),
@@ -1296,17 +1301,23 @@ def _validate_prelaunch_receipt(
     receipt_sha256 = receipt.get("receipt_sha256")
     if (
         set(receipt) != _PRELAUNCH_FIELDS
+        or not isinstance(expected_actor, str)
+        or not expected_actor
+        or not isinstance(expected_host, str)
+        or not expected_host
         or type(receipt.get("schema_version")) is not int
         or receipt.get("schema_version") != 1
         or receipt.get("receipt_id") != f"{run_id}-prelaunch"
         or receipt.get("kind") != "run_prelaunch"
         or receipt.get("run_id") != run_id
+        or not isinstance(receipt.get("actor"), str)
         or receipt.get("actor") != expected_actor
         or not _valid_utc_timestamp(receipt.get("created_at"))
         or receipt.get("base_commit") != manifest.get("base_commit")
         or receipt.get("manifest_sha256") != manifest.get("manifest_sha256")
         or receipt.get("carrier") != "tmux"
         or receipt.get("tmux_session") != expected_session
+        or not isinstance(receipt.get("host"), str)
         or receipt.get("host") != expected_host
         or type(receipt.get("runner_version")) is not int
         or receipt.get("runner_version") != 1

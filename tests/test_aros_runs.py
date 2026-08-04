@@ -582,6 +582,54 @@ def test_validated_final_rejects_forged_prelaunch_provenance(
         service.read_validated_final(run_id)
 
 
+@pytest.mark.parametrize(
+    "tamper",
+    ("empty-actor", "empty-host", "missing-final-host", "empty-final-host"),
+)
+def test_validated_final_requires_nonempty_attributed_provenance(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "print('attributed')"],
+        key=f"attributed-final-{tamper}",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    prelaunch_path = tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json"
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    final_path = tmp_path / "runs" / run_id / "final.json"
+    prelaunch = json.loads(prelaunch_path.read_text(encoding="utf-8"))
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    if tamper == "empty-actor":
+        prelaunch["actor"] = ""
+        status["actor"] = ""
+    elif tamper == "empty-host":
+        prelaunch["host"] = ""
+        status["host"] = ""
+        final.pop("host")
+    elif tamper == "missing-final-host":
+        final.pop("host")
+    else:
+        final["host"] = ""
+    if tamper in {"empty-actor", "empty-host"}:
+        prelaunch["receipt_sha256"] = record_sha256(
+            prelaunch,
+            "receipt_sha256",
+        )
+        status["launch_receipt_sha256"] = prelaunch["receipt_sha256"]
+        final["launch_receipt_sha256"] = prelaunch["receipt_sha256"]
+    atomic_write_json(prelaunch_path, prelaunch)
+    atomic_write_json(status_path, status)
+    atomic_write_json(final_path, final)
+
+    with pytest.raises(RunError, match="prelaunch|provenance|host|final"):
+        service.read_validated_final(run_id)
+
+
 def test_prepare_defaults_to_isolated_linux_and_freezes_capability_policy(
     tmp_path: Path,
 ) -> None:

@@ -447,15 +447,21 @@ def test_terminal_status_operation_rebuilds_deterministically(
     run_id = _mark_runner_launched(tmp_path, service, manifest)
     status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
     launched_status = json.loads(status_path.read_text(encoding="utf-8"))
+    prelaunch_path = (
+        tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json"
+    )
+    prelaunch = json.loads(prelaunch_path.read_text(encoding="utf-8"))
+    prelaunch["actor"] = "launch-principal"
+    prelaunch["receipt_sha256"] = record_sha256(prelaunch, "receipt_sha256")
+    atomic_write_json(prelaunch_path, prelaunch)
+    launched_status["actor"] = prelaunch["actor"]
+    launched_status["launch_receipt_sha256"] = prelaunch["receipt_sha256"]
+    atomic_write_json(status_path, launched_status)
     assert runner_module.run(str(tmp_path), run_id) == 0
     final = json.loads(
         (tmp_path / "runs" / run_id / "final.json").read_text(encoding="utf-8")
     )
-    prelaunch = json.loads(
-        (
-            tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json"
-        ).read_text(encoding="utf-8")
-    )
+    assert prelaunch["actor"] != manifest["actor"]
     expected = {
         "schema_version": 1,
         "run_id": run_id,

@@ -41,7 +41,7 @@ commissioned.
   retried. The commissioned descriptor uses fixed `python3`; no isolation
   policy was weakened.
 - Fresh current-baseline verification reached
-  `1621 passed, 6 skipped in 355.56s` in the whole suite. Maintained Ruff,
+  `1626 passed, 6 skipped in 361.54s` in the whole suite. Maintained Ruff,
   registry, diff, and `uv.lock` gates are clean; reviewed Task carrier
   hardening is current through `a9b30e4`.
 - Wave 2 child-task evidence remains current. Exact carrier probing and the

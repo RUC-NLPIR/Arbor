@@ -1533,6 +1533,105 @@ def test_signaled_tmux_client_does_not_overwrite_live_session(
     assert (worktree / "adapter-count").read_text(encoding="utf-8") == "1"
 
 
+@pytest.mark.parametrize("returncode", (7, -signal.SIGKILL))
+def test_failed_guardian_result_preserves_valid_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key=f"guardian-valid-final-{returncode}",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    guardian_calls: list[list[str]] = []
+    prior_final_bytes: list[bytes] = []
+
+    def publish_final_then_fail(
+        task_service: TaskService,
+        _lock_descriptor: int,
+        command: list[str],
+        _environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        guardian_calls.append(command)
+        assert task_runner_module.record_carrier_failure(
+            task_service,
+            task_id,
+            "prior valid carrier final",
+        )
+        prior_final_bytes.append((runtime / "final.json").read_bytes())
+        assert not (runtime / "execution.json").exists()
+        return subprocess.CompletedProcess(command, returncode, "", "tmux failed")
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: "/fake/tmux")
+    monkeypatch.setattr(TaskService, "_run_carrier_guardian", publish_final_then_fail)
+
+    terminal = service.start(task_id)
+    final_bytes = (runtime / "final.json").read_bytes()
+    final = json.loads(final_bytes)
+    replay = service.start(task_id)
+
+    assert terminal["state"] == final["state"] == "failed_process"
+    assert replay == terminal
+    assert final["error"] == "carrier launch failed: prior valid carrier final"
+    assert prior_final_bytes == [final_bytes]
+    assert not (runtime / "execution.json").exists()
+    assert len(guardian_calls) == 1
+
+
+@pytest.mark.parametrize("returncode", (7, -signal.SIGKILL))
+def test_failed_guardian_result_preserves_valid_execution_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key=f"guardian-valid-execution-{returncode}",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    guardian_calls: list[list[str]] = []
+
+    def claim_then_fail(
+        task_service: TaskService,
+        _lock_descriptor: int,
+        command: list[str],
+        _environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        guardian_calls.append(command)
+        recorded_brief = task_service._load_brief(task_id)
+        ownership = task_service._load_ownership(recorded_brief)
+        launch = task_service._load_launch(recorded_brief, ownership)
+        token = process_start_token(os.getpid())
+        assert token is not None
+        execution = task_runner_module.create_execution_claim(
+            task_service,
+            recorded_brief,
+            ownership,
+            launch,
+            (os.getpid(), os.getpgid(0), token),
+        )
+        assert execution is not None
+        return subprocess.CompletedProcess(command, returncode, "", "tmux failed")
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: "/fake/tmux")
+    monkeypatch.setattr(TaskService, "_run_carrier_guardian", claim_then_fail)
+
+    launched = service.start(task_id)
+    replay = service.start(task_id)
+
+    assert launched["state"] == replay["state"] == "launched"
+    assert (runtime / "execution.json").is_file()
+    assert not (runtime / "final.json").exists()
+    assert len(guardian_calls) == 1
+
+
 def test_pending_sigint_after_guardian_spawn_waits_and_records_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1613,6 +1712,120 @@ def test_pending_sigint_after_guardian_spawn_waits_and_records_failure(
     assert terminal["state"] == "failed_process"
     assert client_pid is not None
     assert not _process_is_running(client_pid)
+
+
+def test_real_sigint_waits_for_carrier_failure_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key="real-sigint-carrier-failure",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    fake_tmux = tmp_path / ".git" / "real-sigint-tmux-client"
+    client_started = tmp_path / ".git" / "real-sigint-client-started"
+    release_client = tmp_path / ".git" / "release-real-sigint-client"
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "if 'new-session' not in sys.argv:\n"
+        "    raise SystemExit(1)\n"
+        f"Path({str(client_started)!r}).touch()\n"
+        f"while not Path({str(release_client)!r}).exists():\n"
+        "    time.sleep(0.01)\n"
+        "raise SystemExit(7)\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: str(fake_tmux))
+
+    starter_pid = os.fork()
+    if starter_pid == 0:
+        signal.pthread_sigmask(signal.SIG_SETMASK, set())
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            service.start(task_id)
+        except KeyboardInterrupt:
+            try:
+                status = TaskService(tmp_path).status(task_id)
+                final = json.loads(
+                    (runtime / "final.json").read_text(encoding="utf-8")
+                )
+            except BaseException:
+                os._exit(3)
+            os._exit(
+                0
+                if status["state"] == final["state"] == "failed_process"
+                else 4
+            )
+        except BaseException:
+            os._exit(5)
+        os._exit(6)
+
+    starter_reaped = False
+    try:
+        deadline = time.monotonic() + 5
+        while not client_started.is_file() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert client_started.is_file()
+        os.kill(starter_pid, signal.SIGINT)
+
+        pending_mask = 1 << (signal.SIGINT - 1)
+        pending_observed = False
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                process_status = Path(f"/proc/{starter_pid}/status").read_text(
+                    encoding="ascii"
+                )
+            except OSError:
+                break
+            masks = {
+                name: int(value, 16)
+                for name, value in (
+                    line.split(":", 1)
+                    for line in process_status.splitlines()
+                    if line.startswith(("SigPnd:", "ShdPnd:"))
+                )
+            }
+            if any(mask & pending_mask for mask in masks.values()):
+                pending_observed = True
+                break
+            time.sleep(0.01)
+
+        during_interrupt = [TaskService(tmp_path).status(task_id) for _ in range(3)]
+        release_client.touch()
+        waited, wait_status = os.waitpid(starter_pid, 0)
+        starter_reaped = True
+    finally:
+        release_client.touch(exist_ok=True)
+        if not starter_reaped:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                waited, _wait_status = os.waitpid(starter_pid, os.WNOHANG)
+                if waited == starter_pid:
+                    starter_reaped = True
+                    break
+                time.sleep(0.02)
+            if not starter_reaped:
+                try:
+                    os.kill(starter_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(starter_pid, 0)
+
+    terminal = TaskService(tmp_path).status(task_id)
+    assert pending_observed
+    assert [status["state"] for status in during_interrupt] == ["launched"] * 3
+    assert waited == starter_pid
+    assert os.waitstatus_to_exitcode(wait_status) == 0
+    assert terminal["state"] == "failed_process"
 
 
 def test_pending_sigint_during_guardian_spawn_error_records_failure(

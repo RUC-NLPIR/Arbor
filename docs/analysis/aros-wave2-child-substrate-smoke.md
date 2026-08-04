@@ -677,17 +677,24 @@ closes both sides of the startup interval without authorizing retry:
   launch, or status publication, remains blocked through definitive outcome
   publication, and is re-raised only after restoring the exact prior mask;
 - a nonzero or signaled tmux client cannot overwrite a valid final, a valid
-  execution claim, or the exact live session; absent rc 7 and spawn errors
-  still publish `failed_process` while the launch guard is held;
+  execution claim, or the exact live session; direct rc 7 and `-SIGKILL`
+  characterization tests cover both immutable-record branches, while absent
+  rc 7 and spawn errors still publish `failed_process` under the launch guard;
 - guardian diagnostics use replacement decoding, so invalid UTF-8 remains
   bounded factual failure detail instead of producing `lost`;
 - same-task replay never launches again, while different tasks retain
   independent launch locks and can enter tmux concurrently.
 
 Deterministic gates covered the pre-carrier interval, starter `SIGKILL`, lock-FD
-non-leak to a long-lived fake server, all SIGINT publication windows, rc 0,
-absent nonzero and signaled-client outcomes, invalid UTF-8, failure publication
-under the guard, exact-session recovery, no retry, and cross-task parallelism.
+non-leak to a long-lived fake server, all synthetic SIGINT publication windows,
+rc 0, absent nonzero and signaled-client outcomes, invalid UTF-8, failure
+publication under the guard, exact-session recovery, no retry, and cross-task
+parallelism. A separate forked-starter integration sends a real `SIGINT` with
+`os.kill`, observes it pending in `/proc` while repeated status remains
+`launched`, and proves `KeyboardInterrupt` reaches the caller only after the
+rc 7 `failed_process` final is published. Direct guardian-result tests also
+prove rc 7 and `-SIGKILL` preserve an existing valid final or execution claim
+and that same-task replay does not invoke the guardian again.
 The reviewed implementation was checkpointed in order at:
 
 ```text
@@ -706,7 +713,8 @@ Fresh current-baseline receipts were:
 
 ```text
 Complete Task/runner/TaskTool/CLI gates:  exit 0 in prior fresh runs
-Full suite:                              1621 passed, 6 skipped in 355.56s
+Guardian evidence closure:              5 passed in 6.58s
+Full suite:                              1626 passed, 6 skipped in 361.54s
 Maintained src/tests/scripts Ruff:       All checks passed
 Git diff-check:                          exit 0
 Working-tree uv.lock comparison:         unchanged

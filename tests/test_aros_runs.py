@@ -1183,6 +1183,7 @@ def test_carrier_failure_preserves_runner_winner_final_and_reattaches(
     real_run = subprocess.run
     real_create_json = runs_module.create_json
     final_create_results: list[bool] = []
+    event_create_results: list[bool] = []
     tmux_calls = 0
     winner_final_bytes: bytes | None = None
 
@@ -1190,6 +1191,8 @@ def test_carrier_failure_preserves_runner_winner_final_and_reattaches(
         created = real_create_json(path, value)
         if Path(path) == final_path:
             final_create_results.append(created)
+        elif Path(path) == event_path:
+            event_create_results.append(created)
         return created
 
     def seal_runner_before_tmux_failure(
@@ -1201,6 +1204,8 @@ def test_carrier_failure_preserves_runner_winner_final_and_reattaches(
             return real_run(command, **kwargs)
         tmux_calls += 1
         assert runner_module.run(str(tmp_path), run_id) == 0
+        assert event_path.is_file()
+        event_path.unlink()
         winner_final_bytes = final_path.read_bytes()
         return subprocess.CompletedProcess(command, 7, "", "carrier refused")
 
@@ -1217,6 +1222,7 @@ def test_carrier_failure_preserves_runner_winner_final_and_reattaches(
 
     assert winner_final_bytes is not None
     assert final_create_results == [False]
+    assert event_create_results == [True]
     assert final_path.read_bytes() == winner_final_bytes
     final = service.read_validated_final(run_id)
     prelaunch = json.loads(

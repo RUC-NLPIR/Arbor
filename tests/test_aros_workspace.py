@@ -54,9 +54,21 @@ def test_init_workspace_creates_only_the_minimal_real_workspace(tmp_path: Path) 
     )
 
     assert not (tmp_path / "memory" / "BOOT.md").exists()
-    assert not (tmp_path / "questions").exists()
-    assert not (tmp_path / "model").exists()
-    assert not (tmp_path / "ideas").exists()
+    assert (tmp_path / "memory" / "decisions").is_dir()
+    assert (tmp_path / "knowledge" / "claims").is_dir()
+    assert (tmp_path / "ideas").is_dir()
+    assert (tmp_path / "transitions").is_dir()
+
+    frontier = (tmp_path / "questions" / "FRONTIER.md").read_text(encoding="utf-8")
+    assert "focus_question:" in frontier
+    assert "Q-0001" not in frontier
+    current_model = (tmp_path / "model" / "CURRENT.md").read_text(encoding="utf-8")
+    assert current_model.startswith("# Current Model\n")
+    assert "claim" not in current_model.lower()
+
+    assert list((tmp_path / "questions").glob("Q-*")) == []
+    assert list((tmp_path / "knowledge" / "claims").glob("C-*.md")) == []
+    assert list((tmp_path / "ideas").glob("I-*.md")) == []
     assert not (tmp_path / "runs").exists()
     assert not (tmp_path / ".arbor").exists()
 
@@ -85,11 +97,14 @@ def test_init_workspace_requires_the_git_repository_root(tmp_path: Path) -> None
 
 def test_init_workspace_is_idempotent_and_never_overwrites_project_files(tmp_path: Path) -> None:
     _init_git(tmp_path)
-    (tmp_path / "memory").mkdir()
+    for relative in ("memory", "questions", "model"):
+        (tmp_path / relative).mkdir()
     originals = {
         "AROS.md": "# Existing mission\n",
         "memory/NOW.md": "# Human state\nDo not replace me.\n",
         "AGENTS.md": "# Existing project instructions\n",
+        "questions/FRONTIER.md": "# Human frontier\nDo not replace me.\n",
+        "model/CURRENT.md": "# Human model\nDo not replace me.\n",
     }
     for relative, content in originals.items():
         (tmp_path / relative).write_text(content, encoding="utf-8")
@@ -103,7 +118,13 @@ def test_init_workspace_is_idempotent_and_never_overwrites_project_files(tmp_pat
     assert (tmp_path / ".gitignore").read_text(encoding="utf-8") == (
         "build/\n/.aros/\n/.worktree/\n"
     )
-    assert first["preserved"] == ["AGENTS.md", "AROS.md", "memory/NOW.md"]
+    assert first["preserved"] == [
+        "AGENTS.md",
+        "AROS.md",
+        "memory/NOW.md",
+        "questions/FRONTIER.md",
+        "model/CURRENT.md",
+    ]
     assert second["created"] == []
     assert second["updated"] == []
 
@@ -125,7 +146,6 @@ def test_status_workspace_reports_explicit_views_without_reading_their_meaning(
 ) -> None:
     _init_git(tmp_path)
     init_workspace(tmp_path, "Mission")
-    (tmp_path / "questions").mkdir()
     (tmp_path / "questions" / "FRONTIER.md").write_text("live question", encoding="utf-8")
 
     status = status_workspace(tmp_path)
@@ -285,7 +305,6 @@ def test_boot_workspace_uses_only_durable_allowlisted_views_and_git(tmp_path: Pa
         "# Current State\n\nThe strongest counterevidence is C.\n",
         encoding="utf-8",
     )
-    (tmp_path / "questions").mkdir()
     (tmp_path / "questions" / "FRONTIER.md").write_text(
         "# Frontier\n\nIs mediator M load-bearing?\n",
         encoding="utf-8",
@@ -323,7 +342,6 @@ def test_boot_workspace_has_a_strict_size_limit_without_losing_git_reality(
     _init_git(tmp_path)
     init_workspace(tmp_path, "M" * 20_000)
     (tmp_path / "memory" / "NOW.md").write_text("N" * 20_000, encoding="utf-8")
-    (tmp_path / "questions").mkdir()
     (tmp_path / "questions" / "FRONTIER.md").write_text(
         "Q" * 20_000, encoding="utf-8"
     )

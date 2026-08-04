@@ -41,6 +41,19 @@ _NOW_TEMPLATE = """# Current State
 <!-- Record only evidence-linked state needed by a new principal to continue. -->
 """
 
+_FRONTIER_TEMPLATE = """---
+focus_question:
+---
+# Research Frontier
+
+<!-- The focus is optional. Keep every live branch visible; this is not a queue. -->
+"""
+
+_CURRENT_MODEL_TEMPLATE = """# Current Model
+
+<!-- Describe the current explanatory model here when one exists. -->
+"""
+
 _AGENTS_TEMPLATE = """# AROS Workspace
 
 Act as the scientific principal for this workspace.
@@ -64,13 +77,25 @@ def init_workspace(root: str | Path, mission: str) -> dict[str, object]:
     workspace = Path(root).expanduser().resolve()
     _require_git_root(workspace)
 
-    for relative in ("memory", ".aros", ".worktree"):
-        (workspace / relative).mkdir(exist_ok=True)
+    for relative in (
+        "memory",
+        "questions",
+        "model",
+        "knowledge/claims",
+        "ideas",
+        "memory/decisions",
+        "transitions",
+        ".aros",
+        ".worktree",
+    ):
+        (workspace / relative).mkdir(parents=True, exist_ok=True)
 
     files = {
         "AGENTS.md": _AGENTS_TEMPLATE,
         "AROS.md": f"# AROS Project\n\n## Mission\n\n{mission.strip()}\n",
         "memory/NOW.md": _NOW_TEMPLATE,
+        "questions/FRONTIER.md": _FRONTIER_TEMPLATE,
+        "model/CURRENT.md": _CURRENT_MODEL_TEMPLATE,
     }
     created: list[str] = []
     preserved: list[str] = []

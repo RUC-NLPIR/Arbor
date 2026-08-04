@@ -428,6 +428,95 @@ def test_existing_run_manifest_and_final_schema_remain_readable(
     assert final_path.read_bytes() == final_bytes
 
 
+@pytest.mark.parametrize(
+    "mutable_status",
+    ("missing", "launched", "lost", "forged-terminal"),
+)
+def test_terminal_status_is_rebuilt_deterministically_and_start_reattaches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutable_status: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        key=f"terminal-status-{mutable_status}",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    launched_status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    final = json.loads(
+        (tmp_path / "runs" / run_id / "final.json").read_text(encoding="utf-8")
+    )
+    prelaunch = json.loads(
+        (
+            tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json"
+        ).read_text(encoding="utf-8")
+    )
+    expected = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": final["state"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "actor": prelaunch["actor"],
+        "carrier": "tmux",
+        "tmux_session": prelaunch["tmux_session"],
+        "host": prelaunch["host"],
+        "launch_receipt_sha256": prelaunch["receipt_sha256"],
+        "launched_at": prelaunch["created_at"],
+        "started_at": final["started_at"],
+        "exit_code": final["exit_code"],
+        "finished_at": final["finished_at"],
+        "heartbeat_at": final["finished_at"],
+        "final_ref": f"runs/{run_id}/final.json",
+        "updated_at": final["finished_at"],
+    }
+    if mutable_status == "missing":
+        status_path.unlink()
+    elif mutable_status == "launched":
+        atomic_write_json(status_path, launched_status)
+    elif mutable_status == "lost":
+        atomic_write_json(
+            status_path,
+            {
+                **launched_status,
+                "state": "lost",
+                "reason": "forged mutable loss",
+                "updated_at": final["finished_at"],
+            },
+        )
+    else:
+        atomic_write_json(
+            status_path,
+            {
+                **expected,
+                "state": "cancelled",
+                "actor": "forged-terminal-actor",
+                "host": "forged-terminal-host",
+                "tmux_session": "forged-terminal-session",
+                "launch_receipt_sha256": "f" * 64,
+                "exit_code": None,
+                "finished_at": prelaunch["created_at"],
+                "heartbeat_at": prelaunch["created_at"],
+                "updated_at": prelaunch["created_at"],
+                "mutable_only": "forged-terminal-field",
+            },
+        )
+
+    assert service.status(run_id) == expected
+    assert json.loads(status_path.read_text(encoding="utf-8")) == expected
+    repaired_status = status_path.read_bytes()
+
+    def forbidden_process(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("terminal start must only reattach")
+
+    monkeypatch.setattr(runs_module.subprocess, "run", forbidden_process)
+
+    assert service.start(run_id) == expected
+    assert status_path.read_bytes() == repaired_status
+
+
 def test_read_verified_output_returns_exact_terminal_log_bytes(
     tmp_path: Path,
 ) -> None:
@@ -446,6 +535,35 @@ def test_read_verified_output_returns_exact_terminal_log_bytes(
 
     assert service.read_verified_output(run_id, "stdout") == b"exact metric bytes\n"
     assert service.read_verified_output(run_id, "stderr") == b""
+
+
+def test_immutable_final_readers_ignore_missing_mutable_status_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "print('immutable final')"],
+        key="immutable-final-without-status",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    final_path = tmp_path / "runs" / run_id / "final.json"
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    status_path.unlink()
+
+    assert service.read_validated_final(run_id) == final
+    assert not status_path.exists()
+    assert service.read_verified_output(run_id, "stdout") == b"immutable final\n"
+    assert not status_path.exists()
+
+    corrupt_final = {**final, "state": "forged-terminal"}
+    atomic_write_json(final_path, corrupt_final)
+
+    with pytest.raises(RunError, match="final"):
+        service.status(run_id)
+    assert not status_path.exists()
 
 
 def test_verify_output_streams_large_log_without_capture(
@@ -712,7 +830,7 @@ def test_read_verified_output_rejects_invalid_final_semantics(
 
 @pytest.mark.parametrize(
     "forgery",
-    ("runner_invocation", "actor", "host", "status-mismatch"),
+    ("runner_invocation", "actor", "host"),
 )
 def test_validated_final_rejects_forged_prelaunch_provenance(
     tmp_path: Path,
@@ -732,22 +850,55 @@ def test_validated_final_rejects_forged_prelaunch_provenance(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     status = json.loads(status_path.read_text(encoding="utf-8"))
     final = json.loads(final_path.read_text(encoding="utf-8"))
-    if forgery == "status-mismatch":
-        status["actor"] = "forged-status-actor"
+    if forgery == "runner_invocation":
+        receipt[forgery] = ["/forged/runner", run_id]
     else:
-        if forgery == "runner_invocation":
-            receipt[forgery] = ["/forged/runner", run_id]
-        else:
-            receipt[forgery] = f"forged-{forgery}"
-        receipt["receipt_sha256"] = record_sha256(receipt, "receipt_sha256")
-        status["launch_receipt_sha256"] = receipt["receipt_sha256"]
-        final["launch_receipt_sha256"] = receipt["receipt_sha256"]
+        receipt[forgery] = f"forged-{forgery}"
+    receipt["receipt_sha256"] = record_sha256(receipt, "receipt_sha256")
+    status["launch_receipt_sha256"] = receipt["receipt_sha256"]
+    final["launch_receipt_sha256"] = receipt["receipt_sha256"]
     atomic_write_json(receipt_path, receipt)
     atomic_write_json(status_path, status)
     atomic_write_json(final_path, final)
 
     with pytest.raises(RunError, match="prelaunch|status.*lineage"):
         service.read_validated_final(run_id)
+
+
+def test_mutable_status_actor_cannot_invalidate_final_and_is_reconciled(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "print('mutable status')"],
+        key="forged-mutable-status-actor",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    prelaunch_path = (
+        tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json"
+    )
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    final_path = tmp_path / "runs" / run_id / "final.json"
+    prelaunch = json.loads(prelaunch_path.read_text(encoding="utf-8"))
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    final_bytes = final_path.read_bytes()
+    status["actor"] = "forged-mutable-actor"
+    atomic_write_json(status_path, status)
+    forged_status_bytes = status_path.read_bytes()
+
+    assert service.read_validated_final(run_id) == final
+    assert status_path.read_bytes() == forged_status_bytes
+
+    reconciled = service.status(run_id)
+
+    assert reconciled["actor"] == prelaunch["actor"]
+    assert json.loads(status_path.read_text(encoding="utf-8"))["actor"] == prelaunch[
+        "actor"
+    ]
+    assert final_path.read_bytes() == final_bytes
 
 
 @pytest.mark.parametrize(

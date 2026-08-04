@@ -2728,7 +2728,7 @@ def test_linked_run_status_rejects_bogus_or_terminal_without_final(
 
 
 @requires_linux_claims
-def test_linked_run_status_rejects_wrong_final_state(
+def test_linked_run_status_reconciles_wrong_mutable_final_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2764,12 +2764,18 @@ def test_linked_run_status_rejects_wrong_final_state(
     run_link = json.loads((evaluation_root / "run.json").read_text(encoding="utf-8"))
     run_id = str(run_link["run_id"])
     status_path = root / ".aros" / "runs" / run_id / "status.json"
+    final_path = root / "runs" / run_id / "final.json"
+    final_bytes = final_path.read_bytes()
     status = json.loads(status_path.read_text(encoding="utf-8"))
     status["state"] = "failed_process"
     atomic_write_json(status_path, status)
 
-    with pytest.raises(EvalError, match="linked Run|lineage|state|final"):
-        service._linked_run_status(request, run_link)
+    observed = service._linked_run_status(request, run_link)
+
+    assert observed["state"] == "completed"
+    assert observed["final_ref"] == f"runs/{run_id}/final.json"
+    assert json.loads(status_path.read_text(encoding="utf-8")) == observed
+    assert final_path.read_bytes() == final_bytes
 
 
 @requires_linux_claims
@@ -3075,7 +3081,7 @@ def test_corrupt_run_final_never_reads_output_cleans_or_receipts(
     assert not receipt_path.exists()
     assert (root / ".worktree" / "eval" / eval_id).is_dir()
 
-    with pytest.raises(EvalError, match="linked terminal Run final"):
+    with pytest.raises(EvalError, match=r"linked.*Run.*(?:final|lineage)"):
         service.run(
             "quality",
             "1",
@@ -3176,7 +3182,7 @@ def test_forged_prelaunch_provenance_never_publishes_measurement(
     assert not receipt_path.exists()
     assert (root / ".worktree" / "eval" / eval_id).is_dir()
 
-    with pytest.raises(EvalError, match="linked terminal Run final"):
+    with pytest.raises(EvalError, match=r"linked.*Run.*(?:final|lineage)"):
         service.run(
             "quality",
             "1",
@@ -3776,6 +3782,64 @@ def test_audit_is_exact_nonpersisted_and_side_effect_free(
         ],
         "issues": [],
     }
+    assert {
+        path.relative_to(root): (path.stat().st_ino, path.read_bytes())
+        for path in root.rglob("*")
+        if path.is_file()
+    } == before
+
+
+@requires_linux_claims
+def test_audit_reports_missing_status_while_validating_immutable_run_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.7,"sample_count":7}\n',
+        stderr=b"visible diagnostics\n",
+    )
+    receipt = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key="audit-missing-status",
+    )
+    assert receipt["measurement_state"] == "valid"
+    eval_id = str(receipt["eval_id"])
+    run_id = str(receipt["run_id"])
+    status_path = root / ".aros" / "runs" / run_id / "status.json"
+    status_path.unlink()
+    before = {
+        path.relative_to(root): (path.stat().st_ino, path.read_bytes())
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+    audit = service.audit(eval_id)
+
+    status_ref = f".aros/runs/{run_id}/status.json"
+    immutable_refs = {
+        f"runs/{run_id}/final.json",
+        f".aros/runs/{run_id}/stdout.log",
+        f".aros/runs/{run_id}/stderr.log",
+    }
+    assert audit["valid"] is False
+    assert status_ref in audit["checked_refs"]
+    assert any(
+        status_ref in issue and "does not exist" in issue
+        for issue in audit["issues"]
+    )
+    assert immutable_refs <= set(audit["checked_refs"])
+    assert not any(
+        ref in issue for issue in audit["issues"] for ref in immutable_refs
+    )
+    assert not status_path.exists()
     assert {
         path.relative_to(root): (path.stat().st_ino, path.read_bytes())
         for path in root.rglob("*")

@@ -470,7 +470,6 @@ class EvalService:
                 final_value = runs.read_validated_final(
                     run_id,
                     reader=reader,
-                    for_audit=True,
                 )
             except (OSError, ValueError) as error:
                 issues.append(f"{final_ref}: {error}")
@@ -493,7 +492,6 @@ class EvalService:
                         run_id,
                         stream,
                         reader=reader,
-                        for_audit=True,
                     )
                 except (OSError, ValueError) as error:
                     issues.append(f"{log_ref}: {error}")

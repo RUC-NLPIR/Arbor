@@ -1408,6 +1408,132 @@ def test_carrier_failure_is_recorded_before_launch_lock_release(
     assert len(guardian_calls) == 1
 
 
+def test_pending_sigint_after_guardian_spawn_waits_and_records_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key="guardian-pending-sigint",
+    )
+    task_id = str(brief["task_id"])
+    fake_tmux = tmp_path / ".git" / "sigint-tmux-client"
+    client_started = tmp_path / ".git" / "sigint-client-started"
+    client_pid_path = tmp_path / ".git" / "sigint-client-pid"
+    client_mask = tmp_path / ".git" / "sigint-client-mask"
+    release_client = tmp_path / ".git" / "release-sigint-client"
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import signal\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())\n"
+        f"Path({str(client_mask)!r}).write_text("
+        "'blocked' if signal.SIGINT in blocked else 'unblocked')\n"
+        f"Path({str(client_pid_path)!r}).write_text(str(os.getpid()))\n"
+        f"Path({str(client_started)!r}).touch()\n"
+        f"while not Path({str(release_client)!r}).exists():\n"
+        "    time.sleep(0.01)\n"
+        "raise SystemExit(7)\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+    original_pthread_sigmask = signal.pthread_sigmask
+    starter_thread: list[int] = []
+    mask_calls: list[int] = []
+    restore_attempted = Event()
+
+    def deliver_pending_sigint(how: int, mask: object) -> set[signal.Signals]:
+        result = original_pthread_sigmask(how, mask)  # type: ignore[arg-type]
+        if starter_thread and get_ident() == starter_thread[0]:
+            mask_calls.append(how)
+            if how == signal.SIG_SETMASK:
+                restore_attempted.set()
+                raise KeyboardInterrupt
+        return result
+
+    def start_task() -> dict[str, object]:
+        starter_thread.append(get_ident())
+        return service.start(task_id)
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: str(fake_tmux))
+    monkeypatch.setattr(signal, "pthread_sigmask", deliver_pending_sigint)
+    client_pid: int | None = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            starter = pool.submit(start_task)
+            deadline = time.monotonic() + 5
+            while not client_started.is_file() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert client_started.is_file()
+            client_pid = int(client_pid_path.read_text(encoding="utf-8"))
+            during_interrupt = [service.status(task_id) for _ in range(3)]
+            release_client.touch()
+            with pytest.raises(KeyboardInterrupt):
+                starter.result(timeout=5)
+    finally:
+        release_client.touch(exist_ok=True)
+
+    terminal = service.status(task_id)
+    assert restore_attempted.is_set()
+    assert mask_calls == [signal.SIG_BLOCK, signal.SIG_SETMASK]
+    assert client_mask.read_text(encoding="utf-8") == "unblocked"
+    assert [status["state"] for status in during_interrupt] == ["launched"] * 3
+    assert terminal["state"] == "failed_process"
+    assert client_pid is not None
+    assert not _process_is_running(client_pid)
+
+
+def test_pending_sigint_during_guardian_spawn_error_records_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key="guardian-spawn-error-pending-sigint",
+    )
+    task_id = str(brief["task_id"])
+    original_popen = tasks_module.subprocess.Popen
+    original_pthread_sigmask = signal.pthread_sigmask
+    mask_calls: list[int] = []
+    guardian_spawn_attempted = False
+
+    def fail_guardian_spawn(
+        command: object,
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes]:
+        nonlocal guardian_spawn_attempted
+        if kwargs.get("pass_fds"):
+            guardian_spawn_attempted = True
+            raise OSError("injected guardian Popen failure")
+        return original_popen(command, *args, **kwargs)  # type: ignore[arg-type]
+
+    def deliver_pending_sigint(how: int, mask: object) -> set[signal.Signals]:
+        result = original_pthread_sigmask(how, mask)  # type: ignore[arg-type]
+        mask_calls.append(how)
+        if how == signal.SIG_SETMASK:
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.subprocess, "Popen", fail_guardian_spawn)
+    monkeypatch.setattr(signal, "pthread_sigmask", deliver_pending_sigint)
+
+    with pytest.raises(KeyboardInterrupt):
+        service.start(task_id)
+
+    terminal = service.status(task_id)
+    assert guardian_spawn_attempted
+    assert mask_calls == [signal.SIG_BLOCK, signal.SIG_SETMASK]
+    assert terminal["state"] == "failed_process"
+    assert (tmp_path / ".aros" / "tasks" / task_id / "final.json").is_file()
+
+
 def test_carrier_launch_lock_probe_does_not_create_or_accept_stale_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

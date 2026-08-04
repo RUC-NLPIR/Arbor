@@ -12,6 +12,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -195,6 +196,7 @@ import subprocess
 import sys
 import tempfile
 
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
 lock_fd = int(sys.argv[1])
 argv = sys.argv[2:]
 os.fstat(lock_fd)
@@ -584,6 +586,13 @@ class TaskService:
                         )
                     except OSError as error:
                         carrier_error = error
+                        delivered_interrupt = getattr(
+                            error,
+                            "_aros_pending_interrupt",
+                            None,
+                        )
+                        if isinstance(delivered_interrupt, KeyboardInterrupt):
+                            pending_interrupt = delivered_interrupt
 
                     if carrier_error is not None:
                         carrier_failure_detail = str(carrier_error)
@@ -604,6 +613,8 @@ class TaskService:
         if existing_launch:
             return self._existing_execution_status(task_id, actor)
         if carrier_error is not None:
+            if pending_interrupt is not None:
+                raise pending_interrupt
             raise TaskError(
                 f"tmux launch failed for task {task_id}: {carrier_error}"
             ) from carrier_error
@@ -2338,18 +2349,33 @@ class TaskService:
             str(lock_descriptor),
             *command,
         ]
-        guardian = subprocess.Popen(
-            guardian_command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            close_fds=True,
-            pass_fds=(lock_descriptor,),
-            start_new_session=True,
-            env=environment,
-        )
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        try:
+            guardian = subprocess.Popen(
+                guardian_command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                close_fds=True,
+                pass_fds=(lock_descriptor,),
+                start_new_session=True,
+                env=environment,
+            )
+        except OSError as error:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+            except KeyboardInterrupt as interrupt:
+                error._aros_pending_interrupt = interrupt  # type: ignore[attr-defined]
+            raise
+        except BaseException:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+            raise
         interrupted: KeyboardInterrupt | None = None
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        except KeyboardInterrupt as error:
+            interrupted = error
         while True:
             try:
                 stdout, stderr = guardian.communicate()

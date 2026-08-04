@@ -12,6 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from . import processes
 from .isolation import IsolationError, IsolationLimits, build_isolated_linux
 from .receipts import content_receipt, digest_chunks
 from .store import (
@@ -21,7 +22,6 @@ from .store import (
     final_identity as _final_identity,
     json_sha256 as _json_sha256,
     manifest_sha256 as _manifest_sha256,
-    process_start_token as _process_start_token,
     read_json,
     utc_now as _utc_now,
 )
@@ -158,23 +158,8 @@ def _read_stop_receipt(root: Path, run_id: str) -> dict[str, Any] | None:
     return _read_object(path) if path.is_file() else None
 
 
-def _signal_process_group(process: subprocess.Popen[bytes], signal_number: int) -> None:
-    try:
-        os.killpg(process.pid, signal_number)
-    except ProcessLookupError:
-        pass
-
-
-def _terminate_for_timeout(process: subprocess.Popen[bytes]) -> list[str]:
-    sequence = ["TERM"]
-    _signal_process_group(process, signal.SIGTERM)
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        sequence.append("KILL")
-        _signal_process_group(process, signal.SIGKILL)
-        process.wait()
-    return sequence
+def _noop_child_setup() -> None:
+    pass
 
 
 def _execution_bundle_binding(
@@ -275,7 +260,8 @@ def run(workspace: str, run_id: str) -> int:
         )
         return 0
 
-    popen_options: dict[str, Any] = {}
+    child_environment: dict[str, str] | None = None
+    after_parent_death = _noop_child_setup
     actual_environment_sha256 = _environment_sha256()
     try:
         execution_root = root
@@ -312,10 +298,8 @@ def run(workspace: str, run_id: str) -> int:
             }
             if any(manifest.get(key) != value for key, value in frozen_policy.items()):
                 raise ValueError("isolated launch policy differs from frozen manifest")
-            popen_options = {
-                "env": launch.env,
-                "preexec_fn": launch.preexec_fn,
-            }
+            child_environment = launch.env
+            after_parent_death = launch.preexec_fn
             actual_environment_sha256 = _json_sha256(launch.env)
         elif profile != "trusted-local":
             raise ValueError("manifest has an unsupported security profile")
@@ -324,17 +308,24 @@ def run(workspace: str, run_id: str) -> int:
         ) as stderr:
             if bundle_binding is not None:
                 validate_execution_bundle(*bundle_binding)
-            process = subprocess.Popen(
+            handle = processes.spawn_process(
                 list(manifest["argv"]),
                 cwd=cwd,
+                stdin=None,
                 stdout=stdout,
                 stderr=stderr,
-                start_new_session=True,
-                **popen_options,
+                env=child_environment,
+                pass_fds=(),
+                parent_death=processes.ParentDeathSetup(
+                    expected_parent_pid=os.getpid(),
+                    before_install=_noop_child_setup,
+                    after_install=after_parent_death,
+                ),
             )
     except (
         IsolationError,
         OSError,
+        RuntimeError,
         subprocess.SubprocessError,
         TypeError,
         WorktreeError,
@@ -359,9 +350,9 @@ def run(workspace: str, run_id: str) -> int:
         **status,
         "state": "running",
         "runner_pid": os.getpid(),
-        "process_pid": process.pid,
-        "process_pgid": process.pid,
-        "process_start_token": _process_start_token(process.pid),
+        "process_pid": handle.identity.pid,
+        "process_pgid": handle.identity.pgid,
+        "process_start_token": handle.identity.start_token,
         "started_at": started_at,
         "heartbeat_at": started_at,
         "updated_at": started_at,
@@ -375,7 +366,7 @@ def run(workspace: str, run_id: str) -> int:
     stop_started_monotonic: float | None = None
     last_heartbeat = time.monotonic()
 
-    while process.poll() is None:
+    while handle.process.poll() is None:
         stop_request = _read_stop_request(runtime)
         if stop_request is not None and not delivered_stop:
             requested_name = str(stop_request.get("signal", "TERM"))
@@ -384,7 +375,7 @@ def run(workspace: str, run_id: str) -> int:
                 "KILL": signal.SIGKILL,
                 "INT": signal.SIGINT,
             }.get(requested_name, signal.SIGTERM)
-            _signal_process_group(process, requested_signal)
+            processes.signal_process_group(handle.identity, requested_signal)
             stop_signal_sequence.append(requested_name)
             stop_started_monotonic = time.monotonic()
             delivered_stop = True
@@ -394,11 +385,14 @@ def run(workspace: str, run_id: str) -> int:
             and stop_signal_sequence[-1] != "KILL"
             and time.monotonic() - stop_started_monotonic >= 1
         ):
-            _signal_process_group(process, signal.SIGKILL)
+            processes.signal_process_group(handle.identity, signal.SIGKILL)
             stop_signal_sequence.append("KILL")
         if stop_request is None and time.monotonic() - started_monotonic >= timeout_seconds:
             timeout_hit = True
-            timeout_signal_sequence = _terminate_for_timeout(process)
+            timeout_signal_sequence = processes.terminate_and_reap(
+                handle,
+                grace_seconds=1,
+            )
         now = time.monotonic()
         if now - last_heartbeat >= 0.2:
             heartbeat_at = _utc_now()
@@ -406,10 +400,10 @@ def run(workspace: str, run_id: str) -> int:
             running_status["updated_at"] = heartbeat_at
             atomic_write_json(runtime / "status.json", running_status)
             last_heartbeat = now
-        if process.poll() is None:
+        if handle.process.poll() is None:
             time.sleep(0.02)
 
-    exit_code = process.wait()
+    exit_code = processes.reap_leader(handle)
     stop_request = _read_stop_request(runtime)
     stop_receipt = _read_stop_receipt(root, run_id)
     if stop_request is not None and not delivered_stop and stop_receipt is None:

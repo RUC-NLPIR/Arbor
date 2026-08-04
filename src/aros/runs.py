@@ -24,6 +24,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import processes
 from .isolation import IsolationError, isolated_linux_policy, probe_isolated_linux
 from .receipts import record_sha256
 from .store import (
@@ -34,7 +35,6 @@ from .store import (
     final_identity as _final_identity,
     json_sha256 as _sha256,
     manifest_sha256 as _manifest_sha256,
-    process_start_token as _process_start_token,
     read_json,
     read_json_strict,
     utc_now as _utc_now,
@@ -913,10 +913,20 @@ class RunService:
         pid = status.get("process_pid")
         pgid = status.get("process_pgid")
         expected_start_token = status.get("process_start_token")
-        if not isinstance(pid, int) or pid <= 1 or not isinstance(expected_start_token, str):
+        if (
+            not isinstance(pid, int)
+            or pid <= 1
+            or not isinstance(pgid, int)
+            or pgid <= 1
+            or not isinstance(expected_start_token, str)
+        ):
             raise RunError(f"run process identity is unavailable; refusing stop: {run_id}")
-        actual_start_token = _process_start_token(pid)
-        if actual_start_token != expected_start_token:
+        identity = processes.ProcessIdentity(
+            pid=pid,
+            pgid=pgid,
+            start_token=expected_start_token,
+        )
+        if not processes.identity_is_live(identity):
             raise RunError(f"run process identity changed; refusing stop: {run_id}")
 
         requested_at = _utc_now()
@@ -961,14 +971,10 @@ class RunService:
 
         delivered = False
         try:
-            if isinstance(pgid, int) and pgid > 1:
-                os.killpg(pgid, _ALLOWED_SIGNALS[normalized_signal])
-                delivered = True
-            elif isinstance(pid, int) and pid > 1:
-                os.kill(pid, _ALLOWED_SIGNALS[normalized_signal])
-                delivered = True
-        except ProcessLookupError:
-            delivered = False
+            delivered = processes.signal_process_group(
+                identity,
+                _ALLOWED_SIGNALS[normalized_signal],
+            )
         except PermissionError as error:
             raise RunError(f"permission denied stopping run {run_id}") from error
 
@@ -1043,11 +1049,19 @@ class RunService:
         if status.get("state") not in _ACTIVE_STATES:
             return status
         pid = status.get("process_pid")
+        pgid = status.get("process_pgid")
         token = status.get("process_start_token")
         if (
             isinstance(pid, int)
+            and isinstance(pgid, int)
             and isinstance(token, str)
-            and _process_start_token(pid) == token
+            and processes.identity_is_live(
+                processes.ProcessIdentity(
+                    pid=pid,
+                    pgid=pgid,
+                    start_token=token,
+                )
+            )
         ):
             return status
         session_name = status.get("tmux_session")
@@ -1607,18 +1621,6 @@ def _porcelain_path(line: str) -> str:
 def _is_runtime_change(line: str) -> bool:
     path = _porcelain_path(line)
     return path == ".aros" or path.startswith(".aros/")
-
-
-def _process_exists(pid: int) -> bool:
-    if pid <= 1:
-        return False
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, ValueError):
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 def _tmux_session_exists(session_name: str) -> bool:

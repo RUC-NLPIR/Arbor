@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import arbor.aros.processes as processes_module
 import arbor.aros.runner as runner_module
 import arbor.aros.runs as runs_module
 import arbor.aros.store as store_module
@@ -1446,13 +1447,13 @@ def test_runner_revalidates_both_trees_immediately_before_spawn(
         validate_execution_bundle(observed_repository, observed_bundle)
         events.append("validated-both-trees")
 
-    real_popen = runner_module.subprocess.Popen
+    real_spawn_process = processes_module.spawn_process
 
     def observe_spawn(*args: object, **kwargs: object):
         if args and args[0] == manifest["argv"]:
             events.append("spawn")
             assert events == ["validated-both-trees", "spawn"]
-        return real_popen(*args, **kwargs)
+        return real_spawn_process(*args, **kwargs)
 
     monkeypatch.setattr(
         runner_module,
@@ -1460,7 +1461,7 @@ def test_runner_revalidates_both_trees_immediately_before_spawn(
         observe_validation,
         raising=False,
     )
-    monkeypatch.setattr(runner_module.subprocess, "Popen", observe_spawn)
+    monkeypatch.setattr(processes_module, "spawn_process", observe_spawn)
 
     assert runner_module.run(str(tmp_path), run_id) == 0
     assert events == ["validated-both-trees", "spawn"]
@@ -1490,15 +1491,15 @@ def test_bundle_runner_finalizes_missing_checkout_marker_without_spawn(
     checkout = getattr(bundle, missing_checkout)
     (checkout.path / ".git").unlink()
     spawned = False
-    real_popen = runner_module.subprocess.Popen
+    real_spawn_process = processes_module.spawn_process
 
     def observe_spawn(*args: object, **kwargs: object):
         nonlocal spawned
         if args and args[0] == manifest["argv"]:
             spawned = True
-        return real_popen(*args, **kwargs)
+        return real_spawn_process(*args, **kwargs)
 
-    monkeypatch.setattr(runner_module.subprocess, "Popen", observe_spawn)
+    monkeypatch.setattr(processes_module, "spawn_process", observe_spawn)
 
     assert runner_module.run(str(tmp_path), run_id) == 1
 
@@ -1542,15 +1543,15 @@ def test_bundle_runner_finalizes_symlink_loop_cwd_without_spawn(
     cwd.rename(preserved)
     cwd.symlink_to("work", target_is_directory=True)
     spawned = False
-    real_popen = runner_module.subprocess.Popen
+    real_spawn_process = processes_module.spawn_process
 
     def observe_spawn(*args: object, **kwargs: object):
         nonlocal spawned
         if args and args[0] == manifest["argv"]:
             spawned = True
-        return real_popen(*args, **kwargs)
+        return real_spawn_process(*args, **kwargs)
 
-    monkeypatch.setattr(runner_module.subprocess, "Popen", observe_spawn)
+    monkeypatch.setattr(processes_module, "spawn_process", observe_spawn)
 
     assert runner_module.run(str(tmp_path), run_id) == 1
 
@@ -1639,15 +1640,15 @@ def test_bundle_run_rejects_path_symlink_head_tree_or_filter_drift(
             f"sh -c 'touch {driver_marker}; cat'",
         )
     spawned = False
-    real_popen = runner_module.subprocess.Popen
+    real_spawn_process = processes_module.spawn_process
 
     def observe_spawn(*args: object, **kwargs: object):
         nonlocal spawned
         if args and args[0] == manifest["argv"]:
             spawned = True
-        return real_popen(*args, **kwargs)
+        return real_spawn_process(*args, **kwargs)
 
-    monkeypatch.setattr(runner_module.subprocess, "Popen", observe_spawn)
+    monkeypatch.setattr(processes_module, "spawn_process", observe_spawn)
 
     assert runner_module.run(str(tmp_path), run_id) == 1
 
@@ -1993,10 +1994,12 @@ def test_stop_locked_does_not_reenter_run_flock(tmp_path: Path, monkeypatch) -> 
         }
     )
     atomic_write_json(runtime / "status.json", status)
+    monkeypatch.setattr(processes_module, "identity_is_live", lambda _identity: True)
     monkeypatch.setattr(
-        "arbor.aros.runs._process_start_token", lambda _pid: "stable-process"
+        processes_module,
+        "signal_process_group",
+        lambda _identity, _signal: True,
     )
-    monkeypatch.setattr("arbor.aros.runs.os.killpg", lambda _pgid, _signal: None)
 
     def fail_public_reconcile(_run_id: str) -> dict[str, object]:
         raise AssertionError("stop must use the already-locked reconcile helper")
@@ -2063,15 +2066,17 @@ def test_stop_fails_closed_when_process_identity_token_changed(
     )
     run_id = str(manifest["run_id"])
     service.start(run_id)
-    from arbor.aros import runs
-
-    original = runs._process_start_token
-    monkeypatch.setattr(runs, "_process_start_token", lambda _pid: "reused-pid")
+    original = processes_module.identity_is_live
+    monkeypatch.setattr(
+        processes_module,
+        "identity_is_live",
+        lambda _identity: False,
+    )
     with pytest.raises(RunError, match="process identity"):
         service.stop(run_id, actor="owner", reason="must not hit reused PID")
     assert not (tmp_path / ".aros" / "runs" / run_id / "stop-request.json").exists()
 
-    monkeypatch.setattr(runs, "_process_start_token", original)
+    monkeypatch.setattr(processes_module, "identity_is_live", original)
     service.stop(run_id, actor="owner", reason="test cleanup")
     assert _wait_for_state(service, run_id)["state"] == "cancelled"
 
@@ -2147,9 +2152,7 @@ def test_stop_retries_after_request_was_persisted_before_signal(
         }
     )
     atomic_write_json(runtime / "status.json", status)
-    monkeypatch.setattr(
-        "arbor.aros.runs._process_start_token", lambda _pid: "stable-process"
-    )
+    monkeypatch.setattr(processes_module, "identity_is_live", lambda _identity: True)
 
     def fail_after_request(**_kwargs: object) -> None:
         raise RuntimeError("simulated crash after durable stop request")
@@ -2160,7 +2163,11 @@ def test_stop_retries_after_request_was_persisted_before_signal(
     request = json.loads((runtime / "stop-request.json").read_text(encoding="utf-8"))
 
     monkeypatch.setattr(service, "_write_event", lambda **_kwargs: None)
-    monkeypatch.setattr("arbor.aros.runs.os.killpg", lambda _pgid, _signal: None)
+    monkeypatch.setattr(
+        processes_module,
+        "signal_process_group",
+        lambda _identity, _signal: True,
+    )
     receipt = service.stop(run_id, actor="owner", reason="same request")
 
     assert receipt["delivered"] is True
@@ -2310,8 +2317,11 @@ def test_reconcile_prefers_final_while_mutable_status_process_is_alive(
     )
     atomic_write_json(runtime / "status.json", status)
     monkeypatch.setattr(
-        "arbor.aros.runs._process_start_token",
-        lambda _pid: pytest.fail("terminal reconciliation read mutable process state"),
+        processes_module,
+        "identity_is_live",
+        lambda _identity: pytest.fail(
+            "terminal reconciliation read mutable process state"
+        ),
     )
 
     reconciled = service.reconcile(run_id)

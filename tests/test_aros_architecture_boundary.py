@@ -269,6 +269,71 @@ def test_eval_module_has_no_process_or_process_final_implementation() -> None:
     assert violations == []
 
 
+def test_run_runner_uses_process_seam_for_spawn_and_group_signals() -> None:
+    path = REPO_ROOT / "src" / "aros" / "runner.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    forbidden_calls = {"Popen", "killpg"}
+    violations = [
+        (node.lineno, node.func.attr)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in forbidden_calls
+    ]
+
+    assert violations == []
+
+
+def test_run_service_uses_process_seam_for_stop_and_liveness() -> None:
+    path = REPO_ROOT / "src" / "aros" / "runs.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    process_calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "processes"
+    }
+    direct_calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "os"
+        and node.func.attr in {"kill", "killpg"}
+    }
+
+    assert {"identity_is_live", "signal_process_group"} <= process_calls
+    assert direct_calls == set()
+
+
+def test_process_seam_has_no_lifecycle_or_domain_policy_imports() -> None:
+    path = REPO_ROOT / "src" / "aros" / "processes.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    forbidden_fragments = {
+        "lifecycle",
+        "status",
+        "receipt",
+        "worktree",
+        "parser",
+        "science",
+    }
+    imports: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imports.append(node.module or "")
+
+    assert not {
+        module
+        for module in imports
+        if any(fragment in module for fragment in forbidden_fragments)
+    }
+
+
 def test_ci_legacy_freeze_uses_immutable_base_for_pull_requests_and_pushes() -> None:
     workflow = yaml.safe_load(
         (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(

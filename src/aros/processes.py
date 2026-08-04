@@ -9,12 +9,9 @@ from collections.abc import Iterable as _Iterable
 from collections.abc import Mapping as _Mapping
 from collections.abc import Sequence as _Sequence
 from dataclasses import dataclass as _dataclass
-from os import PathLike as _PathLike
+from pathlib import Path as _Path
 from typing import IO as _IO
 from typing import Any as _Any
-
-from .store import process_start_token as _process_start_token
-
 
 __all__ = [
     "ProcessIdentity",
@@ -37,7 +34,7 @@ class ProcessIdentity:
     start_token: str
 
 
-@_dataclass(frozen=True)
+@_dataclass
 class ProcessHandle:
     process: _subprocess.Popen[bytes]
     identity: ProcessIdentity
@@ -86,16 +83,27 @@ def _parent_death_preexec(setup: ParentDeathSetup) -> _Callable[[], None]:
     return install
 
 
+def _read_process_stat(pid: int) -> tuple[str, int, str] | None:
+    if type(pid) is not int or pid <= 1:
+        return None
+    try:
+        raw = _Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields_after_name = raw.rsplit(")", 1)[1].split()
+        return (
+            fields_after_name[0],
+            int(fields_after_name[2]),
+            f"linux-proc-start:{fields_after_name[19]}",
+        )
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def _capture_identity(process: _subprocess.Popen[bytes]) -> ProcessIdentity:
     pid = process.pid
-    try:
-        pgid = _os.getpgid(pid)
-    except OSError as error:
-        raise RuntimeError(f"unable to capture process identity: {pid}") from error
-    start_token = _process_start_token(pid)
-    if pgid != pid or start_token is None:
+    observed = _read_process_stat(pid)
+    if observed is None or observed[1] != pid:
         raise RuntimeError(f"unable to capture process identity: {pid}")
-    return ProcessIdentity(pid=pid, pgid=pgid, start_token=start_token)
+    return ProcessIdentity(pid=pid, pgid=observed[1], start_token=observed[2])
 
 
 def _terminate_unidentified(process: _subprocess.Popen[bytes]) -> None:
@@ -110,12 +118,12 @@ def _terminate_unidentified(process: _subprocess.Popen[bytes]) -> None:
 def spawn_process(
     argv: _Sequence[str],
     *,
-    cwd: str | _PathLike[str] | None,
-    stdin: int | _IO[_Any] | None,
-    stdout: int | _IO[_Any] | None,
-    stderr: int | _IO[_Any] | None,
-    env: _Mapping[str, str] | None,
-    pass_fds: _Iterable[int],
+    cwd: _Path,
+    stdin: int | _IO[_Any] | None = None,
+    stdout: int | _IO[_Any] | None = None,
+    stderr: int | _IO[_Any] | None = None,
+    env: _Mapping[str, str] | None = None,
+    pass_fds: _Iterable[int] = (),
     preexec_fn: _Callable[[], None] | None = None,
     parent_death: ParentDeathSetup | None = None,
 ) -> ProcessHandle:
@@ -150,12 +158,18 @@ def identity_is_live(identity: ProcessIdentity) -> bool:
         type(identity.pid) is not int
         or identity.pid <= 1
         or type(identity.pgid) is not int
-        or identity.pgid != identity.pid
+        or identity.pgid <= 1
         or not isinstance(identity.start_token, str)
         or not identity.start_token
     ):
         return False
-    return _process_start_token(identity.pid) == identity.start_token
+    observed = _read_process_stat(identity.pid)
+    return bool(
+        observed is not None
+        and observed[0] not in {"Z", "X", "x"}
+        and observed[1] == identity.pgid
+        and observed[2] == identity.start_token
+    )
 
 
 def signal_process_group(
@@ -173,7 +187,6 @@ def signal_process_group(
 
 def reap_leader(
     handle: ProcessHandle,
-    *,
     timeout_seconds: float | None = None,
 ) -> int:
     try:
@@ -186,20 +199,17 @@ def reap_leader(
 
 def terminate_and_reap(
     handle: ProcessHandle,
-    *,
     grace_seconds: float = 1.0,
-    reap_timeout_seconds: float = 2.0,
-) -> list[str]:
+) -> tuple[int, tuple[str, ...]]:
     if handle.process.poll() is not None:
-        reap_leader(handle, timeout_seconds=reap_timeout_seconds)
-        return []
+        return reap_leader(handle), ()
     sequence: list[str] = []
     if signal_process_group(handle.identity, _signal.SIGTERM):
         sequence.append("TERM")
     try:
-        reap_leader(handle, timeout_seconds=grace_seconds)
+        exit_code = reap_leader(handle, grace_seconds)
     except TimeoutError:
         if signal_process_group(handle.identity, _signal.SIGKILL):
             sequence.append("KILL")
-        reap_leader(handle, timeout_seconds=reap_timeout_seconds)
-    return sequence
+        exit_code = reap_leader(handle)
+    return exit_code, tuple(sequence)

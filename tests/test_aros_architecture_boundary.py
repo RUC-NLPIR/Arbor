@@ -319,6 +319,7 @@ def test_process_seam_has_no_lifecycle_or_domain_policy_imports() -> None:
         "worktree",
         "parser",
         "science",
+        "store",
     }
     imports: list[str] = []
     for node in ast.walk(tree):

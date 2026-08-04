@@ -158,10 +158,6 @@ def _read_stop_receipt(root: Path, run_id: str) -> dict[str, Any] | None:
     return _read_object(path) if path.is_file() else None
 
 
-def _noop_child_setup() -> None:
-    pass
-
-
 def _execution_bundle_binding(
     root: Path,
     manifest: dict[str, Any],
@@ -261,7 +257,7 @@ def run(workspace: str, run_id: str) -> int:
         return 0
 
     child_environment: dict[str, str] | None = None
-    after_parent_death = _noop_child_setup
+    child_preexec_fn = None
     actual_environment_sha256 = _environment_sha256()
     try:
         execution_root = root
@@ -299,7 +295,7 @@ def run(workspace: str, run_id: str) -> int:
             if any(manifest.get(key) != value for key, value in frozen_policy.items()):
                 raise ValueError("isolated launch policy differs from frozen manifest")
             child_environment = launch.env
-            after_parent_death = launch.preexec_fn
+            child_preexec_fn = launch.preexec_fn
             actual_environment_sha256 = _json_sha256(launch.env)
         elif profile != "trusted-local":
             raise ValueError("manifest has an unsupported security profile")
@@ -316,11 +312,7 @@ def run(workspace: str, run_id: str) -> int:
                 stderr=stderr,
                 env=child_environment,
                 pass_fds=(),
-                parent_death=processes.ParentDeathSetup(
-                    expected_parent_pid=os.getpid(),
-                    before_install=_noop_child_setup,
-                    after_install=after_parent_death,
-                ),
+                preexec_fn=child_preexec_fn,
             )
     except (
         IsolationError,
@@ -361,6 +353,7 @@ def run(workspace: str, run_id: str) -> int:
     timeout_seconds = float(manifest["timeout_seconds"])
     timeout_hit = False
     timeout_signal_sequence: list[str] = []
+    exit_code: int | None = None
     delivered_stop = False
     stop_signal_sequence: list[str] = []
     stop_started_monotonic: float | None = None
@@ -389,10 +382,11 @@ def run(workspace: str, run_id: str) -> int:
             stop_signal_sequence.append("KILL")
         if stop_request is None and time.monotonic() - started_monotonic >= timeout_seconds:
             timeout_hit = True
-            timeout_signal_sequence = processes.terminate_and_reap(
+            exit_code, timeout_signals = processes.terminate_and_reap(
                 handle,
-                grace_seconds=1,
+                1,
             )
+            timeout_signal_sequence = list(timeout_signals)
         now = time.monotonic()
         if now - last_heartbeat >= 0.2:
             heartbeat_at = _utc_now()
@@ -403,7 +397,8 @@ def run(workspace: str, run_id: str) -> int:
         if handle.process.poll() is None:
             time.sleep(0.02)
 
-    exit_code = processes.reap_leader(handle)
+    if exit_code is None:
+        exit_code = processes.reap_leader(handle)
     stop_request = _read_stop_request(runtime)
     stop_receipt = _read_stop_receipt(root, run_id)
     if stop_request is not None and not delivered_stop and stop_receipt is None:

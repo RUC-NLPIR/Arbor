@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -427,6 +428,93 @@ def test_existing_run_manifest_and_final_schema_remain_readable(
     assert runner_module.run(str(tmp_path), run_id) == 0
     assert manifest_path.read_bytes() == manifest_bytes
     assert final_path.read_bytes() == final_bytes
+
+
+def test_trusted_run_spawn_omits_parent_death_and_uses_no_preexec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "pass"],
+        key="trusted-spawn-contract",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    real_spawn_process = processes_module.spawn_process
+    observed: list[dict[str, object]] = []
+
+    def observe_spawn(*args: object, **kwargs: object):
+        observed.append(kwargs)
+        return real_spawn_process(*args, **kwargs)
+
+    monkeypatch.setattr(processes_module, "spawn_process", observe_spawn)
+
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    assert len(observed) == 1
+    assert "parent_death" not in observed[0]
+    assert observed[0]["preexec_fn"] is None
+
+
+def test_trusted_run_payload_survives_runner_process_death(tmp_path: Path) -> None:
+    _init_clean_repo(tmp_path)
+    pid_path = tmp_path / ".aros" / "payload.pid"
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,sys,time;"
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));"
+                "time.sleep(30)"
+            ),
+            str(pid_path),
+        ],
+        key="ordinary-runner-death",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    runner_pid = os.fork()
+    if runner_pid == 0:
+        try:
+            os._exit(runner_module.run(str(tmp_path), run_id))
+        except BaseException:
+            os._exit(2)
+
+    payload_pid: int | None = None
+    runner_waited = False
+    try:
+        deadline = time.monotonic() + 5
+        while not pid_path.is_file() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pid_path.is_file()
+        payload_pid = int(pid_path.read_text(encoding="utf-8"))
+
+        os.kill(runner_pid, signal.SIGKILL)
+        waited, wait_status = os.waitpid(runner_pid, 0)
+        runner_waited = True
+        assert waited == runner_pid
+        assert os.waitstatus_to_exitcode(wait_status) == -signal.SIGKILL
+        time.sleep(0.1)
+
+        raw = Path(f"/proc/{payload_pid}/stat").read_text(encoding="utf-8")
+        state = raw.rsplit(")", 1)[1].split()[0]
+        assert state not in {"Z", "X", "x"}
+    finally:
+        if not runner_waited:
+            try:
+                os.kill(runner_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(runner_pid, 0)
+            except ChildProcessError:
+                pass
+        if payload_pid is not None:
+            try:
+                os.killpg(payload_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 @pytest.mark.parametrize(
@@ -1453,6 +1541,8 @@ def test_runner_revalidates_both_trees_immediately_before_spawn(
         if args and args[0] == manifest["argv"]:
             events.append("spawn")
             assert events == ["validated-both-trees", "spawn"]
+            assert "parent_death" not in kwargs
+            assert callable(kwargs.get("preexec_fn"))
         return real_spawn_process(*args, **kwargs)
 
     monkeypatch.setattr(

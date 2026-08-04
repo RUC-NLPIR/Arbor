@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -31,6 +33,34 @@ def _wait_until_not_live(pid: int, timeout_seconds: float = 5.0) -> bool:
     return False
 
 
+def _proc_stat(
+    pid: int,
+    *,
+    state: str = "R",
+    pgid: int | None = None,
+    starttime: int = 987654,
+) -> str:
+    fields = [state, "1", str(pid if pgid is None else pgid)]
+    fields.extend("0" for _ in range(16))
+    fields.append(str(starttime))
+    return f"{pid} (test process) {' '.join(fields)}\n"
+
+
+def _read_announced_pid(descriptor: int) -> int:
+    readable, _, _ = select.select([descriptor], [], [], 5)
+    assert readable
+    raw = os.read(descriptor, 64)
+    assert raw.endswith(b"\n")
+    return int(raw.strip())
+
+
+def _kill_process_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def test_spawn_process_uses_exact_popen_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -43,12 +73,23 @@ def test_spawn_process_uses_exact_popen_contract(
         return process
 
     monkeypatch.setattr(processes._subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(processes._os, "getpgid", lambda pid: pid)
+    getpgid_calls: list[int] = []
     monkeypatch.setattr(
-        processes,
-        "_process_start_token",
-        lambda pid: f"linux-proc-start:{pid}",
+        processes._os,
+        "getpgid",
+        lambda pid: getpgid_calls.append(pid) or pid,
     )
+    stat_path = Path("/proc/321/stat")
+    stat_reads: list[Path] = []
+    real_read_text = Path.read_text
+
+    def read_process_stat(path: Path, *args: object, **kwargs: object) -> str:
+        if path == stat_path:
+            stat_reads.append(path)
+            return _proc_stat(321, starttime=321)
+        return real_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", read_process_stat)
     stdin = object()
     stdout = object()
     stderr = object()
@@ -103,6 +144,28 @@ def test_spawn_process_uses_exact_popen_contract(
             },
         )
     ]
+    default_handle = processes.spawn_process(
+        ["python", "-c", "pass"],
+        cwd=tmp_path,
+    )
+    assert default_handle.identity == handle.identity
+    assert calls[1] == (
+        (["python", "-c", "pass"],),
+        {
+            "shell": False,
+            "cwd": tmp_path,
+            "stdin": None,
+            "stdout": None,
+            "stderr": None,
+            "env": None,
+            "close_fds": True,
+            "pass_fds": (),
+            "start_new_session": True,
+            "preexec_fn": None,
+        },
+    )
+    assert stat_reads == [stat_path, stat_path]
+    assert getpgid_calls == []
     with pytest.raises(ValueError, match="mutually exclusive"):
         processes.spawn_process(
             ["python", "-c", "pass"],
@@ -119,7 +182,52 @@ def test_spawn_process_uses_exact_popen_contract(
                 after_install=_noop,
             ),
         )
-    assert len(calls) == 1
+    assert len(calls) == 2
+
+
+def test_process_seam_has_exact_function_signatures() -> None:
+    spawn = inspect.signature(processes.spawn_process).parameters
+    assert list(spawn) == [
+        "argv",
+        "cwd",
+        "stdin",
+        "stdout",
+        "stderr",
+        "env",
+        "pass_fds",
+        "preexec_fn",
+        "parent_death",
+    ]
+    assert spawn["cwd"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert spawn["cwd"].annotation is Path
+    assert spawn["cwd"].default is inspect.Parameter.empty
+    for name in ("stdin", "stdout", "stderr", "env"):
+        assert spawn[name].default is None
+    assert spawn["pass_fds"].default == ()
+    assert spawn["preexec_fn"].default is None
+    assert spawn["parent_death"].default is None
+
+    reap = inspect.signature(processes.reap_leader).parameters
+    assert list(reap) == ["handle", "timeout_seconds"]
+    assert reap["timeout_seconds"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert reap["timeout_seconds"].default is None
+
+    terminate_signature = inspect.signature(processes.terminate_and_reap)
+    terminate = terminate_signature.parameters
+    assert list(terminate) == ["handle", "grace_seconds"]
+    assert terminate["grace_seconds"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert terminate["grace_seconds"].default == 1.0
+    assert terminate_signature.return_annotation == tuple[int, tuple[str, ...]]
+
+
+def test_process_handle_is_mutable() -> None:
+    first = processes.ProcessIdentity(123, 123, "linux-proc-start:1")
+    second = processes.ProcessIdentity(456, 456, "linux-proc-start:2")
+    handle = processes.ProcessHandle(process=object(), identity=first)  # type: ignore[arg-type]
+
+    handle.identity = second
+
+    assert handle.identity == second
 
 
 def test_spawn_process_only_preserves_declared_file_descriptors(
@@ -198,7 +306,18 @@ def test_spawn_process_identity_capture_failure_terminates_and_reaps(
     signals: list[tuple[int, int]] = []
     monkeypatch.setattr(processes._subprocess, "Popen", lambda *_a, **_k: process)
     monkeypatch.setattr(processes._os, "getpgid", lambda pid: pid)
-    monkeypatch.setattr(processes, "_process_start_token", lambda _pid: None)
+    real_read_text = Path.read_text
+
+    def missing_process_stat(
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> str:
+        if path == Path("/proc/4321/stat"):
+            raise FileNotFoundError(path)
+        return real_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", missing_process_stat)
     monkeypatch.setattr(
         processes._os,
         "killpg",
@@ -224,6 +343,17 @@ def test_spawn_process_identity_capture_failure_terminates_and_reaps(
     monkeypatch.setattr(processes._subprocess, "Popen", lambda *_a, **_k: fallback)
     monkeypatch.setattr(processes._os, "getpgid", lambda pid: pid + 1)
 
+    def mismatched_process_stat(
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> str:
+        if path == Path("/proc/4321/stat"):
+            return _proc_stat(4321, pgid=4322)
+        return real_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", mismatched_process_stat)
+
     def missing_group(_pgid: int, _signal_number: int) -> None:
         raise ProcessLookupError
 
@@ -242,6 +372,47 @@ def test_spawn_process_identity_capture_failure_terminates_and_reaps(
 
     assert fallback.kill_calls == 1
     assert fallback.wait_calls == [None]
+
+
+@pytest.mark.parametrize(
+    ("state", "actual_pgid"),
+    (("R", 4322), ("Z", 4321)),
+    ids=("actual-pgid-drift", "zombie-leader"),
+)
+def test_identity_liveness_rejects_actual_pgid_drift_and_zombie(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    actual_pgid: int,
+) -> None:
+    identity = processes.ProcessIdentity(
+        pid=4321,
+        pgid=4321,
+        start_token="linux-proc-start:987654",
+    )
+    reads = 0
+
+    def changed_process_stat(
+        path: Path,
+        *_args: object,
+        **_kwargs: object,
+    ) -> str:
+        nonlocal reads
+        assert path == Path("/proc/4321/stat")
+        reads += 1
+        return _proc_stat(4321, state=state, pgid=actual_pgid)
+
+    delivered: list[tuple[int, int]] = []
+    monkeypatch.setattr(Path, "read_text", changed_process_stat)
+    monkeypatch.setattr(
+        processes._os,
+        "killpg",
+        lambda pgid, signal_number: delivered.append((pgid, signal_number)),
+    )
+
+    assert processes.identity_is_live(identity) is False
+    assert processes.signal_process_group(identity, signal.SIGTERM) is False
+    assert reads == 2
+    assert delivered == []
 
 
 def test_signal_process_group_refuses_reused_pid_or_start_token(
@@ -300,10 +471,10 @@ def test_terminate_and_reap_escalates_term_to_kill_and_reaps_leader(
     assert handle.process.stdout is not None
     assert handle.process.stdout.readline() == b"ready\n"
 
-    sequence = processes.terminate_and_reap(handle, grace_seconds=0.05)
+    exit_code, sequence = processes.terminate_and_reap(handle, 0.05)
 
-    assert sequence == ["TERM", "KILL"]
-    assert handle.process.returncode == -signal.SIGKILL
+    assert exit_code == handle.process.returncode == -signal.SIGKILL
+    assert sequence == ("TERM", "KILL")
 
 
 def test_reap_leader_has_bounded_timeout(tmp_path: Path) -> None:
@@ -318,7 +489,7 @@ def test_reap_leader_has_bounded_timeout(tmp_path: Path) -> None:
     )
     try:
         with pytest.raises(TimeoutError, match="reap process leader"):
-            processes.reap_leader(handle, timeout_seconds=0.01)
+            processes.reap_leader(handle, 0.01)
     finally:
         processes.terminate_and_reap(handle, grace_seconds=0.1)
 
@@ -361,7 +532,7 @@ def test_parent_death_setup_order_and_kills_child_with_real_broker(
                     after_install=lambda: os.write(order_write, b"A"),
                 ),
             )
-            assert processes.reap_leader(handle, timeout_seconds=5) == 0
+            assert processes.reap_leader(handle, 5) == 0
         os.close(order_write)
         order_write = -1
         assert os.read(order_read, 5) == b"BPCAE"
@@ -411,3 +582,152 @@ def test_parent_death_setup_order_and_kills_child_with_real_broker(
             os.killpg(child_pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+def test_parent_death_before_prctl_race_kills_child_without_exec(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "before-prctl-exec"
+    announced_read, announced_write = os.pipe()
+    release_read, release_write = os.pipe()
+    broker_pid = os.fork()
+    if broker_pid == 0:
+        os.close(announced_read)
+        os.close(release_write)
+
+        def pause_before_install() -> None:
+            os.write(announced_write, f"{os.getpid()}\n".encode())
+            os.read(release_read, 1)
+
+        try:
+            processes.spawn_process(
+                [
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path;Path({str(marker)!r}).touch()",
+                ],
+                cwd=tmp_path,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=None,
+                pass_fds=(announced_write, release_read),
+                parent_death=processes.ParentDeathSetup(
+                    expected_parent_pid=os.getpid(),
+                    before_install=pause_before_install,
+                    after_install=_noop,
+                ),
+            )
+        except BaseException:
+            os._exit(2)
+        os._exit(3)
+
+    os.close(announced_write)
+    os.close(release_read)
+    child_pid = _read_announced_pid(announced_read)
+    os.close(announced_read)
+    try:
+        os.kill(broker_pid, signal.SIGKILL)
+        waited, wait_status = os.waitpid(broker_pid, 0)
+        assert waited == broker_pid
+        assert os.waitstatus_to_exitcode(wait_status) == -signal.SIGKILL
+        os.write(release_write, b"1")
+        os.close(release_write)
+        release_write = -1
+
+        assert _wait_until_not_live(child_pid)
+        assert not marker.exists()
+    finally:
+        if release_write >= 0:
+            os.close(release_write)
+        _kill_process_group(child_pid)
+
+
+def test_parent_death_after_prctl_before_parent_check_kills_child_without_exec(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "after-prctl-exec"
+    announced_read, announced_write = os.pipe()
+    release_read, release_write = os.pipe()
+    broker_pid = os.fork()
+    if broker_pid == 0:
+        os.close(announced_read)
+        os.close(release_write)
+        expected_parent_pid = os.getpid()
+        real_getppid = processes._os.getppid
+
+        def pause_during_parent_check() -> int:
+            os.write(announced_write, f"{os.getpid()}\n".encode())
+            os.read(release_read, 1)
+            return real_getppid()
+
+        processes._os.getppid = pause_during_parent_check
+        try:
+            processes.spawn_process(
+                [
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path;Path({str(marker)!r}).touch()",
+                ],
+                cwd=tmp_path,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=None,
+                pass_fds=(announced_write, release_read),
+                parent_death=processes.ParentDeathSetup(
+                    expected_parent_pid=expected_parent_pid,
+                    before_install=_noop,
+                    after_install=_noop,
+                ),
+            )
+        except BaseException:
+            os._exit(2)
+        os._exit(3)
+
+    os.close(announced_write)
+    os.close(release_read)
+    child_pid = _read_announced_pid(announced_read)
+    os.close(announced_read)
+    try:
+        os.kill(broker_pid, signal.SIGKILL)
+        waited, wait_status = os.waitpid(broker_pid, 0)
+        assert waited == broker_pid
+        assert os.waitstatus_to_exitcode(wait_status) == -signal.SIGKILL
+
+        assert _wait_until_not_live(child_pid, timeout_seconds=2)
+        assert not marker.exists()
+    finally:
+        os.close(release_write)
+        _kill_process_group(child_pid)
+
+
+def test_parent_death_mismatch_branch_kills_child_without_after_or_exec(
+    tmp_path: Path,
+) -> None:
+    after_marker = tmp_path / "mismatch-after"
+    exec_marker = tmp_path / "mismatch-exec"
+    handle = processes.spawn_process(
+        [
+            sys.executable,
+            "-c",
+            f"from pathlib import Path;Path({str(exec_marker)!r}).touch()",
+        ],
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=None,
+        pass_fds=(),
+        parent_death=processes.ParentDeathSetup(
+            expected_parent_pid=0,
+            before_install=_noop,
+            after_install=after_marker.touch,
+        ),
+    )
+
+    exit_code = processes.reap_leader(handle, 5)
+
+    assert exit_code == -signal.SIGKILL
+    assert not after_marker.exists()
+    assert not exec_marker.exists()

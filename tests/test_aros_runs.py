@@ -1154,6 +1154,111 @@ def test_carrier_launch_failure_uses_immutable_lineage_for_terminal_projection(
     assert json.loads(status_path.read_text(encoding="utf-8")) == expected_status
 
 
+def test_carrier_failure_preserves_runner_winner_final_and_reattaches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    attempt_path = tmp_path / "attempts.txt"
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path\n"
+                "path = Path('attempts.txt')\n"
+                "prior = path.read_text() if path.exists() else ''\n"
+                "path.write_text(prior + 'attempt\\n')\n"
+            ),
+        ],
+        key="runner-wins-carrier-failure",
+    )
+    run_id = str(manifest["run_id"])
+    final_path = tmp_path / "runs" / run_id / "final.json"
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    event_path = (
+        tmp_path / ".aros" / "events" / f"EVT-{run_id}-completed.json"
+    )
+    real_run = subprocess.run
+    real_create_json = runs_module.create_json
+    final_create_results: list[bool] = []
+    tmux_calls = 0
+    winner_final_bytes: bytes | None = None
+
+    def track_create_json(path: str | Path, value: object) -> bool:
+        created = real_create_json(path, value)
+        if Path(path) == final_path:
+            final_create_results.append(created)
+        return created
+
+    def seal_runner_before_tmux_failure(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal tmux_calls, winner_final_bytes
+        if command[0] != "/test/tmux":
+            return real_run(command, **kwargs)
+        tmux_calls += 1
+        assert runner_module.run(str(tmp_path), run_id) == 0
+        winner_final_bytes = final_path.read_bytes()
+        return subprocess.CompletedProcess(command, 7, "", "carrier refused")
+
+    monkeypatch.setattr(runs_module, "create_json", track_create_json)
+    monkeypatch.setattr(runs_module.shutil, "which", lambda _name: "/test/tmux")
+    monkeypatch.setattr(
+        runs_module.subprocess,
+        "run",
+        seal_runner_before_tmux_failure,
+    )
+
+    with pytest.raises(RunError, match="tmux launch failed"):
+        service.start(run_id)
+
+    assert winner_final_bytes is not None
+    assert final_create_results == [False]
+    assert final_path.read_bytes() == winner_final_bytes
+    final = service.read_validated_final(run_id)
+    prelaunch = json.loads(
+        (
+            tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json"
+        ).read_text(encoding="utf-8")
+    )
+    expected_status = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": "completed",
+        "manifest_sha256": manifest["manifest_sha256"],
+        "actor": prelaunch["actor"],
+        "carrier": prelaunch["carrier"],
+        "tmux_session": prelaunch["tmux_session"],
+        "host": prelaunch["host"],
+        "launch_receipt_sha256": prelaunch["receipt_sha256"],
+        "launched_at": prelaunch["created_at"],
+        "started_at": final["started_at"],
+        "exit_code": final["exit_code"],
+        "finished_at": final["finished_at"],
+        "heartbeat_at": final["finished_at"],
+        "final_ref": f"runs/{run_id}/final.json",
+        "updated_at": final["finished_at"],
+    }
+    event = json.loads(event_path.read_text(encoding="utf-8"))
+
+    assert final["state"] == "completed"
+    assert json.loads(status_path.read_text(encoding="utf-8")) == expected_status
+    assert event["created_at"] == final["finished_at"]
+    assert event["summary"] == "Run reached process state completed."
+    assert "failed_process" not in json.dumps(event)
+    assert attempt_path.read_text(encoding="utf-8").splitlines() == ["attempt"]
+
+    replayed = service.start(run_id)
+
+    assert replayed == expected_status
+    assert tmux_calls == 1
+    assert attempt_path.read_text(encoding="utf-8").splitlines() == ["attempt"]
+    assert final_path.read_bytes() == winner_final_bytes
+
+
 def test_isolated_start_probe_failure_precedes_launch_receipt(
     tmp_path: Path,
     monkeypatch,

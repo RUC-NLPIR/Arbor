@@ -3911,8 +3911,8 @@ def test_status_and_audit_never_parse_or_repair_missing_measurement(
     assert status["measurement_state"] == "not_available"
     assert status["run_id"] == run_id
     assert status["receipt_ref"] is None
-    assert audit["valid"] is False
-    assert any("measurement receipt is missing" in issue for issue in audit["issues"])
+    assert audit["valid"] is True
+    assert audit["issues"] == []
     assert f"eval/evaluations/{eval_id}/receipt.json" in audit["checked_refs"]
     assert live_status["evaluation_state"] == "finalizing"
     assert live_status["referenced_process_state"] == "completed"

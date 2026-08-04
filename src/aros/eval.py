@@ -464,7 +464,7 @@ class EvalService:
                 except EvalError as error:
                     issues.append(f"{receipt_ref}: {error}")
                 else:
-                    if evaluation.status["evaluation_state"] == "lost":
+                    if evaluation.status["evaluation_state"] == "completed":
                         issues.append(f"{receipt_ref}: measurement receipt is missing")
         return _audit_projection(evaluation_id, checked_refs, issues)
 

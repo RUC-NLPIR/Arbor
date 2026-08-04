@@ -31,6 +31,8 @@ from .store import create_json, file_lock, json_sha256, read_json_strict, utc_no
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_EVAL_ID = re.compile(r"^EVAL-[0-9a-f]{64}$")
+_MAX_OBSERVE_BYTES = 65_536
 _DESCRIPTOR_METADATA_FIELDS = {
     "manifest_ref",
     "manifest_commit",
@@ -247,6 +249,224 @@ class EvalService:
                 status,
                 runs,
             )
+
+    def status(self, eval_id: str) -> dict[str, object]:
+        """Return the factual public projection for one visible evaluation."""
+        evaluation_id = _evaluation_id(eval_id)
+        request = self._load_request(evaluation_id)
+        state = self._existing_evaluation(request, reconcile_run=False).status
+        if state.get("evaluation_state") == "completed":
+            return {
+                "eval_id": evaluation_id,
+                "evaluation_state": state["evaluation_state"],
+                "referenced_process_state": state["referenced_process_state"],
+                "measurement_state": state["measurement_state"],
+                "run_id": state["run_id"],
+                "receipt_ref": f"eval/evaluations/{evaluation_id}/receipt.json",
+                "reason": None,
+                "updated_at": state["finished_at"],
+            }
+        return {
+            field: state[field]
+            for field in (
+                "eval_id",
+                "evaluation_state",
+                "referenced_process_state",
+                "measurement_state",
+                "run_id",
+                "receipt_ref",
+                "reason",
+                "updated_at",
+            )
+        }
+
+    def observe(
+        self,
+        eval_id: str,
+        *,
+        stream: str,
+        max_bytes: int = _MAX_OBSERVE_BYTES,
+    ) -> str:
+        """Return one bounded strict-UTF-8 tail from a linked visible Run."""
+        evaluation_id = _evaluation_id(eval_id)
+        if stream not in {"stdout", "stderr"}:
+            raise EvalError("stream must be 'stdout' or 'stderr'")
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 1 <= max_bytes <= _MAX_OBSERVE_BYTES
+        ):
+            raise EvalError("max_bytes must be a plain integer from 1 through 65536")
+        request = self._load_request(evaluation_id)
+        descriptor = self._load_descriptor(
+            str(request["evaluator_id"]),
+            str(request["evaluator_version"]),
+        )
+        if (
+            descriptor.get("visibility") != "visible"
+            or descriptor.get("descriptor_sha256")
+            != request["descriptor_sha256"]
+        ):
+            raise EvalError("evaluation is not bound to a visible evaluator")
+        execution = self._load_execution(request)
+        run_link = self._load_run_link(request, execution)
+        if run_link is None:
+            raise EvalError("evaluation has no linked visible Run")
+        self._linked_run_status(request, run_link, reconcile=False)
+        try:
+            raw = RunService(self.root)._tail_bytes(
+                str(run_link["run_id"]),
+                stream=stream,
+                max_bytes=max_bytes,
+            )
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise EvalError(f"visible {stream} is not strict UTF-8") from error
+        except (OSError, ValueError) as error:
+            raise EvalError(f"unable to observe visible {stream}") from error
+
+    def audit(self, eval_id: str) -> dict[str, object]:
+        """Validate one visible evaluation lineage without changing it."""
+        evaluation_id = _evaluation_id(eval_id)
+        checked_refs: list[str] = []
+        issues: list[str] = []
+
+        request_ref = f".aros/evaluations/{evaluation_id}/request.json"
+        checked_refs.append(request_ref)
+        try:
+            request = self._load_request(evaluation_id)
+        except EvalError as error:
+            issues.append(f"{request_ref}: {error}")
+            return _audit_projection(evaluation_id, checked_refs, issues)
+
+        descriptor_ref = (
+            ".aros/evaluators/"
+            f"{request['evaluator_id']}/{request['evaluator_version']}/descriptor.json"
+        )
+        checked_refs.append(descriptor_ref)
+        try:
+            descriptor = self._load_descriptor(
+                str(request["evaluator_id"]),
+                str(request["evaluator_version"]),
+            )
+            self._validate_descriptor_lineage(descriptor, request)
+        except (OSError, ValueError) as error:
+            issues.append(f"{descriptor_ref}: {error}")
+
+        execution_ref = f".aros/evaluations/{evaluation_id}/execution.json"
+        checked_refs.append(execution_ref)
+        try:
+            execution = self._load_execution(request)
+        except EvalError as error:
+            issues.append(f"{execution_ref}: {error}")
+            return _audit_projection(evaluation_id, checked_refs, issues)
+
+        run_link_ref = f".aros/evaluations/{evaluation_id}/run.json"
+        checked_refs.append(run_link_ref)
+        try:
+            run_link = self._load_run_link(request, execution)
+        except EvalError as error:
+            issues.append(f"{run_link_ref}: {error}")
+            return _audit_projection(evaluation_id, checked_refs, issues)
+        if run_link is None:
+            issues.append(f"{run_link_ref}: evaluation Run link is missing")
+            return _audit_projection(evaluation_id, checked_refs, issues)
+
+        run_id = str(run_link["run_id"])
+        manifest_ref = f"runs/{run_id}/manifest.json"
+        status_ref = f".aros/runs/{run_id}/status.json"
+        checked_refs.extend((manifest_ref, status_ref))
+        try:
+            manifest_value = read_json_strict(self.root / manifest_ref)
+            if not isinstance(manifest_value, dict):
+                raise ValueError("Run manifest is not an object")
+            bundle = manifest_value.get("execution_bundle")
+            if not isinstance(bundle, dict):
+                raise ValueError("Run execution bundle is missing")
+            portable = {
+                "candidate": bundle.get("candidate"),
+                "apparatus": bundle.get("apparatus"),
+                "temp": bundle.get("temp"),
+            }
+            if (
+                bundle.get("bundle_sha256") != run_link["bundle_sha256"]
+                or json_sha256(portable) != run_link["bundle_sha256"]
+            ):
+                raise ValueError("Run execution bundle hash mismatch")
+        except (OSError, ValueError) as error:
+            issues.append(f"{manifest_ref}: {error}")
+        runs = RunService(self.root)
+        try:
+            observed_status = runs.status(run_id, reconcile=False)
+        except (OSError, ValueError) as error:
+            issues.append(f"{status_ref}: {error}")
+            observed_status = None
+        try:
+            self._linked_run_status(
+                request,
+                run_link,
+                reconcile=False,
+            )
+        except EvalError as error:
+            issues.append(f"{manifest_ref} or {status_ref}: {error}")
+
+        terminal = observed_status is not None and observed_status.get("state") in {
+            "completed",
+            "failed_process",
+            "timed_out",
+            "cancelled",
+        }
+        if terminal:
+            prelaunch_ref = f".aros/receipts/{run_id}-prelaunch.json"
+            final_ref = f"runs/{run_id}/final.json"
+            checked_refs.extend((prelaunch_ref, final_ref))
+            try:
+                final_value = runs.read_validated_final(run_id)
+            except (OSError, ValueError) as error:
+                issues.append(f"{final_ref}: {error}")
+                final_value = None
+            for stream in ("stdout", "stderr"):
+                log_ref = f".aros/runs/{run_id}/{stream}.log"
+                checked_refs.append(log_ref)
+                content = final_value.get(stream) if final_value is not None else None
+                declared_size = content.get("bytes") if isinstance(content, dict) else None
+                output_bound = (
+                    max(1, declared_size)
+                    if type(declared_size) is int and declared_size >= 0
+                    else _MAX_OBSERVE_BYTES
+                )
+                try:
+                    runs.read_verified_output(
+                        run_id,
+                        stream,
+                        max_bytes=output_bound,
+                    )
+                except (OSError, ValueError) as error:
+                    issues.append(f"{log_ref}: {error}")
+
+        receipt_ref = f"eval/evaluations/{evaluation_id}/receipt.json"
+        checked_refs.append(receipt_ref)
+        try:
+            receipt = self._load_receipt(
+                request,
+                execution,
+                reconcile_run=False,
+            )
+        except EvalError as error:
+            issues.append(f"{receipt_ref}: {error}")
+        else:
+            if receipt is None:
+                try:
+                    evaluation = self._existing_evaluation(
+                        request,
+                        reconcile_run=False,
+                    )
+                except EvalError as error:
+                    issues.append(f"{receipt_ref}: {error}")
+                else:
+                    if evaluation.status["evaluation_state"] == "lost":
+                        issues.append(f"{receipt_ref}: measurement receipt is missing")
+        return _audit_projection(evaluation_id, checked_refs, issues)
 
     def _linked_lost_evaluation(
         self,
@@ -497,6 +717,33 @@ class EvalService:
             raise EvalError("idempotency key belongs to a different request")
         return dict(existing)
 
+    def _load_request(self, eval_id: str) -> dict[str, object]:
+        path = self.root / ".aros" / "evaluations" / eval_id / "request.json"
+        try:
+            value = read_json_strict(path)
+            request = _eval_records._validate_request(value)
+        except FileNotFoundError as error:
+            raise EvalError(f"evaluation request does not exist: {eval_id}") from error
+        except (OSError, ValueError) as error:
+            raise EvalError(f"evaluation request is invalid: {eval_id}") from error
+        if request["eval_id"] != eval_id:
+            raise EvalError("evaluation request identity mismatch")
+        return dict(request)
+
+    def _load_execution(
+        self,
+        request: dict[str, object],
+    ) -> dict[str, object]:
+        eval_id = str(request["eval_id"])
+        try:
+            value = read_json_strict(self._execution_path(eval_id))
+            execution = _eval_records._validate_execution(value, request)
+        except FileNotFoundError as error:
+            raise EvalError(f"evaluation execution does not exist: {eval_id}") from error
+        except (OSError, ValueError) as error:
+            raise EvalError(f"evaluation execution is invalid: {eval_id}") from error
+        return dict(execution)
+
     def _begin_execution(
         self,
         evaluator_id: str,
@@ -559,8 +806,14 @@ class EvalService:
     def _existing_evaluation(
         self,
         request: dict[str, object],
+        *,
+        reconcile_run: bool = True,
     ) -> ExistingEvaluation:
-        receipt = self._load_receipt(request, None)
+        receipt = self._load_receipt(
+            request,
+            None,
+            reconcile_run=reconcile_run,
+        )
         execution_path = self._execution_path(str(request["eval_id"]))
         try:
             execution_value = read_json_strict(execution_path)
@@ -572,6 +825,7 @@ class EvalService:
                 request,
                 None,
                 "request has no execution claim",
+                reconcile_run=reconcile_run,
             )
         except (OSError, ValueError) as error:
             raise EvalError("existing evaluation execution claim is invalid") from error
@@ -582,6 +836,7 @@ class EvalService:
                 request,
                 execution,
                 receipt,
+                reconcile_run=reconcile_run,
             )
             return ExistingEvaluation(receipt)
         if execution["host"] != socket.gethostname():
@@ -589,6 +844,7 @@ class EvalService:
                 request,
                 execution,
                 "execution claim host is not local",
+                reconcile_run=reconcile_run,
             )
         lock_state, lock_fd, lock_identity = _observe_execution_lock(
             self._execution_lock_path(str(request["eval_id"]))
@@ -600,6 +856,7 @@ class EvalService:
                     request,
                     execution,
                     "execution claim lock was released",
+                    reconcile_run=reconcile_run,
                 )
             finally:
                 _release_execution_lock(lock_fd)
@@ -608,6 +865,7 @@ class EvalService:
                 request,
                 execution,
                 "execution claim lock was released",
+                reconcile_run=reconcile_run,
             )
         assert lock_identity is not None
         broker_pid = int(execution["broker_pid"])
@@ -616,19 +874,29 @@ class EvalService:
                 request,
                 execution,
                 "execution claim broker is not live",
+                reconcile_run=reconcile_run,
             )
         if not _linux_broker_owns_lock(execution, lock_identity):
             return self._receipt_or_lost(
                 request,
                 execution,
                 "execution claim broker does not own the lock",
+                reconcile_run=reconcile_run,
             )
-        receipt = self._load_receipt(request, execution)
+        receipt = self._load_receipt(
+            request,
+            execution,
+            reconcile_run=reconcile_run,
+        )
         if receipt is not None:
             return ExistingEvaluation(receipt)
         run_link = self._load_run_link(request, execution)
         if run_link is not None:
-            run_status = self._linked_run_status(request, run_link)
+            run_status = self._linked_run_status(
+                request,
+                run_link,
+                reconcile=reconcile_run,
+            )
             referenced_state = run_status.get("state")
             evaluation_state = (
                 "finalizing"
@@ -665,6 +933,8 @@ class EvalService:
         self,
         request: dict[str, object],
         execution: dict[str, object] | None,
+        *,
+        reconcile_run: bool = True,
     ) -> dict[str, object] | None:
         receipt_path = self._receipt_path(str(request["eval_id"]))
         try:
@@ -696,7 +966,12 @@ class EvalService:
         ):
             raise EvalError("existing receipt execution lineage mismatch")
         if execution is not None:
-            self._validate_receipt_run_lineage(request, execution, receipt)
+            self._validate_receipt_run_lineage(
+                request,
+                execution,
+                receipt,
+                reconcile_run=reconcile_run,
+            )
         return receipt
 
     def _receipt_or_lost(
@@ -704,8 +979,14 @@ class EvalService:
         request: dict[str, object],
         execution: dict[str, object] | None,
         reason: str,
+        *,
+        reconcile_run: bool = True,
     ) -> ExistingEvaluation:
-        receipt = self._load_receipt(request, execution)
+        receipt = self._load_receipt(
+            request,
+            execution,
+            reconcile_run=reconcile_run,
+        )
         if receipt is not None:
             if execution is None:
                 raise EvalError("existing receipt execution lineage is missing")
@@ -713,7 +994,11 @@ class EvalService:
         if execution is not None:
             run_link = self._load_run_link(request, execution)
             if run_link is not None:
-                run_status = self._linked_run_status(request, run_link)
+                run_status = self._linked_run_status(
+                    request,
+                    run_link,
+                    reconcile=reconcile_run,
+                )
                 return self._linked_lost_evaluation(
                     request,
                     run_link,
@@ -750,11 +1035,17 @@ class EvalService:
         request: dict[str, object],
         execution: dict[str, object],
         receipt: dict[str, object],
+        *,
+        reconcile_run: bool = True,
     ) -> None:
         run_link = self._load_run_link(request, execution)
         if run_link is None:
             raise EvalError("existing receipt Run link lineage is missing")
-        self._linked_run_status(request, run_link)
+        self._linked_run_status(
+            request,
+            run_link,
+            reconcile=reconcile_run,
+        )
         run_id = str(run_link["run_id"])
         try:
             final_value = RunService(self.root).read_validated_final(run_id)
@@ -786,11 +1077,13 @@ class EvalService:
         self,
         request: dict[str, object],
         run_link: dict[str, object],
+        *,
+        reconcile: bool = True,
     ) -> dict[str, object]:
         run_id = str(run_link["run_id"])
         try:
             runs = RunService(self.root)
-            status = runs.status(run_id)
+            status = runs.status(run_id, reconcile=reconcile)
             manifest_value = read_json_strict(
                 self.root / "runs" / run_id / "manifest.json"
             )
@@ -935,6 +1228,58 @@ class EvalService:
             raise EvalError("evaluator descriptor binding is invalid")
         return dict(value)
 
+    def _validate_descriptor_lineage(
+        self,
+        descriptor: dict[str, object],
+        request: dict[str, object],
+    ) -> None:
+        if (
+            descriptor["descriptor_sha256"] != request["descriptor_sha256"]
+            or descriptor["apparatus_commit"] != request["apparatus_commit"]
+        ):
+            raise EvalError("evaluator descriptor differs from the frozen request")
+        manifest_ref = str(descriptor["manifest_ref"])
+        manifest_commit = str(descriptor["manifest_commit"])
+        manifest_blob = _read_regular_git_blob(
+            self.repository,
+            manifest_commit,
+            manifest_ref,
+            "manifest",
+        )
+        if hashlib.sha256(manifest_blob).hexdigest() != descriptor["manifest_blob_sha256"]:
+            raise EvalError("evaluator manifest blob hash mismatch")
+        try:
+            manifest_value = _store._strict_json_loads(manifest_blob)
+            manifest = parse_visible_manifest(manifest_value)
+        except (UnicodeError, ValueError) as error:
+            raise EvalError("evaluator manifest blob is invalid") from error
+        descriptor_manifest = {
+            field: item
+            for field, item in descriptor.items()
+            if field not in _DESCRIPTOR_METADATA_FIELDS
+        }
+        if manifest != descriptor_manifest:
+            raise EvalError("evaluator descriptor differs from its manifest blob")
+        apparatus_commit = str(descriptor["apparatus_commit"])
+        apparatus_tree = _worktrees._git_text(
+            self.repository,
+            "rev-parse",
+            "--verify",
+            f"{apparatus_commit}^{{tree}}",
+        )
+        if apparatus_tree != descriptor["apparatus_tree"]:
+            raise EvalError("evaluator apparatus tree mismatch")
+        for entry in descriptor["apparatus_paths"]:  # type: ignore[union-attr]
+            path = str(entry["path"])
+            blob = _read_regular_git_blob(
+                self.repository,
+                apparatus_commit,
+                path,
+                "apparatus",
+            )
+            if hashlib.sha256(blob).hexdigest() != entry["blob_sha256"]:
+                raise EvalError(f"evaluator apparatus blob hash mismatch: {path}")
+
 
 def _manifest_reference(value: object) -> str:
     if not isinstance(value, str):
@@ -970,6 +1315,26 @@ def _identifier(value: object, field: str) -> str:
     if _IDENTIFIER.fullmatch(text) is None:
         raise EvalError(f"{field} must be a safe path component")
     return text
+
+
+def _evaluation_id(value: object) -> str:
+    if not isinstance(value, str) or _EVAL_ID.fullmatch(value) is None:
+        raise EvalError("eval_id must be EVAL- followed by 64 lowercase hex digits")
+    return value
+
+
+def _audit_projection(
+    eval_id: str,
+    checked_refs: list[str],
+    issues: list[str],
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "eval_id": eval_id,
+        "valid": not issues,
+        "checked_refs": checked_refs,
+        "issues": issues,
+    }
 
 
 def _resolve_exact_commit(

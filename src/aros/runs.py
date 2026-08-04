@@ -545,6 +545,19 @@ class RunService:
         stream: str = "stdout",
         max_bytes: int = 65_536,
     ) -> str:
+        return self._tail_bytes(
+            run_id,
+            stream=stream,
+            max_bytes=max_bytes,
+        ).decode("utf-8", errors="replace")
+
+    def _tail_bytes(
+        self,
+        run_id: str,
+        *,
+        stream: str,
+        max_bytes: int,
+    ) -> bytes:
         self._validate_run_id(run_id)
         if stream not in {"stdout", "stderr"}:
             raise RunError("stream must be 'stdout' or 'stderr'")
@@ -552,12 +565,12 @@ class RunService:
             raise RunError("max_bytes must be a positive integer")
         path = self._runtime_path(run_id) / f"{stream}.log"
         if not path.is_file():
-            return ""
+            return b""
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
             handle.seek(max(0, size - max_bytes))
-            return handle.read().decode("utf-8", errors="replace")
+            return handle.read()
 
     def read_verified_output(
         self,

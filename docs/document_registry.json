@@ -26,6 +26,14 @@
       "agent_visibility": "on_demand"
     },
     {
+      "id": "aros-principal-research-loop-design",
+      "title": "AROS Principal Research Loop Design",
+      "path": "docs/superpowers/specs/2026-08-04-aros-principal-research-loop-design.md",
+      "status": "proposed",
+      "authority": "implementation_baseline",
+      "agent_visibility": "on_demand"
+    },
+    {
       "id": "aros-public-guide",
       "title": "AROS Public Guide",
       "path": "docs/aros/README.md",

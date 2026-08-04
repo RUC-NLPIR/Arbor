@@ -139,7 +139,7 @@ were clean. No `uv` command was invoked and no commissioning receipt was
 rewritten.
 
 Documentation commissioning on the `c6b80ee` implementation baseline then
-reached `231 passed in 10.10s` for the architecture/public-entry/registry gate.
+reached `231 passed (exit 0)` for the architecture/public-entry/registry gate.
 The exact unqualified `/workspace/Arbor/.venv/bin/python -m pytest` command
 reached `1640 passed, 6 skipped in 359.32s (0:05:59)`. Full
 `ruff check src tests scripts` reported `All checks passed!`; both

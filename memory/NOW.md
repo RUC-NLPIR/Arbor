@@ -53,8 +53,8 @@ commissioned.
   status is an independent issue and does not prevent immutable final/log
   validation; audit does not reconstruct status, final, measurement or retry.
 - Fresh current-branch gates reached `92 passed` for Run, `383 passed in
-  64.98s` for the Run/Eval/Eval-records combination, `231 passed in 10.10s`
-  for architecture/public-entry/registry, and `1640 passed, 6 skipped in
+  64.98s` for the Run/Eval/Eval-records combination, `231 passed (exit 0)` for
+  architecture/public-entry/registry, and `1640 passed, 6 skipped in
   359.32s (0:05:59)` for the exact unqualified full pytest command. Full Ruff
   reported `All checks passed!`; diff-check and the `uv.lock` comparison both
   exited 0. No `uv` command ran and no commissioning receipt changed.
@@ -67,6 +67,8 @@ commissioned.
   MCP parity, and Arbor retirement remain unavailable.
 - This repair does not commission all Phase 3 exits, Phase 4, or the complete
   AROS target.
+- The Phase 3 sequence deviation is already recorded in the current
+  implementation baseline; it is not a pending registration action.
 
 ## Preserved operational evidence
 
@@ -79,8 +81,7 @@ commissioned.
 
 ## Next obligations
 
-1. Integrate the immutable Run projection and Eval audit repair, then register
-   the Phase 3 sequence deviation in current implementation context.
+1. Integrate the immutable Run projection and Eval audit repair.
 2. Implement and commission protected registration/admission as a separate
    Gate C-D change; do not infer it from visible evidence.
 3. Consolidate Run/Task into the shared Operations process core, including

@@ -27,8 +27,9 @@ The exposed command surface for the direct `aros` entry is:
 ## Not yet implemented
 
 - protected evaluation registration and admission
-- shared Operations events, budgets, checkpoints, search, audit, skills, and
-  Principal lease
+- shared mechanical Operations events, budgets, leases, checkpoints, search,
+  and audit
+- project-local user-space Skills lifecycle and procedural memory
 - provider child profiles/adapters, `child_done`, and positive assimilation
 - semantic K/M/G plus one-way migration adapters
 - MCP parity and provider parity

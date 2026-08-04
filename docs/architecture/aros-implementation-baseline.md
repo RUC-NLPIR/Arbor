@@ -52,8 +52,9 @@ AROS 只保留四个不可约部分：
 4. Capability isolation：隔离不可用时 fail closed，不静默降级。
 5. Mechanical child task substrate：write-heavy child 使用独立 `.worktree/`，dirty work 永不被强制清理。
 6. Deterministic evaluation：exact-commit clean rerun，worker prose 不能设置 primary metric。
-7. Migration/adapters：同一 kernel 服务 native CLI 与 MCP；旧数据只单向导入。
-8. Commissioning：完成 fresh boot、long-run restart、independent admission、isolated child、assimilation 与 provider switch 后，才切换默认路径并退役重复模块。
+7. Mechanical Operations：统一 events、budgets、leases、checkpoint、search 与 audit；不拥有 Skills、scientific semantics 或 semantic scheduler。
+8. Remaining Phase 3 + semantic migration/adapters：完成 Principal lease、provider child profiles/adapters、`child_done`、positive assimilation 与 project-local user-space Skills lifecycle/procedural memory；同一 kernel 服务 native CLI 与 MCP，旧数据只单向导入。
+9. Commissioning：完成 fresh boot、long-run restart、independent admission、isolated child、assimilation 与 provider switch 后，才切换默认路径并退役重复模块。
 
 每个 gate 都需要命令输出、状态文件、receipt 或测试作为证据；仅有代码路径或 mock 不能证明端到端能力。
 

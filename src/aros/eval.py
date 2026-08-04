@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import stat
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -17,7 +18,7 @@ from . import store as _store
 from . import worktrees as _worktrees
 from .eval_records import parse_visible_manifest, validate_measurement_receipt
 from .receipts import record_sha256
-from .store import create_json, file_lock, process_start_token, read_json_strict, utc_now
+from .store import create_json, file_lock, read_json_strict, utc_now
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -242,6 +243,7 @@ class EvalService:
         idempotency_key: str,
     ) -> ExecutionLease | ExistingEvaluation:
         """Publish and hold the sole local execution claim for one request."""
+        _require_linux_claim_runtime()
         key = _required_text(idempotency_key, "idempotency_key")
         key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         idempotency_lock = (
@@ -266,7 +268,7 @@ class EvalService:
                 raise EvalError("new evaluation request could not acquire execution lock")
             try:
                 broker_pid = os.getpid()
-                start_token = process_start_token(broker_pid)
+                start_token = _linux_process_start_token(broker_pid)
                 if start_token is None:
                     raise EvalError("unable to bind local evaluation broker identity")
                 execution: dict[str, object] = {
@@ -295,32 +297,7 @@ class EvalService:
         self,
         request: dict[str, object],
     ) -> ExistingEvaluation:
-        receipt: dict[str, object] | None = None
-        receipt_path = self._receipt_path(str(request["eval_id"]))
-        try:
-            receipt_value = read_json_strict(receipt_path)
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            raise EvalError("existing evaluation receipt is unreadable") from error
-        except ValueError as error:
-            raise EvalError("existing evaluation receipt is invalid") from error
-        else:
-            try:
-                receipt = validate_measurement_receipt(receipt_value)
-            except ValueError as error:
-                raise EvalError("existing evaluation receipt is invalid") from error
-            if any(
-                receipt[field] != request[field]
-                for field in (
-                    "eval_id",
-                    "descriptor_sha256",
-                    "request_sha256",
-                    "candidate_commit",
-                    "apparatus_commit",
-                )
-            ):
-                raise EvalError("existing evaluation receipt lineage is invalid")
+        receipt = self._load_receipt(request, None)
         execution_path = self._execution_path(str(request["eval_id"]))
         try:
             execution_value = read_json_strict(execution_path)
@@ -328,7 +305,11 @@ class EvalService:
         except FileNotFoundError:
             if receipt is not None:
                 raise EvalError("existing receipt execution lineage is missing")
-            return self._lost_evaluation(request, "request has no execution claim")
+            return self._receipt_or_lost(
+                request,
+                None,
+                "request has no execution claim",
+            )
         except (OSError, ValueError) as error:
             raise EvalError("existing evaluation execution claim is invalid") from error
         if receipt is not None:
@@ -336,17 +317,47 @@ class EvalService:
                 raise EvalError("existing receipt execution lineage mismatch")
             return ExistingEvaluation(receipt)
         if execution["host"] != socket.gethostname():
-            return self._lost_evaluation(request, "execution claim host is not local")
-        if not _execution_lock_is_held(
-            self._execution_lock_path(str(request["eval_id"]))
-        ):
-            return self._lost_evaluation(request, "execution claim lock was released")
-        broker_pid = int(execution["broker_pid"])
-        if process_start_token(broker_pid) != execution["broker_start_token"]:
-            return self._lost_evaluation(
+            return self._receipt_or_lost(
                 request,
+                execution,
+                "execution claim host is not local",
+            )
+        lock_state, lock_fd, lock_identity = _observe_execution_lock(
+            self._execution_lock_path(str(request["eval_id"]))
+        )
+        if lock_state == "acquired":
+            assert lock_fd is not None
+            try:
+                return self._receipt_or_lost(
+                    request,
+                    execution,
+                    "execution claim lock was released",
+                )
+            finally:
+                _release_execution_lock(lock_fd)
+        if lock_state == "missing":
+            return self._receipt_or_lost(
+                request,
+                execution,
+                "execution claim lock was released",
+            )
+        assert lock_identity is not None
+        broker_pid = int(execution["broker_pid"])
+        if _linux_process_start_token(broker_pid) != execution["broker_start_token"]:
+            return self._receipt_or_lost(
+                request,
+                execution,
                 "execution claim broker is not live",
             )
+        if not _linux_broker_owns_lock(execution, lock_identity):
+            return self._receipt_or_lost(
+                request,
+                execution,
+                "execution claim broker does not own the lock",
+            )
+        receipt = self._load_receipt(request, execution)
+        if receipt is not None:
+            return ExistingEvaluation(receipt)
         return ExistingEvaluation(
             {
                 "eval_id": request["eval_id"],
@@ -359,6 +370,55 @@ class EvalService:
                 "updated_at": execution["claimed_at"],
             }
         )
+
+    def _load_receipt(
+        self,
+        request: dict[str, object],
+        execution: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        receipt_path = self._receipt_path(str(request["eval_id"]))
+        try:
+            receipt_value = read_json_strict(receipt_path)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise EvalError("existing evaluation receipt is unreadable") from error
+        except ValueError as error:
+            raise EvalError("existing evaluation receipt is invalid") from error
+        try:
+            receipt = validate_measurement_receipt(receipt_value)
+        except ValueError as error:
+            raise EvalError("existing evaluation receipt is invalid") from error
+        if any(
+            receipt[field] != request[field]
+            for field in (
+                "eval_id",
+                "descriptor_sha256",
+                "request_sha256",
+                "candidate_commit",
+                "apparatus_commit",
+            )
+        ):
+            raise EvalError("existing evaluation receipt lineage is invalid")
+        if (
+            execution is not None
+            and receipt["execution_sha256"] != execution["execution_sha256"]
+        ):
+            raise EvalError("existing receipt execution lineage mismatch")
+        return receipt
+
+    def _receipt_or_lost(
+        self,
+        request: dict[str, object],
+        execution: dict[str, object] | None,
+        reason: str,
+    ) -> ExistingEvaluation:
+        receipt = self._load_receipt(request, execution)
+        if receipt is not None:
+            if execution is None:
+                raise EvalError("existing receipt execution lineage is missing")
+            return ExistingEvaluation(receipt)
+        return self._lost_evaluation(request, reason)
 
     def _lost_evaluation(
         self,
@@ -561,27 +621,74 @@ def _acquire_execution_lock(path: Path) -> int | None:
         raise
 
 
-def _execution_lock_is_held(path: Path) -> bool:
+def _observe_execution_lock(
+    path: Path,
+) -> tuple[str, int | None, tuple[int, int] | None]:
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:
-        return False
+        return "missing", None, None
     except OSError as error:
         raise EvalError(f"unable to inspect execution lock: {path}") from error
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise EvalError(f"execution lock must be a single-link regular file: {path}")
+        identity = (metadata.st_dev, metadata.st_ino)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return True
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        return False
-    finally:
+            os.close(descriptor)
+            return "contended", None, identity
+        return "acquired", descriptor, identity
+    except BaseException:
         os.close(descriptor)
+        raise
+
+
+def _linux_broker_owns_lock(
+    execution: dict[str, object],
+    lock_identity: tuple[int, int],
+) -> bool:
+    broker_pid = int(execution["broker_pid"])
+    recorded_token = str(execution["broker_start_token"])
+    if _linux_process_start_token(broker_pid) != recorded_token:
+        return False
+    owns_lock_file = False
+    try:
+        with os.scandir(f"/proc/{broker_pid}/fd") as entries:
+            for entry in entries:
+                try:
+                    metadata = entry.stat(follow_symlinks=True)
+                except OSError:
+                    continue
+                if (metadata.st_dev, metadata.st_ino) == lock_identity:
+                    owns_lock_file = True
+                    break
+    except OSError:
+        return False
+    return (
+        _linux_process_start_token(broker_pid) == recorded_token
+        and owns_lock_file
+    )
+
+
+def _linux_process_start_token(pid: int) -> str | None:
+    if pid < 1:
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields_after_name = raw.rsplit(")", 1)[1].split()
+        return f"linux-proc-start:{fields_after_name[19]}"
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _require_linux_claim_runtime() -> None:
+    if sys.platform != "linux":
+        raise EvalError("evaluation execution claim runtime requires Linux")
 
 
 def _release_execution_lock(descriptor: int) -> None:

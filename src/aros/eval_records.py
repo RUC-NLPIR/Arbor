@@ -471,7 +471,7 @@ def _validate_execution(
     ):
         raise ValueError("evaluation execution lineage mismatch")
     _utf8(execution["host"], "host", nonempty=True)
-    if type(execution["broker_pid"]) is not int or execution["broker_pid"] <= 1:
+    if type(execution["broker_pid"]) is not int or execution["broker_pid"] < 1:
         raise ValueError("broker_pid must be a plain process ID")
     start_token = _utf8(
         execution["broker_start_token"],

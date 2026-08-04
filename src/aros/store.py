@@ -192,6 +192,8 @@ def _read_json(path: str | Path, *, strict: bool) -> Any:
 
 
 def _strict_json_loads(raw: str | bytes | bytearray) -> Any:
+    if isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw).decode("utf-8")
     return json.loads(
         raw,
         object_pairs_hook=_unique_json_object,

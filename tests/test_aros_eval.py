@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import threading
 import fcntl
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,12 @@ from arbor.aros.eval_records import validate_measurement_receipt
 from arbor.aros.receipts import record_sha256
 from arbor.aros.runs import RunService
 from arbor.aros.store import process_start_token
+
+
+requires_linux_claims = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="evaluation execution claims require Linux procfs and flock",
+)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -380,6 +387,27 @@ def test_register_strict_json_rejects_overflowing_float_before_manifest_parse(
     assert not (root / ".aros" / "evaluators").exists()
 
 
+@pytest.mark.parametrize("encoding", ("utf-16", "utf-32"))
+def test_register_rejects_non_utf8_manifest_bytes(
+    tmp_path: Path,
+    encoding: str,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, _manifest_commit = _init_evaluator_repository(root)
+    manifest_path = root / "eval" / "suites" / "quality" / "1" / "manifest.json"
+    manifest_path.write_bytes(manifest_path.read_text(encoding="utf-8").encode(encoding))
+    _git(root, "add", "eval/suites/quality/1/manifest.json")
+    _git(root, "commit", "-qm", f"encode manifest as {encoding}")
+
+    with pytest.raises(EvalError, match="UTF-8"):
+        EvalService(root).register(
+            "eval/suites/quality/1/manifest.json",
+            actor="principal",
+        )
+
+    assert not (root / ".aros" / "evaluators").exists()
+
+
 def test_eval_id_is_full_idempotency_digest_and_request_is_create_once(
     tmp_path: Path,
 ) -> None:
@@ -480,6 +508,7 @@ def test_same_key_different_request_rejects_without_materialization(
     assert not (root / ".aros" / "runs").exists()
 
 
+@requires_linux_claims
 def test_existing_request_replay_does_not_reresolve_git_or_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -524,6 +553,74 @@ def test_existing_request_replay_does_not_reresolve_git_or_descriptor(
         )
 
 
+def test_execution_claim_runtime_is_linux_only_but_requests_are_portable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    key = "portable-request-linux-claim"
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    request, created = service._publish_request(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        key,
+    )
+
+    assert created is True
+    with pytest.raises(EvalError, match="requires Linux"):
+        service._begin_execution(
+            "quality",
+            "1",
+            candidate_commit,
+            "principal",
+            key,
+        )
+    evaluation_root = root / ".aros" / "evaluations" / str(request["eval_id"])
+    assert sorted(path.name for path in evaluation_root.iterdir()) == ["request.json"]
+
+
+@requires_linux_claims
+def test_linux_start_token_and_execution_claim_allow_pid_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    real_read_text = Path.read_text
+    proc_stat = "1 (init) " + " ".join(["S", *map(str, range(4, 23))])
+
+    def read_proc_stat(path: Path, *args: object, **kwargs: object) -> str:
+        if path == Path("/proc/1/stat"):
+            return proc_stat
+        return real_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", read_proc_stat)
+    monkeypatch.setattr(eval_module.os, "getpid", lambda: 1)
+    assert eval_module._linux_process_start_token(1) == "linux-proc-start:22"
+
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        "pid-one-broker",
+    )
+
+    assert isinstance(lease, eval_module.ExecutionLease)
+    assert lease.execution["broker_pid"] == 1
+    assert lease.execution["broker_start_token"] == "linux-proc-start:22"
+    lease.close()
+
+
+@requires_linux_claims
 def test_execution_claim_is_local_one_attempt_and_never_transfers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -596,6 +693,7 @@ def test_execution_claim_is_local_one_attempt_and_never_transfers(
     assert not (root / ".aros" / "runs").exists()
 
 
+@requires_linux_claims
 def test_execution_lease_close_is_an_atomic_one_shot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -661,6 +759,7 @@ def test_execution_lease_close_is_an_atomic_one_shot(
     assert vars(lease)["lock_fd"] == -1
 
 
+@requires_linux_claims
 def test_existing_released_claim_returns_lost_before_bundle_or_run_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -732,6 +831,7 @@ def test_existing_released_claim_returns_lost_before_bundle_or_run_creation(
     assert not (root / ".aros" / "runs").exists()
 
 
+@requires_linux_claims
 def test_missing_execution_lock_is_lost(tmp_path: Path) -> None:
     root = tmp_path / "repository"
     _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
@@ -768,6 +868,141 @@ def test_missing_execution_lock_is_lost(tmp_path: Path) -> None:
     assert "released" in str(replay.status["reason"])
 
 
+@requires_linux_claims
+def test_unrelated_process_flock_does_not_keep_released_claim_running(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    key = "unrelated-flock"
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        key,
+    )
+    assert isinstance(lease, eval_module.ExecutionLease)
+    lock_path = (
+        root
+        / ".aros"
+        / "locks"
+        / f"{lease.request['eval_id']}-execution.lock"
+    )
+    lease.close()
+    ready_reader, ready_writer = os.pipe()
+    release_reader, release_writer = os.pipe()
+    holder_pid = os.fork()
+    if holder_pid == 0:
+        try:
+            os.close(ready_reader)
+            os.close(release_writer)
+            lock_fd = os.open(lock_path, os.O_RDWR)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            os.write(ready_writer, b"1")
+            os.read(release_reader, 1)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except BaseException:
+            os._exit(91)
+        os._exit(0)
+    os.close(ready_writer)
+    os.close(release_reader)
+    assert os.read(ready_reader, 1) == b"1"
+    try:
+        replay = service._begin_execution(
+            "quality",
+            "1",
+            candidate_commit,
+            "principal",
+            key,
+        )
+    finally:
+        os.write(release_writer, b"1")
+        os.close(release_writer)
+        os.close(ready_reader)
+        _, holder_status = os.waitpid(holder_pid, 0)
+
+    assert os.waitstatus_to_exitcode(holder_status) == 0
+    assert isinstance(replay, eval_module.ExistingEvaluation)
+    assert replay.status["evaluation_state"] == "lost"
+    assert "broker" in str(replay.status["reason"])
+
+
+@requires_linux_claims
+def test_cross_process_winner_and_follower_observe_one_live_claim(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    key = "cross-process-one-claim"
+    ready_reader, ready_writer = os.pipe()
+    release_reader, release_writer = os.pipe()
+    winner_pid = os.fork()
+    if winner_pid == 0:
+        try:
+            os.close(ready_reader)
+            os.close(release_writer)
+            winner = EvalService(root)._begin_execution(
+                "quality",
+                "1",
+                candidate_commit,
+                "principal",
+                key,
+            )
+            if not isinstance(winner, eval_module.ExecutionLease):
+                os._exit(92)
+            os.write(ready_writer, b"1")
+            os.read(release_reader, 1)
+            winner.close()
+        except BaseException:
+            os._exit(91)
+        os._exit(0)
+    os.close(ready_writer)
+    os.close(release_reader)
+    assert os.read(ready_reader, 1) == b"1"
+    try:
+        follower = service._begin_execution(
+            "quality",
+            "1",
+            candidate_commit,
+            "principal",
+            key,
+        )
+        execution_path = (
+            root
+            / ".aros"
+            / "evaluations"
+            / str(follower.status["eval_id"])
+            / "execution.json"
+        )
+        execution = json.loads(execution_path.read_text(encoding="utf-8"))
+        assert execution["broker_pid"] == winner_pid
+        assert isinstance(follower, eval_module.ExistingEvaluation)
+        assert follower.status["evaluation_state"] == "running"
+    finally:
+        os.write(release_writer, b"1")
+        os.close(release_writer)
+        os.close(ready_reader)
+        _, winner_status = os.waitpid(winner_pid, 0)
+
+    assert os.waitstatus_to_exitcode(winner_status) == 0
+    replay = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        key,
+    )
+    assert isinstance(replay, eval_module.ExistingEvaluation)
+    assert replay.status["evaluation_state"] == "lost"
+
+
+@requires_linux_claims
 def test_crash_after_request_before_claim_is_irrevocably_lost(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -831,6 +1066,7 @@ def test_crash_after_request_before_claim_is_irrevocably_lost(
     assert not (root / ".aros" / "runs").exists()
 
 
+@requires_linux_claims
 def test_concurrent_same_key_publishes_one_request_and_one_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -913,6 +1149,7 @@ def test_concurrent_same_key_publishes_one_request_and_one_claim(
     assert not (root / ".aros" / "runs").exists()
 
 
+@requires_linux_claims
 def test_existing_receipt_wins_over_a_live_execution_claim(tmp_path: Path) -> None:
     root = tmp_path / "repository"
     _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
@@ -954,6 +1191,71 @@ def test_existing_receipt_wins_over_a_live_execution_claim(tmp_path: Path) -> No
     lease.close()
 
 
+@requires_linux_claims
+def test_receipt_publication_linearizes_before_released_claim_becomes_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    key = "receipt-linearization"
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        key,
+    )
+    assert isinstance(lease, eval_module.ExecutionLease)
+    receipt = _terminal_receipt(lease.request, lease.execution)
+    receipt_path = (
+        root
+        / "eval"
+        / "evaluations"
+        / str(lease.request["eval_id"])
+        / "receipt.json"
+    )
+    initial_receipt_miss = threading.Event()
+    receipt_published = threading.Event()
+    real_read_json_strict = eval_module.read_json_strict
+    first_receipt_read = True
+
+    def pause_initial_receipt_read(path: str | Path) -> object:
+        nonlocal first_receipt_read
+        if Path(path) == receipt_path and first_receipt_read:
+            first_receipt_read = False
+            initial_receipt_miss.set()
+            assert receipt_published.wait(timeout=5)
+            raise FileNotFoundError(receipt_path)
+        return real_read_json_strict(path)
+
+    monkeypatch.setattr(eval_module, "read_json_strict", pause_initial_receipt_read)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        replay_future = pool.submit(
+            service._begin_execution,
+            "quality",
+            "1",
+            candidate_commit,
+            "principal",
+            key,
+        )
+        assert initial_receipt_miss.wait(timeout=5)
+        receipt_path.parent.mkdir(parents=True)
+        receipt_path.write_text(
+            json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        lease.close()
+        receipt_published.set()
+        replay = replay_future.result(timeout=5)
+
+    assert isinstance(replay, eval_module.ExistingEvaluation)
+    assert replay.status == receipt
+
+
+@requires_linux_claims
 def test_existing_receipt_must_match_the_local_execution_claim(tmp_path: Path) -> None:
     root = tmp_path / "repository"
     _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
@@ -1003,6 +1305,8 @@ def test_eval_rejects_duplicate_keys_at_persisted_json_boundaries(
     tmp_path: Path,
     boundary: str,
 ) -> None:
+    if boundary in {"execution", "receipt"} and sys.platform != "linux":
+        pytest.skip("evaluation execution claims require Linux")
     root = tmp_path / "repository"
     _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
     service = EvalService(root)
@@ -1083,6 +1387,7 @@ def test_eval_rejects_duplicate_keys_at_persisted_json_boundaries(
             lease.close()
 
 
+@requires_linux_claims
 def test_dead_claim_holder_is_lost_even_when_execution_lock_is_held(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1157,6 +1462,7 @@ def test_dead_claim_holder_is_lost_even_when_execution_lock_is_held(
     assert not (root / ".aros" / "runs").exists()
 
 
+@requires_linux_claims
 def test_claim_from_another_host_is_lost_even_when_pid_and_lock_are_live(
     tmp_path: Path,
 ) -> None:
@@ -1207,6 +1513,7 @@ def test_claim_from_another_host_is_lost_even_when_pid_and_lock_are_live(
     assert "host" in str(replay.status["reason"])
 
 
+@requires_linux_claims
 def test_crash_after_claim_publication_never_transfers_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

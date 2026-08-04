@@ -381,6 +381,15 @@ def test_read_json_strict_rejects_overflowing_float_without_changing_default(
         store_module.read_json_strict(target)
 
 
+@pytest.mark.parametrize("encoding", ("utf-16", "utf-32"))
+def test_strict_json_bytes_reject_utf16_and_utf32(encoding: str) -> None:
+    payload = '{"value":1}'.encode(encoding)
+    assert json.loads(payload) == {"value": 1}
+
+    with pytest.raises(UnicodeDecodeError):
+        store_module._strict_json_loads(payload)
+
+
 def test_read_json_rejects_path_replaced_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

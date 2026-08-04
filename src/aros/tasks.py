@@ -451,125 +451,125 @@ class TaskService:
             if _path_exists(self._launch_path(task_id)):
                 existing_launch = True
             else:
-                publication_lock = self._publication_lock_path()
-                _ensure_durable_lock_file(
-                    publication_lock,
-                    "task record publication lock",
+                old_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    {signal.SIGINT},
                 )
-                with file_lock(publication_lock):
-                    lifecycle_lock = self._lifecycle_lock_path(task_id)
+                try:
+                    publication_lock = self._publication_lock_path()
                     _ensure_durable_lock_file(
-                        lifecycle_lock,
-                        "task lifecycle lock",
+                        publication_lock,
+                        "task record publication lock",
                     )
-                    with file_lock(lifecycle_lock):
-                        self._reconcile_authoritative_briefs()
-                        brief = self._load_brief(task_id)
-                        ownership = self._load_ownership(brief)
-                        if _path_exists(self._launch_path(task_id)):
-                            existing_launch = True
-                        else:
-                            status = self._load_task_status(brief, ownership)
-                            if status["state"] != "worktree_ready":
-                                raise TaskError(
-                                    f"task is not ready for launch: {task_id}"
-                                )
-                            launch_actor = _validate_text(
-                                actor if actor is not None else ownership["actor"],
-                                "actor",
-                            )
-                            if launch_actor != ownership["actor"]:
-                                raise TaskError(
-                                    f"task ownership actor conflict: {task_id}"
-                                )
-                            tmux = shutil.which("tmux")
-                            if tmux is None:
-                                raise TaskError(
-                                    "tmux is required for durable child tasks"
-                                )
-                            runtime = self._runtime_path(task_id)
-                            preparation = self._create_preparation(
-                                brief,
-                                ownership,
-                                launch_actor,
-                            )
-                            self._prepare_execution_paths(
-                                runtime,
-                                filesystem_permissions_enforced=preparation[
-                                    "filesystem_permissions_enforced"
-                                ],
-                            )
-                            launched_at = utc_now()
-                            session_name = f"aros-task-{task_id.lower()}"
-                            socket_name = _tmux_socket_name(self.root, task_id)
-                            runner_cwd = runtime / "home"
-                            runner_invocation = [
-                                sys.executable,
-                                "-I",
-                                "-c",
-                                _TASK_RUNNER_BOOTSTRAP,
-                                str(runtime / "runner-import"),
-                                "--workspace",
-                                str(self.root),
-                                "--task-id",
-                                task_id,
-                            ]
-                            launch: dict[str, object] = {
-                                "schema_version": 1,
-                                "task_id": task_id,
-                                "actor": launch_actor,
-                                "brief_sha256": brief["brief_sha256"],
-                                "ownership_sha256": ownership["ownership_sha256"],
-                                "base_commit": brief["base_commit"],
-                                "security_profile": "trusted-local",
-                                "isolation_scope": "application",
-                                "capabilities_enforced": False,
-                                "filesystem_permissions_enforced": preparation[
-                                    "filesystem_permissions_enforced"
-                                ],
-                                "filesystem_permission_probe": dict(
-                                    preparation[  # type: ignore[arg-type]
-                                        "filesystem_permission_probe"
-                                    ]
-                                ),
-                                "carrier": "tmux",
-                                "tmux_session": session_name,
-                                "tmux_socket": socket_name,
-                                "host": socket.gethostname(),
-                                "runner_version": 1,
-                                "runner_cwd": str(runner_cwd),
-                                "runner_invocation": runner_invocation,
-                                "launched_at": launched_at,
-                            }
-                            launch["launch_sha256"] = _record_sha256(
-                                launch,
-                                "launch_sha256",
-                            )
-                            if not create_json(self._launch_path(task_id), launch):
+                    with file_lock(publication_lock):
+                        lifecycle_lock = self._lifecycle_lock_path(task_id)
+                        _ensure_durable_lock_file(
+                            lifecycle_lock,
+                            "task lifecycle lock",
+                        )
+                        with file_lock(lifecycle_lock):
+                            self._reconcile_authoritative_briefs()
+                            brief = self._load_brief(task_id)
+                            ownership = self._load_ownership(brief)
+                            if _path_exists(self._launch_path(task_id)):
                                 existing_launch = True
                             else:
-                                recorded_launch = self._load_launch(brief, ownership)
-                                if recorded_launch != launch:
+                                status = self._load_task_status(brief, ownership)
+                                if status["state"] != "worktree_ready":
                                     raise TaskError(
-                                        f"task launch differs after write: {task_id}"
+                                        f"task is not ready for launch: {task_id}"
                                     )
-                                from .task_runner import launched_status
-
-                                atomic_write_json(
-                                    self._status_path(task_id),
-                                    launched_status(
-                                        brief,
-                                        ownership,
-                                        recorded_launch,
-                                    ),
+                                launch_actor = _validate_text(
+                                    actor if actor is not None else ownership["actor"],
+                                    "actor",
                                 )
+                                if launch_actor != ownership["actor"]:
+                                    raise TaskError(
+                                        f"task ownership actor conflict: {task_id}"
+                                    )
+                                tmux = shutil.which("tmux")
+                                if tmux is None:
+                                    raise TaskError(
+                                        "tmux is required for durable child tasks"
+                                    )
+                                runtime = self._runtime_path(task_id)
+                                preparation = self._create_preparation(
+                                    brief,
+                                    ownership,
+                                    launch_actor,
+                                )
+                                self._prepare_execution_paths(
+                                    runtime,
+                                    filesystem_permissions_enforced=preparation[
+                                        "filesystem_permissions_enforced"
+                                    ],
+                                )
+                                launched_at = utc_now()
+                                session_name = f"aros-task-{task_id.lower()}"
+                                socket_name = _tmux_socket_name(self.root, task_id)
+                                runner_cwd = runtime / "home"
+                                runner_invocation = [
+                                    sys.executable,
+                                    "-I",
+                                    "-c",
+                                    _TASK_RUNNER_BOOTSTRAP,
+                                    str(runtime / "runner-import"),
+                                    "--workspace",
+                                    str(self.root),
+                                    "--task-id",
+                                    task_id,
+                                ]
+                                launch: dict[str, object] = {
+                                    "schema_version": 1,
+                                    "task_id": task_id,
+                                    "actor": launch_actor,
+                                    "brief_sha256": brief["brief_sha256"],
+                                    "ownership_sha256": ownership["ownership_sha256"],
+                                    "base_commit": brief["base_commit"],
+                                    "security_profile": "trusted-local",
+                                    "isolation_scope": "application",
+                                    "capabilities_enforced": False,
+                                    "filesystem_permissions_enforced": preparation[
+                                        "filesystem_permissions_enforced"
+                                    ],
+                                    "filesystem_permission_probe": dict(
+                                        preparation[  # type: ignore[arg-type]
+                                            "filesystem_permission_probe"
+                                        ]
+                                    ),
+                                    "carrier": "tmux",
+                                    "tmux_session": session_name,
+                                    "tmux_socket": socket_name,
+                                    "host": socket.gethostname(),
+                                    "runner_version": 1,
+                                    "runner_cwd": str(runner_cwd),
+                                    "runner_invocation": runner_invocation,
+                                    "launched_at": launched_at,
+                                }
+                                launch["launch_sha256"] = _record_sha256(
+                                    launch,
+                                    "launch_sha256",
+                                )
+                                if not create_json(self._launch_path(task_id), launch):
+                                    existing_launch = True
+                                else:
+                                    recorded_launch = self._load_launch(brief, ownership)
+                                    if recorded_launch != launch:
+                                        raise TaskError(
+                                            f"task launch differs after write: {task_id}"
+                                        )
+                                    from .task_runner import launched_status
 
-                if not existing_launch:
-                    old_mask = signal.pthread_sigmask(
-                        signal.SIG_BLOCK,
-                        {signal.SIGINT},
-                    )
-                    try:
+                                    atomic_write_json(
+                                        self._status_path(task_id),
+                                        launched_status(
+                                            brief,
+                                            ownership,
+                                            recorded_launch,
+                                        ),
+                                    )
+
+                    if not existing_launch:
                         try:
                             from .task_runner import runner_environment
 
@@ -599,19 +599,21 @@ class TaskService:
                                 carrier_failure_detail,
                             )
                         elif result is not None and result.returncode != 0:
-                            carrier_failure_detail = (
+                            detail = (
                                 (result.stderr or result.stdout).strip()
                                 or "unknown tmux error"
                             )
-                            self._record_carrier_failure(
+                            if self._record_carrier_failure(
                                 task_id,
-                                carrier_failure_detail,
-                            )
-                    finally:
-                        try:
-                            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-                        except KeyboardInterrupt as error:
-                            pending_interrupt = error
+                                detail,
+                                preserve_execution=True,
+                            ):
+                                carrier_failure_detail = detail
+                finally:
+                    try:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+                    except KeyboardInterrupt as error:
+                        pending_interrupt = error
 
         if existing_launch:
             return self._existing_execution_status(task_id, actor)
@@ -2358,6 +2360,7 @@ class TaskService:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            errors="replace",
             close_fds=True,
             pass_fds=(lock_descriptor,),
             start_new_session=True,
@@ -2647,10 +2650,21 @@ class TaskService:
         )
         _require_absent(runtime / "final.json", "task final receipt")
 
-    def _record_carrier_failure(self, task_id: str, detail: str) -> None:
+    def _record_carrier_failure(
+        self,
+        task_id: str,
+        detail: str,
+        *,
+        preserve_execution: bool = False,
+    ) -> bool:
         from .task_runner import record_carrier_failure
 
-        record_carrier_failure(self, task_id, detail)
+        return record_carrier_failure(
+            self,
+            task_id,
+            detail,
+            preserve_execution=preserve_execution,
+        )
 
     def _require_startable_parent(
         self,

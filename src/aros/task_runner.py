@@ -1727,7 +1727,9 @@ def record_carrier_failure(
     service: TaskService,
     task_id: str,
     detail: str,
-) -> None:
+    *,
+    preserve_execution: bool = False,
+) -> bool:
     """Record a proven tmux launch failure without creating another attempt."""
     lifecycle_lock = service._lifecycle_lock_path(task_id)
     with file_lock(lifecycle_lock):
@@ -1736,7 +1738,13 @@ def record_carrier_failure(
         launch = service._load_launch(brief, ownership)
         if service._final_path(task_id).exists():
             service._load_final(brief, ownership, launch)
-            return
+            return False
+        if preserve_execution:
+            if _path_exists(service._execution_path(task_id)):
+                load_execution_claim(service, brief, ownership, launch)
+                return False
+            if service._carrier_is_live(launch):
+                return False
         final = _final_record(
             brief=brief,
             ownership=ownership,
@@ -1760,6 +1768,7 @@ def record_carrier_failure(
             service._status_path(task_id),
             terminal_status(brief, ownership, launch, recorded),
         )
+        return True
 
 
 def run(workspace: str | Path, task_id: str) -> int:

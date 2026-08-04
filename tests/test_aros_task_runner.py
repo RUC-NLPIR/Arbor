@@ -1334,6 +1334,50 @@ def test_guardian_forwards_tmux_exit_and_exec_results(tmp_path: Path) -> None:
     assert service._carrier_launch_is_active(task_id) is False
 
 
+def test_invalid_utf8_guardian_error_records_failed_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key="guardian-invalid-utf8",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    fake_tmux = tmp_path / ".git" / "invalid-utf8-tmux"
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "if 'new-session' not in sys.argv:\n"
+        "    raise SystemExit(1)\n"
+        "os.write(2, b'\\xffbad guardian error')\n"
+        "raise SystemExit(7)\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: str(fake_tmux))
+    start_error: TaskError | None = None
+    decode_error: UnicodeDecodeError | None = None
+
+    try:
+        service.start(task_id)
+    except TaskError as error:
+        start_error = error
+    except UnicodeDecodeError as error:
+        decode_error = error
+
+    status = service.status(task_id)
+    final_path = runtime / "final.json"
+    final = json.loads(final_path.read_text(encoding="utf-8")) if final_path.exists() else {}
+    assert decode_error is None
+    assert start_error is not None
+    assert status["state"] == "failed_process"
+    assert "\ufffdbad guardian error" in str(final["error"])
+
+
 @pytest.mark.parametrize("failure", ("nonzero", "oserror"))
 def test_carrier_failure_is_recorded_before_launch_lock_release(
     tmp_path: Path,
@@ -1367,10 +1411,17 @@ def test_carrier_failure_is_recorded_before_launch_lock_release(
         task_service: TaskService,
         failed_task_id: str,
         detail: str,
-    ) -> None:
+        *,
+        preserve_execution: bool = False,
+    ) -> bool:
         record_entered.set()
         assert release_record.wait(timeout=5)
-        original_record(task_service, failed_task_id, detail)
+        return original_record(
+            task_service,
+            failed_task_id,
+            detail,
+            preserve_execution=preserve_execution,
+        )
 
     def absent_carrier(
         command: list[str],
@@ -1405,6 +1456,83 @@ def test_carrier_failure_is_recorded_before_launch_lock_release(
     assert len(guardian_calls) == 1
 
 
+def test_signaled_tmux_client_does_not_overwrite_live_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code = (
+        "from pathlib import Path\n"
+        "path = Path('adapter-count')\n"
+        "path.write_text((path.read_text() if path.exists() else '') + '1')\n"
+    )
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", code],
+        key="signaled-client-live-session",
+    )
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    release_runner = tmp_path / ".git" / "release-signaled-client-runner"
+    real_tmux = shutil.which("tmux")
+    assert real_tmux is not None
+    fake_tmux = tmp_path / ".git" / "signaled-client-tmux"
+    runner_gate = (
+        f"while [ ! -e {shlex.quote(str(release_runner))} ]; "
+        "do sleep 0.01; done; exec "
+    )
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import signal\n"
+        "import subprocess\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if 'new-session' not in args:\n"
+        f"    os.execv({real_tmux!r}, [{real_tmux!r}, *args])\n"
+        f"args[-1] = {runner_gate!r} + args[-1]\n"
+        f"result = subprocess.run([{real_tmux!r}, *args], check=False)\n"
+        "if result.returncode != 0:\n"
+        "    raise SystemExit(result.returncode)\n"
+        "os.kill(os.getpid(), signal.SIGKILL)\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: str(fake_tmux))
+    launch: dict[str, object] | None = None
+    start_error: TaskError | None = None
+    try:
+        try:
+            started = service.start(task_id)
+        except TaskError as error:
+            start_error = error
+            started = service.status(task_id)
+        launch = json.loads((runtime / "launch.json").read_text(encoding="utf-8"))
+        release_runner.touch()
+        terminal = _wait_terminal(service, task_id)
+    finally:
+        release_runner.touch(exist_ok=True)
+        if launch is not None:
+            subprocess.run(
+                [
+                    real_tmux,
+                    "-L",
+                    str(launch["tmux_socket"]),
+                    "kill-session",
+                    "-t",
+                    f"={launch['tmux_session']}",
+                ],
+                capture_output=True,
+                check=False,
+            )
+
+    assert start_error is None
+    assert started["state"] == "launched"
+    assert terminal["state"] == "completed"
+    assert (worktree / "adapter-count").read_text(encoding="utf-8") == "1"
+
+
 def test_pending_sigint_after_guardian_spawn_waits_and_records_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1424,8 +1552,11 @@ def test_pending_sigint_after_guardian_spawn_waits_and_records_failure(
         f"#!{sys.executable}\n"
         "import os\n"
         "import signal\n"
+        "import sys\n"
         "import time\n"
         "from pathlib import Path\n"
+        "if 'new-session' not in sys.argv:\n"
+        "    raise SystemExit(1)\n"
         "blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())\n"
         f"Path({str(client_mask)!r}).write_text("
         "'blocked' if signal.SIGINT in blocked else 'unblocked')\n"
@@ -1561,14 +1692,21 @@ def test_pending_sigint_after_guardian_result_waits_for_failure_publication(
         task_service: TaskService,
         failed_task_id: str,
         detail: str,
-    ) -> None:
+        *,
+        preserve_execution: bool = False,
+    ) -> bool:
         nonlocal pending_sigint
         blocked = original_pthread_sigmask(signal.SIG_BLOCK, set())
         record_mask_blocked.append(signal.SIGINT in blocked)
         pending_sigint = True
         record_entered.set()
         assert release_record.wait(timeout=5)
-        original_record(task_service, failed_task_id, detail)
+        return original_record(
+            task_service,
+            failed_task_id,
+            detail,
+            preserve_execution=preserve_execution,
+        )
 
     def deliver_pending_sigint(how: int, mask: object) -> set[signal.Signals]:
         result = original_pthread_sigmask(how, mask)  # type: ignore[arg-type]
@@ -1578,7 +1716,6 @@ def test_pending_sigint_after_guardian_result_waits_for_failure_publication(
         return result
 
     monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: "/fake/tmux")
     monkeypatch.setattr(TaskService, "_run_carrier_guardian", completed_guardian)
     monkeypatch.setattr(TaskService, "_record_carrier_failure", arm_sigint_before_record)
     monkeypatch.setattr(signal, "pthread_sigmask", deliver_pending_sigint)
@@ -1659,6 +1796,90 @@ def test_pending_sigint_after_successful_guardian_result_keeps_carrier_live(
     assert active["state"] in {"launched", "running"}
     assert terminal is not None
     assert terminal["state"] == "cancelled"
+
+
+def test_pending_sigint_after_launch_guard_precedes_launch_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief = _create_committed_task(
+        tmp_path,
+        [sys.executable, "-c", "raise AssertionError('must not run')"],
+        key="launch-guard-pending-sigint",
+    )
+    task_id = str(brief["task_id"])
+    original_guard = TaskService._carrier_launch_guard
+    original_publication_path = TaskService._publication_lock_path
+    original_pthread_sigmask = signal.pthread_sigmask
+    guard_entered = False
+    pending_sigint = False
+    publication_mask_blocked: list[bool] = []
+    mask_calls: list[int] = []
+    guardian_calls: list[list[str]] = []
+
+    @contextmanager
+    def observe_guard(
+        task_service: TaskService,
+        guarded_task_id: str,
+    ) -> Iterator[int]:
+        nonlocal guard_entered
+        with original_guard(task_service, guarded_task_id) as descriptor:
+            guard_entered = True
+            try:
+                yield descriptor
+            finally:
+                guard_entered = False
+
+    def arm_sigint_at_publication(task_service: TaskService) -> Path:
+        nonlocal pending_sigint
+        if guard_entered and not publication_mask_blocked:
+            blocked = original_pthread_sigmask(signal.SIG_BLOCK, set())
+            is_blocked = signal.SIGINT in blocked
+            publication_mask_blocked.append(is_blocked)
+            if not is_blocked:
+                raise RuntimeError("SIGINT delivered before launch publication")
+            pending_sigint = True
+        return original_publication_path(task_service)
+
+    def failed_guardian(
+        _service: TaskService,
+        _lock_descriptor: int,
+        command: list[str],
+        _environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        guardian_calls.append(command)
+        return subprocess.CompletedProcess(command, 7, "", "tmux failed")
+
+    def deliver_pending_sigint(how: int, mask: object) -> set[signal.Signals]:
+        result = original_pthread_sigmask(how, mask)  # type: ignore[arg-type]
+        mask_calls.append(how)
+        if how == signal.SIG_SETMASK and pending_sigint:
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(TaskService, "_carrier_launch_guard", observe_guard)
+    monkeypatch.setattr(TaskService, "_publication_lock_path", arm_sigint_at_publication)
+    monkeypatch.setattr(TaskService, "_run_carrier_guardian", failed_guardian)
+    monkeypatch.setattr(signal, "pthread_sigmask", deliver_pending_sigint)
+
+    with pytest.raises((KeyboardInterrupt, RuntimeError)) as interrupt:
+        service.start(task_id)
+
+    status = service.status(task_id)
+    replay_error: TaskError | None = None
+    try:
+        replay = service.start(task_id)
+    except TaskError as error:
+        replay_error = error
+        replay = service.status(task_id)
+    assert publication_mask_blocked == [True]
+    assert isinstance(interrupt.value, KeyboardInterrupt)
+    assert mask_calls == [signal.SIG_BLOCK, signal.SIG_SETMASK]
+    assert status["state"] == "failed_process"
+    assert replay_error is None
+    assert replay == status
+    assert len(guardian_calls) == 1
 
 
 def test_carrier_launch_lock_probe_does_not_create_or_accept_stale_lock(

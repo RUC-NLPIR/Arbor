@@ -314,6 +314,32 @@ def test_read_json_recovers_same_inode_temp_alias_after_process_crash(
     assert _temporary_paths(target) == []
 
 
+def test_read_json_strict_no_repair_rejects_and_preserves_crash_alias(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "record.json"
+    value = {"payload": "complete"}
+    _crash_after_link(target, value)
+    temporary = _temporary_paths(target)
+    assert len(temporary) == 1
+    alias = temporary[0]
+    before = {
+        path: (path.lstat().st_ino, path.lstat().st_nlink, path.read_bytes())
+        for path in (target, alias)
+    }
+
+    with pytest.raises(ValueError, match="single-link"):
+        store_module.read_json_strict_no_repair(target)
+
+    assert {
+        path: (path.lstat().st_ino, path.lstat().st_nlink, path.read_bytes())
+        for path in (target, alias)
+    } == before
+    assert read_json(target) == value
+    assert target.stat().st_nlink == 1
+    assert _temporary_paths(target) == []
+
+
 def test_read_json_rejects_and_preserves_unrelated_hardlink(
     tmp_path: Path,
 ) -> None:

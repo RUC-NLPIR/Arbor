@@ -126,21 +126,31 @@ def final_identity(manifest: dict[str, Any]) -> dict[str, Any]:
 
 def read_json(path: str | Path) -> Any:
     """Read one securely bound JSON file with standard decoder compatibility."""
-    return _read_json(path, strict=False)
+    return _read_json(path, strict=False, repair_aliases=True)
 
 
 def read_json_strict(path: str | Path) -> Any:
     """Read one securely bound JSON file, rejecting ambiguous JSON values."""
-    return _read_json(path, strict=True)
+    return _read_json(path, strict=True, repair_aliases=True)
 
 
-def _read_json(path: str | Path, *, strict: bool) -> Any:
+def read_json_strict_no_repair(path: str | Path) -> Any:
+    """Strictly read one JSON authority without repairing crash aliases."""
+    return _read_json(path, strict=True, repair_aliases=False)
+
+
+def _read_json(
+    path: str | Path,
+    *,
+    strict: bool,
+    repair_aliases: bool,
+) -> Any:
     target = Path(path)
     metadata = target.lstat()
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError(f"JSON path must be a regular file: {target}")
     identity = (metadata.st_dev, metadata.st_ino)
-    if metadata.st_nlink > 1:
+    if repair_aliases and metadata.st_nlink > 1:
         _remove_json_temp_aliases(target, identity)
         metadata = target.lstat()
         if (

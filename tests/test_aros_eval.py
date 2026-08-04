@@ -425,6 +425,13 @@ def _prepend_duplicate_json_field(path: Path, field: str, value: object) -> None
     )
 
 
+def _install_json_crash_alias(path: Path) -> Path:
+    digest = hashlib.sha256(os.fsencode(path.name)).hexdigest()
+    alias = path.parent / f".aros-json-{digest}.inspection-crash.tmp"
+    os.link(path, alias, follow_symlinks=False)
+    return alias
+
+
 def test_register_freezes_manifest_blob_and_exact_apparatus_files(
     tmp_path: Path,
 ) -> None:
@@ -3496,9 +3503,15 @@ def test_status_is_side_effect_free_and_never_reconciles_run(
         run_id: str,
         *,
         reconcile: bool = True,
+        reader: eval_module._JsonReader | None = None,
     ) -> dict[str, object]:
         reconcile_arguments.append(reconcile)
-        return real_status(run_service, run_id, reconcile=False)
+        return real_status(
+            run_service,
+            run_id,
+            reconcile=False,
+            reader=reader,
+        )
 
     monkeypatch.setattr(RunService, "status", recording_status)
 
@@ -3513,6 +3526,118 @@ def test_status_is_side_effect_free_and_never_reconciles_run(
         for path in root.rglob("*")
         if path.is_file()
     } == before
+
+
+@requires_linux_claims
+def test_public_status_serializes_execution_lock_probes_across_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        "serialize-public-status-probes",
+    )
+    assert isinstance(lease, eval_module.ExecutionLease)
+    eval_id = str(lease.request["eval_id"])
+    lease.close()
+
+    start_reader, start_writer = os.pipe()
+    outcome_reader, outcome_writer = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        try:
+            os.close(start_writer)
+            os.close(outcome_reader)
+            assert os.read(start_reader, 1) == b"1"
+            child_status = service.status(eval_id)
+            os.write(
+                outcome_writer,
+                str(child_status["evaluation_state"]).encode("ascii"),
+            )
+        except BaseException:
+            os._exit(91)
+        os._exit(0)
+    os.close(start_reader)
+    os.close(outcome_writer)
+
+    probe_held = threading.Event()
+    release_probe = threading.Event()
+    parent_pid = os.getpid()
+    real_receipt_or_lost = service._receipt_or_lost
+
+    def pause_parent_probe(*args: object, **kwargs: object) -> object:
+        if os.getpid() == parent_pid:
+            probe_held.set()
+            assert release_probe.wait(5)
+        return real_receipt_or_lost(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_receipt_or_lost", pause_parent_probe)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            parent_status = pool.submit(service.status, eval_id)
+            assert probe_held.wait(5)
+            os.write(start_writer, b"1")
+            readable, _, _ = select.select([outcome_reader], [], [], 0.3)
+            release_probe.set()
+            assert parent_status.result(timeout=5)["evaluation_state"] == "lost"
+        child_outcome = os.read(outcome_reader, 16)
+    finally:
+        release_probe.set()
+        os.close(start_writer)
+        os.close(outcome_reader)
+        _, child_status = os.waitpid(child_pid, 0)
+
+    assert os.waitstatus_to_exitcode(child_status) == 0
+    assert readable == []
+    assert child_outcome == b"lost"
+
+
+@requires_linux_claims
+def test_public_status_rejects_replaced_idempotency_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    key = "replaced-public-status-lock"
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        key,
+    )
+    assert isinstance(lease, eval_module.ExecutionLease)
+    eval_id = str(lease.request["eval_id"])
+    lease.close()
+    key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    lock_path = root / ".aros" / "locks" / f"eval-idempotency-{key_digest}.lock"
+    replacement = lock_path.with_name("replacement.lock")
+    replacement.write_bytes(lock_path.read_bytes())
+    replacement_inode = replacement.stat().st_ino
+    real_flock = eval_module.fcntl.flock
+
+    def replace_before_flock(descriptor: int, operation: int) -> None:
+        if operation == eval_module.fcntl.LOCK_EX and replacement.exists():
+            replacement.replace(lock_path)
+        real_flock(descriptor, operation)
+
+    monkeypatch.setattr(eval_module.fcntl, "flock", replace_before_flock)
+
+    with pytest.raises(EvalError, match="idempotency lock.*changed"):
+        service.status(eval_id)
+
+    assert lock_path.stat().st_ino == replacement_inode
+    assert not replacement.exists()
 
 
 @requires_linux_claims
@@ -3616,6 +3741,7 @@ def test_audit_is_exact_nonpersisted_and_side_effect_free(
 
     monkeypatch.setattr(eval_module, "parse_scalar_metric", forbidden_side_effect)
     monkeypatch.setattr(eval_module, "create_json", forbidden_side_effect)
+    monkeypatch.setattr(RunService, "read_verified_output", forbidden_side_effect)
     monkeypatch.setattr(RunService, "prepare_bundle", forbidden_side_effect)
     monkeypatch.setattr(RunService, "start", forbidden_side_effect)
     monkeypatch.setattr(
@@ -3925,3 +4051,92 @@ def test_status_and_audit_never_parse_or_repair_missing_measurement(
         if path.is_file()
     } == before
     live_lease.close()
+
+
+@requires_linux_claims
+@pytest.mark.parametrize(
+    ("authority", "operations"),
+    (
+        ("descriptor", ("observe", "audit")),
+        ("request", ("status", "observe", "audit")),
+        ("execution", ("status", "observe", "audit")),
+        ("run-link", ("status", "observe", "audit")),
+        ("run-manifest", ("status", "observe", "audit")),
+        ("run-status", ("status", "observe", "audit")),
+        ("prelaunch", ("status", "observe", "audit")),
+        ("run-final", ("status", "observe", "audit")),
+        ("receipt", ("status", "audit")),
+    ),
+)
+def test_public_inspection_preserves_crash_aliases_for_every_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority: str,
+    operations: tuple[str, ...],
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.7,"sample_count":7}\n',
+    )
+    receipt = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key=f"read-only-crash-alias-{authority}",
+    )
+    eval_id = str(receipt["eval_id"])
+    run_id = str(receipt["run_id"])
+    evaluation_root = root / ".aros" / "evaluations" / eval_id
+    path = {
+        "descriptor": root
+        / ".aros"
+        / "evaluators"
+        / "quality"
+        / "1"
+        / "descriptor.json",
+        "request": evaluation_root / "request.json",
+        "execution": evaluation_root / "execution.json",
+        "run-link": evaluation_root / "run.json",
+        "run-manifest": root / "runs" / run_id / "manifest.json",
+        "run-status": root / ".aros" / "runs" / run_id / "status.json",
+        "prelaunch": root / ".aros" / "receipts" / f"{run_id}-prelaunch.json",
+        "run-final": root / "runs" / run_id / "final.json",
+        "receipt": root / "eval" / "evaluations" / eval_id / "receipt.json",
+    }[authority]
+
+    for operation in operations:
+        alias = _install_json_crash_alias(path)
+        before = {
+            item.relative_to(root): (
+                item.lstat().st_ino,
+                item.lstat().st_nlink,
+                item.read_bytes(),
+            )
+            for item in root.rglob("*")
+            if item.is_file()
+        }
+
+        if operation == "audit":
+            assert service.audit(eval_id)["valid"] is False
+        else:
+            with pytest.raises(EvalError):
+                if operation == "status":
+                    service.status(eval_id)
+                else:
+                    service.observe(eval_id, stream="stdout", max_bytes=1)
+
+        assert {
+            item.relative_to(root): (
+                item.lstat().st_ino,
+                item.lstat().st_nlink,
+                item.read_bytes(),
+            )
+            for item in root.rglob("*")
+            if item.is_file()
+        } == before
+        alias.unlink()

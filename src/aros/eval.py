@@ -11,6 +11,7 @@ import stat
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -25,7 +26,14 @@ from .eval_records import (
 )
 from .receipts import record_sha256
 from .runs import RunService
-from .store import create_json, file_lock, json_sha256, read_json_strict, utc_now
+from .store import (
+    create_json,
+    file_lock,
+    json_sha256,
+    read_json_strict,
+    read_json_strict_no_repair,
+    utc_now,
+)
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -33,6 +41,7 @@ _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _EVAL_ID = re.compile(r"^EVAL-[0-9a-f]{64}$")
 _MAX_OBSERVE_BYTES = 65_536
+_JsonReader = Callable[[str | Path], object]
 _DESCRIPTOR_METADATA_FIELDS = {
     "manifest_ref",
     "manifest_commit",
@@ -253,8 +262,23 @@ class EvalService:
     def status(self, eval_id: str) -> dict[str, object]:
         """Return the factual public projection for one visible evaluation."""
         evaluation_id = _evaluation_id(eval_id)
-        request = self._load_request(evaluation_id)
-        state = self._existing_evaluation(request, reconcile_run=False).status
+        reader = read_json_strict_no_repair
+        request = self._load_request(evaluation_id, reader=reader)
+        idempotency_lock = (
+            self.root
+            / ".aros"
+            / "locks"
+            / f"eval-idempotency-{request['idempotency_key_sha256']}.lock"
+        )
+        lock_fd = _acquire_existing_idempotency_lock(idempotency_lock)
+        try:
+            state = self._existing_evaluation(
+                request,
+                reconcile_run=False,
+                reader=reader,
+            ).status
+        finally:
+            os.close(lock_fd)
         if state.get("evaluation_state") == "completed":
             return {
                 "eval_id": evaluation_id,
@@ -289,6 +313,7 @@ class EvalService:
     ) -> str:
         """Return one bounded strict-UTF-8 tail from a linked visible Run."""
         evaluation_id = _evaluation_id(eval_id)
+        reader = read_json_strict_no_repair
         if stream not in {"stdout", "stderr"}:
             raise EvalError("stream must be 'stdout' or 'stderr'")
         if (
@@ -297,10 +322,11 @@ class EvalService:
             or not 1 <= max_bytes <= _MAX_OBSERVE_BYTES
         ):
             raise EvalError("max_bytes must be a plain integer from 1 through 65536")
-        request = self._load_request(evaluation_id)
+        request = self._load_request(evaluation_id, reader=reader)
         descriptor = self._load_descriptor(
             str(request["evaluator_id"]),
             str(request["evaluator_version"]),
+            reader=reader,
         )
         if (
             descriptor.get("visibility") != "visible"
@@ -308,11 +334,16 @@ class EvalService:
             != request["descriptor_sha256"]
         ):
             raise EvalError("evaluation is not bound to a visible evaluator")
-        execution = self._load_execution(request)
-        run_link = self._load_run_link(request, execution)
+        execution = self._load_execution(request, reader=reader)
+        run_link = self._load_run_link(request, execution, reader=reader)
         if run_link is None:
             raise EvalError("evaluation has no linked visible Run")
-        self._linked_run_status(request, run_link, reconcile=False)
+        self._linked_run_status(
+            request,
+            run_link,
+            reconcile=False,
+            reader=reader,
+        )
         try:
             raw = RunService(self.root)._tail_bytes(
                 str(run_link["run_id"]),
@@ -328,13 +359,14 @@ class EvalService:
     def audit(self, eval_id: str) -> dict[str, object]:
         """Validate one visible evaluation lineage without changing it."""
         evaluation_id = _evaluation_id(eval_id)
+        reader = read_json_strict_no_repair
         checked_refs: list[str] = []
         issues: list[str] = []
 
         request_ref = f".aros/evaluations/{evaluation_id}/request.json"
         checked_refs.append(request_ref)
         try:
-            request = self._load_request(evaluation_id)
+            request = self._load_request(evaluation_id, reader=reader)
         except EvalError as error:
             issues.append(f"{request_ref}: {error}")
             return _audit_projection(evaluation_id, checked_refs, issues)
@@ -348,6 +380,7 @@ class EvalService:
             descriptor = self._load_descriptor(
                 str(request["evaluator_id"]),
                 str(request["evaluator_version"]),
+                reader=reader,
             )
             self._validate_descriptor_lineage(descriptor, request)
         except (OSError, ValueError) as error:
@@ -356,7 +389,7 @@ class EvalService:
         execution_ref = f".aros/evaluations/{evaluation_id}/execution.json"
         checked_refs.append(execution_ref)
         try:
-            execution = self._load_execution(request)
+            execution = self._load_execution(request, reader=reader)
         except EvalError as error:
             issues.append(f"{execution_ref}: {error}")
             return _audit_projection(evaluation_id, checked_refs, issues)
@@ -364,7 +397,7 @@ class EvalService:
         run_link_ref = f".aros/evaluations/{evaluation_id}/run.json"
         checked_refs.append(run_link_ref)
         try:
-            run_link = self._load_run_link(request, execution)
+            run_link = self._load_run_link(request, execution, reader=reader)
         except EvalError as error:
             issues.append(f"{run_link_ref}: {error}")
             return _audit_projection(evaluation_id, checked_refs, issues)
@@ -377,7 +410,7 @@ class EvalService:
         status_ref = f".aros/runs/{run_id}/status.json"
         checked_refs.extend((manifest_ref, status_ref))
         try:
-            manifest_value = read_json_strict(self.root / manifest_ref)
+            manifest_value = reader(self.root / manifest_ref)
             if not isinstance(manifest_value, dict):
                 raise ValueError("Run manifest is not an object")
             bundle = manifest_value.get("execution_bundle")
@@ -397,7 +430,11 @@ class EvalService:
             issues.append(f"{manifest_ref}: {error}")
         runs = RunService(self.root)
         try:
-            observed_status = runs.status(run_id, reconcile=False)
+            observed_status = runs.status(
+                run_id,
+                reconcile=False,
+                reader=reader,
+            )
         except (OSError, ValueError) as error:
             issues.append(f"{status_ref}: {error}")
             observed_status = None
@@ -406,6 +443,7 @@ class EvalService:
                 request,
                 run_link,
                 reconcile=False,
+                reader=reader,
             )
         except EvalError as error:
             issues.append(f"{manifest_ref} or {status_ref}: {error}")
@@ -421,25 +459,17 @@ class EvalService:
             final_ref = f"runs/{run_id}/final.json"
             checked_refs.extend((prelaunch_ref, final_ref))
             try:
-                final_value = runs.read_validated_final(run_id)
+                runs.read_validated_final(run_id, reader=reader)
             except (OSError, ValueError) as error:
                 issues.append(f"{final_ref}: {error}")
-                final_value = None
             for stream in ("stdout", "stderr"):
                 log_ref = f".aros/runs/{run_id}/{stream}.log"
                 checked_refs.append(log_ref)
-                content = final_value.get(stream) if final_value is not None else None
-                declared_size = content.get("bytes") if isinstance(content, dict) else None
-                output_bound = (
-                    max(1, declared_size)
-                    if type(declared_size) is int and declared_size >= 0
-                    else _MAX_OBSERVE_BYTES
-                )
                 try:
-                    runs.read_verified_output(
+                    runs.verify_output(
                         run_id,
                         stream,
-                        max_bytes=output_bound,
+                        reader=reader,
                     )
                 except (OSError, ValueError) as error:
                     issues.append(f"{log_ref}: {error}")
@@ -451,6 +481,7 @@ class EvalService:
                 request,
                 execution,
                 reconcile_run=False,
+                reader=reader,
             )
         except EvalError as error:
             issues.append(f"{receipt_ref}: {error}")
@@ -460,6 +491,7 @@ class EvalService:
                     evaluation = self._existing_evaluation(
                         request,
                         reconcile_run=False,
+                        reader=reader,
                     )
                 except EvalError as error:
                     issues.append(f"{receipt_ref}: {error}")
@@ -717,10 +749,15 @@ class EvalService:
             raise EvalError("idempotency key belongs to a different request")
         return dict(existing)
 
-    def _load_request(self, eval_id: str) -> dict[str, object]:
+    def _load_request(
+        self,
+        eval_id: str,
+        *,
+        reader: _JsonReader | None = None,
+    ) -> dict[str, object]:
         path = self.root / ".aros" / "evaluations" / eval_id / "request.json"
         try:
-            value = read_json_strict(path)
+            value = _read_json_authority(path, reader)
             request = _eval_records._validate_request(value)
         except FileNotFoundError as error:
             raise EvalError(f"evaluation request does not exist: {eval_id}") from error
@@ -733,10 +770,12 @@ class EvalService:
     def _load_execution(
         self,
         request: dict[str, object],
+        *,
+        reader: _JsonReader | None = None,
     ) -> dict[str, object]:
         eval_id = str(request["eval_id"])
         try:
-            value = read_json_strict(self._execution_path(eval_id))
+            value = _read_json_authority(self._execution_path(eval_id), reader)
             execution = _eval_records._validate_execution(value, request)
         except FileNotFoundError as error:
             raise EvalError(f"evaluation execution does not exist: {eval_id}") from error
@@ -808,15 +847,17 @@ class EvalService:
         request: dict[str, object],
         *,
         reconcile_run: bool = True,
+        reader: _JsonReader | None = None,
     ) -> ExistingEvaluation:
         receipt = self._load_receipt(
             request,
             None,
             reconcile_run=reconcile_run,
+            reader=reader,
         )
         execution_path = self._execution_path(str(request["eval_id"]))
         try:
-            execution_value = read_json_strict(execution_path)
+            execution_value = _read_json_authority(execution_path, reader)
             execution = _eval_records._validate_execution(execution_value, request)
         except FileNotFoundError:
             if receipt is not None:
@@ -826,6 +867,7 @@ class EvalService:
                 None,
                 "request has no execution claim",
                 reconcile_run=reconcile_run,
+                reader=reader,
             )
         except (OSError, ValueError) as error:
             raise EvalError("existing evaluation execution claim is invalid") from error
@@ -837,6 +879,7 @@ class EvalService:
                 execution,
                 receipt,
                 reconcile_run=reconcile_run,
+                reader=reader,
             )
             return ExistingEvaluation(receipt)
         if execution["host"] != socket.gethostname():
@@ -845,6 +888,7 @@ class EvalService:
                 execution,
                 "execution claim host is not local",
                 reconcile_run=reconcile_run,
+                reader=reader,
             )
         lock_state, lock_fd, lock_identity = _observe_execution_lock(
             self._execution_lock_path(str(request["eval_id"]))
@@ -857,6 +901,7 @@ class EvalService:
                     execution,
                     "execution claim lock was released",
                     reconcile_run=reconcile_run,
+                    reader=reader,
                 )
             finally:
                 _release_execution_lock(lock_fd)
@@ -866,6 +911,7 @@ class EvalService:
                 execution,
                 "execution claim lock was released",
                 reconcile_run=reconcile_run,
+                reader=reader,
             )
         assert lock_identity is not None
         broker_pid = int(execution["broker_pid"])
@@ -875,6 +921,7 @@ class EvalService:
                 execution,
                 "execution claim broker is not live",
                 reconcile_run=reconcile_run,
+                reader=reader,
             )
         if not _linux_broker_owns_lock(execution, lock_identity):
             return self._receipt_or_lost(
@@ -882,20 +929,23 @@ class EvalService:
                 execution,
                 "execution claim broker does not own the lock",
                 reconcile_run=reconcile_run,
+                reader=reader,
             )
         receipt = self._load_receipt(
             request,
             execution,
             reconcile_run=reconcile_run,
+            reader=reader,
         )
         if receipt is not None:
             return ExistingEvaluation(receipt)
-        run_link = self._load_run_link(request, execution)
+        run_link = self._load_run_link(request, execution, reader=reader)
         if run_link is not None:
             run_status = self._linked_run_status(
                 request,
                 run_link,
                 reconcile=reconcile_run,
+                reader=reader,
             )
             referenced_state = run_status.get("state")
             evaluation_state = (
@@ -935,10 +985,11 @@ class EvalService:
         execution: dict[str, object] | None,
         *,
         reconcile_run: bool = True,
+        reader: _JsonReader | None = None,
     ) -> dict[str, object] | None:
         receipt_path = self._receipt_path(str(request["eval_id"]))
         try:
-            receipt_value = read_json_strict(receipt_path)
+            receipt_value = _read_json_authority(receipt_path, reader)
         except FileNotFoundError:
             return None
         except OSError as error:
@@ -971,6 +1022,7 @@ class EvalService:
                 execution,
                 receipt,
                 reconcile_run=reconcile_run,
+                reader=reader,
             )
         return receipt
 
@@ -981,23 +1033,26 @@ class EvalService:
         reason: str,
         *,
         reconcile_run: bool = True,
+        reader: _JsonReader | None = None,
     ) -> ExistingEvaluation:
         receipt = self._load_receipt(
             request,
             execution,
             reconcile_run=reconcile_run,
+            reader=reader,
         )
         if receipt is not None:
             if execution is None:
                 raise EvalError("existing receipt execution lineage is missing")
             return ExistingEvaluation(receipt)
         if execution is not None:
-            run_link = self._load_run_link(request, execution)
+            run_link = self._load_run_link(request, execution, reader=reader)
             if run_link is not None:
                 run_status = self._linked_run_status(
                     request,
                     run_link,
                     reconcile=reconcile_run,
+                    reader=reader,
                 )
                 return self._linked_lost_evaluation(
                     request,
@@ -1011,6 +1066,8 @@ class EvalService:
         self,
         request: dict[str, object],
         execution: dict[str, object],
+        *,
+        reader: _JsonReader | None = None,
     ) -> dict[str, object] | None:
         path = (
             self.root
@@ -1020,7 +1077,7 @@ class EvalService:
             / "run.json"
         )
         try:
-            value = read_json_strict(path)
+            value = _read_json_authority(path, reader)
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as error:
@@ -1037,18 +1094,23 @@ class EvalService:
         receipt: dict[str, object],
         *,
         reconcile_run: bool = True,
+        reader: _JsonReader | None = None,
     ) -> None:
-        run_link = self._load_run_link(request, execution)
+        run_link = self._load_run_link(request, execution, reader=reader)
         if run_link is None:
             raise EvalError("existing receipt Run link lineage is missing")
         self._linked_run_status(
             request,
             run_link,
             reconcile=reconcile_run,
+            reader=reader,
         )
         run_id = str(run_link["run_id"])
         try:
-            final_value = RunService(self.root).read_validated_final(run_id)
+            final_value = RunService(self.root).read_validated_final(
+                run_id,
+                reader=reader,
+            )
         except ValueError as error:
             raise EvalError("existing receipt Run final lineage is invalid") from error
         measurement = {
@@ -1079,13 +1141,19 @@ class EvalService:
         run_link: dict[str, object],
         *,
         reconcile: bool = True,
+        reader: _JsonReader | None = None,
     ) -> dict[str, object]:
         run_id = str(run_link["run_id"])
         try:
             runs = RunService(self.root)
-            status = runs.status(run_id, reconcile=reconcile)
-            manifest_value = read_json_strict(
-                self.root / "runs" / run_id / "manifest.json"
+            status = runs.status(
+                run_id,
+                reconcile=reconcile,
+                reader=reader,
+            )
+            manifest_value = _read_json_authority(
+                self.root / "runs" / run_id / "manifest.json",
+                reader,
             )
         except (OSError, ValueError) as error:
             raise EvalError("linked Run lineage is invalid") from error
@@ -1148,7 +1216,7 @@ class EvalService:
             if status.get("final_ref") != f"runs/{run_id}/final.json":
                 raise EvalError("linked terminal Run final reference is invalid")
             try:
-                final = runs.read_validated_final(run_id)
+                final = runs.read_validated_final(run_id, reader=reader)
             except ValueError as error:
                 raise EvalError("linked terminal Run final is invalid") from error
             if final.get("state") != state:
@@ -1186,6 +1254,8 @@ class EvalService:
         self,
         evaluator_id: str,
         version: str,
+        *,
+        reader: _JsonReader | None = None,
     ) -> dict[str, object]:
         path = (
             self.root
@@ -1196,7 +1266,7 @@ class EvalService:
             / "descriptor.json"
         )
         try:
-            value = read_json_strict(path)
+            value = _read_json_authority(path, reader)
         except (OSError, ValueError) as error:
             raise EvalError(f"unable to load evaluator descriptor: {path}") from error
         if type(value) is not dict or not _DESCRIPTOR_METADATA_FIELDS.issubset(value):
@@ -1337,6 +1407,13 @@ def _audit_projection(
     }
 
 
+def _read_json_authority(
+    path: str | Path,
+    reader: _JsonReader | None,
+) -> object:
+    return read_json_strict(path) if reader is None else reader(path)
+
+
 def _resolve_exact_commit(
     repo: _worktrees.RepositoryBinding,
     value: object,
@@ -1422,6 +1499,39 @@ def _acquire_execution_lock(path: Path) -> int | None:
         except BlockingIOError:
             os.close(descriptor)
             return None
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _acquire_existing_idempotency_lock(path: Path) -> int:
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise EvalError(f"unable to open existing idempotency lock: {path}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise EvalError(
+                f"idempotency lock must be a single-link regular file: {path}"
+            )
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = os.fstat(descriptor)
+        try:
+            observed = path.lstat()
+        except OSError as error:
+            raise EvalError(f"idempotency lock path changed: {path}") from error
+        if (
+            not stat.S_ISREG(locked.st_mode)
+            or locked.st_nlink != 1
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino) != (locked.st_dev, locked.st_ino)
+        ):
+            raise EvalError(f"idempotency lock identity changed: {path}")
         return descriptor
     except BaseException:
         os.close(descriptor)

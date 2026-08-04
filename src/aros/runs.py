@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,7 @@ _TERMINAL_STATES = {
 }
 _ACTIVE_STATES = {"launched", "running"}
 _CONTENT_RECEIPT_FIELDS = {"path", "bytes", "sha256"}
+_JsonReader = Callable[[str | Path], object]
 _FINAL_REQUIRED_FIELDS = {
     "schema_version",
     "state",
@@ -514,12 +516,13 @@ class RunService:
         run_id: str,
         *,
         reconcile: bool = True,
+        reader: _JsonReader | None = None,
     ) -> dict[str, object]:
-        manifest = self._load_manifest(run_id)
+        manifest = self._load_manifest(run_id, reader=reader)
         status_path = self._runtime_path(run_id) / "status.json"
         if not status_path.is_file():
             raise RunError(f"run status does not exist: {run_id}")
-        status = _read_run_status(status_path)
+        status = _read_run_status(status_path, reader=reader)
         if status.get("run_id") != run_id:
             raise RunError(f"run status identity mismatch: {run_id}")
         if status.get("manifest_sha256") != manifest.get("manifest_sha256"):
@@ -564,27 +567,117 @@ class RunService:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
             raise RunError("max_bytes must be a positive integer")
         path = self._runtime_path(run_id) / f"{stream}.log"
-        if not path.is_file():
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
             return b""
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - max_bytes))
-            return handle.read()
+        except OSError as error:
+            raise RunError(f"unable to inspect {stream} tail: {run_id}") from error
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RunError(
+                f"{stream} tail must be a single-link regular file: {run_id}"
+            )
+        identity = (metadata.st_dev, metadata.st_ino)
+        initial_size = metadata.st_size
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as error:
+            raise RunError(f"unable to open {stream} tail: {run_id}") from error
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_size != initial_size
+                or (opened.st_dev, opened.st_ino) != identity
+            ):
+                raise RunError(f"{stream} tail identity changed: {run_id}")
+            start = max(0, initial_size - max_bytes)
+            os.lseek(descriptor, start, os.SEEK_SET)
+            remaining = initial_size - start
+            chunks: list[bytes] = []
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 65_536))
+                if not chunk:
+                    raise RunError(f"{stream} tail size changed: {run_id}")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after_open = os.fstat(descriptor)
+            after_path = path.lstat()
+            for observed in (after_open, after_path):
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or observed.st_nlink != 1
+                    or observed.st_size != initial_size
+                    or (observed.st_dev, observed.st_ino) != identity
+                ):
+                    raise RunError(f"{stream} tail identity changed: {run_id}")
+            return b"".join(chunks)
+        except OSError as error:
+            raise RunError(f"unable to read {stream} tail: {run_id}") from error
+        finally:
+            os.close(descriptor)
 
     def read_verified_output(
         self,
         run_id: str,
         stream: str,
         max_bytes: int = 65_536,
+        *,
+        reader: _JsonReader | None = None,
     ) -> bytes:
         """Read one terminal Run log exactly as bound by its final receipt."""
+        raw = self._verify_output(
+            run_id,
+            stream,
+            max_bytes=max_bytes,
+            capture=True,
+            reader=reader,
+        )
+        assert isinstance(raw, bytes)
+        return raw
+
+    def verify_output(
+        self,
+        run_id: str,
+        stream: str,
+        *,
+        reader: _JsonReader | None = None,
+    ) -> None:
+        """Stream-verify one terminal Run log without retaining its bytes."""
+        result = self._verify_output(
+            run_id,
+            stream,
+            max_bytes=None,
+            capture=False,
+            reader=reader,
+        )
+        assert result is None
+
+    def _verify_output(
+        self,
+        run_id: str,
+        stream: str,
+        *,
+        max_bytes: int | None,
+        capture: bool,
+        reader: _JsonReader | None,
+    ) -> bytes | None:
         self._validate_run_id(run_id)
         if stream not in {"stdout", "stderr"}:
             raise RunError("stream must be 'stdout' or 'stderr'")
-        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or max_bytes <= 0
+        ):
             raise RunError("max_bytes must be a positive integer")
-        final = self.read_validated_final(run_id)
+        final = self.read_validated_final(run_id, reader=reader)
         content = final.get(stream)
         canonical = f".aros/runs/{run_id}/{stream}.log"
         if (
@@ -598,7 +691,7 @@ class RunService:
         if (
             type(declared_size) is not int
             or declared_size < 0
-            or declared_size > max_bytes
+            or (max_bytes is not None and declared_size > max_bytes)
             or not isinstance(declared_sha256, str)
             or re.fullmatch(r"[0-9a-f]{64}", declared_sha256) is None
         ):
@@ -628,17 +721,19 @@ class RunService:
                 != (metadata.st_dev, metadata.st_ino)
             ):
                 raise RunError(f"verified {stream} identity differs: {run_id}")
-            chunks: list[bytes] = []
+            digest = hashlib.sha256()
+            captured = bytearray() if capture else None
             remaining = declared_size
             while remaining:
-                chunk = os.read(descriptor, remaining)
+                chunk = os.read(descriptor, min(remaining, 65_536))
                 if not chunk:
                     break
-                chunks.append(chunk)
+                digest.update(chunk)
+                if captured is not None:
+                    captured.extend(chunk)
                 remaining -= len(chunk)
             if remaining or os.read(descriptor, 1):
                 raise RunError(f"verified {stream} size differs from receipt: {run_id}")
-            raw = b"".join(chunks)
             after_open = os.fstat(descriptor)
             after_path = path.lstat()
             for observed in (after_open, after_path):
@@ -654,22 +749,33 @@ class RunService:
             raise RunError(f"unable to read verified {stream}: {run_id}") from error
         finally:
             os.close(descriptor)
-        if hashlib.sha256(raw).hexdigest() != declared_sha256:
+        if digest.hexdigest() != declared_sha256:
             raise RunError(f"verified {stream} hash differs from receipt: {run_id}")
-        return raw
+        return bytes(captured) if captured is not None else None
 
-    def read_validated_final(self, run_id: str) -> dict[str, object]:
+    def read_validated_final(
+        self,
+        run_id: str,
+        *,
+        reader: _JsonReader | None = None,
+    ) -> dict[str, object]:
         """Load one terminal final with complete manifest and launch lineage."""
         self._validate_run_id(run_id)
-        manifest = self._load_manifest(run_id)
-        final = _read_strict_object(self._final_path(run_id), "final receipt")
+        manifest = self._load_manifest(run_id, reader=reader)
+        final = _read_strict_object(
+            self._final_path(run_id),
+            "final receipt",
+            reader=reader,
+        )
         status = _read_strict_object(
             self._runtime_path(run_id) / "status.json",
             "run status",
+            reader=reader,
         )
         prelaunch = _read_strict_object(
             self._receipts_path() / f"{run_id}-prelaunch.json",
             "prelaunch receipt",
+            reader=reader,
         )
         identity = _final_identity(manifest)
         required_fields = set(identity) | _FINAL_REQUIRED_FIELDS
@@ -1068,12 +1174,17 @@ class RunService:
             },
         )
 
-    def _load_manifest(self, run_id: str) -> dict[str, object]:
+    def _load_manifest(
+        self,
+        run_id: str,
+        *,
+        reader: _JsonReader | None = None,
+    ) -> dict[str, object]:
         self._validate_run_id(run_id)
         path = self._manifest_path(run_id)
         if not path.is_file():
             raise RunError(f"run manifest does not exist: {run_id}")
-        manifest = _read_object(path, "run manifest")
+        manifest = _read_object(path, "run manifest", reader=reader)
         if manifest.get("run_id") != run_id:
             raise RunError(f"run manifest identity mismatch: {run_id}")
         recorded = manifest.get("manifest_sha256")
@@ -1440,9 +1551,14 @@ def _normalize_label(label: str | None) -> str:
     return normalized or "run"
 
 
-def _read_object(path: Path, description: str) -> dict[str, object]:
+def _read_object(
+    path: Path,
+    description: str,
+    *,
+    reader: _JsonReader | None = None,
+) -> dict[str, object]:
     try:
-        value = read_json(path)
+        value = read_json(path) if reader is None else reader(path)
     except (OSError, ValueError) as error:
         raise RunError(f"unable to read {description}: {path}") from error
     if not isinstance(value, dict):
@@ -1450,9 +1566,14 @@ def _read_object(path: Path, description: str) -> dict[str, object]:
     return value
 
 
-def _read_strict_object(path: Path, description: str) -> dict[str, object]:
+def _read_strict_object(
+    path: Path,
+    description: str,
+    *,
+    reader: _JsonReader | None = None,
+) -> dict[str, object]:
     try:
-        value = read_json_strict(path)
+        value = read_json_strict(path) if reader is None else reader(path)
     except (OSError, ValueError) as error:
         raise RunError(f"unable to read {description}: {path}") from error
     if not isinstance(value, dict):
@@ -1460,11 +1581,15 @@ def _read_strict_object(path: Path, description: str) -> dict[str, object]:
     return value
 
 
-def _read_run_status(path: Path) -> dict[str, object]:
+def _read_run_status(
+    path: Path,
+    *,
+    reader: _JsonReader | None = None,
+) -> dict[str, object]:
     first_error: RunError | None = None
     for _attempt in range(3):
         try:
-            return _read_object(path, "run status")
+            return _read_object(path, "run status", reader=reader)
         except RunError as error:
             if first_error is None:
                 first_error = error

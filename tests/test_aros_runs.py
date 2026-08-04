@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ import pytest
 
 import arbor.aros.runner as runner_module
 import arbor.aros.runs as runs_module
+import arbor.aros.store as store_module
 from arbor.aros.isolation import (
     ENVIRONMENT_POLICY,
     NETWORK_POLICY,
@@ -178,6 +180,13 @@ def _prepare(
         security_profile="trusted-local",
     )
     return service, manifest
+
+
+def _install_json_crash_alias(path: Path) -> Path:
+    digest = hashlib.sha256(os.fsencode(path.name)).hexdigest()
+    alias = path.parent / f".aros-json-{digest}.inspection-crash.tmp"
+    os.link(path, alias, follow_symlinks=False)
+    return alias
 
 
 def _wait_for_state(
@@ -437,6 +446,165 @@ def test_read_verified_output_returns_exact_terminal_log_bytes(
 
     assert service.read_verified_output(run_id, "stdout") == b"exact metric bytes\n"
     assert service.read_verified_output(run_id, "stderr") == b""
+
+
+def test_verify_output_streams_large_log_without_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'x' * 200_003)",
+        ],
+        key="stream-verified-output",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    real_read = runs_module.os.read
+    read_sizes: list[int] = []
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        read_sizes.append(size)
+        return real_read(descriptor, size)
+
+    def forbidden_capture(*_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("stream verification must not call the capture API")
+
+    monkeypatch.setattr(runs_module.os, "read", bounded_read)
+    monkeypatch.setattr(service, "read_verified_output", forbidden_capture)
+
+    assert service.verify_output(run_id, "stdout") is None
+    assert len(read_sizes) > 3
+    assert max(read_sizes) <= 65_536
+
+
+def test_tail_bytes_returns_only_the_bounded_regular_log_tail(tmp_path: Path) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key="bounded-tail-bytes")
+    run_id = str(manifest["run_id"])
+    log = tmp_path / ".aros" / "runs" / run_id / "stdout.log"
+
+    assert service._tail_bytes(run_id, stream="stdout", max_bytes=8) == b""
+
+    log.write_bytes(b"prefix:bounded-tail")
+
+    assert service._tail_bytes(run_id, stream="stdout", max_bytes=7) == b"ed-tail"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("symlink", "hardlink", "replacement", "concurrent-append"),
+)
+def test_tail_bytes_rejects_alias_replacement_and_concurrent_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key=f"adversarial-tail-{tamper}")
+    run_id = str(manifest["run_id"])
+    log = tmp_path / ".aros" / "runs" / run_id / "stdout.log"
+    log.write_bytes(b"authority-tail")
+
+    if tamper == "symlink":
+        backing = log.with_name("outside.log")
+        backing.write_bytes(b"outside-secret")
+        log.unlink()
+        log.symlink_to(backing.name)
+    elif tamper == "hardlink":
+        log.with_name("stdout-alias.log").hardlink_to(log)
+    elif tamper == "replacement":
+        replacement = log.with_name("stdout-replacement.log")
+        replacement.write_bytes(log.read_bytes())
+        real_open = runs_module.os.open
+
+        def replace_before_open(
+            path: str | bytes | Path,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            if Path(path) == log and replacement.exists():
+                replacement.replace(log)
+            return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(runs_module.os, "open", replace_before_open)
+    else:
+        real_lseek = runs_module.os.lseek
+        appended = False
+
+        def append_after_seek(descriptor: int, offset: int, whence: int) -> int:
+            nonlocal appended
+            position = real_lseek(descriptor, offset, whence)
+            if whence == runs_module.os.SEEK_SET and not appended:
+                with log.open("ab") as handle:
+                    handle.write(b"-concurrent-append")
+                appended = True
+            return position
+
+        monkeypatch.setattr(runs_module.os, "lseek", append_after_seek)
+
+    with pytest.raises(RunError, match="tail|regular|link|identity|changed"):
+        service._tail_bytes(run_id, stream="stdout", max_bytes=8)
+
+    if tamper == "concurrent-append":
+        assert appended is True
+
+
+@pytest.mark.parametrize(
+    "authority",
+    ("manifest", "status", "prelaunch", "final"),
+)
+def test_run_read_only_loaders_preserve_crash_aliases(
+    tmp_path: Path,
+    authority: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key=f"run-read-only-{authority}")
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    path = {
+        "manifest": tmp_path / "runs" / run_id / "manifest.json",
+        "status": tmp_path / ".aros" / "runs" / run_id / "status.json",
+        "prelaunch": tmp_path
+        / ".aros"
+        / "receipts"
+        / f"{run_id}-prelaunch.json",
+        "final": tmp_path / "runs" / run_id / "final.json",
+    }[authority]
+    alias = _install_json_crash_alias(path)
+    before = {
+        item: (item.lstat().st_ino, item.lstat().st_nlink, item.read_bytes())
+        for item in (path, alias)
+    }
+
+    with pytest.raises(RunError):
+        if authority in {"manifest", "status"}:
+            service.status(
+                run_id,
+                reconcile=False,
+                reader=store_module.read_json_strict_no_repair,
+            )
+        else:
+            service.read_validated_final(
+                run_id,
+                reader=store_module.read_json_strict_no_repair,
+            )
+
+    assert {
+        item: (item.lstat().st_ino, item.lstat().st_nlink, item.read_bytes())
+        for item in (path, alias)
+    } == before
+    if authority in {"manifest", "status"}:
+        service.status(run_id, reconcile=False)
+    else:
+        service.read_validated_final(run_id)
+    assert not alias.exists()
+    assert path.stat().st_nlink == 1
 
 
 @pytest.mark.parametrize(

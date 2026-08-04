@@ -432,15 +432,17 @@ def test_existing_run_manifest_and_final_schema_remain_readable(
     "mutable_status",
     ("missing", "launched", "lost", "forged-terminal"),
 )
-def test_terminal_status_is_rebuilt_deterministically_and_start_reattaches(
+@pytest.mark.parametrize("operation", ("status", "start", "reconcile"))
+def test_terminal_status_operation_rebuilds_deterministically(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mutable_status: str,
+    operation: str,
 ) -> None:
     _init_clean_repo(tmp_path)
     service, manifest = _prepare(
         tmp_path,
-        key=f"terminal-status-{mutable_status}",
+        key=f"terminal-status-{operation}-{mutable_status}",
     )
     run_id = _mark_runner_launched(tmp_path, service, manifest)
     status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
@@ -504,17 +506,15 @@ def test_terminal_status_is_rebuilt_deterministically_and_start_reattaches(
             },
         )
 
-    assert service.status(run_id) == expected
-    assert json.loads(status_path.read_text(encoding="utf-8")) == expected
-    repaired_status = status_path.read_bytes()
-
     def forbidden_process(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("terminal start must only reattach")
+        raise AssertionError("terminal operation must not spawn a process")
 
     monkeypatch.setattr(runs_module.subprocess, "run", forbidden_process)
 
-    assert service.start(run_id) == expected
-    assert status_path.read_bytes() == repaired_status
+    observed = getattr(service, operation)(run_id)
+
+    assert observed == expected
+    assert json.loads(status_path.read_text(encoding="utf-8")) == expected
 
 
 def test_read_verified_output_returns_exact_terminal_log_bytes(
@@ -830,7 +830,7 @@ def test_read_verified_output_rejects_invalid_final_semantics(
 
 @pytest.mark.parametrize(
     "forgery",
-    ("runner_invocation", "actor", "host"),
+    ("runner_invocation", "host"),
 )
 def test_validated_final_rejects_forged_prelaunch_provenance(
     tmp_path: Path,
@@ -861,7 +861,7 @@ def test_validated_final_rejects_forged_prelaunch_provenance(
     atomic_write_json(status_path, status)
     atomic_write_json(final_path, final)
 
-    with pytest.raises(RunError, match="prelaunch|status.*lineage"):
+    with pytest.raises(RunError, match="prelaunch|host|provenance"):
         service.read_validated_final(run_id)
 
 

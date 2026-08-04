@@ -448,20 +448,43 @@ class EvalService:
         except EvalError as error:
             issues.append(f"{manifest_ref} or {status_ref}: {error}")
 
-        terminal = observed_status is not None and observed_status.get("state") in {
+        terminal_state = observed_status is not None and observed_status.get("state") in {
             "completed",
             "failed_process",
             "timed_out",
             "cancelled",
         }
-        if terminal:
+        final_ref = f"runs/{run_id}/final.json"
+        try:
+            reader(self.root / final_ref)
+        except FileNotFoundError:
+            final_exists = False
+        except (OSError, ValueError):
+            final_exists = True
+        else:
+            final_exists = True
+        if final_exists:
             prelaunch_ref = f".aros/receipts/{run_id}-prelaunch.json"
-            final_ref = f"runs/{run_id}/final.json"
             checked_refs.extend((prelaunch_ref, final_ref))
             try:
-                runs.read_validated_final(run_id, reader=reader)
+                final_value = runs.read_validated_final(
+                    run_id,
+                    reader=reader,
+                    for_audit=True,
+                )
             except (OSError, ValueError) as error:
                 issues.append(f"{final_ref}: {error}")
+                final_value = None
+            if final_value is not None and observed_status is not None:
+                if observed_status.get("state") != final_value.get("state"):
+                    issues.append(
+                        f"{status_ref} and {final_ref}: state mismatch "
+                        f"({observed_status.get('state')} != {final_value.get('state')})"
+                    )
+                if observed_status.get("final_ref") != final_ref:
+                    issues.append(
+                        f"{status_ref} and {final_ref}: final reference mismatch"
+                    )
             for stream in ("stdout", "stderr"):
                 log_ref = f".aros/runs/{run_id}/{stream}.log"
                 checked_refs.append(log_ref)
@@ -470,9 +493,13 @@ class EvalService:
                         run_id,
                         stream,
                         reader=reader,
+                        for_audit=True,
                     )
                 except (OSError, ValueError) as error:
                     issues.append(f"{log_ref}: {error}")
+        elif terminal_state:
+            checked_refs.append(final_ref)
+            issues.append(f"{final_ref}: terminal Run final is missing")
 
         receipt_ref = f"eval/evaluations/{evaluation_id}/receipt.json"
         checked_refs.append(receipt_ref)

@@ -638,6 +638,7 @@ class RunService:
             max_bytes=max_bytes,
             capture=True,
             reader=reader,
+            for_audit=False,
         )
         assert isinstance(raw, bytes)
         return raw
@@ -648,6 +649,7 @@ class RunService:
         stream: str,
         *,
         reader: _JsonReader | None = None,
+        for_audit: bool = False,
     ) -> None:
         """Stream-verify one terminal Run log without retaining its bytes."""
         result = self._verify_output(
@@ -656,6 +658,7 @@ class RunService:
             max_bytes=None,
             capture=False,
             reader=reader,
+            for_audit=for_audit,
         )
         assert result is None
 
@@ -667,6 +670,7 @@ class RunService:
         max_bytes: int | None,
         capture: bool,
         reader: _JsonReader | None,
+        for_audit: bool,
     ) -> bytes | None:
         self._validate_run_id(run_id)
         if stream not in {"stdout", "stderr"}:
@@ -677,7 +681,11 @@ class RunService:
             or max_bytes <= 0
         ):
             raise RunError("max_bytes must be a positive integer")
-        final = self.read_validated_final(run_id, reader=reader)
+        final = self.read_validated_final(
+            run_id,
+            reader=reader,
+            for_audit=for_audit,
+        )
         content = final.get(stream)
         canonical = f".aros/runs/{run_id}/{stream}.log"
         if (
@@ -758,6 +766,7 @@ class RunService:
         run_id: str,
         *,
         reader: _JsonReader | None = None,
+        for_audit: bool = False,
     ) -> dict[str, object]:
         """Load one terminal final with complete manifest and launch lineage."""
         self._validate_run_id(run_id)
@@ -855,12 +864,17 @@ class RunService:
         if (
             status.get("schema_version") != 1
             or status.get("run_id") != run_id
-            or status.get("state") != state
             or status.get("manifest_sha256") != manifest.get("manifest_sha256")
             or status.get("launch_receipt_sha256") != launch_sha256
             or status.get("launched_at") != prelaunch.get("created_at")
             or status.get("finished_at") != finished_at
-            or status.get("final_ref") != f"runs/{run_id}/final.json"
+            or (
+                not for_audit
+                and (
+                    status.get("state") != state
+                    or status.get("final_ref") != f"runs/{run_id}/final.json"
+                )
+            )
         ):
             raise RunError(f"final and status lineage mismatch: {run_id}")
         expected_actor = status.get("actor")

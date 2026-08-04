@@ -3945,6 +3945,66 @@ def test_audit_detects_request_run_bundle_log_or_receipt_tampering(
 
 
 @requires_linux_claims
+def test_audit_validates_immutable_final_and_logs_before_lost_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.7,"sample_count":7}\n',
+        stderr=b"visible diagnostics\n",
+    )
+    receipt = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key="audit-final-before-lost-status",
+    )
+    eval_id = str(receipt["eval_id"])
+    run_id = str(receipt["run_id"])
+    status_path = root / ".aros" / "runs" / run_id / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["state"] = "lost"
+    status["reason"] = "tampered mutable status"
+    atomic_write_json(status_path, status)
+    stdout_path = root / ".aros" / "runs" / run_id / "stdout.log"
+    stdout = stdout_path.read_bytes()
+    stdout_path.write_bytes(b"X" + stdout[1:])
+    before = {
+        path.relative_to(root): (path.stat().st_ino, path.read_bytes())
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+    def forbidden_reconcile(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("audit must not reconcile mutable Run status")
+
+    monkeypatch.setattr(RunService, "reconcile", forbidden_reconcile)
+
+    audit = service.audit(eval_id)
+
+    final_ref = f"runs/{run_id}/final.json"
+    stdout_ref = f".aros/runs/{run_id}/stdout.log"
+    stderr_ref = f".aros/runs/{run_id}/stderr.log"
+    assert audit["valid"] is False
+    assert final_ref in audit["checked_refs"]
+    assert stdout_ref in audit["checked_refs"]
+    assert stderr_ref in audit["checked_refs"]
+    assert any("state" in issue and "mismatch" in issue for issue in audit["issues"])
+    assert any(stdout_ref in issue and "hash" in issue for issue in audit["issues"])
+    assert {
+        path.relative_to(root): (path.stat().st_ino, path.read_bytes())
+        for path in root.rglob("*")
+        if path.is_file()
+    } == before
+
+
+@requires_linux_claims
 def test_status_and_audit_never_parse_or_repair_missing_measurement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

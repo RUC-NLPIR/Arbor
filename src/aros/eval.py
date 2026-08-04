@@ -477,7 +477,7 @@ class EvalService:
         receipt_ref = f"eval/evaluations/{evaluation_id}/receipt.json"
         checked_refs.append(receipt_ref)
         try:
-            receipt = self._load_receipt(
+            self._load_receipt(
                 request,
                 execution,
                 reconcile_run=False,
@@ -485,19 +485,6 @@ class EvalService:
             )
         except EvalError as error:
             issues.append(f"{receipt_ref}: {error}")
-        else:
-            if receipt is None:
-                try:
-                    evaluation = self._existing_evaluation(
-                        request,
-                        reconcile_run=False,
-                        reader=reader,
-                    )
-                except EvalError as error:
-                    issues.append(f"{receipt_ref}: {error}")
-                else:
-                    if evaluation.status["evaluation_state"] == "completed":
-                        issues.append(f"{receipt_ref}: measurement receipt is missing")
         return _audit_projection(evaluation_id, checked_refs, issues)
 
     def _linked_lost_evaluation(

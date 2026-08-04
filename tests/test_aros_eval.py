@@ -4054,6 +4054,99 @@ def test_status_and_audit_never_parse_or_repair_missing_measurement(
 
 
 @requires_linux_claims
+def test_receiptless_audit_never_probes_execution_lock_or_distorts_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _apparatus_tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        "receiptless-concurrent-audit-status",
+    )
+    assert isinstance(lease, eval_module.ExecutionLease)
+    terminal = _terminal_receipt(root, lease.request, lease.execution)
+    eval_id = str(lease.request["eval_id"])
+    run_id = str(terminal["run_id"])
+    runtime = root / ".aros" / "runs" / run_id
+    (runtime / "stdout.log").write_bytes(b"")
+    (runtime / "stderr.log").write_bytes(b"")
+    lease.close()
+    receipt_path = root / "eval" / "evaluations" / eval_id / "receipt.json"
+    assert not receipt_path.exists()
+    before = {
+        path.relative_to(root): (path.stat().st_ino, path.read_bytes())
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    receipt_missed = threading.Event()
+    release_audit = threading.Event()
+    audit_ident: int | None = None
+    paused = False
+    audit_probes: list[Path] = []
+    real_load_receipt = service._load_receipt
+    real_observe_lock = eval_module._observe_execution_lock
+
+    def pause_after_audit_receipt_miss(
+        *args: object,
+        **kwargs: object,
+    ) -> dict[str, object] | None:
+        nonlocal paused
+        receipt = real_load_receipt(*args, **kwargs)  # type: ignore[arg-type]
+        if (
+            threading.get_ident() == audit_ident
+            and receipt is None
+            and not paused
+        ):
+            paused = True
+            receipt_missed.set()
+            assert release_audit.wait(5)
+        return receipt
+
+    def record_execution_probe(
+        path: Path,
+    ) -> tuple[str, int | None, tuple[int, int] | None]:
+        if threading.get_ident() == audit_ident:
+            audit_probes.append(path)
+        return real_observe_lock(path)
+
+    def run_audit() -> dict[str, object]:
+        nonlocal audit_ident
+        audit_ident = threading.get_ident()
+        return service.audit(eval_id)
+
+    monkeypatch.setattr(service, "_load_receipt", pause_after_audit_receipt_miss)
+    monkeypatch.setattr(eval_module, "_observe_execution_lock", record_execution_probe)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        audit_future = pool.submit(run_audit)
+        assert receipt_missed.wait(5)
+        try:
+            status = service.status(eval_id)
+        finally:
+            release_audit.set()
+        audit = audit_future.result(timeout=5)
+
+    assert status["evaluation_state"] == "lost"
+    assert status["referenced_process_state"] == "completed"
+    assert status["measurement_state"] == "not_available"
+    assert audit["valid"] is True
+    assert audit["issues"] == []
+    assert f"eval/evaluations/{eval_id}/receipt.json" in audit["checked_refs"]
+    assert audit_probes == []
+    assert not receipt_path.exists()
+    assert {
+        path.relative_to(root): (path.stat().st_ino, path.read_bytes())
+        for path in root.rglob("*")
+        if path.is_file()
+    } == before
+
+
+@requires_linux_claims
 @pytest.mark.parametrize(
     ("authority", "operations"),
     (

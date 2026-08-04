@@ -234,6 +234,15 @@ def test_process_handle_is_mutable() -> None:
     assert handle.identity == second
 
 
+def test_process_seam_documents_single_owner_toctou_contract() -> None:
+    documentation = processes.__doc__ or ""
+
+    assert "single ProcessHandle owner" in documentation
+    assert "must not reap" in documentation
+    assert "concurrently" in documentation
+    assert "not atomic" in documentation
+
+
 def test_spawn_process_only_preserves_declared_file_descriptors(
     tmp_path: Path,
 ) -> None:
@@ -292,6 +301,13 @@ def test_spawn_process_identity_capture_failure_terminates_and_reaps(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        processes,
+        "_REAP_TIMEOUT_SECONDS",
+        0.25,
+        raising=False,
+    )
+
     class FakeProcess:
         pid = 4321
 
@@ -341,7 +357,7 @@ def test_spawn_process_identity_capture_failure_terminates_and_reaps(
 
     assert signals == [(4321, signal.SIGKILL)]
     assert process.kill_calls == 0
-    assert process.wait_calls == [None]
+    assert process.wait_calls == [0.25]
 
     fallback = FakeProcess()
     monkeypatch.setattr(processes._subprocess, "Popen", lambda *_a, **_k: fallback)
@@ -375,7 +391,49 @@ def test_spawn_process_identity_capture_failure_terminates_and_reaps(
         )
 
     assert fallback.kill_calls == 1
-    assert fallback.wait_calls == [None]
+    assert fallback.wait_calls == [0.25]
+
+    permission_fallback = FakeProcess()
+    monkeypatch.setattr(
+        processes._subprocess,
+        "Popen",
+        lambda *_a, **_k: permission_fallback,
+    )
+
+    def denied_group(_pgid: int, _signal_number: int) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(processes._os, "killpg", denied_group)
+
+    with pytest.raises(RuntimeError, match="capture process identity"):
+        processes.spawn_process(
+            ["python", "-c", "pass"],
+            cwd=tmp_path,
+        )
+
+    assert permission_fallback.kill_calls == 1
+    assert permission_fallback.wait_calls == [0.25]
+
+    class UnreapableProcess(FakeProcess):
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls.append(timeout)
+            raise subprocess.TimeoutExpired("test", timeout)
+
+    unreapable = UnreapableProcess()
+    monkeypatch.setattr(
+        processes._subprocess,
+        "Popen",
+        lambda *_a, **_k: unreapable,
+    )
+
+    with pytest.raises(TimeoutError, match="reap unidentified process leader"):
+        processes.spawn_process(
+            ["python", "-c", "pass"],
+            cwd=tmp_path,
+        )
+
+    assert unreapable.kill_calls == 1
+    assert unreapable.wait_calls == [0.25]
 
 
 @pytest.mark.parametrize(
@@ -482,6 +540,130 @@ def test_terminate_and_reap_escalates_term_to_kill_and_reaps_leader(
 
     assert exit_code == handle.process.returncode == -signal.SIGKILL
     assert sequence == ("TERM", "KILL")
+
+
+def test_terminate_and_reap_falls_back_when_group_kill_is_not_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        pid = 5432
+
+        def __init__(self) -> None:
+            self.wait_calls: list[float | None] = []
+            self.kill_calls = 0
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) == 1:
+                raise subprocess.TimeoutExpired("test", timeout)
+            return -signal.SIGKILL
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    process = FakeProcess()
+    handle = processes.ProcessHandle(
+        process=process,  # type: ignore[arg-type]
+        identity=processes.ProcessIdentity(5432, 5432, "linux-proc-start:1"),
+    )
+    monkeypatch.setattr(processes, "_REAP_TIMEOUT_SECONDS", 0.25, raising=False)
+    monkeypatch.setattr(
+        processes,
+        "signal_process_group",
+        lambda _identity, _signal_number: False,
+    )
+
+    result = processes.terminate_and_reap(handle, grace_seconds=0.1)
+
+    assert result == (-signal.SIGKILL, ("KILL",))
+    assert process.kill_calls == 1
+    assert process.wait_calls == [0.1, 0.25]
+
+
+def test_terminate_and_reap_falls_back_when_group_kill_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        pid = 5432
+
+        def __init__(self) -> None:
+            self.wait_calls: list[float | None] = []
+            self.kill_calls = 0
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) == 1:
+                raise subprocess.TimeoutExpired("test", timeout)
+            return -signal.SIGKILL
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    process = FakeProcess()
+    handle = processes.ProcessHandle(
+        process=process,  # type: ignore[arg-type]
+        identity=processes.ProcessIdentity(5432, 5432, "linux-proc-start:1"),
+    )
+    calls = 0
+
+    def deliver_then_deny(
+        _identity: processes.ProcessIdentity,
+        _signal_number: int,
+    ) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return True
+        raise PermissionError
+
+    monkeypatch.setattr(processes, "_REAP_TIMEOUT_SECONDS", 0.25, raising=False)
+    monkeypatch.setattr(processes, "signal_process_group", deliver_then_deny)
+
+    result = processes.terminate_and_reap(handle, grace_seconds=0.1)
+
+    assert result == (-signal.SIGKILL, ("TERM", "KILL"))
+    assert process.kill_calls == 1
+    assert process.wait_calls == [0.1, 0.25]
+
+
+def test_terminate_and_reap_post_kill_reap_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        pid = 5432
+
+        def __init__(self) -> None:
+            self.wait_calls: list[float | None] = []
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls.append(timeout)
+            raise subprocess.TimeoutExpired("test", timeout)
+
+    process = FakeProcess()
+    handle = processes.ProcessHandle(
+        process=process,  # type: ignore[arg-type]
+        identity=processes.ProcessIdentity(5432, 5432, "linux-proc-start:1"),
+    )
+    monkeypatch.setattr(processes, "_REAP_TIMEOUT_SECONDS", 0.25, raising=False)
+    monkeypatch.setattr(
+        processes,
+        "signal_process_group",
+        lambda _identity, _signal_number: True,
+    )
+
+    with pytest.raises(TimeoutError, match="reap process leader"):
+        processes.terminate_and_reap(handle, grace_seconds=0.1)
+
+    assert process.wait_calls == [0.1, 0.25]
 
 
 def test_reap_leader_has_bounded_timeout(tmp_path: Path) -> None:

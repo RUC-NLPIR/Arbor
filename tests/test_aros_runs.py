@@ -2088,7 +2088,15 @@ def test_stop_locked_does_not_reenter_run_flock(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr(
         processes_module,
         "signal_process_group",
-        lambda _identity, _signal: True,
+        lambda _identity, _signal: pytest.fail(
+            "RunService must not own process signalling"
+        ),
+    )
+    monkeypatch.setattr(
+        runs_module,
+        "_STOP_ACK_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
     )
 
     def fail_public_reconcile(_run_id: str) -> dict[str, object]:
@@ -2096,9 +2104,120 @@ def test_stop_locked_does_not_reenter_run_flock(tmp_path: Path, monkeypatch) -> 
 
     monkeypatch.setattr(service, "reconcile", fail_public_reconcile)
 
-    receipt = service.stop(run_id, actor="owner", reason="locked stop")
+    with pytest.raises(RunError, match="stop acknowledgement timed out"):
+        service.stop(run_id, actor="owner", reason="locked stop")
 
-    assert receipt["delivered"] is True
+    assert (runtime / "stop-request.json").is_file()
+
+
+def test_stop_signal_false_ack_does_not_cancel_successful_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "import time; time.sleep(0.4)"],
+        key="signal-false-race",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    signal_callers: list[int] = []
+    service_thread = threading.get_ident()
+
+    def refuse_signal(
+        _identity: processes_module.ProcessIdentity,
+        _signal_number: int,
+    ) -> bool:
+        signal_callers.append(threading.get_ident())
+        return False
+
+    monkeypatch.setattr(processes_module, "signal_process_group", refuse_signal)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+        deadline = time.monotonic() + 5
+        running: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            running = service.status(run_id, reconcile=False)
+            if running["state"] == "running":
+                break
+            time.sleep(0.02)
+        assert running["state"] == "running"
+
+        receipt = service.stop(
+            run_id,
+            actor="race-owner",
+            reason="signal refused",
+        )
+        assert runner.result(timeout=5) == 0
+
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    request = json.loads((runtime / "stop-request.json").read_text(encoding="utf-8"))
+    final = json.loads(
+        (tmp_path / "runs" / run_id / "final.json").read_text(encoding="utf-8")
+    )
+
+    assert signal_callers and len(signal_callers) == 1
+    assert signal_callers[0] != service_thread
+    assert receipt["delivered"] is False
+    assert receipt["signal_sequence"] == []
+    assert receipt["actor"] == request["actor"] == "race-owner"
+    assert receipt["reason"] == request["reason"] == "signal refused"
+    assert receipt["signal"] == request["signal"] == "TERM"
+    assert receipt["process_pid"] == running["process_pid"]
+    assert receipt["process_pgid"] == running["process_pgid"]
+    assert receipt["process_start_token"] == running["process_start_token"]
+    assert final["state"] == "completed"
+    assert final["exit_code"] == 0
+    assert final["stop"] == request
+    assert "signal_sequence" not in final
+
+
+def test_stop_request_remains_when_runner_acknowledgement_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key="missing-runner-ack")
+    run_id = str(manifest["run_id"])
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
+    status.update(
+        {
+            "state": "running",
+            "process_pid": 12345,
+            "process_pgid": 12345,
+            "process_start_token": "stable-process",
+            "launch_receipt_sha256": "a" * 64,
+        }
+    )
+    atomic_write_json(runtime / "status.json", status)
+    signal_calls = 0
+
+    def refuse_service_signal(
+        _identity: processes_module.ProcessIdentity,
+        _signal_number: int,
+    ) -> bool:
+        nonlocal signal_calls
+        signal_calls += 1
+        return False
+
+    monkeypatch.setattr(processes_module, "identity_is_live", lambda _identity: True)
+    monkeypatch.setattr(processes_module, "signal_process_group", refuse_service_signal)
+    monkeypatch.setattr(
+        runs_module,
+        "_STOP_ACK_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+
+    with pytest.raises(RunError, match="stop acknowledgement timed out"):
+        service.stop(run_id, actor="owner", reason="runner absent")
+
+    request = json.loads((runtime / "stop-request.json").read_text(encoding="utf-8"))
+    assert request["actor"] == "owner"
+    assert request["reason"] == "runner absent"
+    assert signal_calls == 0
+    assert not (tmp_path / ".aros" / "receipts" / f"{run_id}-stop.json").exists()
 
 
 def test_stop_persists_actor_reason_signal_request_and_receipt(tmp_path: Path) -> None:
@@ -2224,7 +2343,7 @@ def test_concurrent_identical_stop_requests_share_one_receipt(tmp_path: Path) ->
     assert _wait_for_state(service, run_id)["state"] == "cancelled"
 
 
-def test_stop_retries_after_request_was_persisted_before_signal(
+def test_stop_retries_after_request_was_persisted_before_ack(
     tmp_path: Path, monkeypatch,
 ) -> None:
     _init_clean_repo(tmp_path)
@@ -2254,14 +2373,33 @@ def test_stop_retries_after_request_was_persisted_before_signal(
 
     monkeypatch.setattr(service, "_write_event", lambda **_kwargs: None)
     monkeypatch.setattr(
+        runs_module,
+        "_STOP_ACK_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    signal_calls = 0
+
+    def refuse_service_signal(
+        _identity: processes_module.ProcessIdentity,
+        _signal_number: int,
+    ) -> bool:
+        nonlocal signal_calls
+        signal_calls += 1
+        return False
+
+    monkeypatch.setattr(
         processes_module,
         "signal_process_group",
-        lambda _identity, _signal: True,
+        refuse_service_signal,
     )
-    receipt = service.stop(run_id, actor="owner", reason="same request")
+    with pytest.raises(RunError, match="stop acknowledgement timed out"):
+        service.stop(run_id, actor="owner", reason="same request")
+    retried = json.loads((runtime / "stop-request.json").read_text(encoding="utf-8"))
 
-    assert receipt["delivered"] is True
-    assert receipt["requested_at"] == request["requested_at"]
+    assert retried["requested_at"] == request["requested_at"]
+    assert signal_calls == 0
+    assert not (tmp_path / ".aros" / "receipts" / f"{run_id}-stop.json").exists()
 
 
 def test_reconcile_absent_process_without_final_is_lost_not_failed(

@@ -1,4 +1,8 @@
-"""Narrow synchronous process operations shared by AROS run control."""
+"""Synchronous operations for a single ProcessHandle owner.
+
+The owner must not reap the leader concurrently with signalling or termination.
+Identity validation and process-group signalling are not atomic.
+"""
 
 import ctypes as _ctypes
 import os as _os
@@ -23,6 +27,7 @@ __all__ = [
 ]
 
 _PR_SET_PDEATHSIG = 1
+_REAP_TIMEOUT_SECONDS = 2.0
 
 
 @_dataclass(frozen=True)
@@ -107,10 +112,14 @@ def _capture_identity(process: _subprocess.Popen[bytes]) -> ProcessIdentity:
 def _terminate_unidentified(process: _subprocess.Popen[bytes]) -> None:
     try:
         _os.killpg(process.pid, _signal.SIGKILL)
-    except ProcessLookupError:
+    except OSError:
         process.kill()
-    finally:
-        process.wait()
+    try:
+        process.wait(timeout=_REAP_TIMEOUT_SECONDS)
+    except _subprocess.TimeoutExpired as error:
+        raise TimeoutError(
+            f"unable to reap unidentified process leader: {process.pid}"
+        ) from error
 
 
 def spawn_process(
@@ -208,7 +217,15 @@ def terminate_and_reap(
     try:
         exit_code = reap_leader(handle, grace_seconds)
     except TimeoutError:
-        if signal_process_group(handle.identity, _signal.SIGKILL):
-            sequence.append("KILL")
-        exit_code = reap_leader(handle)
+        try:
+            group_killed = signal_process_group(
+                handle.identity,
+                _signal.SIGKILL,
+            )
+        except PermissionError:
+            group_killed = False
+        if not group_killed:
+            handle.process.kill()
+        sequence.append("KILL")
+        exit_code = reap_leader(handle, _REAP_TIMEOUT_SECONDS)
     return exit_code, tuple(sequence)

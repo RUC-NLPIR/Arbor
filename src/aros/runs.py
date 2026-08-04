@@ -60,6 +60,7 @@ _TERMINAL_STATES = {
     "lost",
 }
 _ACTIVE_STATES = {"launched", "running"}
+_STOP_ACK_TIMEOUT_SECONDS = 3.0
 _CONTENT_RECEIPT_FIELDS = {"path", "bytes", "sha256"}
 _JsonReader = Callable[[str | Path], object]
 _FINAL_REQUIRED_FIELDS = {
@@ -969,33 +970,43 @@ class RunService:
             artifact_refs=[f".aros/runs/{run_id}/stop-request.json"],
         )
 
-        delivered = False
-        try:
-            delivered = processes.signal_process_group(
-                identity,
-                _ALLOWED_SIGNALS[normalized_signal],
-            )
-        except PermissionError as error:
-            raise RunError(f"permission denied stopping run {run_id}") from error
-
-        receipt = {
-            "schema_version": 1,
-            "receipt_id": f"{run_id}-stop",
-            "kind": "run_stop",
-            "run_id": run_id,
-            "actor": run_actor,
-            "reason": stop_reason,
-            "signal": normalized_signal,
-            "signal_sequence": [normalized_signal],
-            "requested_at": requested_at,
-            "recorded_at": _utc_now(),
-            "delivered": delivered,
-            "process_pid": pid,
-            "process_pgid": pgid,
-            "process_start_token": expected_start_token,
-        }
-        create_json(receipt_path, receipt)
-        return receipt
+        deadline = time.monotonic() + _STOP_ACK_TIMEOUT_SECONDS
+        while True:
+            if receipt_path.is_file():
+                receipt = _read_object(receipt_path, "stop receipt")
+                matching_fields = (
+                    "run_id",
+                    "actor",
+                    "reason",
+                    "signal",
+                    "requested_at",
+                    "process_pid",
+                    "process_start_token",
+                )
+                if (
+                    receipt.get("schema_version") != 1
+                    or receipt.get("kind") != "run_stop"
+                    or receipt.get("process_pgid") != pgid
+                    or type(receipt.get("delivered")) is not bool
+                    or not isinstance(receipt.get("signal_sequence"), list)
+                    or any(
+                        receipt.get(field) != request.get(field)
+                        for field in matching_fields
+                    )
+                ):
+                    raise RunError(f"run stop acknowledgement mismatch: {run_id}")
+                return receipt
+            final_path = self._final_path(run_id)
+            if final_path.is_file():
+                final = self.read_validated_final(run_id)
+                if final.get("stop") == request:
+                    return final
+                raise RunError(
+                    f"run finalized without matching stop acknowledgement: {run_id}"
+                )
+            if time.monotonic() >= deadline:
+                raise RunError(f"run stop acknowledgement timed out: {run_id}")
+            time.sleep(0.02)
 
     def reconcile(self, run_id: str) -> dict[str, object]:
         self._validate_run_id(run_id)

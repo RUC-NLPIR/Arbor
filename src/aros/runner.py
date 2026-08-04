@@ -153,9 +153,33 @@ def _read_stop_request(runtime: Path) -> dict[str, Any] | None:
     return _read_object(path) if path.is_file() else None
 
 
-def _read_stop_receipt(root: Path, run_id: str) -> dict[str, Any] | None:
+def _write_stop_receipt(
+    root: Path,
+    run_id: str,
+    stop_request: dict[str, Any],
+    identity: processes.ProcessIdentity,
+    signal_sequence: list[str],
+    delivered: bool,
+) -> None:
     path = root / ".aros" / "receipts" / f"{run_id}-stop.json"
-    return _read_object(path) if path.is_file() else None
+    receipt = {
+        "schema_version": 1,
+        "receipt_id": f"{run_id}-stop",
+        "kind": "run_stop",
+        "run_id": run_id,
+        "actor": stop_request["actor"],
+        "reason": stop_request["reason"],
+        "signal": stop_request["signal"],
+        "signal_sequence": signal_sequence,
+        "requested_at": stop_request["requested_at"],
+        "recorded_at": _utc_now(),
+        "delivered": delivered,
+        "process_pid": identity.pid,
+        "process_pgid": identity.pgid,
+        "process_start_token": identity.start_token,
+    }
+    if not create_json(path, receipt):
+        _read_object(path)
 
 
 def _execution_bundle_binding(
@@ -238,23 +262,6 @@ def run(workspace: str, run_id: str) -> int:
     stderr_path.touch(exist_ok=True)
     started_at = _utc_now()
     started_monotonic = time.monotonic()
-
-    stop_request = _read_stop_request(runtime)
-    if stop_request is not None:
-        _finish(
-            root=root,
-            runtime=runtime,
-            manifest=manifest,
-            prior_status=status,
-            state="cancelled",
-            exit_code=None,
-            started_at=started_at,
-            started_monotonic=started_monotonic,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            stop_request=stop_request,
-        )
-        return 0
 
     child_environment: dict[str, str] | None = None
     child_preexec_fn = None
@@ -355,32 +362,40 @@ def run(workspace: str, run_id: str) -> int:
     timeout_signal_sequence: list[str] = []
     exit_code: int | None = None
     delivered_stop = False
+    stop_attempted = False
+    stop_escalated = False
     stop_signal_sequence: list[str] = []
     stop_started_monotonic: float | None = None
     last_heartbeat = time.monotonic()
 
     while handle.process.poll() is None:
         stop_request = _read_stop_request(runtime)
-        if stop_request is not None and not delivered_stop:
+        if stop_request is not None and not stop_attempted:
             requested_name = str(stop_request.get("signal", "TERM"))
             requested_signal = {
                 "TERM": signal.SIGTERM,
                 "KILL": signal.SIGKILL,
                 "INT": signal.SIGINT,
             }.get(requested_name, signal.SIGTERM)
-            processes.signal_process_group(handle.identity, requested_signal)
-            stop_signal_sequence.append(requested_name)
+            delivered_stop = processes.signal_process_group(
+                handle.identity,
+                requested_signal,
+            )
+            if delivered_stop:
+                stop_signal_sequence.append(requested_name)
             stop_started_monotonic = time.monotonic()
-            delivered_stop = True
+            stop_attempted = True
+            stop_escalated = requested_name == "KILL"
         elif (
-            stop_request is not None
+            delivered_stop
+            and not stop_escalated
             and stop_started_monotonic is not None
-            and stop_signal_sequence[-1] != "KILL"
             and time.monotonic() - stop_started_monotonic >= 1
         ):
-            processes.signal_process_group(handle.identity, signal.SIGKILL)
-            stop_signal_sequence.append("KILL")
-        if stop_request is None and time.monotonic() - started_monotonic >= timeout_seconds:
+            if processes.signal_process_group(handle.identity, signal.SIGKILL):
+                stop_signal_sequence.append("KILL")
+            stop_escalated = True
+        if not delivered_stop and time.monotonic() - started_monotonic >= timeout_seconds:
             timeout_hit = True
             exit_code, timeout_signals = processes.terminate_and_reap(
                 handle,
@@ -400,14 +415,16 @@ def run(workspace: str, run_id: str) -> int:
     if exit_code is None:
         exit_code = processes.reap_leader(handle)
     stop_request = _read_stop_request(runtime)
-    stop_receipt = _read_stop_receipt(root, run_id)
-    if stop_request is not None and not delivered_stop and stop_receipt is None:
-        deadline = time.monotonic() + 0.5
-        while stop_receipt is None and time.monotonic() < deadline:
-            time.sleep(0.01)
-            stop_receipt = _read_stop_receipt(root, run_id)
-    externally_delivered = bool(stop_receipt and stop_receipt.get("delivered"))
-    if stop_request is not None and (delivered_stop or externally_delivered):
+    if stop_request is not None:
+        _write_stop_receipt(
+            root,
+            run_id,
+            stop_request,
+            handle.identity,
+            stop_signal_sequence,
+            delivered_stop,
+        )
+    if stop_request is not None and delivered_stop:
         state = "cancelled"
     elif timeout_hit:
         state = "timed_out"
@@ -415,12 +432,8 @@ def run(workspace: str, run_id: str) -> int:
         state = "completed"
     else:
         state = "failed_process"
-    if stop_request is not None and (delivered_stop or externally_delivered):
-        final_signal_sequence = stop_signal_sequence or (
-            list(stop_receipt.get("signal_sequence", []))
-            if stop_receipt is not None
-            else []
-        )
+    if stop_request is not None and delivered_stop:
+        final_signal_sequence = stop_signal_sequence
     else:
         final_signal_sequence = timeout_signal_sequence
     _finish(

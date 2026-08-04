@@ -280,8 +280,22 @@ def test_run_runner_uses_process_seam_for_spawn_and_group_signals() -> None:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr in forbidden_calls
     ]
+    process_calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "processes"
+    }
 
     assert violations == []
+    assert {
+        "spawn_process",
+        "signal_process_group",
+        "reap_leader",
+        "terminate_and_reap",
+    } <= process_calls
 
 
 def test_run_service_uses_process_seam_for_stop_and_liveness() -> None:
@@ -305,7 +319,8 @@ def test_run_service_uses_process_seam_for_stop_and_liveness() -> None:
         and node.func.attr in {"kill", "killpg"}
     }
 
-    assert {"identity_is_live", "signal_process_group"} <= process_calls
+    assert "identity_is_live" in process_calls
+    assert "signal_process_group" not in process_calls
     assert direct_calls == set()
 
 

@@ -130,6 +130,8 @@ The change sequence is recorded by these commits:
 | `57be2c7` | tests separating launch actor authority from mutable status |
 | `01a72f0` | Run terminal projection derived from immutable receipts |
 | `c6b80ee` | read-only Eval audit kept independent of missing Run status |
+| `05aa41d` | carrier failure preserves an already sealed Runner final |
+| `a9ee500` | loser-path event writer projects the create-once final winner |
 
 Fresh implementation gates reached `92 passed` for `tests/test_aros_runs.py`
 and `383 passed in 64.98s` for `tests/test_aros_runs.py`,
@@ -140,8 +142,8 @@ rewritten.
 
 Documentation commissioning on the `c6b80ee` implementation baseline then
 reached `231 passed (exit 0)` for the architecture/public-entry/registry gate.
-The exact unqualified `/workspace/Arbor/.venv/bin/python -m pytest` command
-reached `1640 passed, 6 skipped in 359.32s (0:05:59)`. Full
+The final exact unqualified `/workspace/Arbor/.venv/bin/python -m pytest`
+command reached `1641 passed, 6 skipped in 350.36s (0:05:50)`. Full
 `ruff check src tests scripts` reported `All checks passed!`; both
 `git diff --check` and `git diff --exit-code -- uv.lock` exited 0. The working
 diff contained only the four commissioned documentation files, so these checks

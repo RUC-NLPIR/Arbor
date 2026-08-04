@@ -13,7 +13,8 @@ commissioned.
 - Current implementation baselines are deliberately separated: immutable Run
   terminal projection is `01a72f07ed6bc88fa6d7bd5fbe1527d985ffe558`;
   read-only Eval audit compatibility is
-  `c6b80ee2a5b8df183d1c92b51d525b43d246a47c`.
+  `c6b80ee2a5b8df183d1c92b51d525b43d246a47c`; the final create-once
+  carrier-race evidence is `a9ee500379107d9f777f5b57b11917b5a472429b`.
 - The guarded Task carrier work is merged on `main` at
   `904f7ae2786ce7f57c9d987c7d6c4608f7d37dc2`; this branch descends from that
   baseline.
@@ -54,10 +55,10 @@ commissioned.
   validation; audit does not reconstruct status, final, measurement or retry.
 - Fresh current-branch gates reached `92 passed` for Run, `383 passed in
   64.98s` for the Run/Eval/Eval-records combination, `231 passed (exit 0)` for
-  architecture/public-entry/registry, and `1640 passed, 6 skipped in
-  359.32s (0:05:59)` for the exact unqualified full pytest command. Full Ruff
-  reported `All checks passed!`; diff-check and the `uv.lock` comparison both
-  exited 0. No `uv` command ran and no commissioning receipt changed.
+  architecture/public-entry/registry, and `1641 passed, 6 skipped in
+  350.36s (0:05:50)` for the final exact unqualified full pytest command. Full
+  Ruff reported `All checks passed!`; diff-check and the `uv.lock` comparison
+  both exited 0. No `uv` command ran and no commissioning receipt changed.
 - Wave 2 child-task evidence remains current. Exact carrier probing and the
   per-task OFD guardian close the reviewed Task startup-loss intervals without
   retry; Task adapters remain trusted-local, application-scoped, and not a

@@ -7,6 +7,7 @@ memory are not continuity inputs.
 
 from __future__ import annotations
 
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -88,7 +89,7 @@ def init_workspace(root: str | Path, mission: str) -> dict[str, object]:
         ".aros",
         ".worktree",
     ):
-        (workspace / relative).mkdir(parents=True, exist_ok=True)
+        _ensure_scaffold_directory(workspace, relative)
 
     files = {
         "AGENTS.md": _AGENTS_TEMPLATE,
@@ -188,10 +189,32 @@ def _write_new(path: Path, content: str) -> bool:
         with path.open("x", encoding="utf-8") as handle:
             handle.write(content)
     except FileExistsError:
-        if not path.is_file():
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"expected an ordinary file but found a symlink: {path}")
+        if not stat.S_ISREG(metadata.st_mode):
             raise ValueError(f"expected a file but found a non-file path: {path}")
         return False
     return True
+
+
+def _ensure_scaffold_directory(root: Path, relative: str) -> None:
+    current = root
+    for component in Path(relative).parts:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            current.mkdir()
+            metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(
+                f"workspace scaffold must not contain a symlink: {current}"
+            )
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(
+                f"workspace scaffold component must be a directory: {current}"
+            )
 
 
 def _append_missing_ignore_entries(path: Path) -> bool:

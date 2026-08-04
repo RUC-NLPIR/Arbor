@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 import stat
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, Mapping, cast
 
 import yaml
@@ -13,6 +16,9 @@ import yaml
 from .store import _strict_json_loads, json_sha256
 
 
+_open = os.open
+_DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 EvidenceRelation = Literal["supports", "challenges", "bounds", "context"]
 _RELATIONS = {"supports", "challenges", "bounds", "context"}
 _EVIDENCE_FIELDS = {"observation_ref", "relation", "scope"}
@@ -112,14 +118,8 @@ class _UniqueSafeLoader(yaml.SafeLoader):
 
 def read_semantic_document(root: Path, relative: str) -> SemanticDocument:
     """Read one contained ordinary UTF-8 semantic document."""
-    path = _ordinary_contained_file(root, relative)
-    normalized_relative = Path(relative).as_posix()
-    try:
-        raw = path.read_bytes()
-    except OSError as error:
-        raise ResearchFileError(
-            f"semantic file could not be read: {normalized_relative}"
-        ) from error
+    normalized_relative = _normalized_relative(relative)
+    raw = _read_ordinary_contained_file(root, normalized_relative)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -129,7 +129,7 @@ def read_semantic_document(root: Path, relative: str) -> SemanticDocument:
 
     frontmatter, body = _split_frontmatter(text, normalized_relative)
     identifier = _validate_navigation_identity(normalized_relative, frontmatter)
-    sections = _sections(body)
+    sections = _sections(body, normalized_relative)
     evidence_links = _evidence_links(normalized_relative, sections)
     warnings = tuple(
         f"missing recommended section: {heading}"
@@ -139,14 +139,14 @@ def read_semantic_document(root: Path, relative: str) -> SemanticDocument:
     return SemanticDocument(
         path=normalized_relative,
         identifier=identifier,
-        frontmatter=frontmatter,
-        sections=sections,
+        frontmatter=MappingProxyType(dict(frontmatter)),
+        sections=MappingProxyType(dict(sections)),
         evidence_links=evidence_links,
         warnings=warnings,
     )
 
 
-def _ordinary_contained_file(root: Path, relative: str) -> Path:
+def _normalized_relative(relative: str) -> str:
     if not isinstance(relative, str) or not relative:
         raise ResearchFileError("semantic path must name a contained file")
     relative_path = Path(relative)
@@ -156,34 +156,52 @@ def _ordinary_contained_file(root: Path, relative: str) -> Path:
         or ".." in relative_path.parts
     ):
         raise ResearchFileError(f"semantic path must be contained: {relative}")
+    return relative_path.as_posix()
 
-    try:
-        workspace = Path(root).expanduser().resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise ResearchFileError(f"semantic root is unavailable: {root}") from error
-    if not workspace.is_dir():
-        raise ResearchFileError(f"semantic root must be a directory: {workspace}")
 
-    current = workspace
-    for index, part in enumerate(relative_path.parts):
-        current = current / part
+def _read_ordinary_contained_file(root: Path, relative: str) -> bytes:
+    parts = Path(relative).parts
+    workspace = Path(root).expanduser()
+    with ExitStack() as descriptors:
         try:
-            metadata = current.lstat()
+            directory_fd = _open(workspace, _DIRECTORY_OPEN_FLAGS)
         except OSError as error:
-            raise ResearchFileError(f"semantic file is unavailable: {relative}") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ResearchFileError(f"semantic path must not contain a symlink: {relative}")
-        if index < len(relative_path.parts) - 1 and not stat.S_ISDIR(
-            metadata.st_mode
-        ):
             raise ResearchFileError(
-                f"semantic path component must be a directory: {relative}"
-            )
+                f"semantic root must be an ordinary directory without symlinks: {root}"
+            ) from error
+        descriptors.callback(os.close, directory_fd)
 
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ResearchFileError(f"semantic path must be a regular file: {relative}")
-    return current
+        for component in parts[:-1]:
+            try:
+                directory_fd = _open(
+                    component,
+                    _DIRECTORY_OPEN_FLAGS,
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise ResearchFileError(
+                    f"semantic path must stay contained and contain no symlink: {relative}"
+                ) from error
+            descriptors.callback(os.close, directory_fd)
 
+        try:
+            file_fd = _open(parts[-1], _FILE_OPEN_FLAGS, dir_fd=directory_fd)
+        except OSError as error:
+            raise ResearchFileError(
+                f"semantic path must stay contained and contain no symlink: {relative}"
+            ) from error
+        descriptors.callback(os.close, file_fd)
+
+        try:
+            metadata = os.fstat(file_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ResearchFileError(
+                    f"semantic path must be a regular file: {relative}"
+                )
+            with os.fdopen(file_fd, "rb", closefd=False) as handle:
+                return handle.read()
+        except OSError as error:
+            raise ResearchFileError(f"semantic file could not be read: {relative}") from error
 
 def _split_frontmatter(
     text: str,
@@ -240,7 +258,7 @@ def _validate_navigation_identity(
     return identifier
 
 
-def _sections(body: str) -> dict[str, str]:
+def _sections(body: str, relative: str) -> dict[str, str]:
     sections: dict[str, str] = {}
     heading: str | None = None
     content: list[str] = []
@@ -271,7 +289,12 @@ def _sections(body: str) -> dict[str, str]:
                 content.append(line)
             continue
         finish()
-        heading = re.sub(r"[ \t]+#+[ \t]*$", "", match.group(1)).strip()
+        next_heading = re.sub(r"[ \t]+#+[ \t]*$", "", match.group(1)).strip()
+        if next_heading in sections:
+            raise ResearchFileError(
+                f"duplicate Markdown heading in {relative}: {next_heading}"
+            )
+        heading = next_heading
         content = []
 
     finish()

@@ -129,6 +129,35 @@ def test_init_workspace_is_idempotent_and_never_overwrites_project_files(tmp_pat
     assert second["updated"] == []
 
 
+@pytest.mark.parametrize("component", ["memory", "questions", "model", "knowledge"])
+def test_init_workspace_rejects_symlinked_scaffold_component(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    _init_git(tmp_path)
+    target = tmp_path.parent / f"{tmp_path.name}-{component}-target"
+    target.mkdir()
+    (tmp_path / component).symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        init_workspace(tmp_path, "Mission")
+
+    assert list(target.iterdir()) == []
+
+
+def test_init_workspace_rejects_symlinked_navigation_file(tmp_path: Path) -> None:
+    _init_git(tmp_path)
+    (tmp_path / "questions").mkdir()
+    target = tmp_path.parent / f"{tmp_path.name}-frontier.md"
+    target.write_text("# Existing external frontier\n", encoding="utf-8")
+    (tmp_path / "questions" / "FRONTIER.md").symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        init_workspace(tmp_path, "Mission")
+
+    assert target.read_text(encoding="utf-8") == "# Existing external frontier\n"
+
+
 def test_init_workspace_does_not_duplicate_existing_ignore_entries(tmp_path: Path) -> None:
     _init_git(tmp_path)
     (tmp_path / ".gitignore").write_text("/.aros/\n", encoding="utf-8")

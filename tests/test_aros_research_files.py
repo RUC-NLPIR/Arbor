@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
+from arbor.aros import research_files as research_files_module
 from arbor.aros.research_files import (
     ResearchFileError,
     read_semantic_document,
@@ -139,6 +141,26 @@ def test_evidence_link_rejects_duplicate_unknown_or_invalid_relation(
         read_semantic_document(tmp_path, claim)
 
 
+def test_duplicate_markdown_heading_is_mechanically_ambiguous(tmp_path: Path) -> None:
+    claim = _write(
+        tmp_path,
+        "knowledge/claims/C-0001.md",
+        "---\nid: C-0001\n---\n"
+        "# Claim\n\n"
+        "## Evidence links\n"
+        "not-json\n\n"
+        "## Evidence links ##\n"
+        '{"observation_ref":"runs/RUN-a/final.json","relation":"supports",'
+        '"scope":"x"}\n',
+    )
+
+    with pytest.raises(
+        ResearchFileError,
+        match=r"knowledge/claims/C-0001\.md.*Evidence links",
+    ):
+        read_semantic_document(tmp_path, claim)
+
+
 def test_missing_recommended_sections_are_warnings(tmp_path: Path) -> None:
     question = _write(
         tmp_path,
@@ -185,6 +207,70 @@ def test_semantic_reader_rejects_symlink_non_utf8_and_escape(tmp_path: Path) -> 
         read_semantic_document(root, "../outside.md")
 
 
+def test_semantic_reader_rejects_symlink_root(tmp_path: Path) -> None:
+    actual = tmp_path / "actual"
+    relative = _write(
+        actual,
+        "questions/Q-0001/question.md",
+        "---\nid: Q-0001\n---\n# Question\n",
+    )
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(actual, target_is_directory=True)
+
+    with pytest.raises(ResearchFileError, match="symlink"):
+        read_semantic_document(linked_root, relative)
+
+
+@pytest.mark.parametrize("swap", ["component", "final"])
+def test_semantic_reader_rejects_component_or_final_symlink_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    swap: str,
+) -> None:
+    root = tmp_path / "workspace"
+    relative = _write(
+        root,
+        "questions/Q-0001/question.md",
+        "---\nid: Q-0001\n---\n# Question\n",
+    )
+    outside = tmp_path / "outside"
+    _write(
+        outside,
+        "question.md",
+        "---\nid: Q-0001\n---\n# Question\n",
+    )
+    original_open = os.open
+    swapped = False
+
+    def racing_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        name = os.fsdecode(path)
+        trigger = "Q-0001" if swap == "component" else "question.md"
+        if not swapped and name == trigger:
+            if swap == "component":
+                victim = root / "questions/Q-0001"
+                victim.rename(root / "questions/Q-0001-original")
+                victim.symlink_to(outside, target_is_directory=True)
+            else:
+                victim = root / relative
+                victim.rename(victim.with_suffix(".original.md"))
+                victim.symlink_to(outside / "question.md")
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(research_files_module, "_open", racing_open, raising=False)
+
+    with pytest.raises(ResearchFileError, match="symlink|contained"):
+        read_semantic_document(root, relative)
+    assert swapped is True
+
+
 def test_frontier_focus_is_optional_and_does_not_hide_other_questions(
     tmp_path: Path,
 ) -> None:
@@ -221,3 +307,7 @@ def test_semantic_records_are_immutable(tmp_path: Path) -> None:
         document.path = "other.md"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         document.evidence_links[0].link.scope = "changed"  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        document.frontmatter["id"] = "C-9999"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        document.sections["Evidence links"] = "changed"  # type: ignore[index]

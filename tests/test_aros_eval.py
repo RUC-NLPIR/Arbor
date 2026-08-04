@@ -19,10 +19,16 @@ import pytest
 import arbor.aros.eval as eval_module
 import arbor.aros.worktrees as worktrees_module
 from arbor.aros.eval import EvalError, EvalService
-from arbor.aros.eval_records import validate_measurement_receipt
+from arbor.aros.eval_records import build_measurement_receipt, validate_measurement_receipt
 from arbor.aros.receipts import record_sha256
-from arbor.aros.runs import RunService
-from arbor.aros.store import process_start_token
+from arbor.aros.runs import RunError, RunService
+from arbor.aros.store import (
+    atomic_write_json,
+    final_identity,
+    json_sha256,
+    manifest_sha256,
+    process_start_token,
+)
 
 
 requires_linux_claims = pytest.mark.skipif(
@@ -105,45 +111,279 @@ def _init_evaluator_repository(root: Path) -> tuple[dict[str, object], str, str]
 
 
 def _terminal_receipt(
+    root: Path,
     request: dict[str, object],
     execution: dict[str, object],
 ) -> dict[str, object]:
-    run_id = "RUN-visible-receipt"
+    run_id = f"RUN-visible-{str(request['eval_id'])[-12:]}"
     empty_sha256 = hashlib.sha256(b"").hexdigest()
-    receipt: dict[str, object] = {
+    portable = {
+        "candidate": {
+            "path": "candidate",
+            "commit": request["candidate_commit"],
+            "tree": _git(root, "rev-parse", f"{request['candidate_commit']}^{{tree}}"),
+        },
+        "apparatus": {
+            "path": "apparatus",
+            "commit": request["apparatus_commit"],
+            "tree": _git(root, "rev-parse", f"{request['apparatus_commit']}^{{tree}}"),
+        },
+        "temp": "tmp",
+    }
+    bundle_sha256 = json_sha256(portable)
+    execution_bundle = {**portable, "bundle_sha256": bundle_sha256}
+    manifest: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "repository_ref": f".worktree/eval/{request['eval_id']}",
+        "base_commit": request["candidate_commit"],
+        "candidate_commit": request["candidate_commit"],
+        "argv": [sys.executable, "../apparatus/evaluation/score.py"],
+        "cwd": "candidate",
+        "timeout_seconds": 300,
+        "idempotency_key": request["eval_id"],
+        "security_profile": "isolated-linux",
+        "writable_paths": ["tmp"],
+        "network_policy": "none",
+        "process_policy": "isolated",
+        "environment_policy": {"kind": "empty"},
+        "isolation_limits": {},
+        "environment_ref": {"kind": "test"},
+        "environment_sha256": "0" * 64,
+        "actor": request["actor"],
+        "question_refs": [],
+        "experiment_ref": None,
+        "prediction_ref": None,
+        "evaluator_ref": None,
+        "evaluator_version": None,
+        "seed": None,
+        "dataset_ref": None,
+        "resource_request": {},
+        "budget": {},
+        "output_paths": [
+            f".aros/runs/{run_id}/stdout.log",
+            f".aros/runs/{run_id}/stderr.log",
+            f"runs/{run_id}/final.json",
+        ],
+        "success_exit_codes": [0],
+        "created_at": execution["claimed_at"],
+        "execution_bundle": execution_bundle,
+    }
+    manifest["manifest_sha256"] = manifest_sha256(manifest)
+    atomic_write_json(root / "runs" / run_id / "manifest.json", manifest)
+    run_link: dict[str, object] = {
         "schema_version": 1,
         "eval_id": request["eval_id"],
-        "evaluation_state": "completed",
-        "referenced_process_state": "completed",
-        "measurement_state": "valid",
-        "descriptor_sha256": request["descriptor_sha256"],
         "request_sha256": request["request_sha256"],
         "execution_sha256": execution["execution_sha256"],
         "run_id": run_id,
-        "run_manifest_sha256": "1" * 64,
-        "run_final_sha256": "2" * 64,
-        "bundle_sha256": "3" * 64,
+        "run_manifest_sha256": manifest["manifest_sha256"],
+        "bundle_sha256": bundle_sha256,
         "candidate_commit": request["candidate_commit"],
         "apparatus_commit": request["apparatus_commit"],
-        "metric": 0.5,
-        "sample_count": 1,
-        "metric_name": "quality",
-        "parser": "aros.scalar-metric-v1",
-        "bundle_cleanup_state": "removed",
-        "stdout": {
+        "linked_at": execution["claimed_at"],
+    }
+    run_link["run_link_sha256"] = record_sha256(run_link, "run_link_sha256")
+    atomic_write_json(
+        root / ".aros" / "evaluations" / str(request["eval_id"]) / "run.json",
+        run_link,
+    )
+    prelaunch: dict[str, object] = {
+        "schema_version": 1,
+        "receipt_id": f"{run_id}-prelaunch",
+        "kind": "run_prelaunch",
+        "run_id": run_id,
+        "actor": request["actor"],
+        "created_at": execution["claimed_at"],
+        "base_commit": manifest["base_commit"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "carrier": "tmux",
+        "tmux_session": f"aros-{run_id.lower()}",
+        "host": "test-host",
+        "runner_version": 1,
+        "runner_invocation": [sys.executable, "-m", "arbor.aros.runner"],
+    }
+    prelaunch["receipt_sha256"] = record_sha256(prelaunch, "receipt_sha256")
+    atomic_write_json(
+        root / ".aros" / "receipts" / f"{run_id}-prelaunch.json",
+        prelaunch,
+    )
+    final = final_identity(manifest)
+    final.update(
+        {
+            "schema_version": 1,
+            "state": "completed",
+            "exit_code": 0,
+            "started_at": execution["claimed_at"],
+            "finished_at": execution["claimed_at"],
+            "finalized_at": execution["claimed_at"],
+            "duration_seconds": 0.0,
+            "resource_usage": {"wall_seconds": 0.0},
+            "host": "test-host",
+            "actual_environment_sha256": "0" * 64,
+            "launch_receipt_sha256": prelaunch["receipt_sha256"],
+            "stdout": {
             "path": f".aros/runs/{run_id}/stdout.log",
             "bytes": 0,
             "sha256": empty_sha256,
+            },
+            "stderr": {
+                "path": f".aros/runs/{run_id}/stderr.log",
+                "bytes": 0,
+                "sha256": empty_sha256,
+            },
+        }
+    )
+    atomic_write_json(root / "runs" / run_id / "final.json", final)
+    atomic_write_json(
+        root / ".aros" / "runs" / run_id / "status.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "completed",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "launch_receipt_sha256": prelaunch["receipt_sha256"],
+            "launched_at": execution["claimed_at"],
+            "finished_at": execution["claimed_at"],
+            "final_ref": f"runs/{run_id}/final.json",
+            "updated_at": execution["claimed_at"],
         },
-        "stderr": {
-            "path": f".aros/runs/{run_id}/stderr.log",
-            "bytes": 0,
-            "sha256": empty_sha256,
+    )
+    return build_measurement_receipt(
+        request,
+        execution,
+        run_link,
+        final,
+        "valid",
+        {
+            "measurement_state": "valid",
+            "metric": 0.5,
+            "sample_count": 1,
+            "metric_name": "quality",
+            "parser": "aros.scalar-metric-v1",
         },
-        "finished_at": execution["claimed_at"],
-    }
-    receipt["receipt_sha256"] = record_sha256(receipt, "receipt_sha256")
-    return validate_measurement_receipt(receipt)
+        "removed",
+    )
+
+
+def _registered_visible_run_service(
+    root: Path,
+    *,
+    minimum: int | float = 0,
+    minimum_samples: int = 1,
+) -> tuple[EvalService, dict[str, object], str]:
+    manifest, _apparatus_tree, _manifest_commit = _init_evaluator_repository(root)
+    manifest["metric_output"]["minimum"] = minimum  # type: ignore[index]
+    manifest["metric_output"]["minimum_samples"] = minimum_samples  # type: ignore[index]
+    manifest_path = root / "eval" / "suites" / "quality" / "1" / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (root / ".gitignore").write_text("/.aros/\n/.worktree/\n", encoding="utf-8")
+    _git(root, "add", ".gitignore", "eval/suites/quality/1/manifest.json")
+    _git(root, "commit", "-qm", "configure visible evaluation run")
+    candidate_commit = _git(root, "rev-parse", "HEAD")
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    return service, manifest, candidate_commit
+
+
+def _install_terminal_run(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    state: str,
+    stdout: bytes,
+    stderr: bytes = b"",
+) -> list[str]:
+    starts: list[str] = []
+
+    def terminal_start(
+        service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        del actor
+        starts.append(run_id)
+        manifest = json.loads(
+            (root / "runs" / run_id / "manifest.json").read_text(encoding="utf-8")
+        )
+        runtime = root / ".aros" / "runs" / run_id
+        runtime.mkdir(parents=True, exist_ok=True)
+        (runtime / "stdout.log").write_bytes(stdout)
+        (runtime / "stderr.log").write_bytes(stderr)
+        launched_at = str(manifest["created_at"])
+        prelaunch: dict[str, object] = {
+            "schema_version": 1,
+            "receipt_id": f"{run_id}-prelaunch",
+            "kind": "run_prelaunch",
+            "run_id": run_id,
+            "actor": manifest["actor"],
+            "created_at": launched_at,
+            "base_commit": manifest["base_commit"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "carrier": "tmux",
+            "tmux_session": f"aros-{run_id.lower()}",
+            "host": "test-host",
+            "runner_version": 1,
+            "runner_invocation": [sys.executable, "-m", "arbor.aros.runner"],
+        }
+        prelaunch["receipt_sha256"] = record_sha256(
+            prelaunch,
+            "receipt_sha256",
+        )
+        atomic_write_json(
+            root / ".aros" / "receipts" / f"{run_id}-prelaunch.json",
+            prelaunch,
+        )
+        final = final_identity(manifest)
+        final.update(
+            {
+                "schema_version": 1,
+                "state": state,
+                "exit_code": 0 if state == "completed" else 1,
+                "started_at": launched_at,
+                "finished_at": manifest["created_at"],
+                "finalized_at": manifest["created_at"],
+                "resource_usage": {"wall_seconds": 0.0},
+                "launch_receipt_sha256": prelaunch["receipt_sha256"],
+                "stdout": {
+                    "path": f".aros/runs/{run_id}/stdout.log",
+                    "bytes": len(stdout),
+                    "sha256": hashlib.sha256(stdout).hexdigest(),
+                },
+                "stderr": {
+                    "path": f".aros/runs/{run_id}/stderr.log",
+                    "bytes": len(stderr),
+                    "sha256": hashlib.sha256(stderr).hexdigest(),
+                },
+            }
+        )
+        atomic_write_json(root / "runs" / run_id / "final.json", final)
+        status_path = runtime / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        status.update(
+            {
+                "state": state,
+                "exit_code": final["exit_code"],
+                "finished_at": final["finished_at"],
+                "final_ref": f"runs/{run_id}/final.json",
+                "launch_receipt_sha256": prelaunch["receipt_sha256"],
+                "launched_at": launched_at,
+                "updated_at": final["finished_at"],
+            }
+        )
+        atomic_write_json(status_path, status)
+        return {
+            "run_id": run_id,
+            "state": state,
+            "final_ref": f"runs/{run_id}/final.json",
+        }
+
+    monkeypatch.setattr(RunService, "start", terminal_start)
+    return starts
 
 
 def _prepend_duplicate_json_field(path: Path, field: str, value: object) -> None:
@@ -1389,7 +1629,7 @@ def test_existing_receipt_wins_over_a_live_execution_claim(tmp_path: Path) -> No
         key,
     )
     assert isinstance(lease, eval_module.ExecutionLease)
-    receipt = _terminal_receipt(lease.request, lease.execution)
+    receipt = _terminal_receipt(root, lease.request, lease.execution)
     receipt_path = (
         root
         / "eval"
@@ -1434,7 +1674,7 @@ def test_receipt_publication_linearizes_before_released_claim_becomes_lost(
         key,
     )
     assert isinstance(lease, eval_module.ExecutionLease)
-    receipt = _terminal_receipt(lease.request, lease.execution)
+    receipt = _terminal_receipt(root, lease.request, lease.execution)
     receipt_path = (
         root
         / "eval"
@@ -1495,7 +1735,7 @@ def test_existing_receipt_must_match_the_local_execution_claim(tmp_path: Path) -
         key,
     )
     assert isinstance(lease, eval_module.ExecutionLease)
-    receipt = _terminal_receipt(lease.request, lease.execution)
+    receipt = _terminal_receipt(root, lease.request, lease.execution)
     receipt["execution_sha256"] = "f" * 64
     receipt["receipt_sha256"] = record_sha256(receipt, "receipt_sha256")
     receipt = validate_measurement_receipt(receipt)
@@ -1574,7 +1814,7 @@ def test_eval_rejects_duplicate_keys_at_persisted_json_boundaries(
                 / "execution.json"
             )
         else:
-            receipt = _terminal_receipt(lease.request, lease.execution)
+            receipt = _terminal_receipt(root, lease.request, lease.execution)
             target = (
                 root
                 / "eval"
@@ -1811,3 +2051,1104 @@ def test_crash_after_claim_publication_never_transfers_execution(
     ]
     assert not (root / ".worktree").exists()
     assert not (root / ".aros" / "runs").exists()
+
+
+@requires_linux_claims
+def test_visible_eval_uses_one_run_and_parses_verified_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    manifest, _apparatus_tree, _manifest_commit = _init_evaluator_repository(root)
+    (root / ".gitignore").write_text("/.aros/\n/.worktree/\n", encoding="utf-8")
+    _git(root, "add", ".gitignore")
+    _git(root, "commit", "-qm", "ignore evaluation worktrees")
+    candidate_commit = _git(root, "rev-parse", "HEAD")
+    service = EvalService(root)
+    service.register(
+        "eval/suites/quality/1/manifest.json",
+        actor="registrar",
+    )
+    stdout = b'{"schema_version":1,"metric":0.25,"sample_count":4}\n'
+    stderr = b"diagnostic only\n"
+    calls: list[tuple[object, ...]] = []
+
+    class FactualRunService:
+        def __init__(self, run_root: str | Path):
+            assert Path(run_root) == root
+            calls.append(("construct",))
+            self.manifest: dict[str, object] | None = None
+            self.status_count = 0
+
+        def prepare_bundle(
+            self,
+            bundle: worktrees_module.ExecutionBundle,
+            argv: list[str],
+            *,
+            cwd: str,
+            timeout_seconds: float,
+            success_exit_codes: list[int],
+            idempotency_key: str,
+            actor: str,
+            label: str | None = None,
+        ) -> dict[str, object]:
+            calls.append(
+                (
+                    "prepare_bundle",
+                    bundle,
+                    argv,
+                    cwd,
+                    timeout_seconds,
+                    success_exit_codes,
+                    idempotency_key,
+                    actor,
+                    label,
+                )
+            )
+            self.manifest = {
+                "run_id": "RUN-visible-one",
+                "manifest_sha256": "a" * 64,
+                "execution_bundle": {
+                    "candidate": {
+                        "path": "candidate",
+                        "commit": bundle.candidate.commit,
+                        "tree": bundle.candidate.tree,
+                    },
+                    "apparatus": {
+                        "path": "apparatus",
+                        "commit": bundle.apparatus.commit,
+                        "tree": bundle.apparatus.tree,
+                    },
+                    "temp": "tmp",
+                    "bundle_sha256": bundle.bundle_sha256,
+                },
+            }
+            return self.manifest
+
+        def start(self, run_id: str, *, actor: str | None = None) -> dict[str, object]:
+            calls.append(("start", run_id, actor))
+            return {"run_id": run_id, "state": "launched"}
+
+        def status(self, run_id: str) -> dict[str, object]:
+            calls.append(("status", run_id))
+            self.status_count += 1
+            if self.status_count == 1:
+                return {"run_id": run_id, "state": "running"}
+            assert self.manifest is not None
+            final = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "manifest_sha256": self.manifest["manifest_sha256"],
+                "state": "completed",
+                "candidate_commit": candidate_commit,
+                "execution_bundle": self.manifest["execution_bundle"],
+                "stdout": {
+                    "path": f".aros/runs/{run_id}/stdout.log",
+                    "bytes": len(stdout),
+                    "sha256": hashlib.sha256(stdout).hexdigest(),
+                },
+                "stderr": {
+                    "path": f".aros/runs/{run_id}/stderr.log",
+                    "bytes": len(stderr),
+                    "sha256": hashlib.sha256(stderr).hexdigest(),
+                },
+                "finished_at": "2026-08-04T00:00:00.000Z",
+            }
+            final_path = root / "runs" / run_id / "final.json"
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            final_path.write_text(json.dumps(final), encoding="utf-8")
+            return {
+                "run_id": run_id,
+                "state": "completed",
+                "final_ref": f"runs/{run_id}/final.json",
+            }
+
+        def read_verified_output(
+            self,
+            run_id: str,
+            stream: str,
+            max_bytes: int = 65_536,
+        ) -> bytes:
+            calls.append(("read_verified_output", run_id, stream, max_bytes))
+            assert (root / "runs" / run_id / "final.json").is_file()
+            return stdout if stream == "stdout" else stderr
+
+        def read_validated_final(self, run_id: str) -> dict[str, object]:
+            return json.loads(
+                (root / "runs" / run_id / "final.json").read_text(encoding="utf-8")
+            )
+
+    monkeypatch.setattr(eval_module, "RunService", FactualRunService, raising=False)
+
+    receipt = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key="visible-one-run",
+    )
+
+    assert receipt["evaluation_state"] == "completed"
+    assert receipt["referenced_process_state"] == "completed"
+    assert receipt["measurement_state"] == "valid"
+    assert receipt["metric"] == 0.25
+    assert receipt["sample_count"] == 4
+    assert receipt["bundle_cleanup_state"] == "removed"
+    prepare = [call for call in calls if call[0] == "prepare_bundle"]
+    assert len(prepare) == 1
+    assert prepare[0][2:6] == (
+        manifest["scorer_argv"],
+        manifest["scorer_cwd"],
+        manifest["resource_limits"]["timeout_seconds"],
+        manifest["success_exit_codes"],
+    )
+    assert type(prepare[0][4]) is type(manifest["resource_limits"]["timeout_seconds"])
+    assert len([call for call in calls if call[0] == "start"]) == 1
+    assert [call[0] for call in calls].count("read_verified_output") == 2
+    assert not (root / ".worktree" / "eval" / receipt["eval_id"]).exists()
+    receipt_path = root / "eval" / "evaluations" / receipt["eval_id"] / "receipt.json"
+    assert validate_measurement_receipt(
+        json.loads(receipt_path.read_text(encoding="utf-8"))
+    ) == receipt
+
+
+@requires_linux_claims
+@pytest.mark.parametrize(
+    (
+        "case",
+        "run_state",
+        "stdout",
+        "minimum",
+        "minimum_samples",
+        "expected_state",
+        "expected_metric",
+        "expected_samples",
+    ),
+    (
+        (
+            "underpowered",
+            "completed",
+            b'{"schema_version":1,"metric":0.2,"sample_count":1}\n',
+            0,
+            5,
+            "underpowered",
+            0.2,
+            1,
+        ),
+        (
+            "invalid",
+            "completed",
+            b"worker prose is not a metric\n",
+            0,
+            1,
+            "invalid_eval",
+            None,
+            None,
+        ),
+        (
+            "valid-negative",
+            "completed",
+            b'{"schema_version":1,"metric":-0.25,"sample_count":3}\n',
+            -1,
+            1,
+            "valid",
+            -0.25,
+            3,
+        ),
+        (
+            "failed-process",
+            "failed_process",
+            b'{"schema_version":1,"metric":0.9,"sample_count":9}\n',
+            0,
+            1,
+            "not_available",
+            None,
+            None,
+        ),
+        (
+            "timed-out",
+            "timed_out",
+            b"not parsed after timeout\n",
+            0,
+            1,
+            "not_available",
+            None,
+            None,
+        ),
+        (
+            "cancelled",
+            "cancelled",
+            b"not parsed after cancellation\n",
+            0,
+            1,
+            "not_available",
+            None,
+            None,
+        ),
+    ),
+)
+def test_visible_eval_separates_failed_invalid_underpowered_and_valid_negative(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    run_state: str,
+    stdout: bytes,
+    minimum: int | float,
+    minimum_samples: int,
+    expected_state: str,
+    expected_metric: int | float | None,
+    expected_samples: int | None,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(
+        root,
+        minimum=minimum,
+        minimum_samples=minimum_samples,
+    )
+    starts = _install_terminal_run(
+        root,
+        monkeypatch,
+        state=run_state,
+        stdout=stdout,
+    )
+
+    receipt = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key=f"visible-{case}",
+    )
+
+    assert receipt["referenced_process_state"] == run_state
+    assert receipt["measurement_state"] == expected_state
+    assert receipt["metric"] == expected_metric
+    assert receipt["sample_count"] == expected_samples
+    assert len(starts) == 1
+
+
+@requires_linux_claims
+def test_visible_eval_uses_terminal_final_from_start_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state="failed_process",
+        stdout=b"",
+        stderr=b"carrier launch failed\n",
+    )
+    terminal_start = RunService.start
+    starts = 0
+
+    def fail_after_final(
+        run_service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        nonlocal starts
+        starts += 1
+        terminal_start(run_service, run_id, actor=actor)
+        raise RunError("tmux launch failed after writing final")
+
+    monkeypatch.setattr(RunService, "start", fail_after_final)
+
+    receipt = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key="visible-terminal-start-failure",
+    )
+
+    assert starts == 1
+    assert receipt["referenced_process_state"] == "failed_process"
+    assert receipt["measurement_state"] == "not_available"
+
+
+@requires_linux_claims
+def test_run_lost_makes_eval_lost_without_receipt_or_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    starts: list[str] = []
+
+    def lost_start(
+        _service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        del actor
+        starts.append(run_id)
+        status_path = root / ".aros" / "runs" / run_id / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        status.update(
+            {
+                "state": "lost",
+                "reason": "process_absent_without_final_receipt",
+                "updated_at": "2026-08-04T00:00:00.000Z",
+            }
+        )
+        atomic_write_json(status_path, status)
+        return {
+            "run_id": run_id,
+            "state": "lost",
+            "reason": "process_absent_without_final_receipt",
+            "updated_at": "2026-08-04T00:00:00.000Z",
+        }
+
+    monkeypatch.setattr(RunService, "start", lost_start)
+
+    result = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key="visible-run-lost",
+    )
+
+    assert isinstance(result, eval_module.ExistingEvaluation)
+    assert result.status == {
+        "eval_id": result.status["eval_id"],
+        "evaluation_state": "lost",
+        "referenced_process_state": "lost",
+        "measurement_state": "not_available",
+        "run_id": starts[0],
+        "receipt_ref": None,
+        "reason": "process_absent_without_final_receipt",
+        "updated_at": "2026-08-04T00:00:00.000Z",
+    }
+    assert len(starts) == 1
+    assert not (
+        root / "eval" / "evaluations" / str(result.status["eval_id"]) / "receipt.json"
+    ).exists()
+    assert (root / ".worktree" / "eval" / str(result.status["eval_id"])).is_dir()
+
+    def forbidden_side_effect(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("lost evaluation replay must have no side effects")
+
+    monkeypatch.setattr(
+        worktrees_module,
+        "create_execution_bundle",
+        forbidden_side_effect,
+    )
+    monkeypatch.setattr(RunService, "prepare_bundle", forbidden_side_effect)
+    monkeypatch.setattr(RunService, "start", forbidden_side_effect)
+    monkeypatch.setattr(service, "_publish_visible_receipt", forbidden_side_effect)
+
+    replay = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key="visible-run-lost",
+    )
+
+    assert isinstance(replay, eval_module.ExistingEvaluation)
+    assert replay.status["evaluation_state"] == "lost"
+    assert replay.status["referenced_process_state"] == "lost"
+    assert replay.status["run_id"] == starts[0]
+    assert len(starts) == 1
+
+
+@requires_linux_claims
+def test_same_lost_key_never_prepares_starts_attaches_or_finalizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    prepared: list[str] = []
+    real_prepare = RunService.prepare_bundle
+
+    def counting_prepare(
+        run_service: RunService,
+        bundle: worktrees_module.ExecutionBundle,
+        argv: list[str],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        manifest = real_prepare(run_service, bundle, argv, **kwargs)  # type: ignore[arg-type]
+        prepared.append(str(manifest["run_id"]))
+        return manifest
+
+    def crash_before_start(
+        _service: RunService,
+        _run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        del actor
+        raise RuntimeError("injected crash before Run start")
+
+    monkeypatch.setattr(RunService, "prepare_bundle", counting_prepare)
+    monkeypatch.setattr(RunService, "start", crash_before_start)
+    with pytest.raises(RuntimeError, match="before Run start"):
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key="visible-linked-prepared-loss",
+        )
+
+    assert len(prepared) == 1
+    run_id = prepared[0]
+    eval_id = "EVAL-" + hashlib.sha256(
+        b"visible-linked-prepared-loss"
+    ).hexdigest()
+    link_path = root / ".aros" / "evaluations" / eval_id / "run.json"
+    assert link_path.is_file()
+    assert RunService(root).status(run_id, reconcile=False)["state"] == "prepared"
+
+    def forbidden_side_effect(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("lost evaluation must never resume its attempt")
+
+    monkeypatch.setattr(
+        worktrees_module,
+        "create_execution_bundle",
+        forbidden_side_effect,
+    )
+    monkeypatch.setattr(RunService, "prepare_bundle", forbidden_side_effect)
+    monkeypatch.setattr(RunService, "start", forbidden_side_effect)
+    monkeypatch.setattr(
+        worktrees_module,
+        "remove_clean_execution_bundle",
+        forbidden_side_effect,
+    )
+    monkeypatch.setattr(service, "_publish_visible_receipt", forbidden_side_effect)
+
+    replay = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key="visible-linked-prepared-loss",
+    )
+
+    assert isinstance(replay, eval_module.ExistingEvaluation)
+    assert replay.status["evaluation_state"] == "lost"
+    assert replay.status["referenced_process_state"] == "prepared"
+    assert replay.status["run_id"] == run_id
+    assert len(list((root / "runs").glob("RUN-*/manifest.json"))) == 1
+    assert (root / ".worktree" / "eval" / eval_id).is_dir()
+    assert not (root / "eval" / "evaluations" / eval_id / "receipt.json").exists()
+
+
+@requires_linux_claims
+def test_broker_loss_after_run_final_never_reconstructs_measurement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    starts = _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.8,"sample_count":8}\n',
+    )
+
+    def crash_before_finalization(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("injected broker loss after Run final")
+
+    monkeypatch.setattr(
+        service,
+        "_publish_visible_receipt",
+        crash_before_finalization,
+    )
+    with pytest.raises(RuntimeError, match="after Run final"):
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key="visible-final-broker-loss",
+        )
+
+    assert len(starts) == 1
+    run_id = starts[0]
+    eval_id = "EVAL-" + hashlib.sha256(b"visible-final-broker-loss").hexdigest()
+    assert (root / "runs" / run_id / "final.json").is_file()
+    assert not (root / "eval" / "evaluations" / eval_id / "receipt.json").exists()
+
+    def forbidden_side_effect(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("released broker must never reconstruct measurement")
+
+    monkeypatch.setattr(
+        worktrees_module,
+        "create_execution_bundle",
+        forbidden_side_effect,
+    )
+    monkeypatch.setattr(RunService, "prepare_bundle", forbidden_side_effect)
+    monkeypatch.setattr(RunService, "start", forbidden_side_effect)
+    monkeypatch.setattr(RunService, "read_verified_output", forbidden_side_effect)
+    monkeypatch.setattr(eval_module, "parse_scalar_metric", forbidden_side_effect)
+    monkeypatch.setattr(
+        worktrees_module,
+        "remove_clean_execution_bundle",
+        forbidden_side_effect,
+    )
+    monkeypatch.setattr(service, "_publish_visible_receipt", forbidden_side_effect)
+
+    replay = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key="visible-final-broker-loss",
+    )
+
+    assert isinstance(replay, eval_module.ExistingEvaluation)
+    assert replay.status["evaluation_state"] == "lost"
+    assert replay.status["referenced_process_state"] == "completed"
+    assert replay.status["measurement_state"] == "not_available"
+    assert replay.status["run_id"] == run_id
+    assert not (root / "eval" / "evaluations" / eval_id / "receipt.json").exists()
+
+
+@requires_linux_claims
+def test_receipt_replay_requires_full_run_link_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.6,"sample_count":6}\n',
+    )
+    key = "visible-receipt-run-link-lineage"
+    receipt = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key=key,
+    )
+    assert receipt["measurement_state"] == "valid"
+    eval_id = str(receipt["eval_id"])
+    link_path = root / ".aros" / "evaluations" / eval_id / "run.json"
+    run_link = json.loads(link_path.read_text(encoding="utf-8"))
+    run_link["bundle_sha256"] = "0" * 64
+    run_link["run_link_sha256"] = record_sha256(
+        run_link,
+        "run_link_sha256",
+    )
+    atomic_write_json(link_path, run_link)
+
+    with pytest.raises(EvalError, match="Run link|lineage"):
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key=key,
+        )
+
+
+@requires_linux_claims
+@pytest.mark.parametrize(
+    ("run_state", "measurement_state"),
+    (("completed", "invalid_eval"), ("failed_process", "not_available")),
+)
+@pytest.mark.parametrize("bundle_drift", ("dirty", "ambiguous"))
+def test_visible_eval_removes_exact_clean_bundle_and_preserves_dirty_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_state: str,
+    measurement_state: str,
+    bundle_drift: str,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state=run_state,
+        stdout=b'{"schema_version":1,"metric":0.7,"sample_count":7}\n',
+    )
+    terminal_start = RunService.start
+
+    def dirty_after_final(
+        run_service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        status = terminal_start(run_service, run_id, actor=actor)
+        run_manifest = json.loads(
+            (root / "runs" / run_id / "manifest.json").read_text(encoding="utf-8")
+        )
+        bundle_root = root / str(run_manifest["repository_ref"])
+        if bundle_drift == "dirty":
+            (bundle_root / "candidate" / "untracked-result.txt").write_text(
+                "preserve this dirty evaluation evidence\n",
+                encoding="utf-8",
+            )
+        else:
+            marker = bundle_root / "candidate" / ".git"
+            saved = marker.with_name(".git.saved")
+            marker.rename(saved)
+            marker.symlink_to(saved.name)
+        return status
+
+    monkeypatch.setattr(RunService, "start", dirty_after_final)
+
+    receipt = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key=f"visible-{bundle_drift}-bundle-{run_state}",
+    )
+
+    eval_id = str(receipt["eval_id"])
+    bundle_root = root / ".worktree" / "eval" / eval_id
+    assert receipt["referenced_process_state"] == run_state
+    assert receipt["measurement_state"] == measurement_state
+    assert receipt["metric"] is None
+    assert receipt["sample_count"] is None
+    assert receipt["bundle_cleanup_state"] == "preserved"
+    if bundle_drift == "dirty":
+        assert (bundle_root / "candidate" / "untracked-result.txt").is_file()
+    else:
+        assert (bundle_root / "candidate" / ".git").is_symlink()
+        assert (bundle_root / "candidate" / ".git.saved").is_file()
+    assert (bundle_root / "apparatus").is_dir()
+
+
+@requires_linux_claims
+def test_partial_bundle_removal_without_receipt_is_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    starts = _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.4,"sample_count":4}\n',
+    )
+    real_remove_checkout = worktrees_module.remove_clean_checkout
+    removals = 0
+
+    def remove_candidate_then_fail(
+        repository: worktrees_module.RepositoryBinding,
+        checkout: worktrees_module.CheckoutBinding,
+    ) -> bool:
+        nonlocal removals
+        removals += 1
+        if removals == 1:
+            return real_remove_checkout(repository, checkout)
+        raise worktrees_module.WorktreeError("injected apparatus removal failure")
+
+    monkeypatch.setattr(
+        worktrees_module,
+        "remove_clean_checkout",
+        remove_candidate_then_fail,
+    )
+    key = "visible-partial-cleanup-loss"
+    with pytest.raises(
+        worktrees_module.BundleRemovalError,
+        match="removal failed",
+    ) as failure:
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key=key,
+        )
+
+    assert len(starts) == 1
+    eval_id = "EVAL-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+    bundle_root = root / ".worktree" / "eval" / eval_id
+    assert not (bundle_root / "candidate").exists()
+    assert (bundle_root / "apparatus").is_dir()
+    assert failure.value.removed == (bundle_root / "candidate",)
+    assert failure.value.remaining == (bundle_root / "apparatus",)
+    registrations = _git(root, "worktree", "list", "--porcelain")
+    assert str(bundle_root / "candidate") not in registrations
+    assert str(bundle_root / "apparatus") in registrations
+    assert not (root / "eval" / "evaluations" / eval_id / "receipt.json").exists()
+
+    def forbidden_cleanup(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("lost replay must never resume partial cleanup")
+
+    monkeypatch.setattr(
+        worktrees_module,
+        "remove_clean_execution_bundle",
+        forbidden_cleanup,
+    )
+    replay = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key=key,
+    )
+
+    assert isinstance(replay, eval_module.ExistingEvaluation)
+    assert replay.status["evaluation_state"] == "lost"
+    assert replay.status["referenced_process_state"] == "completed"
+    assert replay.status["measurement_state"] == "not_available"
+    assert not (root / "eval" / "evaluations" / eval_id / "receipt.json").exists()
+
+
+@requires_linux_claims
+def test_cleanup_ambiguity_before_first_removal_is_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.4,"sample_count":4}\n',
+    )
+
+    def ambiguous_before_removal(
+        _repository: worktrees_module.RepositoryBinding,
+        bundle: worktrees_module.ExecutionBundle,
+    ) -> bool:
+        raise worktrees_module.BundleRemovalError(
+            (),
+            (bundle.candidate.path, bundle.apparatus.path),
+        )
+
+    monkeypatch.setattr(
+        worktrees_module,
+        "remove_clean_execution_bundle",
+        ambiguous_before_removal,
+    )
+
+    receipt = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key="visible-pre-removal-ambiguity",
+    )
+
+    bundle_root = root / ".worktree" / "eval" / str(receipt["eval_id"])
+    assert receipt["measurement_state"] == "invalid_eval"
+    assert receipt["bundle_cleanup_state"] == "preserved"
+    assert (bundle_root / "candidate").is_dir()
+    assert (bundle_root / "apparatus").is_dir()
+
+
+@requires_linux_claims
+def test_completed_output_integrity_failure_is_invalid_eval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.9,"sample_count":9}\n',
+    )
+    terminal_start = RunService.start
+
+    def drift_output_after_final(
+        run_service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        status = terminal_start(run_service, run_id, actor=actor)
+        log = root / ".aros" / "runs" / run_id / "stdout.log"
+        log.write_bytes(log.read_bytes() + b"post-final drift\n")
+        return status
+
+    monkeypatch.setattr(RunService, "start", drift_output_after_final)
+
+    receipt = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key="visible-output-integrity-failure",
+    )
+
+    assert receipt["referenced_process_state"] == "completed"
+    assert receipt["measurement_state"] == "invalid_eval"
+    assert receipt["metric"] is None
+    assert receipt["sample_count"] is None
+    assert receipt["bundle_cleanup_state"] == "removed"
+
+
+@requires_linux_claims
+@pytest.mark.parametrize("tamper", ("launch-lineage", "schema", "timestamp"))
+def test_corrupt_run_final_never_reads_output_cleans_or_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    _install_terminal_run(
+        root,
+        monkeypatch,
+        state="completed",
+        stdout=b'{"schema_version":1,"metric":0.9,"sample_count":9}\n',
+    )
+    terminal_start = RunService.start
+
+    def corrupt_after_final(
+        run_service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        status = terminal_start(run_service, run_id, actor=actor)
+        final_path = root / "runs" / run_id / "final.json"
+        final = json.loads(final_path.read_text(encoding="utf-8"))
+        if tamper == "launch-lineage":
+            final["launch_receipt_sha256"] = "b" * 64
+        elif tamper == "schema":
+            final["schema_version"] = 2
+        else:
+            final["finalized_at"] = "2026-08-04T00:00:00.000Z"
+            assert final["finalized_at"] != final["finished_at"]
+        atomic_write_json(final_path, final)
+        return status
+
+    monkeypatch.setattr(RunService, "start", corrupt_after_final)
+
+    def forbidden_after_invalid_final(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("invalid Run final must stop before output or cleanup")
+
+    monkeypatch.setattr(
+        RunService,
+        "read_verified_output",
+        forbidden_after_invalid_final,
+    )
+    monkeypatch.setattr(
+        worktrees_module,
+        "remove_clean_execution_bundle",
+        forbidden_after_invalid_final,
+    )
+    key = f"visible-corrupt-final-{tamper}"
+    with pytest.raises(EvalError, match="Run final"):
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key=key,
+        )
+
+    eval_id = "EVAL-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+    receipt_path = root / "eval" / "evaluations" / eval_id / "receipt.json"
+    assert not receipt_path.exists()
+    assert (root / ".worktree" / "eval" / eval_id).is_dir()
+
+    replay = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key=key,
+    )
+    assert isinstance(replay, eval_module.ExistingEvaluation)
+    assert replay.status["evaluation_state"] == "lost"
+    assert replay.status["referenced_process_state"] == "completed"
+    assert not receipt_path.exists()
+
+
+@requires_linux_claims
+@pytest.mark.parametrize(
+    "checkpoint",
+    (
+        "before_bundle",
+        "after_bundle",
+        "before_prepare",
+        "after_prepare",
+        "before_link",
+        "after_link",
+        "before_start",
+        "after_start",
+        "before_cleanup",
+        "after_cleanup",
+        "after_receipt",
+    ),
+)
+def test_visible_eval_fault_boundaries_never_resume_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+) -> None:
+    root = tmp_path / "repository"
+    service, _manifest, candidate_commit = _registered_visible_run_service(root)
+    key = f"visible-fault-{checkpoint}"
+    eval_id = "EVAL-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+    evaluation_root = root / ".aros" / "evaluations" / eval_id
+    bundle_root = root / ".worktree" / "eval" / eval_id
+    receipt_path = root / "eval" / "evaluations" / eval_id / "receipt.json"
+
+    def injected() -> None:
+        raise RuntimeError(f"injected {checkpoint} crash")
+
+    real_create_bundle = worktrees_module.create_execution_bundle
+    real_prepare = RunService.prepare_bundle
+    real_publish_link = service._publish_run_link
+    if checkpoint == "before_bundle":
+        monkeypatch.setattr(
+            worktrees_module,
+            "create_execution_bundle",
+            lambda *_args, **_kwargs: injected(),
+        )
+    elif checkpoint == "after_bundle":
+        def crash_after_bundle(*args: object, **kwargs: object) -> object:
+            real_create_bundle(*args, **kwargs)  # type: ignore[arg-type]
+            injected()
+
+        monkeypatch.setattr(
+            worktrees_module,
+            "create_execution_bundle",
+            crash_after_bundle,
+        )
+    elif checkpoint == "before_prepare":
+        monkeypatch.setattr(
+            RunService,
+            "prepare_bundle",
+            lambda *_args, **_kwargs: injected(),
+        )
+    elif checkpoint == "after_prepare":
+        def crash_after_prepare(*args: object, **kwargs: object) -> object:
+            real_prepare(*args, **kwargs)  # type: ignore[arg-type]
+            injected()
+
+        monkeypatch.setattr(RunService, "prepare_bundle", crash_after_prepare)
+    elif checkpoint == "before_link":
+        monkeypatch.setattr(
+            service,
+            "_publish_run_link",
+            lambda *_args, **_kwargs: injected(),
+        )
+    elif checkpoint == "after_link":
+        def crash_after_link(*args: object, **kwargs: object) -> object:
+            real_publish_link(*args, **kwargs)  # type: ignore[arg-type]
+            injected()
+
+        monkeypatch.setattr(service, "_publish_run_link", crash_after_link)
+    elif checkpoint == "before_start":
+        monkeypatch.setattr(
+            RunService,
+            "start",
+            lambda *_args, **_kwargs: injected(),
+        )
+    elif checkpoint == "after_start":
+        def crash_after_start(
+            _run_service: RunService,
+            run_id: str,
+            *,
+            actor: str | None = None,
+        ) -> object:
+            del actor
+            status_path = root / ".aros" / "runs" / run_id / "status.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status.update(
+                {
+                    "state": "running",
+                    "updated_at": "2026-08-04T00:00:00.000Z",
+                }
+            )
+            atomic_write_json(status_path, status)
+            injected()
+
+        monkeypatch.setattr(RunService, "start", crash_after_start)
+    else:
+        _install_terminal_run(
+            root,
+            monkeypatch,
+            state="completed",
+            stdout=b'{"schema_version":1,"metric":0.3,"sample_count":3}\n',
+        )
+        if checkpoint == "before_cleanup":
+            monkeypatch.setattr(
+                worktrees_module,
+                "remove_clean_execution_bundle",
+                lambda *_args, **_kwargs: injected(),
+            )
+        else:
+            real_create_json = eval_module.create_json
+
+            def crash_at_receipt(path: str | Path, value: object) -> bool:
+                if Path(path) == receipt_path:
+                    if checkpoint == "after_receipt":
+                        assert real_create_json(path, value) is True
+                    injected()
+                return real_create_json(path, value)
+
+            monkeypatch.setattr(eval_module, "create_json", crash_at_receipt)
+
+    with pytest.raises(RuntimeError, match=f"injected {checkpoint}"):
+        service.run(
+            "quality",
+            "1",
+            candidate_commit,
+            actor="principal",
+            idempotency_key=key,
+        )
+
+    before_replay = {
+        "bundle": bundle_root.exists(),
+        "runs": sorted(str(path) for path in (root / "runs").glob("RUN-*/manifest.json")),
+        "link": (evaluation_root / "run.json").exists(),
+        "receipt": receipt_path.exists(),
+    }
+    monkeypatch.undo()
+
+    def forbidden_side_effect(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("lost replay must never resume a faulted attempt")
+
+    monkeypatch.setattr(
+        worktrees_module,
+        "create_execution_bundle",
+        forbidden_side_effect,
+    )
+    monkeypatch.setattr(RunService, "prepare_bundle", forbidden_side_effect)
+    monkeypatch.setattr(RunService, "start", forbidden_side_effect)
+    monkeypatch.setattr(
+        worktrees_module,
+        "remove_clean_execution_bundle",
+        forbidden_side_effect,
+    )
+    monkeypatch.setattr(service, "_publish_visible_receipt", forbidden_side_effect)
+
+    replay = service.run(
+        "quality",
+        "1",
+        candidate_commit,
+        actor="principal",
+        idempotency_key=key,
+    )
+
+    assert isinstance(replay, eval_module.ExistingEvaluation)
+    if checkpoint == "after_receipt":
+        assert replay.status["evaluation_state"] == "completed"
+    else:
+        assert replay.status["evaluation_state"] == "lost"
+        assert replay.status["measurement_state"] == "not_available"
+    assert {
+        "bundle": bundle_root.exists(),
+        "runs": sorted(str(path) for path in (root / "runs").glob("RUN-*/manifest.json")),
+        "link": (evaluation_root / "run.json").exists(),
+        "receipt": receipt_path.exists(),
+    } == before_replay

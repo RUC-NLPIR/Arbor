@@ -15,6 +15,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -34,6 +35,7 @@ from .store import (
     manifest_sha256 as _manifest_sha256,
     process_start_token as _process_start_token,
     read_json,
+    read_json_strict,
     utc_now as _utc_now,
 )
 from .worktrees import (
@@ -45,6 +47,10 @@ from .worktrees import (
 
 
 _RUN_ID = re.compile(r"^RUN-[A-Za-z0-9][A-Za-z0-9-]*$")
+_UTC_TIMESTAMP = re.compile(
+    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+    r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{3}Z$"
+)
 _TERMINAL_STATES = {
     "completed",
     "failed_process",
@@ -53,6 +59,43 @@ _TERMINAL_STATES = {
     "lost",
 }
 _ACTIVE_STATES = {"launched", "running"}
+_CONTENT_RECEIPT_FIELDS = {"path", "bytes", "sha256"}
+_FINAL_REQUIRED_FIELDS = {
+    "schema_version",
+    "state",
+    "exit_code",
+    "started_at",
+    "finished_at",
+    "finalized_at",
+    "resource_usage",
+    "launch_receipt_sha256",
+    "stdout",
+    "stderr",
+}
+_FINAL_OPTIONAL_FIELDS = {
+    "duration_seconds",
+    "host",
+    "actual_environment_sha256",
+    "stop",
+    "signal_sequence",
+    "error",
+}
+_PRELAUNCH_FIELDS = {
+    "schema_version",
+    "receipt_id",
+    "kind",
+    "run_id",
+    "actor",
+    "created_at",
+    "base_commit",
+    "manifest_sha256",
+    "carrier",
+    "tmux_session",
+    "host",
+    "runner_version",
+    "runner_invocation",
+    "receipt_sha256",
+}
 _ALLOWED_SIGNALS = {
     "TERM": signal.SIGTERM,
     "KILL": signal.SIGKILL,
@@ -521,6 +564,218 @@ class RunService:
             size = handle.tell()
             handle.seek(max(0, size - max_bytes))
             return handle.read().decode("utf-8", errors="replace")
+
+    def read_verified_output(
+        self,
+        run_id: str,
+        stream: str,
+        max_bytes: int = 65_536,
+    ) -> bytes:
+        """Read one terminal Run log exactly as bound by its final receipt."""
+        self._validate_run_id(run_id)
+        if stream not in {"stdout", "stderr"}:
+            raise RunError("stream must be 'stdout' or 'stderr'")
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+            raise RunError("max_bytes must be a positive integer")
+        final = self.read_validated_final(run_id)
+        content = final.get(stream)
+        canonical = f".aros/runs/{run_id}/{stream}.log"
+        if (
+            not isinstance(content, dict)
+            or set(content) != _CONTENT_RECEIPT_FIELDS
+            or content.get("path") != canonical
+        ):
+            raise RunError(f"invalid {stream} receipt path: {run_id}")
+        declared_size = content.get("bytes")
+        declared_sha256 = content.get("sha256")
+        if (
+            type(declared_size) is not int
+            or declared_size < 0
+            or declared_size > max_bytes
+            or not isinstance(declared_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", declared_sha256) is None
+        ):
+            raise RunError(f"invalid verified {stream} receipt: {run_id}")
+        path = self.root / canonical
+        try:
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise RunError(
+                    f"verified {stream} must be a single-link regular file: {run_id}"
+                )
+            if metadata.st_size != declared_size:
+                raise RunError(f"verified {stream} size differs from receipt: {run_id}")
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as error:
+            raise RunError(f"unable to read verified {stream}: {run_id}") from error
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_size != declared_size
+                or (opened.st_dev, opened.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+            ):
+                raise RunError(f"verified {stream} identity differs: {run_id}")
+            chunks: list[bytes] = []
+            remaining = declared_size
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if remaining or os.read(descriptor, 1):
+                raise RunError(f"verified {stream} size differs from receipt: {run_id}")
+            raw = b"".join(chunks)
+            after_open = os.fstat(descriptor)
+            after_path = path.lstat()
+            for observed in (after_open, after_path):
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or observed.st_nlink != 1
+                    or observed.st_size != declared_size
+                    or (observed.st_dev, observed.st_ino)
+                    != (metadata.st_dev, metadata.st_ino)
+                ):
+                    raise RunError(f"verified {stream} identity changed: {run_id}")
+        except OSError as error:
+            raise RunError(f"unable to read verified {stream}: {run_id}") from error
+        finally:
+            os.close(descriptor)
+        if hashlib.sha256(raw).hexdigest() != declared_sha256:
+            raise RunError(f"verified {stream} hash differs from receipt: {run_id}")
+        return raw
+
+    def read_validated_final(self, run_id: str) -> dict[str, object]:
+        """Load one terminal final with complete manifest and launch lineage."""
+        self._validate_run_id(run_id)
+        manifest = self._load_manifest(run_id)
+        final = _read_strict_object(self._final_path(run_id), "final receipt")
+        status = _read_strict_object(
+            self._runtime_path(run_id) / "status.json",
+            "run status",
+        )
+        prelaunch = _read_strict_object(
+            self._receipts_path() / f"{run_id}-prelaunch.json",
+            "prelaunch receipt",
+        )
+        identity = _final_identity(manifest)
+        required_fields = set(identity) | _FINAL_REQUIRED_FIELDS
+        if not required_fields <= set(final) or not set(final) <= (
+            required_fields | _FINAL_OPTIONAL_FIELDS
+        ):
+            raise RunError(f"invalid final receipt fields: {run_id}")
+        state = final.get("state")
+        exit_code = final.get("exit_code")
+        started_at = final.get("started_at")
+        finished_at = final.get("finished_at")
+        resource_usage = final.get("resource_usage")
+        launch_sha256 = final.get("launch_receipt_sha256")
+        if (
+            final.get("schema_version") != 1
+            or state not in (_TERMINAL_STATES - {"lost"})
+            or type(exit_code) not in {int, type(None)}
+            or not _valid_utc_timestamp(started_at)
+            or not _valid_utc_timestamp(finished_at)
+            or final.get("finalized_at") != finished_at
+            or str(started_at) > str(finished_at)
+            or not isinstance(resource_usage, dict)
+            or set(resource_usage) != {"wall_seconds"}
+            or type(resource_usage.get("wall_seconds")) not in {int, float}
+            or resource_usage["wall_seconds"] < 0
+            or not isinstance(launch_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", launch_sha256) is None
+            or any(final.get(field) != value for field, value in identity.items())
+        ):
+            raise RunError(f"invalid final receipt: {run_id}")
+        if state == "completed" and (
+            type(exit_code) is not int
+            or exit_code not in manifest.get("success_exit_codes", [])
+        ):
+            raise RunError(f"completed final has an unsuccessful exit code: {run_id}")
+        duration = final.get("duration_seconds")
+        if duration is not None and (
+            type(duration) not in {int, float}
+            or duration < 0
+            or duration != resource_usage["wall_seconds"]
+        ):
+            raise RunError(f"invalid final duration: {run_id}")
+        if "host" in final and (
+            not isinstance(final["host"], str) or not final["host"]
+        ):
+            raise RunError(f"invalid final host: {run_id}")
+        if "actual_environment_sha256" in final and (
+            not isinstance(final["actual_environment_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", final["actual_environment_sha256"])
+            is None
+        ):
+            raise RunError(f"invalid final environment hash: {run_id}")
+        if "stop" in final and not isinstance(final["stop"], dict):
+            raise RunError(f"invalid final stop record: {run_id}")
+        signals = final.get("signal_sequence")
+        if signals is not None and (
+            not isinstance(signals, list)
+            or not signals
+            or any(signal_name not in _ALLOWED_SIGNALS for signal_name in signals)
+        ):
+            raise RunError(f"invalid final signal sequence: {run_id}")
+        if "error" in final and (
+            not isinstance(final["error"], str) or not final["error"]
+        ):
+            raise RunError(f"invalid final error: {run_id}")
+        for stream in ("stdout", "stderr"):
+            content = final.get(stream)
+            if (
+                not isinstance(content, dict)
+                or set(content) != _CONTENT_RECEIPT_FIELDS
+                or content.get("path") != f".aros/runs/{run_id}/{stream}.log"
+                or type(content.get("bytes")) is not int
+                or content["bytes"] < 0
+                or not isinstance(content.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", content["sha256"]) is None
+            ):
+                raise RunError(f"invalid final {stream} receipt: {run_id}")
+        if (
+            status.get("schema_version") != 1
+            or status.get("run_id") != run_id
+            or status.get("state") != state
+            or status.get("manifest_sha256") != manifest.get("manifest_sha256")
+            or status.get("launch_receipt_sha256") != launch_sha256
+            or status.get("launched_at") != prelaunch.get("created_at")
+            or status.get("finished_at") != finished_at
+            or status.get("final_ref") != f"runs/{run_id}/final.json"
+        ):
+            raise RunError(f"final and status lineage mismatch: {run_id}")
+        invocation = prelaunch.get("runner_invocation")
+        if (
+            set(prelaunch) != _PRELAUNCH_FIELDS
+            or prelaunch.get("schema_version") != 1
+            or prelaunch.get("receipt_id") != f"{run_id}-prelaunch"
+            or prelaunch.get("kind") != "run_prelaunch"
+            or prelaunch.get("run_id") != run_id
+            or not isinstance(prelaunch.get("actor"), str)
+            or not prelaunch["actor"]
+            or not _valid_utc_timestamp(prelaunch.get("created_at"))
+            or prelaunch.get("base_commit") != manifest.get("base_commit")
+            or prelaunch.get("manifest_sha256") != manifest.get("manifest_sha256")
+            or prelaunch.get("carrier") != "tmux"
+            or prelaunch.get("tmux_session") != f"aros-{run_id.lower()}"
+            or not isinstance(prelaunch.get("host"), str)
+            or not prelaunch["host"]
+            or prelaunch.get("runner_version") != 1
+            or not isinstance(invocation, list)
+            or not invocation
+            or any(not isinstance(item, str) or not item for item in invocation)
+            or prelaunch.get("receipt_sha256") != _receipt_sha256(prelaunch)
+            or prelaunch.get("receipt_sha256") != launch_sha256
+        ):
+            raise RunError(f"invalid prelaunch receipt lineage: {run_id}")
+        return final
 
     def stop(
         self,
@@ -1100,6 +1355,16 @@ def _validate_text(value: str, field: str) -> str:
     return value.strip()
 
 
+def _valid_utc_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or _UTC_TIMESTAMP.fullmatch(value) is None:
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return False
+    return True
+
+
 def _normalize_label(label: str | None) -> str:
     raw = "run" if label is None else _validate_text(label, "label")
     normalized = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")[:32]
@@ -1109,6 +1374,16 @@ def _normalize_label(label: str | None) -> str:
 def _read_object(path: Path, description: str) -> dict[str, object]:
     try:
         value = read_json(path)
+    except (OSError, ValueError) as error:
+        raise RunError(f"unable to read {description}: {path}") from error
+    if not isinstance(value, dict):
+        raise RunError(f"invalid {description}: {path}")
+    return value
+
+
+def _read_strict_object(path: Path, description: str) -> dict[str, object]:
+    try:
+        value = read_json_strict(path)
     except (OSError, ValueError) as error:
         raise RunError(f"unable to read {description}: {path}") from error
     if not isinstance(value, dict):

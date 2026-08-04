@@ -10,15 +10,22 @@ import socket
 import stat
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from . import eval_records as _eval_records
 from . import store as _store
 from . import worktrees as _worktrees
-from .eval_records import parse_visible_manifest, validate_measurement_receipt
+from .eval_records import (
+    build_measurement_receipt,
+    parse_scalar_metric,
+    parse_visible_manifest,
+    validate_measurement_receipt,
+)
 from .receipts import record_sha256
-from .store import create_json, file_lock, read_json_strict, utc_now
+from .runs import RunService
+from .store import create_json, file_lock, json_sha256, read_json_strict, utc_now
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -160,6 +167,265 @@ class EvalService:
         if not create_json(path, descriptor):
             raise EvalError(f"evaluator descriptor already exists: {path}")
         return descriptor
+
+    def run(
+        self,
+        evaluator_id: str,
+        version: str,
+        candidate_commit: str,
+        *,
+        actor: str,
+        idempotency_key: str,
+    ) -> dict[str, object] | ExistingEvaluation:
+        """Execute one visible evaluation through the durable Run service."""
+        attempt = self._begin_execution(
+            evaluator_id,
+            version,
+            candidate_commit,
+            actor,
+            idempotency_key,
+        )
+        if isinstance(attempt, ExistingEvaluation):
+            return attempt
+        with attempt as lease:
+            request = lease.request
+            execution = lease.execution
+            descriptor = self._load_descriptor(evaluator_id, version)
+            if (
+                descriptor["descriptor_sha256"] != request["descriptor_sha256"]
+                or descriptor["apparatus_commit"] != request["apparatus_commit"]
+            ):
+                raise EvalError("evaluator descriptor differs from the frozen request")
+            bundle = _worktrees.create_execution_bundle(
+                self.repository,
+                self.root / ".worktree" / "eval" / str(request["eval_id"]),
+                str(request["candidate_commit"]),
+                str(request["apparatus_commit"]),
+            )
+            _worktrees.validate_execution_bundle(self.repository, bundle)
+            runs = RunService(self.root)
+            resource_limits = descriptor["resource_limits"]
+            assert isinstance(resource_limits, dict)
+            manifest = runs.prepare_bundle(
+                bundle,
+                list(descriptor["scorer_argv"]),  # type: ignore[arg-type]
+                cwd=str(descriptor["scorer_cwd"]),
+                timeout_seconds=resource_limits["timeout_seconds"],  # type: ignore[arg-type]
+                success_exit_codes=list(  # type: ignore[arg-type]
+                    descriptor["success_exit_codes"]
+                ),
+                idempotency_key=str(request["eval_id"]),
+                actor=str(request["actor"]),
+            )
+            run_link = self._publish_run_link(request, execution, bundle, manifest)
+            try:
+                status = runs.start(
+                    str(run_link["run_id"]),
+                    actor=str(request["actor"]),
+                )
+            except ValueError:
+                status = runs.status(str(run_link["run_id"]))
+                if status.get("state") not in {
+                    "completed",
+                    "failed_process",
+                    "timed_out",
+                    "cancelled",
+                    "lost",
+                }:
+                    raise
+            while status.get("state") in {"launched", "running"}:
+                time.sleep(0.02)
+                status = runs.status(str(run_link["run_id"]))
+            if status.get("state") == "lost":
+                return self._linked_lost_evaluation(request, run_link, status)
+            return self._publish_visible_receipt(
+                request,
+                execution,
+                descriptor,
+                bundle,
+                run_link,
+                status,
+                runs,
+            )
+
+    def _linked_lost_evaluation(
+        self,
+        request: dict[str, object],
+        run_link: dict[str, object],
+        run_status: dict[str, object],
+        reason: str | None = None,
+    ) -> ExistingEvaluation:
+        run_reason = run_status.get("reason")
+        updated_at = run_status.get("updated_at")
+        return ExistingEvaluation(
+            {
+                "eval_id": request["eval_id"],
+                "evaluation_state": "lost",
+                "referenced_process_state": run_status.get("state"),
+                "measurement_state": "not_available",
+                "run_id": run_link["run_id"],
+                "receipt_ref": None,
+                "reason": reason
+                or (run_reason if isinstance(run_reason, str) else "execution was lost"),
+                "updated_at": updated_at if isinstance(updated_at, str) else utc_now(),
+            }
+        )
+
+    def _publish_run_link(
+        self,
+        request: dict[str, object],
+        execution: dict[str, object],
+        bundle: _worktrees.ExecutionBundle,
+        manifest: dict[str, object],
+    ) -> dict[str, object]:
+        run_link: dict[str, object] = {
+            "schema_version": 1,
+            "eval_id": request["eval_id"],
+            "request_sha256": request["request_sha256"],
+            "execution_sha256": execution["execution_sha256"],
+            "run_id": manifest["run_id"],
+            "run_manifest_sha256": manifest["manifest_sha256"],
+            "bundle_sha256": bundle.bundle_sha256,
+            "candidate_commit": request["candidate_commit"],
+            "apparatus_commit": request["apparatus_commit"],
+            "linked_at": utc_now(),
+        }
+        run_link["run_link_sha256"] = record_sha256(
+            run_link,
+            "run_link_sha256",
+        )
+        path = (
+            self.root
+            / ".aros"
+            / "evaluations"
+            / str(request["eval_id"])
+            / "run.json"
+        )
+        if not create_json(path, run_link):
+            raise EvalError("evaluation Run link already exists")
+        try:
+            return dict(
+                _eval_records._validate_run_link(run_link, request, execution)
+            )
+        except ValueError as error:
+            raise EvalError("evaluation Run link is invalid") from error
+
+    def _publish_visible_receipt(
+        self,
+        request: dict[str, object],
+        execution: dict[str, object],
+        descriptor: dict[str, object],
+        bundle: _worktrees.ExecutionBundle,
+        run_link: dict[str, object],
+        status: dict[str, object],
+        runs: RunService,
+    ) -> dict[str, object]:
+        run_id = str(run_link["run_id"])
+        expected_final_ref = f"runs/{run_id}/final.json"
+        process_state = status.get("state")
+        if process_state not in {
+            "completed",
+            "failed_process",
+            "timed_out",
+            "cancelled",
+        } or status.get("final_ref") != expected_final_ref:
+            raise EvalError("visible evaluation Run is not terminal")
+        try:
+            final_value = runs.read_validated_final(run_id)
+        except ValueError as error:
+            raise EvalError("visible evaluation Run final is invalid") from error
+        if final_value.get("state") != process_state:
+            raise EvalError("visible evaluation Run final state differs from status")
+        output_valid = True
+        try:
+            stdout = runs.read_verified_output(run_id, "stdout")
+            stderr = runs.read_verified_output(run_id, "stderr")
+        except ValueError:
+            stdout = stderr = b""
+            output_valid = False
+        if output_valid:
+            for stream, raw in (("stdout", stdout), ("stderr", stderr)):
+                content = final_value.get(stream)
+                if (
+                    not isinstance(content, dict)
+                    or set(content) != {"path", "bytes", "sha256"}
+                    or content.get("path") != f".aros/runs/{run_id}/{stream}.log"
+                    or content.get("bytes") != len(raw)
+                    or content.get("sha256") != hashlib.sha256(raw).hexdigest()
+                ):
+                    output_valid = False
+                    break
+        metric_contract = descriptor["metric_output"]
+        assert isinstance(metric_contract, dict)
+        if process_state == "completed":
+            if output_valid:
+                try:
+                    measurement = parse_scalar_metric(stdout, metric_contract)
+                except ValueError:
+                    measurement = {
+                        "measurement_state": "invalid_eval",
+                        "metric": None,
+                        "sample_count": None,
+                        "metric_name": metric_contract["metric_name"],
+                        "parser": metric_contract["parser"],
+                    }
+            else:
+                measurement = {
+                    "measurement_state": "invalid_eval",
+                    "metric": None,
+                    "sample_count": None,
+                    "metric_name": metric_contract["metric_name"],
+                    "parser": metric_contract["parser"],
+                }
+        else:
+            measurement = {
+                "measurement_state": "not_available",
+                "metric": None,
+                "sample_count": None,
+                "metric_name": metric_contract["metric_name"],
+                "parser": metric_contract["parser"],
+            }
+        cleanup_state = "preserved"
+        try:
+            _worktrees.validate_execution_bundle(self.repository, bundle)
+        except _worktrees.WorktreeError:
+            pass
+        else:
+            try:
+                removed = _worktrees.remove_clean_execution_bundle(
+                    self.repository,
+                    bundle,
+                )
+            except _worktrees.BundleRemovalError as error:
+                if error.removed:
+                    raise
+            else:
+                if removed:
+                    cleanup_state = "removed"
+        if cleanup_state == "preserved" and process_state == "completed":
+            measurement = {
+                "measurement_state": "invalid_eval",
+                "metric": None,
+                "sample_count": None,
+                "metric_name": metric_contract["metric_name"],
+                "parser": metric_contract["parser"],
+            }
+        try:
+            receipt = build_measurement_receipt(
+                request,
+                execution,
+                run_link,
+                final_value,
+                str(measurement["measurement_state"]),
+                measurement,
+                cleanup_state,
+            )
+        except ValueError as error:
+            raise EvalError("visible evaluation receipt is invalid") from error
+        path = self._receipt_path(str(request["eval_id"]))
+        if not create_json(path, receipt):
+            raise EvalError("visible evaluation receipt already exists")
+        return receipt
 
     def _publish_request(
         self,
@@ -312,6 +578,11 @@ class EvalService:
         if receipt is not None:
             if receipt["execution_sha256"] != execution["execution_sha256"]:
                 raise EvalError("existing receipt execution lineage mismatch")
+            self._validate_receipt_run_lineage(
+                request,
+                execution,
+                receipt,
+            )
             return ExistingEvaluation(receipt)
         if execution["host"] != socket.gethostname():
             return self._receipt_or_lost(
@@ -355,6 +626,28 @@ class EvalService:
         receipt = self._load_receipt(request, execution)
         if receipt is not None:
             return ExistingEvaluation(receipt)
+        run_link = self._load_run_link(request, execution)
+        if run_link is not None:
+            run_status = self._linked_run_status(request, run_link)
+            referenced_state = run_status.get("state")
+            evaluation_state = (
+                "finalizing"
+                if referenced_state
+                in {"completed", "failed_process", "timed_out", "cancelled"}
+                else "running"
+            )
+            return ExistingEvaluation(
+                {
+                    "eval_id": request["eval_id"],
+                    "evaluation_state": evaluation_state,
+                    "referenced_process_state": referenced_state,
+                    "measurement_state": "not_available",
+                    "run_id": run_link["run_id"],
+                    "receipt_ref": None,
+                    "reason": "execution claim is live",
+                    "updated_at": run_status.get("updated_at", execution["claimed_at"]),
+                }
+            )
         return ExistingEvaluation(
             {
                 "eval_id": request["eval_id"],
@@ -402,6 +695,8 @@ class EvalService:
             and receipt["execution_sha256"] != execution["execution_sha256"]
         ):
             raise EvalError("existing receipt execution lineage mismatch")
+        if execution is not None:
+            self._validate_receipt_run_lineage(request, execution, receipt)
         return receipt
 
     def _receipt_or_lost(
@@ -415,7 +710,135 @@ class EvalService:
             if execution is None:
                 raise EvalError("existing receipt execution lineage is missing")
             return ExistingEvaluation(receipt)
+        if execution is not None:
+            run_link = self._load_run_link(request, execution)
+            if run_link is not None:
+                run_status = self._linked_run_status(request, run_link)
+                return self._linked_lost_evaluation(
+                    request,
+                    run_link,
+                    run_status,
+                    reason,
+                )
         return self._lost_evaluation(request, reason)
+
+    def _load_run_link(
+        self,
+        request: dict[str, object],
+        execution: dict[str, object],
+    ) -> dict[str, object] | None:
+        path = (
+            self.root
+            / ".aros"
+            / "evaluations"
+            / str(request["eval_id"])
+            / "run.json"
+        )
+        try:
+            value = read_json_strict(path)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as error:
+            raise EvalError("existing evaluation Run link is invalid") from error
+        try:
+            return dict(_eval_records._validate_run_link(value, request, execution))
+        except ValueError as error:
+            raise EvalError("existing evaluation Run link is invalid") from error
+
+    def _validate_receipt_run_lineage(
+        self,
+        request: dict[str, object],
+        execution: dict[str, object],
+        receipt: dict[str, object],
+    ) -> None:
+        run_link = self._load_run_link(request, execution)
+        if run_link is None:
+            raise EvalError("existing receipt Run link lineage is missing")
+        self._linked_run_status(request, run_link)
+        run_id = str(run_link["run_id"])
+        try:
+            final_value = RunService(self.root).read_validated_final(run_id)
+        except ValueError as error:
+            raise EvalError("existing receipt Run final lineage is invalid") from error
+        measurement = {
+            "measurement_state": receipt["measurement_state"],
+            "metric": receipt["metric"],
+            "sample_count": receipt["sample_count"],
+            "metric_name": receipt["metric_name"],
+            "parser": receipt["parser"],
+        }
+        try:
+            rebuilt = build_measurement_receipt(
+                request,
+                execution,
+                run_link,
+                final_value,
+                str(receipt["measurement_state"]),
+                measurement,
+                str(receipt["bundle_cleanup_state"]),
+            )
+        except ValueError as error:
+            raise EvalError("existing receipt Run lineage is invalid") from error
+        if rebuilt != receipt:
+            raise EvalError("existing receipt Run lineage is invalid")
+
+    def _linked_run_status(
+        self,
+        request: dict[str, object],
+        run_link: dict[str, object],
+    ) -> dict[str, object]:
+        run_id = str(run_link["run_id"])
+        try:
+            runs = RunService(self.root)
+            status = runs.status(run_id)
+            manifest_value = read_json_strict(
+                self.root / "runs" / run_id / "manifest.json"
+            )
+        except (OSError, ValueError) as error:
+            raise EvalError("linked Run lineage is invalid") from error
+        if not isinstance(manifest_value, dict):
+            raise EvalError("linked Run manifest is invalid")
+        bundle = manifest_value.get("execution_bundle")
+        if not isinstance(bundle, dict):
+            raise EvalError("linked Run bundle lineage is invalid")
+        portable = {
+            "candidate": bundle.get("candidate"),
+            "apparatus": bundle.get("apparatus"),
+            "temp": bundle.get("temp"),
+        }
+        candidate = bundle.get("candidate")
+        apparatus = bundle.get("apparatus")
+        if (
+            status.get("run_id") != run_id
+            or status.get("manifest_sha256") != run_link["run_manifest_sha256"]
+            or manifest_value.get("manifest_sha256")
+            != run_link["run_manifest_sha256"]
+            or manifest_value.get("repository_ref")
+            != f".worktree/eval/{request['eval_id']}"
+            or manifest_value.get("candidate_commit")
+            != run_link["candidate_commit"]
+            or set(bundle) != {
+                "candidate",
+                "apparatus",
+                "temp",
+                "bundle_sha256",
+            }
+            or not isinstance(candidate, dict)
+            or not isinstance(apparatus, dict)
+            or set(candidate) != {"path", "commit", "tree"}
+            or set(apparatus) != {"path", "commit", "tree"}
+            or candidate.get("path") != "candidate"
+            or apparatus.get("path") != "apparatus"
+            or candidate.get("commit") != run_link["candidate_commit"]
+            or apparatus.get("commit") != run_link["apparatus_commit"]
+            or not _is_commit(candidate.get("tree"))
+            or not _is_commit(apparatus.get("tree"))
+            or bundle.get("temp") != "tmp"
+            or bundle.get("bundle_sha256") != run_link["bundle_sha256"]
+            or json_sha256(portable) != run_link["bundle_sha256"]
+        ):
+            raise EvalError("linked Run lineage is invalid")
+        return status
 
     def _lost_evaluation(
         self,

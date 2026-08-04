@@ -34,6 +34,23 @@ class WorktreeError(ValueError):
     """Raised when repository or checkout authority is unsafe or ambiguous."""
 
 
+class BundleRemovalError(WorktreeError):
+    """Report exactly which bundle checkouts were removed before failure."""
+
+    def __init__(
+        self,
+        removed: tuple[Path, ...],
+        remaining: tuple[Path, ...],
+    ):
+        self.removed = removed
+        self.remaining = remaining
+        super().__init__(
+            "execution bundle removal failed; "
+            f"removed={[str(path) for path in removed]}; "
+            f"remaining={[str(path) for path in remaining]}"
+        )
+
+
 @dataclass(frozen=True)
 class RepositoryBinding:
     root: Path
@@ -238,9 +255,13 @@ def remove_clean_execution_bundle(
     bundle: ExecutionBundle,
 ) -> bool:
     """Remove both exact checkouts only when both are clean."""
-    _validate_execution_bundle_authority(repo, bundle)
-    candidate_clean = _checkout_is_clean(repo, bundle.candidate)
-    apparatus_clean = _checkout_is_clean(repo, bundle.apparatus)
+    checkouts = (bundle.candidate, bundle.apparatus)
+    try:
+        _validate_execution_bundle_authority(repo, bundle)
+        candidate_clean = _checkout_is_clean(repo, bundle.candidate)
+        apparatus_clean = _checkout_is_clean(repo, bundle.apparatus)
+    except WorktreeError as error:
+        raise BundleRemovalError((), tuple(item.path for item in checkouts)) from error
     if not candidate_clean or not apparatus_clean:
         return False
     try:
@@ -254,18 +275,16 @@ def remove_clean_execution_bundle(
         registrations = _parse_worktree_registrations(
             _git_bytes(repo, "worktree", "list", "--porcelain", "-z", "--expire=now")
         )
-        removed: list[str] = []
-        remaining: list[str] = []
-        for checkout in (bundle.candidate, bundle.apparatus):
+        removed: list[Path] = []
+        remaining: list[Path] = []
+        for checkout in checkouts:
             registered = any(
                 _same_path(str(record["worktree"]), checkout.path)
                 for record in registrations
             )
             destination = removed if not _path_exists(checkout.path) and not registered else remaining
-            destination.append(str(checkout.path))
-        raise WorktreeError(
-            f"execution bundle removal failed; removed={removed}; remaining={remaining}"
-        ) from error
+            destination.append(checkout.path)
+        raise BundleRemovalError(tuple(removed), tuple(remaining)) from error
     return True
 
 

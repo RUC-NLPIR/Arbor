@@ -20,12 +20,14 @@ from pathlib import Path
 import pytest
 
 import arbor.aros.runner as runner_module
+import arbor.aros.runs as runs_module
 from arbor.aros.isolation import (
     ENVIRONMENT_POLICY,
     NETWORK_POLICY,
     IsolationError,
     probe_isolated_linux,
 )
+from arbor.aros.receipts import record_sha256
 from arbor.aros.runs import RunError, RunService
 from arbor.aros.store import atomic_write_json, manifest_sha256
 from arbor.aros.worktrees import (
@@ -98,8 +100,41 @@ def _mark_runner_launched(
     manifest: dict[str, object],
 ) -> str:
     run_id = str(manifest["run_id"])
+    launched_at = str(manifest["created_at"])
+    session_name = f"aros-{run_id.lower()}"
+    prelaunch: dict[str, object] = {
+        "schema_version": 1,
+        "receipt_id": f"{run_id}-prelaunch",
+        "kind": "run_prelaunch",
+        "run_id": run_id,
+        "actor": manifest["actor"],
+        "created_at": launched_at,
+        "base_commit": manifest["base_commit"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "carrier": "tmux",
+        "tmux_session": session_name,
+        "host": "test-host",
+        "runner_version": 1,
+        "runner_invocation": [sys.executable, "-m", "arbor.aros.runner"],
+    }
+    prelaunch["receipt_sha256"] = record_sha256(prelaunch, "receipt_sha256")
+    atomic_write_json(
+        root / ".aros" / "receipts" / f"{run_id}-prelaunch.json",
+        prelaunch,
+    )
     launched = service.status(run_id, reconcile=False)
-    launched.update({"state": "launched", "launch_receipt_sha256": "a" * 64})
+    launched.update(
+        {
+            "state": "launched",
+            "actor": manifest["actor"],
+            "carrier": "tmux",
+            "tmux_session": session_name,
+            "host": "test-host",
+            "launch_receipt_sha256": prelaunch["receipt_sha256"],
+            "launched_at": launched_at,
+            "updated_at": launched_at,
+        }
+    )
     atomic_write_json(
         root / ".aros" / "runs" / run_id / "status.json",
         launched,
@@ -364,6 +399,129 @@ def test_existing_run_manifest_and_final_schema_remain_readable(
     assert runner_module.run(str(tmp_path), run_id) == 0
     assert manifest_path.read_bytes() == manifest_bytes
     assert final_path.read_bytes() == final_bytes
+
+
+def test_read_verified_output_returns_exact_terminal_log_bytes(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'exact metric bytes\\n')",
+        ],
+        key="verified-output-happy-path",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+
+    assert service.read_verified_output(run_id, "stdout") == b"exact metric bytes\n"
+    assert service.read_verified_output(run_id, "stderr") == b""
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "path",
+        "symlink",
+        "hardlink",
+        "size",
+        "hash",
+        "replacement",
+        "read-race",
+    ),
+)
+def test_verified_run_output_rejects_symlink_hardlink_hash_size_and_read_race(
+    tmp_path: Path,
+    tamper: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "print('receipt-bound')"],
+        key=f"verified-output-{tamper}",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    log = tmp_path / ".aros" / "runs" / run_id / "stdout.log"
+    if tamper in {"path", "size", "hash"}:
+        final_path = tmp_path / "runs" / run_id / "final.json"
+        final = json.loads(final_path.read_text(encoding="utf-8"))
+        if tamper == "path":
+            final["stdout"]["path"] = f".aros/runs/{run_id}/decoy.log"
+        elif tamper == "size":
+            final["stdout"]["bytes"] += 1
+        else:
+            final["stdout"]["sha256"] = "0" * 64
+        atomic_write_json(final_path, final)
+    elif tamper == "symlink":
+        backing = log.with_name("stdout-real.log")
+        log.rename(backing)
+        log.symlink_to(backing.name)
+    elif tamper == "hardlink":
+        log.with_name("stdout-alias.log").hardlink_to(log)
+    elif tamper == "replacement":
+        replacement = log.with_name("stdout-replacement.log")
+        replacement.write_bytes(log.read_bytes())
+        real_open = runs_module.os.open
+
+        def replace_before_open(
+            path: str | bytes | Path,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            if Path(path) == log and replacement.exists():
+                replacement.replace(log)
+            return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(runs_module.os, "open", replace_before_open)
+    elif tamper == "read-race":
+        replacement = log.with_name("stdout-post-read.log")
+        replacement.write_bytes(log.read_bytes())
+        real_read = runs_module.os.read
+
+        def replace_after_read(descriptor: int, size: int) -> bytes:
+            chunk = real_read(descriptor, size)
+            if chunk and replacement.exists():
+                replacement.replace(log)
+            return chunk
+
+        monkeypatch.setattr(runs_module.os, "read", replace_after_read)
+
+    with pytest.raises(RunError, match="final|path|regular|link|verified"):
+        service.read_verified_output(run_id, "stdout")
+
+
+@pytest.mark.parametrize("tamper", ("launch-lineage", "schema", "timestamp"))
+def test_read_verified_output_rejects_invalid_final_semantics(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "print('final semantics')"],
+        key=f"verified-final-{tamper}",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    final_path = tmp_path / "runs" / run_id / "final.json"
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    if tamper == "launch-lineage":
+        final["launch_receipt_sha256"] = "b" * 64
+    elif tamper == "schema":
+        final["schema_version"] = 2
+    else:
+        final["finalized_at"] = "2026-08-04T00:00:00.000Z"
+        assert final["finalized_at"] != final["finished_at"]
+    atomic_write_json(final_path, final)
+
+    with pytest.raises(RunError, match="final|lineage|timestamp"):
+        service.read_verified_output(run_id, "stdout")
 
 
 def test_prepare_defaults_to_isolated_linux_and_freezes_capability_policy(

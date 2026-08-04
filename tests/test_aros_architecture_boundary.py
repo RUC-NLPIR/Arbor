@@ -230,6 +230,45 @@ APPROVED_E4_SHIM_BLOB = "6e406e7fc783f6c7df5fa348dbed6e68790ba90a"
 OLD_E4_SHIM_BLOB = "0563f98a0d6061745c099c8fd32fbb64e668a866"
 
 
+def test_eval_module_has_no_process_or_process_final_implementation() -> None:
+    path = REPO_ROOT / "src" / "aros" / "eval.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    forbidden_modules = {"subprocess", "tmux", "prctl"}
+    forbidden_calls = {
+        "Popen",
+        "killpg",
+        "prctl",
+        "tmux",
+        "atomic_write_json",
+        "final_identity",
+        "_finish",
+        "_record_launch_failure",
+        "_write_event",
+    }
+    violations: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".", 1)[0] in forbidden_modules:
+                    violations.append((node.lineno, f"import {alias.name}"))
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.split(".", 1)[0] in forbidden_modules or module.endswith(
+                ("runner", "processes")
+            ):
+                violations.append((node.lineno, f"from {module}"))
+            if module == "runs" and {alias.name for alias in node.names} != {
+                "RunService"
+            }:
+                violations.append((node.lineno, "Eval may import only RunService"))
+        elif isinstance(node, ast.Call):
+            name = _terminal_name(node.func)
+            if name in forbidden_calls:
+                violations.append((node.lineno, str(name)))
+
+    assert violations == []
+
+
 def test_ci_legacy_freeze_uses_immutable_base_for_pull_requests_and_pushes() -> None:
     workflow = yaml.safe_load(
         (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(

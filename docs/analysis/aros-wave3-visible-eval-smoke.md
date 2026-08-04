@@ -40,6 +40,12 @@ receipt and was never retried. A separately committed evaluator version changed
 only the launcher to fixed `python3`; no AROS source or isolation policy was
 changed for commissioning.
 
+The original success, dirty, lost, cleanup, and gate sections below were
+executed at pre-hardening baseline
+`265aee93808d533d51005790e242c0222612ed10`. Their receipts remain preserved
+behavior evidence, but they do not by themselves prove the raw-checkout-byte
+verifier added later at `d5cbc7ec4ddd4b677e55df341912394d32e55846`.
+
 ## Source, entry, and environment
 
 ```text
@@ -488,6 +494,118 @@ architecture-boundary gates reached `16 passed` and `205 passed`; it approved
 with no Critical or Important findings. Both reviews explicitly confirmed no
 Eval-owned process stack, retry/attempt history, semantic verdict, protected
 admission claim, or M4 whole-port.
+
+## Post-hardening exact-byte recommission
+
+At exact code baseline
+`d5cbc7ec4ddd4b677e55df341912394d32e55846`, the same direct source entry,
+registered `quality/2` descriptor, candidate A, and apparatus B were reused.
+No manifest or fixture commit changed. The sole new Eval action was:
+
+```bash
+env PYTHONPATH=/workspace/Arbor/.worktree/aros-wave3-eval/src \
+  /workspace/Arbor/.worktree/aros-wave3-eval/.venv/bin/aros \
+  eval run quality 2 bd00b7c8c2ab339d253a775be78d5c5c84081cda \
+  --idempotency-key visible-postraw-success-1 \
+  --actor commissioning-principal \
+  --cwd /workspace/Arbor/.worktree/aros-wave3-eval/.worktree/commissioning/aros-wave3-visible-eval
+```
+
+It produced exactly:
+
+```text
+Eval: EVAL-74d8d73d70d6ec114b7cb562fa1d11888da66c12b863f45135ede49afe54fa5c
+Run:  RUN-20260804-064708-run-a897
+Candidate/tree: bd00b7c8c2ab339d253a775be78d5c5c84081cda / 3944cfb6bc9949457e02efcca4e799acefa22716
+Apparatus/tree: 714fcd7c8d7a5091a8913f9d60a2f687eed0c7c6 / 49f887a876687348ced8ee6c9933144d09be2ab0
+```
+
+The terminal receipt is `completed / completed / valid`, with metric `0.73`,
+sample count `20`, parser `aros.scalar-metric-v1`, and clean bundle state
+`removed`. Direct status returned the same terminal projection, direct observe
+returned `scorer-active mode=success`, and direct audit returned `valid=true`
+with `issues=[]`.
+
+The bounded external observer missed the eight-second live window, so this
+record does not claim a contemporaneous public `running` projection. The
+create-once prelaunch receipt, immutable final, and final-bound stderr instead
+bind launch at `2026-08-04T06:47:08.691Z`, process start at
+`2026-08-04T06:47:09.098Z`, finish at `2026-08-04T06:47:17.714Z`, duration
+`8.615249` seconds, exit code 0, and the active stderr marker. The retained
+mutable terminal status additionally records process PID/PGID `2844022` and
+start token `linux-proc-start:299059901`; its exact canonical and file hashes
+are recorded below without treating it as immutable. Together these records
+prove an active isolated process followed by terminal completion without
+inventing a missed observation.
+
+### Exact raw blob proof
+
+The hardened runner invokes `validate_execution_bundle` immediately before
+spawn; at this baseline that validator recomputes every stage-0 checkout blob
+OID from raw regular-file or symlink bytes and compares it with the index.
+Successful process spawn therefore passed raw validation for both Eval
+checkouts. After automatic Eval cleanup, a separate non-Eval A/B bundle was
+created, validated through the same hardened helper, enumerated, and removed
+through `remove_clean_execution_bundle`. It returned `validation=passed` and
+every comparison below returned `match=true`:
+
+| Checkout | Path | Mode | Bytes | Index/raw blob OID | Raw SHA-256 |
+| --- | --- | --- | ---: | --- | --- |
+| candidate | `.gitignore` | `100644` | 47 | `67bbbcbea17176b1135c6202d4f6a9385b39b505` | `5f3859832ccd7525fedab46195462e685da3d850965ad033256a6d4be6abe297` |
+| candidate | `candidate-mode.txt` | `100644` | 8 | `2e9ba477f89e86c5bbc86c0516283f59d8f6e178` | `81b2bd4ea98c8db66554fbc8d7637a1a69a130f331feb732b75caab4c4868fd5` |
+| apparatus | `.gitignore` | `100644` | 47 | `67bbbcbea17176b1135c6202d4f6a9385b39b505` | `5f3859832ccd7525fedab46195462e685da3d850965ad033256a6d4be6abe297` |
+| apparatus | `candidate-mode.txt` | `100644` | 8 | `2e9ba477f89e86c5bbc86c0516283f59d8f6e178` | `81b2bd4ea98c8db66554fbc8d7637a1a69a130f331feb732b75caab4c4868fd5` |
+| apparatus | `evaluation/score.py` | `100644` | 785 | `6662246f12945e90a93e8935e45ce2fa334cf3fc` | `cc6fbace33e56a404770ecc732d70deab4668e64b4bb5bd4bddaf8e037c1c86c` |
+
+The proof bundle had the same portable bundle hash
+`9aa903e71a440ab9ea814d02bf53889b73097545eea06e813a6566cde9bee6e6`.
+Clean-only removal returned `true`; the proof root and Eval bundle were absent,
+`git worktree list --porcelain` contained only the commissioning project, and
+that project had empty porcelain status.
+
+### Post-hardening authority hashes
+
+| Authority | Record/canonical hash | Exact file SHA-256 |
+| --- | --- | --- |
+| Descriptor | `555205a4eefa32868e6f8c1260678d4b47ea7a53ee0ea2f9186dcd84d00c6d2f` | `0841f20c01445c64be0a87007a5c2ae80af9e32b2a2f40f2030edb3d8d228afc` |
+| Request | `4d73282a22058c40a5948f0f24659444e963ca3842e6106aaef960df1436e58e` | `75402bd004b76c435decb461f38230fc973bb1640713cb5fcc64ac5c8c101407` |
+| Execution | `fc5e6fbae2d04bc885ba6196bcb840d8e64854ad7cc066306e0e7414078d5207` | `b3b222ccc9e9571b3c4b44feab77907f59bde41d87de98431cbc0bde3e63ceb4` |
+| Run link | `730b7104d9def57158e3e360994b9d40d97e2bf8fecdd628b0e75bf5f77440ef` | `9f8e5e5bc625daf038904db396fb3f1e03e1f00fed33a557159b48fe874c6a34` |
+| Run manifest | `02a02cc9d477592b42b29ba653921edd734d373ce3564d547caa710c895691df` | `f2b1bcd0e3c347114154532e9644a29670b147149b86516a8afff0a1db104adc` |
+| Prelaunch receipt | `d4af61b0950c52d56cdeb077c61fd79a25c6691584a994799557ec7444b47a24` | `d043003ffea9e783e3179479bedae64dd39b046713a497a0e0cb3fb4dde4ef2c` |
+| Run final | `64f0ec32aded25d3144dabcba691f862dcd1e5e1bae690476589213450994268` | `29bada42d042e6445cfdd7088aa8244551721c1a06c46cdb1ee6f3d1e5c1b902` |
+| Measurement receipt | `7e7c39173361a500378b91a33d44e1f809be4dbe817d1c5410ce94ebdb36b11c` | `ea456eb4ba1a05ea8bfec11e5f54954ae7e56808c78a9851cf598a5cc5db5b33` |
+| Run status | `ad774b1dbe378ceef5719e0aa941a622defe77168243a1e92abe4b68eb2ba891` | `211dcdc54be8eb33bbca3dc98f33f2279a1935e8c7490802b35b428d26c7361b` |
+| Launch event | `47c46bda8580c7b8b82f017d5f117edca480c118f9aa16ddfcbbd3763137de8c` | `7120064a684add3cbe9628e680a64dbeabdef147738f04338100941a645644b2` |
+| Completed event | `1babd7661896120762affbac1182ec6c108dfccb05960493c5654a479e14533c` | `246ef3e02ad4619ae12cd72d9a0e0d0beb17896025ca3b49cbd3673f6ac442ff` |
+| stdout | `3c23697adcaac8b32745a384aea6454d99efbaaa62830b03fcdaaa85ac3b42bf` (53 bytes) | same |
+| stderr | `9c714d89b5b3bfe7c5a001a7de46f912da77ebff20da1bd55e6ea3169286b9c8` (27 bytes) | same |
+
+The descriptor additionally retains manifest-blob SHA-256
+`fc4d277da358d6fe6c3de6cf90dee3ddd01668547f00b6f4f444170d7f2b19a8`;
+the receipt binds bundle SHA-256
+`9aa903e71a440ab9ea814d02bf53889b73097545eea06e813a6566cde9bee6e6`.
+
+### Post-hardening verification
+
+At exact baseline `d5cbc7ec4ddd4b677e55df341912394d32e55846`, the
+registry gate reached `16 passed in 0.18s`, the same six-suite module command
+listed above reached `427 passed in 66.90s`, and the fresh whole suite reached
+`1599 passed, 6 skipped in 336.45s`. Ruff reported `All checks passed!` for
+`src tests scripts`; `git diff --check` and
+`git diff --exit-code -- uv.lock` both exited 0. Cleanup checks found no Eval or
+raw-proof bundle, no associated tmux session, no detached registration, and no
+commissioning-project dirt.
+
+A fresh post-hardening spec reviewer found one Important wording issue: PID
+fields from mutable Run status had been grouped with immutable authority. The
+text now separates create-once prelaunch/immutable final/final-bound stderr
+from mutable terminal status; re-review approved with no remaining Critical or
+Important findings. Only afterward, a fresh quality/security/simplicity review
+approved with no Critical or Important findings. Its focused registry and raw
+validator gates reached `16 passed` and `5 passed`; it independently matched
+all hashes/OID rows, direct CLI results, cleanup/inventory, security boundaries,
+and the unchanged commissioning worktree.
 
 ## Limits and non-claims
 

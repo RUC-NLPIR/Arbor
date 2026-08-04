@@ -11,7 +11,7 @@ commissioned.
 - Branch: `aros-wave3-eval` in
   `/workspace/Arbor/.worktree/aros-wave3-eval`.
 - Commissioned visible-Eval code baseline:
-  `265aee93808d533d51005790e242c0222612ed10`.
+  `d5cbc7ec4ddd4b677e55df341912394d32e55846`.
 - Wave 3 visible evaluation is implemented and commissioned through the direct
   `aros eval register|run|status|observe|audit` surface. Registered evidence:
   `docs/analysis/aros-wave3-visible-eval-smoke.md`.
@@ -20,6 +20,11 @@ commissioned.
 - Real commissioning produced a `valid` scalar measurement from distinct exact
   candidate/apparatus commits, proved clean removal, and proved direct factual
   status, bounded observe, and lineage audit.
+- Post-hardening recommissioning proved that every stage-0 candidate/apparatus
+  index blob OID matched an OID recomputed from raw checkout bytes before clean
+  removal. The current exact Run again produced one valid measurement and a
+  valid audit; the original dirty/lost receipts remain pre-hardening behavior
+  evidence rather than proof of this raw-byte verifier.
 - External candidate dirt changed a completed process result to
   `measurement_state=invalid_eval`; both checkouts were preserved until the
   injected bytes were recorded, restored, and removed by the clean-only helper.
@@ -32,10 +37,11 @@ commissioned.
   attempt remains factual `failed_process/not_available` evidence and was not
   retried. The commissioned descriptor uses fixed `python3`; no isolation
   policy was weakened.
-- Fresh verification reached `422 passed` in the exact visible-Eval module
-  gate and `1594 passed, 6 skipped` in the whole suite. Ruff, registry, diff,
-  and `uv.lock` gates are clean. Independent spec and quality/security reviews
-  approved with no remaining Critical or Important findings.
+- Fresh post-hardening verification reached `427 passed` in the exact
+  visible-Eval module gate and `1599 passed, 6 skipped` in the whole suite.
+  Ruff, registry, diff, and `uv.lock` gates are clean. Sequential
+  post-hardening spec and quality/security reviews approved with no remaining
+  Critical or Important findings.
 - Wave 2 child-task evidence remains current. Task adapters are trusted-local,
   application-scoped, and not a security sandbox; their exact containment and
   filesystem-permission limits are unchanged.

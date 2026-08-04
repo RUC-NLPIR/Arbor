@@ -1093,6 +1093,67 @@ def test_start_fails_closed_when_tmux_is_missing(tmp_path: Path, monkeypatch) ->
     assert list((tmp_path / ".aros" / "events").glob("*.json")) == []
 
 
+def test_carrier_launch_failure_uses_immutable_lineage_for_terminal_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key="carrier-launch-failure")
+    run_id = str(manifest["run_id"])
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    real_run = subprocess.run
+
+    def fail_tmux(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if command[0] != "/test/tmux":
+            return real_run(command, **kwargs)
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        atomic_write_json(
+            status_path,
+            {
+                **status,
+                "actor": "forged-status-actor",
+                "host": "forged-status-host",
+                "launch_receipt_sha256": "f" * 64,
+            },
+        )
+        return subprocess.CompletedProcess(command, 7, "", "carrier refused")
+
+    monkeypatch.setattr(runs_module.shutil, "which", lambda _name: "/test/tmux")
+    monkeypatch.setattr(runs_module.subprocess, "run", fail_tmux)
+
+    with pytest.raises(RunError, match="tmux launch failed"):
+        service.start(run_id)
+
+    prelaunch = json.loads(
+        (
+            tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json"
+        ).read_text(encoding="utf-8")
+    )
+    final = service.read_validated_final(run_id)
+    expected_status = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": "failed_process",
+        "manifest_sha256": manifest["manifest_sha256"],
+        "actor": prelaunch["actor"],
+        "carrier": prelaunch["carrier"],
+        "tmux_session": prelaunch["tmux_session"],
+        "host": prelaunch["host"],
+        "launch_receipt_sha256": prelaunch["receipt_sha256"],
+        "launched_at": prelaunch["created_at"],
+        "started_at": final["started_at"],
+        "exit_code": None,
+        "finished_at": final["finished_at"],
+        "heartbeat_at": final["finished_at"],
+        "final_ref": f"runs/{run_id}/final.json",
+        "updated_at": final["finished_at"],
+    }
+
+    assert final["host"] == prelaunch["host"]
+    assert final["launch_receipt_sha256"] == prelaunch["receipt_sha256"]
+    assert json.loads(status_path.read_text(encoding="utf-8")) == expected_status
+
+
 def test_isolated_start_probe_failure_precedes_launch_receipt(
     tmp_path: Path,
     monkeypatch,
@@ -1692,28 +1753,12 @@ def test_repeated_start_reconciles_existing_final_before_reattach(
 ) -> None:
     _init_clean_repo(tmp_path)
     service, manifest = _prepare(tmp_path, key="completed-repeated-start")
-    run_id = str(manifest["run_id"])
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
     runtime = tmp_path / ".aros" / "runs" / run_id
     status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
-    status.update(
-        {
-            "state": "launched",
-            "launch_receipt_sha256": "a" * 64,
-        }
-    )
+    status["state"] = "launched"
     atomic_write_json(runtime / "status.json", status)
-    atomic_write_json(
-        tmp_path / "runs" / run_id / "final.json",
-        {
-            "schema_version": 1,
-            "run_id": run_id,
-            "state": "completed",
-            "manifest_sha256": manifest["manifest_sha256"],
-            "launch_receipt_sha256": "a" * 64,
-            "exit_code": 0,
-            "finished_at": manifest["created_at"],
-        },
-    )
 
     repeated = service.start(run_id)
 
@@ -2042,31 +2087,21 @@ def test_reconcile_absent_process_without_final_is_lost_not_failed(
     assert any(event["kind"] == "anomaly" for event in events)
 
 
-def test_reconcile_prefers_existing_final_receipt_over_stale_status(tmp_path: Path) -> None:
+def test_reconcile_prefers_existing_final_receipt_over_stale_status(
+    tmp_path: Path,
+) -> None:
     _init_clean_repo(tmp_path)
     service, manifest = _prepare(tmp_path)
-    run_id = str(manifest["run_id"])
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
     runtime = tmp_path / ".aros" / "runs" / run_id
-    final = {
-        "schema_version": 1,
-        "run_id": run_id,
-        "state": "completed",
-        "manifest_sha256": manifest["manifest_sha256"],
-        "launch_receipt_sha256": "a" * 64,
-        "exit_code": 0,
-        "finished_at": manifest["created_at"],
-    }
-    atomic_write_json(tmp_path / "runs" / run_id / "final.json", final)
+    status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
     atomic_write_json(
         runtime / "status.json",
         {
-            "schema_version": 1,
-            "run_id": run_id,
+            **status,
             "state": "running",
-            "manifest_sha256": manifest["manifest_sha256"],
-            "launch_receipt_sha256": "a" * 64,
             "process_pid": 999_999_999,
-            "updated_at": manifest["created_at"],
         },
     )
 
@@ -2074,11 +2109,12 @@ def test_reconcile_prefers_existing_final_receipt_over_stale_status(tmp_path: Pa
 
     assert status["state"] == "completed"
     assert status["exit_code"] == 0
-    completion_event = (
-        tmp_path / ".aros" / "events" / f"EVT-{run_id}-completed.json"
-    )
+    completion_event = tmp_path / ".aros" / "events" / f"EVT-{run_id}-completed.json"
     assert completion_event.is_file()
-    assert json.loads(completion_event.read_text(encoding="utf-8"))["kind"] == "run_completed"
+    assert (
+        json.loads(completion_event.read_text(encoding="utf-8"))["kind"]
+        == "run_completed"
+    )
 
 
 def test_list_fails_closed_on_unreadable_run_status(tmp_path: Path) -> None:
@@ -2129,38 +2165,29 @@ def test_status_retries_atomic_replacement_during_read(
 def test_reconcile_restores_missing_completion_event(tmp_path: Path) -> None:
     _init_clean_repo(tmp_path)
     service, manifest = _prepare(tmp_path)
-    run_id = str(manifest["run_id"])
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
     runtime = tmp_path / ".aros" / "runs" / run_id
+    event = tmp_path / ".aros" / "events" / f"EVT-{run_id}-completed.json"
+    event.unlink()
     status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
     status["state"] = "running"
-    status["launch_receipt_sha256"] = "a" * 64
     atomic_write_json(runtime / "status.json", status)
-    atomic_write_json(
-        tmp_path / "runs" / run_id / "final.json",
-        {
-            "schema_version": 1,
-            "run_id": run_id,
-            "state": "completed",
-            "manifest_sha256": manifest["manifest_sha256"],
-            "launch_receipt_sha256": "a" * 64,
-            "exit_code": 0,
-            "finished_at": manifest["created_at"],
-        },
-    )
 
     assert service.reconcile(run_id)["state"] == "completed"
-    event = tmp_path / ".aros" / "events" / f"EVT-{run_id}-completed.json"
     assert event.is_file()
     assert service.reconcile(run_id)["state"] == "completed"
     assert len(list((tmp_path / ".aros" / "events").glob("*.json"))) == 1
 
 
-def test_reconcile_rejects_final_while_matching_process_is_alive(
-    tmp_path: Path, monkeypatch,
+def test_reconcile_prefers_final_while_mutable_status_process_is_alive(
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     _init_clean_repo(tmp_path)
     service, manifest = _prepare(tmp_path)
-    run_id = str(manifest["run_id"])
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    assert runner_module.run(str(tmp_path), run_id) == 0
     runtime = tmp_path / ".aros" / "runs" / run_id
     status = json.loads((runtime / "status.json").read_text(encoding="utf-8"))
     status.update(
@@ -2168,25 +2195,15 @@ def test_reconcile_rejects_final_while_matching_process_is_alive(
             "state": "running",
             "process_pid": 12345,
             "process_start_token": "same-process",
-            "launch_receipt_sha256": "a" * 64,
         }
     )
     atomic_write_json(runtime / "status.json", status)
-    atomic_write_json(
-        tmp_path / "runs" / run_id / "final.json",
-        {
-            "schema_version": 1,
-            "run_id": run_id,
-            "state": "completed",
-            "manifest_sha256": manifest["manifest_sha256"],
-            "launch_receipt_sha256": "a" * 64,
-            "exit_code": 0,
-            "finished_at": manifest["created_at"],
-        },
-    )
     monkeypatch.setattr(
-        "arbor.aros.runs._process_start_token", lambda _pid: "same-process"
+        "arbor.aros.runs._process_start_token",
+        lambda _pid: pytest.fail("terminal reconciliation read mutable process state"),
     )
 
-    with pytest.raises(RunError, match="integrity conflict"):
-        service.reconcile(run_id)
+    reconciled = service.reconcile(run_id)
+
+    assert reconciled["state"] == "completed"
+    assert "process_pid" not in reconciled

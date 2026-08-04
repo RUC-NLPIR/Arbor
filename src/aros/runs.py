@@ -495,11 +495,11 @@ class RunService:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
-            self._record_launch_failure(manifest, launched_at, str(error))
+            self._record_launch_failure(manifest, str(error))
             raise RunError(f"tmux launch failed for {run_id}: {error}") from error
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip() or "unknown tmux error"
-            self._record_launch_failure(manifest, launched_at, detail)
+            self._record_launch_failure(manifest, detail)
             raise RunError(f"tmux launch failed for {run_id}: {detail}")
 
         deadline = time.monotonic() + 2
@@ -520,6 +520,8 @@ class RunService:
     ) -> dict[str, object]:
         manifest = self._load_manifest(run_id, reader=reader)
         status_path = self._runtime_path(run_id) / "status.json"
+        if reconcile and self._final_path(run_id).is_file():
+            return self.reconcile(run_id)
         if not status_path.is_file():
             raise RunError(f"run status does not exist: {run_id}")
         status = _read_run_status(status_path, reader=reader)
@@ -638,7 +640,6 @@ class RunService:
             max_bytes=max_bytes,
             capture=True,
             reader=reader,
-            for_audit=False,
         )
         assert isinstance(raw, bytes)
         return raw
@@ -649,7 +650,6 @@ class RunService:
         stream: str,
         *,
         reader: _JsonReader | None = None,
-        for_audit: bool = False,
     ) -> None:
         """Stream-verify one terminal Run log without retaining its bytes."""
         result = self._verify_output(
@@ -658,7 +658,6 @@ class RunService:
             max_bytes=None,
             capture=False,
             reader=reader,
-            for_audit=for_audit,
         )
         assert result is None
 
@@ -670,7 +669,6 @@ class RunService:
         max_bytes: int | None,
         capture: bool,
         reader: _JsonReader | None,
-        for_audit: bool,
     ) -> bytes | None:
         self._validate_run_id(run_id)
         if stream not in {"stdout", "stderr"}:
@@ -681,11 +679,7 @@ class RunService:
             or max_bytes <= 0
         ):
             raise RunError("max_bytes must be a positive integer")
-        final = self.read_validated_final(
-            run_id,
-            reader=reader,
-            for_audit=for_audit,
-        )
+        final = self.read_validated_final(run_id, reader=reader)
         content = final.get(stream)
         canonical = f".aros/runs/{run_id}/{stream}.log"
         if (
@@ -766,24 +760,24 @@ class RunService:
         run_id: str,
         *,
         reader: _JsonReader | None = None,
-        for_audit: bool = False,
     ) -> dict[str, object]:
         """Load one terminal final with complete manifest and launch lineage."""
         self._validate_run_id(run_id)
         manifest = self._load_manifest(run_id, reader=reader)
-        final = _read_strict_object(
-            self._final_path(run_id),
-            "final receipt",
-            reader=reader,
-        )
-        status = _read_strict_object(
-            self._runtime_path(run_id) / "status.json",
-            "run status",
-            reader=reader,
-        )
         prelaunch = _read_strict_object(
             self._receipts_path() / f"{run_id}-prelaunch.json",
             "prelaunch receipt",
+            reader=reader,
+        )
+        _validate_prelaunch_receipt(
+            prelaunch,
+            manifest,
+            expected_session=f"aros-{run_id.lower()}",
+            expected_invocation=_runner_invocation(self.root, run_id),
+        )
+        final = _read_strict_object(
+            self._final_path(run_id),
+            "final receipt",
             reader=reader,
         )
         identity = _final_identity(manifest)
@@ -861,41 +855,9 @@ class RunService:
                 or re.fullmatch(r"[0-9a-f]{64}", content["sha256"]) is None
             ):
                 raise RunError(f"invalid final {stream} receipt: {run_id}")
-        if (
-            status.get("schema_version") != 1
-            or status.get("run_id") != run_id
-            or status.get("manifest_sha256") != manifest.get("manifest_sha256")
-            or status.get("launch_receipt_sha256") != launch_sha256
-            or status.get("launched_at") != prelaunch.get("created_at")
-            or status.get("finished_at") != finished_at
-            or (
-                not for_audit
-                and (
-                    status.get("state") != state
-                    or status.get("final_ref") != f"runs/{run_id}/final.json"
-                )
-            )
-        ):
-            raise RunError(f"final and status lineage mismatch: {run_id}")
-        expected_actor = status.get("actor")
-        expected_host = status.get("host")
-        if (
-            not isinstance(expected_actor, str)
-            or not expected_actor
-            or not isinstance(expected_host, str)
-            or not expected_host
-        ):
-            raise RunError(f"invalid launch provenance in status: {run_id}")
-        _validate_prelaunch_receipt(
-            prelaunch,
-            manifest,
-            expected_actor=expected_actor,
-            expected_host=expected_host,
-            expected_session=f"aros-{run_id.lower()}",
-            expected_invocation=_runner_invocation(self.root, run_id),
-            status=status,
-        )
-        if final_host != expected_host:
+        if launch_sha256 != prelaunch.get("receipt_sha256"):
+            raise RunError(f"final receipt launch lineage mismatch: {run_id}")
+        if final_host != prelaunch.get("host"):
             raise RunError(f"final and launch host mismatch: {run_id}")
         return final
 
@@ -1037,52 +999,47 @@ class RunService:
     def _reconcile_locked(self, run_id: str) -> dict[str, object]:
         manifest = self._load_manifest(run_id)
         runtime = self._runtime_path(run_id)
-        status = _read_run_status(runtime / "status.json")
-        if status.get("manifest_sha256") != manifest.get("manifest_sha256"):
-            raise RunError(f"run status manifest hash mismatch: {run_id}")
         final_path = self._final_path(run_id)
         if final_path.is_file():
-            final = _read_object(final_path, "final receipt")
-            if final.get("run_id") != run_id:
-                raise RunError(f"final receipt identity mismatch: {run_id}")
-            if final.get("manifest_sha256") != status.get("manifest_sha256"):
-                raise RunError(f"final receipt manifest hash mismatch: {run_id}")
-            if final.get("launch_receipt_sha256") != status.get("launch_receipt_sha256"):
+            final = self.read_validated_final(run_id)
+            prelaunch = _read_strict_object(
+                self._receipts_path() / f"{run_id}-prelaunch.json",
+                "prelaunch receipt",
+            )
+            _validate_prelaunch_receipt(
+                prelaunch,
+                manifest,
+                expected_session=f"aros-{run_id.lower()}",
+                expected_invocation=_runner_invocation(self.root, run_id),
+            )
+            if final.get("launch_receipt_sha256") != prelaunch.get("receipt_sha256"):
                 raise RunError(f"final receipt launch lineage mismatch: {run_id}")
-            state = final.get("state")
-            if state not in _TERMINAL_STATES - {"lost"}:
-                raise RunError(f"invalid final process state for {run_id}: {state}")
-            pid = status.get("process_pid")
-            token = status.get("process_start_token")
-            if (
-                status.get("state") in _ACTIVE_STATES
-                and isinstance(pid, int)
-                and isinstance(token, str)
-                and _process_start_token(pid) == token
-            ):
-                raise RunError(
-                    f"integrity conflict: final receipt exists while process is alive: {run_id}"
+            if final.get("host") != prelaunch.get("host"):
+                raise RunError(f"final and launch host mismatch: {run_id}")
+            reconciled = _terminal_status(manifest, prelaunch, final)
+            status_path = runtime / "status.json"
+            try:
+                current = (
+                    _read_run_status(status_path) if status_path.is_file() else None
                 )
-            reconciled = {
-                **status,
-                "state": state,
-                "exit_code": final.get("exit_code"),
-                "finished_at": final.get("finished_at"),
-                "final_ref": f"runs/{run_id}/final.json",
-                "updated_at": final.get("finished_at") or _utc_now(),
-            }
-            if reconciled != status:
-                atomic_write_json(runtime / "status.json", reconciled)
+            except RunError:
+                current = None
+            if current != reconciled:
+                atomic_write_json(status_path, reconciled)
+            state = str(final["state"])
             self._write_event(
                 event_id=f"EVT-{run_id}-completed",
                 kind="run_completed",
                 run_id=run_id,
-                created_at=str(final.get("finished_at") or _utc_now()),
+                created_at=str(final["finished_at"]),
                 summary=f"Run reached process state {state}.",
                 artifact_refs=[f"runs/{run_id}/final.json"],
             )
             return reconciled
 
+        status = _read_run_status(runtime / "status.json")
+        if status.get("manifest_sha256") != manifest.get("manifest_sha256"):
+            raise RunError(f"run status manifest hash mismatch: {run_id}")
         if status.get("state") not in _ACTIVE_STATES:
             return status
         pid = status.get("process_pid")
@@ -1118,48 +1075,52 @@ class RunService:
     def _record_launch_failure(
         self,
         manifest: dict[str, object],
-        started_at: str,
         detail: str,
     ) -> None:
         run_id = str(manifest["run_id"])
         finished_at = _utc_now()
         runtime = self._runtime_path(run_id)
-        status = _read_run_status(runtime / "status.json")
+        prelaunch = _read_strict_object(
+            self._receipts_path() / f"{run_id}-prelaunch.json",
+            "prelaunch receipt",
+        )
+        _validate_prelaunch_receipt(
+            prelaunch,
+            manifest,
+            expected_session=f"aros-{run_id.lower()}",
+            expected_invocation=_runner_invocation(self.root, run_id),
+        )
         final = _final_identity(manifest)
         final.update(
             {
                 "schema_version": 1,
                 "state": "failed_process",
                 "exit_code": None,
-                "started_at": started_at,
+                "started_at": prelaunch["created_at"],
                 "finished_at": finished_at,
                 "finalized_at": finished_at,
                 "resource_usage": {"wall_seconds": 0.0},
-                "host": status["host"],
+                "host": prelaunch["host"],
                 "error": f"carrier launch failed: {detail}",
-                "launch_receipt_sha256": status["launch_receipt_sha256"],
+                "launch_receipt_sha256": prelaunch["receipt_sha256"],
                 "stdout": _empty_output(f".aros/runs/{run_id}/stdout.log"),
                 "stderr": _empty_output(f".aros/runs/{run_id}/stderr.log"),
             }
         )
         create_json(self._final_path(run_id), final)
+        recorded_final = self.read_validated_final(run_id)
         atomic_write_json(
             runtime / "status.json",
-            {
-                **status,
-                "state": "failed_process",
-                "exit_code": None,
-                "finished_at": finished_at,
-                "final_ref": f"runs/{run_id}/final.json",
-                "updated_at": finished_at,
-            },
+            _terminal_status(manifest, prelaunch, recorded_final),
         )
+        recorded_state = str(recorded_final["state"])
+        recorded_finished_at = str(recorded_final["finished_at"])
         self._write_event(
             event_id=f"EVT-{run_id}-completed",
             kind="run_completed",
             run_id=run_id,
-            created_at=finished_at,
-            summary="Run reached process state failed_process.",
+            created_at=recorded_finished_at,
+            summary=f"Run reached process state {recorded_state}.",
             artifact_refs=[f"runs/{run_id}/final.json"],
         )
 
@@ -1429,34 +1390,47 @@ def _validate_prelaunch_receipt(
     receipt: dict[str, object],
     manifest: dict[str, object],
     *,
-    expected_actor: str,
-    expected_host: str,
     expected_session: str,
     expected_invocation: list[str],
-    status: dict[str, object] | None = None,
+    expected_actor: str | None = None,
+    expected_host: str | None = None,
 ) -> None:
     run_id = str(manifest["run_id"])
     receipt_sha256 = receipt.get("receipt_sha256")
+    receipt_actor = receipt.get("actor")
+    receipt_host = receipt.get("host")
     if (
         set(receipt) != _PRELAUNCH_FIELDS
-        or not isinstance(expected_actor, str)
-        or not expected_actor
-        or not isinstance(expected_host, str)
-        or not expected_host
         or type(receipt.get("schema_version")) is not int
         or receipt.get("schema_version") != 1
         or receipt.get("receipt_id") != f"{run_id}-prelaunch"
         or receipt.get("kind") != "run_prelaunch"
         or receipt.get("run_id") != run_id
-        or not isinstance(receipt.get("actor"), str)
-        or receipt.get("actor") != expected_actor
+        or not isinstance(receipt_actor, str)
+        or not receipt_actor
+        or (
+            expected_actor is not None
+            and (
+                not isinstance(expected_actor, str)
+                or not expected_actor
+                or receipt_actor != expected_actor
+            )
+        )
         or not _valid_utc_timestamp(receipt.get("created_at"))
         or receipt.get("base_commit") != manifest.get("base_commit")
         or receipt.get("manifest_sha256") != manifest.get("manifest_sha256")
         or receipt.get("carrier") != "tmux"
         or receipt.get("tmux_session") != expected_session
-        or not isinstance(receipt.get("host"), str)
-        or receipt.get("host") != expected_host
+        or not isinstance(receipt_host, str)
+        or not receipt_host
+        or (
+            expected_host is not None
+            and (
+                not isinstance(expected_host, str)
+                or not expected_host
+                or receipt_host != expected_host
+            )
+        )
         or type(receipt.get("runner_version")) is not int
         or receipt.get("runner_version") != 1
         or receipt.get("runner_invocation") != expected_invocation
@@ -1465,18 +1439,33 @@ def _validate_prelaunch_receipt(
         or receipt_sha256 != _receipt_sha256(receipt)
     ):
         raise RunError(f"invalid prelaunch receipt: {run_id}")
-    if status is not None and (
-        status.get("schema_version") != 1
-        or status.get("run_id") != run_id
-        or status.get("manifest_sha256") != manifest.get("manifest_sha256")
-        or status.get("actor") != expected_actor
-        or status.get("host") != expected_host
-        or status.get("carrier") != "tmux"
-        or status.get("tmux_session") != expected_session
-        or status.get("launch_receipt_sha256") != receipt_sha256
-        or status.get("launched_at") != receipt.get("created_at")
-    ):
-        raise RunError(f"prelaunch and status lineage mismatch: {run_id}")
+
+
+def _terminal_status(
+    manifest: dict[str, object],
+    prelaunch: dict[str, object],
+    final: dict[str, object],
+) -> dict[str, object]:
+    run_id = str(manifest["run_id"])
+    finished_at = final["finished_at"]
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": final["state"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "actor": prelaunch["actor"],
+        "carrier": prelaunch["carrier"],
+        "tmux_session": prelaunch["tmux_session"],
+        "host": prelaunch["host"],
+        "launch_receipt_sha256": prelaunch["receipt_sha256"],
+        "launched_at": prelaunch["created_at"],
+        "started_at": final["started_at"],
+        "exit_code": final["exit_code"],
+        "finished_at": finished_at,
+        "heartbeat_at": finished_at,
+        "final_ref": f"runs/{run_id}/final.json",
+        "updated_at": finished_at,
+    }
 
 
 def _request_sha256(manifest: dict[str, object]) -> str:

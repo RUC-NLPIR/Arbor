@@ -343,6 +343,31 @@ def test_read_json_rejects_symlink(tmp_path: Path) -> None:
     assert alias.is_symlink()
 
 
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    (
+        (b'{"value":1,"value":2}\n', "duplicate"),
+        (b'{"value":NaN}\n', "non-finite"),
+        (b'{"value":Infinity}\n', "non-finite"),
+    ),
+)
+def test_read_json_strict_rejects_ambiguous_json_without_weakening_secure_read(
+    tmp_path: Path,
+    payload: bytes,
+    message: str,
+) -> None:
+    target = tmp_path / "record.json"
+    target.write_bytes(payload)
+
+    with pytest.raises(ValueError, match=message):
+        store_module.read_json_strict(target)
+
+    alias = tmp_path / "alias.json"
+    alias.symlink_to(target.name)
+    with pytest.raises(ValueError, match="regular"):
+        store_module.read_json_strict(alias)
+
+
 def test_read_json_rejects_path_replaced_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -124,6 +124,16 @@ def final_identity(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_json(path: str | Path) -> Any:
+    """Read one securely bound JSON file with standard decoder compatibility."""
+    return _read_json(path, strict=False)
+
+
+def read_json_strict(path: str | Path) -> Any:
+    """Read one securely bound JSON file, rejecting ambiguous JSON values."""
+    return _read_json(path, strict=True)
+
+
+def _read_json(path: str | Path, *, strict: bool) -> Any:
     target = Path(path)
     metadata = target.lstat()
     if not stat.S_ISREG(metadata.st_mode):
@@ -155,7 +165,14 @@ def read_json(path: str | Path) -> Any:
                 f"JSON path must be a create-once single-link regular file: {target}"
             )
         with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as handle:
-            value = json.load(handle)
+            if strict:
+                value = json.load(
+                    handle,
+                    object_pairs_hook=_unique_json_object,
+                    parse_constant=_reject_json_constant,
+                )
+            else:
+                value = json.load(handle)
     finally:
         os.close(descriptor)
 
@@ -170,6 +187,27 @@ def read_json(path: str | Path) -> Any:
             f"JSON path must be a create-once single-link regular file: {target}"
         )
     return value
+
+
+def _strict_json_loads(raw: str | bytes | bytearray) -> Any:
+    return json.loads(
+        raw,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=_reject_json_constant,
+    )
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"JSON contains non-finite number: {value}")
 
 
 def atomic_write_json(path: str | Path, value: Any) -> None:

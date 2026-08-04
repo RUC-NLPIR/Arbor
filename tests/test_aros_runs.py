@@ -2115,9 +2115,19 @@ def test_stop_signal_false_ack_does_not_cancel_successful_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _init_clean_repo(tmp_path)
+    release_path = tmp_path / ".aros" / "release-payload"
     service, manifest = _prepare(
         tmp_path,
-        argv=[sys.executable, "-c", "import time; time.sleep(0.4)"],
+        argv=[
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,sys,time;"
+                "release=pathlib.Path(sys.argv[1]);"
+                "exec('while not release.exists(): time.sleep(0.01)')"
+            ),
+            str(release_path),
+        ],
         key="signal-false-race",
     )
     run_id = _mark_runner_launched(tmp_path, service, manifest)
@@ -2132,22 +2142,27 @@ def test_stop_signal_false_ack_does_not_cancel_successful_process(
         return False
 
     monkeypatch.setattr(processes_module, "signal_process_group", refuse_signal)
+    monkeypatch.setattr(runs_module, "_STOP_ACK_TIMEOUT_SECONDS", 0.2)
     with ThreadPoolExecutor(max_workers=1) as pool:
         runner = pool.submit(runner_module.run, str(tmp_path), run_id)
-        deadline = time.monotonic() + 5
-        running: dict[str, object] = {}
-        while time.monotonic() < deadline:
-            running = service.status(run_id, reconcile=False)
-            if running["state"] == "running":
-                break
-            time.sleep(0.02)
-        assert running["state"] == "running"
+        try:
+            deadline = time.monotonic() + 5
+            running: dict[str, object] = {}
+            while time.monotonic() < deadline:
+                running = service.status(run_id, reconcile=False)
+                if running["state"] == "running":
+                    break
+                time.sleep(0.02)
+            assert running["state"] == "running"
 
-        receipt = service.stop(
-            run_id,
-            actor="race-owner",
-            reason="signal refused",
-        )
+            receipt = service.stop(
+                run_id,
+                actor="race-owner",
+                reason="signal refused",
+            )
+            assert not runner.done()
+        finally:
+            release_path.touch()
         assert runner.result(timeout=5) == 0
 
     runtime = tmp_path / ".aros" / "runs" / run_id

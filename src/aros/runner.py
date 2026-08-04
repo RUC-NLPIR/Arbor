@@ -386,6 +386,15 @@ def run(workspace: str, run_id: str) -> int:
             stop_started_monotonic = time.monotonic()
             stop_attempted = True
             stop_escalated = requested_name == "KILL"
+            if not delivered_stop:
+                _write_stop_receipt(
+                    root,
+                    run_id,
+                    stop_request,
+                    handle.identity,
+                    stop_signal_sequence,
+                    False,
+                )
         elif (
             delivered_stop
             and not stop_escalated

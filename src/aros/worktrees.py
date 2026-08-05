@@ -38,6 +38,10 @@ class WorktreeError(ValueError):
     """Raised when repository or checkout authority is unsafe or ambiguous."""
 
 
+class WorktreeLimitError(WorktreeError):
+    """Raised before capture when a pinned Git object exceeds a bound."""
+
+
 class BundleRemovalError(WorktreeError):
     """Report exactly which bundle checkouts were removed before failure."""
 
@@ -264,16 +268,32 @@ def read_repository_file(
 def read_repository_blob(
     repository: RepositoryBinding,
     blob_oid: str,
+    *,
+    max_bytes: int | None = None,
 ) -> bytes:
     """Read and verify one exact SHA-1 blob without changing object storage."""
     _validate_repository_binding(repository)
     if not isinstance(blob_oid, str) or _COMMIT.fullmatch(blob_oid) is None:
         raise WorktreeError(f"invalid repository blob object ID: {blob_oid!r}")
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+        raise WorktreeError("max_bytes must be nonnegative or null")
+    expected_size: int | None = None
+    if max_bytes is not None:
+        raw_size = _git_text(repository, "cat-file", "-s", blob_oid)
+        if re.fullmatch(r"0|[1-9][0-9]*", raw_size) is None:
+            raise WorktreeError("repository blob size is invalid")
+        expected_size = int(raw_size)
+        if expected_size > max_bytes:
+            raise WorktreeLimitError(
+                f"repository blob size exceeds {max_bytes} bytes"
+            )
     content = _git_bytes(repository, "cat-file", "blob", blob_oid)
     digest = hashlib.sha1(
         b"blob " + str(len(content)).encode("ascii") + b"\0" + content
     ).hexdigest()
-    if digest != blob_oid:
+    if digest != blob_oid or (
+        expected_size is not None and len(content) != expected_size
+    ):
         raise WorktreeError("repository blob bytes do not match object ID")
     _validate_repository_binding(repository)
     return content

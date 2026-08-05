@@ -29,6 +29,7 @@ from .research_files import (
 from .runs import RunError, read_validated_run_final, read_validated_run_manifest
 from .store import (
     AnchoredReadError,
+    AnchoredReadLimitError,
     AnchoredWorkspaceReader,
     _strict_json_loads,
     json_sha256,
@@ -246,7 +247,10 @@ class TransitionAuditService:
         base_commit: str | None = None
         current_head: str | None = None
 
-        with AnchoredWorkspaceReader(self.root) as reader:
+        with AnchoredWorkspaceReader(
+            self.root,
+            max_json_bytes=MAX_VERSIONED_FILE_BYTES,
+        ) as reader:
             repository = _worktrees.bind_repository(reader.root)
             if repository != self.repository:
                 raise WorktreeError("transition repository binding changed")
@@ -614,6 +618,15 @@ class TransitionAuditService:
                         path,
                         base_entries,
                     )
+                except _worktrees.WorktreeLimitError as error:
+                    base = None
+                    _add_issue(
+                        issues,
+                        "warning",
+                        "resource_limit_base_semantic",
+                        path,
+                        f"base semantic baseline ignored: {error}",
+                    )
                 except WorktreeError as error:
                     _add_issue(
                         issues,
@@ -722,7 +735,11 @@ class TransitionAuditService:
                 _add_issue(
                     issues,
                     "error",
-                    "invalid_observation",
+                    (
+                        "resource_limit_observation_json"
+                        if _caused_by_anchored_limit(error)
+                        else "invalid_observation"
+                    ),
                     observation_ref,
                     str(error),
                 )
@@ -1251,7 +1268,11 @@ def _base_repository_file(
         path=path,
         mode=entry.mode,
         blob_oid=entry.oid,
-        content=_worktrees.read_repository_blob(repository, entry.oid),
+        content=_worktrees.read_repository_blob(
+            repository,
+            entry.oid,
+            max_bytes=MAX_VERSIONED_FILE_BYTES,
+        ),
     )
 
 
@@ -1531,6 +1552,27 @@ def _audit_joint_lineage(
                 "|".join(refs),
                 str(error),
             )
+
+
+def _caused_by_anchored_limit(error: BaseException) -> bool:
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, AnchoredReadLimitError):
+            return True
+        for related in (
+            current.__cause__,
+            current.__context__,
+            getattr(current, "original_error", None),
+            getattr(current, "revalidation_error", None),
+        ):
+            if isinstance(related, BaseException):
+                pending.append(related)
+    return False
 
 
 def _add_issue(

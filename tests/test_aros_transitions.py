@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import arbor.aros.transitions as transitions_module
+import arbor.aros.store as store_module
 import arbor.aros.worktrees as worktrees_module
 from arbor.aros.eval import EvalService
 from arbor.aros.observations import ObservationRecord
@@ -1073,6 +1074,83 @@ def test_valid_current_claim_can_repair_invalid_base_semantic(
     assert len(audit["assimilation_links"]) == 1
     assert any(
         issue["severity"] == "warning" and issue["code"] == "invalid_base_semantic"
+        for issue in audit["issues"]
+    )
+
+
+def test_oversized_base_semantic_is_prebounded_without_blob_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    relative = "knowledge/claims/C-large-base.md"
+    claim = tmp_path / relative
+    claim.parent.mkdir(parents=True)
+    claim.write_bytes(
+        b"x" * (transitions_module.MAX_VERSIONED_FILE_BYTES + 1)
+    )
+    _git(tmp_path, "add", relative)
+    _git(tmp_path, "commit", "-qm", "record oversized historical Claim")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    base_blob_oid = _git(tmp_path, "rev-parse", f"{base}:{relative}")
+    observation_ref = f"eval/evaluations/EVAL-{'b' * 64}/receipt.json"
+    claim.write_text(
+        _claim_document(
+            "C-large-base",
+            [
+                {
+                    "observation_ref": observation_ref,
+                    "relation": "supports",
+                    "scope": "Repair oversized historical semantics.",
+                }
+            ],
+        ),
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-large-base-repair",
+        base_commit=base,
+        workspace_paths=[relative],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": [relative],
+                "rationale": f"{relative}#Evidence links",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            observation_ref,
+            kind="measurement",
+            candidate_commit="b" * 40,
+            measurement_state="valid",
+        ),
+    )
+    blob_reads: list[str] = []
+    real_git_bytes = worktrees_module._git_bytes
+
+    def recording_git_bytes(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> bytes:
+        if args == ("cat-file", "blob", base_blob_oid):
+            blob_reads.append(base_blob_oid)
+        return real_git_bytes(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_bytes", recording_git_bytes)
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    assert blob_reads == []
+    assert any(
+        issue["severity"] == "warning"
+        and issue["code"] == "resource_limit_base_semantic"
         for issue in audit["issues"]
     )
 
@@ -2211,6 +2289,55 @@ def test_oversized_current_semantic_and_service_files_fail_before_parse(
         assert len(audit["issues"]) < 5
 
 
+@pytest.mark.parametrize("record_name", ("manifest.json", "final.json"))
+def test_assimilated_run_json_is_prebounded_before_owner_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record_name: str,
+) -> None:
+    _service, manifest, _final = observation_support._install_run_final(tmp_path)
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    run_id = str(manifest["run_id"])
+    observation_ref = f"runs/{run_id}/final.json"
+    oversized = tmp_path / "runs" / run_id / record_name
+    oversized.write_bytes(
+        b" " * (transitions_module.MAX_VERSIONED_FILE_BYTES + 1)
+    )
+    (tmp_path / "memory").mkdir()
+    (tmp_path / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nOversized Run JSON.\n",
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        f"T-prebound-{record_name.removesuffix('.json')}",
+        base_commit=base,
+        workspace_paths=["memory/NOW.md"],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": ["memory/NOW.md"],
+                "rationale": "memory/NOW.md#Findings",
+            }
+        ],
+    )
+    oversized_decodes: list[int] = []
+    real_loads = store_module._strict_json_loads
+
+    def recording_loads(raw: str | bytes | bytearray) -> object:
+        if len(raw) > transitions_module.MAX_VERSIONED_FILE_BYTES:
+            oversized_decodes.append(len(raw))
+        return real_loads(raw)
+
+    monkeypatch.setattr(store_module, "_strict_json_loads", recording_loads)
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert oversized_decodes == []
+    assert any("resource_limit" in issue["code"] for issue in audit["issues"])
+
+
 def test_evidence_link_per_file_and_aggregate_counts_are_bounded(
     tmp_path: Path,
 ) -> None:
@@ -2404,10 +2531,14 @@ def test_large_ref_only_closure_uses_metadata_without_base_blob_reads(
     real_blob = worktrees_module.read_repository_blob
     real_git_bytes = worktrees_module._git_bytes
 
-    def recording_blob(repository: object, oid: str) -> bytes:
+    def recording_blob(
+        repository: object,
+        oid: str,
+        **kwargs: object,
+    ) -> bytes:
         blob_calls.append(oid)
         if len(blob_calls) == 1:
-            return real_blob(repository, oid)  # type: ignore[arg-type]
+            return real_blob(repository, oid, **kwargs)  # type: ignore[arg-type]
         return b""
 
     def recording_git_bytes(

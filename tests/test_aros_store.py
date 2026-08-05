@@ -499,6 +499,37 @@ def test_anchored_workspace_reader_streams_without_oversized_capture(
     assert max(requested) <= 65_536
 
 
+def test_anchored_json_limit_rejects_before_decode_and_defaults_unbounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "large.json"
+    value = {"payload": "x" * 1_000}
+    target.write_text(json.dumps(value), encoding="utf-8")
+
+    with store_module.AnchoredWorkspaceReader(tmp_path) as reader:
+        assert reader.read_json("large.json") == value
+
+    decoded = False
+    real_loads = store_module._strict_json_loads
+
+    def recording_loads(raw: object) -> object:
+        nonlocal decoded
+        decoded = True
+        return real_loads(raw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store_module, "_strict_json_loads", recording_loads)
+
+    with store_module.AnchoredWorkspaceReader(
+        tmp_path,
+        max_json_bytes=32,
+    ) as reader:
+        with pytest.raises(store_module.AnchoredReadLimitError, match="JSON|32"):
+            reader.read_json("large.json")
+
+    assert decoded is False
+
+
 def test_anchored_stream_rejects_actual_size_before_declared_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

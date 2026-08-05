@@ -16,10 +16,12 @@ from arbor.aros.worktrees import (
     ExecutionBundle,
     RepositoryBinding,
     WorktreeError,
+    WorktreeLimitError,
     bind_repository,
     create_detached_checkout,
     create_execution_bundle,
     find_repository_gitlink_ancestor,
+    read_repository_blob,
     read_repository_tree_entries,
     remove_clean_checkout,
     remove_clean_execution_bundle,
@@ -194,6 +196,35 @@ def test_repository_tree_queries_batch_many_literal_paths(
     assert worktrees_module.REPOSITORY_TREE_QUERY_BATCH_SIZE == 256
     assert len(calls) == 3
     assert all("--literal-pathspecs" in call for call in calls)
+
+
+def test_repository_blob_limit_checks_size_before_blob_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    commit, _tree = _init_repository(root)
+    repository = bind_repository(root)
+    blob_oid = _git(root, "rev-parse", f"{commit}:tracked.txt").stdout.strip()
+    blob_reads: list[str] = []
+    real_git_bytes = worktrees_module._git_bytes
+
+    def recording_git_bytes(
+        repo: RepositoryBinding,
+        *args: str,
+        **kwargs: object,
+    ) -> bytes:
+        if args == ("cat-file", "blob", blob_oid):
+            blob_reads.append(blob_oid)
+        return real_git_bytes(repo, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_bytes", recording_git_bytes)
+
+    with pytest.raises(WorktreeLimitError, match="size|0"):
+        read_repository_blob(repository, blob_oid, max_bytes=0)
+
+    assert blob_reads == []
+    assert read_repository_blob(repository, blob_oid) == b"exact repository bytes\n"
 
 
 def test_detached_checkout_is_exact_clean_and_hermetic(

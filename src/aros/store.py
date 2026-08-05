@@ -181,10 +181,25 @@ class AnchoredReadError(ValueError):
         self.revalidation_error = revalidation_error
 
 
+class AnchoredReadLimitError(AnchoredReadError):
+    """Raised before capture when a bounded JSON authority is too large."""
+
+
 class AnchoredWorkspaceReader:
     """Hold one descriptor-anchored multi-file workspace transaction."""
 
-    def __init__(self, root: str | Path):
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        max_json_bytes: int | None = None,
+    ):
+        if max_json_bytes is not None and (
+            type(max_json_bytes) is not int or max_json_bytes < 0
+        ):
+            raise AnchoredReadError(
+                "max_json_bytes must be nonnegative or null"
+            )
         supplied = Path(root).expanduser()
         if not supplied.is_absolute():
             supplied = Path.cwd() / supplied
@@ -201,6 +216,7 @@ class AnchoredWorkspaceReader:
         self._slash_descriptor: int | None = None
         self._root_descriptor: int | None = None
         self._closed = False
+        self._max_json_bytes = max_json_bytes
         flags = _anchored_directory_flags()
         try:
             self._slash_descriptor = os.open(os.sep, flags)
@@ -277,6 +293,14 @@ class AnchoredWorkspaceReader:
         if key in self._json:
             return self._json[key]
         with self._open_file(key) as (descriptor, anchored):
+            if (
+                self._max_json_bytes is not None
+                and anchored.identity[4] > self._max_json_bytes
+            ):
+                raise AnchoredReadLimitError(
+                    "workspace JSON exceeds "
+                    f"{self._max_json_bytes} bytes: {path}"
+                )
             payload, _size, _digest = self._stream_file(
                 descriptor,
                 anchored,

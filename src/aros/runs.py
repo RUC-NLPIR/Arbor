@@ -1219,6 +1219,10 @@ class RunService:
         recorded = manifest.get("manifest_sha256")
         if not isinstance(recorded, str) or recorded != _manifest_sha256(manifest):
             raise RunError(f"run manifest hash mismatch: {run_id}")
+        try:
+            _final_identity(manifest)
+        except KeyError as error:
+            raise RunError(f"run manifest is missing identity fields: {run_id}") from error
         return manifest
 
     def _validate_manifest_against_status(

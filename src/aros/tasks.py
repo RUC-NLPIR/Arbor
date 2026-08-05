@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Protocol
 
 from . import worktrees as worktrees_module
 from .receipts import content_receipt, digest_chunks, record_sha256
@@ -1432,89 +1433,9 @@ class TaskService:
         *,
         return_commit: str | None = None,
     ) -> dict[str, object]:
-        task_id = str(brief["task_id"])
         if return_commit is None:
             return_commit = self._require_clean_owned_worktree(ownership)
-        parent_line = self._safe_git_text(
-            "rev-list",
-            "--parents",
-            "-n",
-            "1",
-            return_commit,
-        ).split()
-        if len(parent_line) != 2 or parent_line[0] != return_commit:
-            raise TaskError(f"task return HEAD must have exactly one parent: {task_id}")
-        child_commit = parent_line[1]
-        if _COMMIT.fullmatch(child_commit) is None or not self._is_commit(child_commit):
-            raise TaskError(f"task child commit is invalid: {task_id}")
-        base_commit = str(brief["base_commit"])
-        if not self._safe_git_success(
-            "merge-base",
-            "--is-ancestor",
-            base_commit,
-            child_commit,
-        ):
-            raise TaskError(f"task child commit does not descend from base: {task_id}")
-
-        relative = f"tasks/{task_id}/return.json"
-        prior = self._safe_git_result("cat-file", "-e", f"{child_commit}:{relative}")
-        if prior.returncode == 0:
-            raise TaskError(f"task child commit already contains its return: {task_id}")
-        changed_in_return = self._safe_git_bytes(
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--name-only",
-            "-z",
-            child_commit,
-            return_commit,
-            "--",
-        )
-        if changed_in_return != relative.encode("utf-8") + b"\0":
-            raise TaskError(f"task return commit must change only {relative}")
-        tree = self._safe_git_bytes(
-            "ls-tree",
-            "-z",
-            return_commit,
-            "--",
-            relative,
-        )
-        entries = tree.split(b"\0")
-        if len(entries) != 2 or entries[1] or not entries[0]:
-            raise TaskError(f"task return path is ambiguous in Git tree: {task_id}")
-        metadata, separator, path = entries[0].partition(b"\t")
-        fields = metadata.split(b" ")
-        if (
-            not separator
-            or len(fields) != 3
-            or path != relative.encode("utf-8")
-            or fields[0] not in {b"100644", b"100755"}
-            or fields[1] != b"blob"
-        ):
-            raise TaskError(f"task return path must be a regular Git file: {task_id}")
-        blob = self._safe_git_bytes(
-            "cat-file",
-            "blob",
-            f"{return_commit}:{relative}",
-        )
-        try:
-            value = json.loads(blob.decode("utf-8"))
-        except (UnicodeError, ValueError) as error:
-            raise TaskError(f"unable to read task return blob: {task_id}") from error
-        if not isinstance(value, dict):
-            raise TaskError(f"invalid task return: {task_id}")
-        returned: dict[str, object] = value
-        self._validate_return(
-            returned,
-            brief,
-            child_commit=child_commit,
-        )
-        return {
-            "child_commit": child_commit,
-            "return_commit": return_commit,
-            "return": returned,
-        }
+        return _read_reviewed_task_return(self, brief, return_commit)
 
     def _validate_return(
         self,
@@ -1523,65 +1444,14 @@ class TaskService:
         *,
         child_commit: str,
     ) -> None:
-        task_id = str(brief["task_id"])
-        if (
-            set(returned) != _RETURN_FIELDS
-            or type(returned.get("schema_version")) is not int
-        ):
-            raise TaskError(f"invalid task return schema: {task_id}")
-        if returned["schema_version"] != 1 or returned["task_id"] != task_id:
-            raise TaskError(f"task return identity mismatch: {task_id}")
-        _validate_hash(returned["brief_sha256"], "task return brief_sha256")
-        if (
-            returned["brief_sha256"] != brief["brief_sha256"]
-            or returned["base_commit"] != brief["base_commit"]
-            or returned["child_commit"] != child_commit
-        ):
-            raise TaskError(f"task return lineage mismatch: {task_id}")
-        summary = _validate_text(returned["summary"], "task return summary")
-        if summary != returned["summary"]:
-            raise TaskError(f"task return summary is not canonical: {task_id}")
-        for field in (
-            "work_performed",
-            "changed_files",
-            "evidence",
-            "deviations",
-            "uncertainty",
-            "follow_up",
-        ):
-            _validate_string_list(returned[field], f"task return {field}")
         changed_files = self._changed_files(
             str(brief["base_commit"]),
             child_commit,
         )
-        if returned["changed_files"] != changed_files:
-            raise TaskError(f"task return changed_files mismatch: {task_id}")
-        _validate_hash(returned["return_sha256"], "task return return_sha256")
-        if returned["return_sha256"] != _record_sha256(
-            returned,
-            "return_sha256",
-        ):
-            raise TaskError(f"task return hash mismatch: {task_id}")
+        _validate_task_return(returned, brief, child_commit, changed_files)
 
     def _changed_files(self, base_commit: str, child_commit: str) -> list[str]:
-        raw = self._safe_git_bytes(
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--name-only",
-            "-z",
-            base_commit,
-            child_commit,
-            "--",
-        )
-        if raw and not raw.endswith(b"\0"):
-            raise TaskError("Git returned an ambiguous changed-files list")
-        encoded = [item for item in raw.split(b"\0") if item]
-        try:
-            return [item.decode("utf-8") for item in sorted(encoded)]
-        except UnicodeError as error:
-            raise TaskError("task changed files must be valid UTF-8") from error
+        return _task_changed_files(self, base_commit, child_commit)
 
     def _require_clean_owned_worktree(
         self,
@@ -1655,40 +1525,7 @@ class TaskService:
             if reader is None
             else _read_object(path, "task collection", reader=reader)
         )
-        if (
-            set(collected) != _COLLECTED_FIELDS
-            or type(collected.get("schema_version")) is not int
-        ):
-            raise TaskError(f"invalid task collection schema: {task_id}")
-        if collected["schema_version"] != 1 or collected["task_id"] != task_id:
-            raise TaskError(f"task collection identity mismatch: {task_id}")
-        for field in (
-            "brief_sha256",
-            "ownership_sha256",
-            "final_sha256",
-            "collected_sha256",
-        ):
-            _validate_hash(collected[field], f"task collection {field}")
-        expected = {
-            "brief_sha256": brief["brief_sha256"],
-            "ownership_sha256": snapshot["ownership_sha256"],
-            "branch_ref": snapshot["branch_ref"],
-            "base_commit": brief["base_commit"],
-            "child_commit": snapshot["child_commit"],
-            "return_commit": snapshot["return_commit"],
-            "final_state": snapshot["final_state"],
-            "final_sha256": snapshot["final_sha256"],
-            "return": snapshot["return"],
-        }
-        if any(collected[field] != value for field, value in expected.items()):
-            raise TaskError(f"task collection binding conflict: {task_id}")
-        _validate_timestamp(collected["collected_at"], "task collection collected_at")
-        if collected["collected_sha256"] != _record_sha256(
-            collected,
-            "collected_sha256",
-        ):
-            raise TaskError(f"task collection hash mismatch: {task_id}")
-        return collected
+        return _validate_task_collection(collected, brief, snapshot)
 
     def _status_unlocked(self, task_id: str) -> dict[str, object]:
         brief = self._load_brief(task_id)
@@ -1808,27 +1645,7 @@ class TaskService:
             if reader is None
             else _read_object(brief_path, "task brief", reader=reader)
         )
-        if set(brief) != _BRIEF_FIELDS or type(brief.get("schema_version")) is not int:
-            raise TaskError(f"invalid task brief schema: {task_id}")
-        if brief["schema_version"] != 1:
-            raise TaskError(f"invalid task brief schema version: {task_id}")
-        if brief["task_id"] != task_id:
-            raise TaskError(f"task brief identity mismatch: {task_id}")
-        _validate_hash(brief["brief_sha256"], "task brief_sha256")
-        if brief["brief_sha256"] != _brief_sha256(brief):
-            raise TaskError(f"task brief hash mismatch: {task_id}")
-        if not isinstance(brief["base_commit"], str) or _COMMIT.fullmatch(brief["base_commit"]) is None:
-            raise TaskError(f"invalid task brief base_commit: {task_id}")
-        _validate_timestamp(brief["created_at"], "task brief created_at")
-        normalized = _normalize_request(
-            **{field: brief[field] for field in _REQUEST_FIELDS}  # type: ignore[arg-type]
-        )
-        if any(brief[field] != normalized[field] for field in _REQUEST_FIELDS):
-            raise TaskError(f"task brief request is not canonical: {task_id}")
-        _validate_hash(brief["request_sha256"], "task brief request_sha256")
-        if brief["request_sha256"] != json_sha256(normalized):
-            raise TaskError(f"task brief request hash mismatch: {task_id}")
-        return brief
+        return _validate_task_brief(brief, task_id)
 
     def _load_idempotency_index(
         self,
@@ -3427,8 +3244,299 @@ class TaskService:
         return self.root / ".aros" / "tasks" / "idempotency" / f"{digest}.json"
 
 
-class _TaskCollectionReader(TaskService):
-    """Reuse Task validation without TaskService's runtime initialization."""
+class _TaskGitOperations(Protocol):
+    def _safe_git_text(self, *args: str) -> str: ...
+
+    def _safe_git_bytes(self, *args: str) -> bytes: ...
+
+    def _safe_git_success(self, *args: str) -> bool: ...
+
+    def _safe_git_result(
+        self,
+        *args: str,
+    ) -> subprocess.CompletedProcess[bytes]: ...
+
+    def _is_commit(self, value: str) -> bool: ...
+
+
+class _PureTaskGit:
+    def __init__(self, repository: worktrees_module.RepositoryBinding):
+        self.repository = repository
+
+    def _safe_git_text(self, *args: str) -> str:
+        result = self._safe_git_result(*args)
+        if result.returncode != 0:
+            raise TaskError(f"Git command failed: {' '.join(args)}: {_git_error(result)}")
+        try:
+            return result.stdout.decode("utf-8").strip()
+        except UnicodeError as error:
+            raise TaskError(
+                f"Git command returned invalid UTF-8: {' '.join(args)}"
+            ) from error
+
+    def _safe_git_bytes(self, *args: str) -> bytes:
+        result = self._safe_git_result(*args)
+        if result.returncode != 0:
+            raise TaskError(f"Git command failed: {' '.join(args)}: {_git_error(result)}")
+        return result.stdout
+
+    def _safe_git_success(self, *args: str) -> bool:
+        return self._safe_git_result(*args).returncode == 0
+
+    def _safe_git_result(
+        self,
+        *args: str,
+    ) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return worktrees_module._git_result(self.repository, *args)
+        except worktrees_module.WorktreeError as error:
+            raise TaskError(f"Git command failed: {' '.join(args)}") from error
+
+    def _is_commit(self, value: str) -> bool:
+        if _COMMIT.fullmatch(value) is None:
+            return False
+        result = self._safe_git_result(
+            "rev-parse",
+            "--verify",
+            f"{value}^{{commit}}",
+        )
+        return result.returncode == 0 and result.stdout.strip() == value.encode()
+
+
+def _validate_task_brief(
+    brief: dict[str, object],
+    task_id: str,
+) -> dict[str, object]:
+    if set(brief) != _BRIEF_FIELDS or type(brief.get("schema_version")) is not int:
+        raise TaskError(f"invalid task brief schema: {task_id}")
+    if brief["schema_version"] != 1:
+        raise TaskError(f"invalid task brief schema version: {task_id}")
+    if brief["task_id"] != task_id:
+        raise TaskError(f"task brief identity mismatch: {task_id}")
+    _validate_hash(brief["brief_sha256"], "task brief_sha256")
+    if brief["brief_sha256"] != _brief_sha256(brief):
+        raise TaskError(f"task brief hash mismatch: {task_id}")
+    if (
+        not isinstance(brief["base_commit"], str)
+        or _COMMIT.fullmatch(brief["base_commit"]) is None
+    ):
+        raise TaskError(f"invalid task brief base_commit: {task_id}")
+    _validate_timestamp(brief["created_at"], "task brief created_at")
+    normalized = _normalize_request(
+        **{field: brief[field] for field in _REQUEST_FIELDS}  # type: ignore[arg-type]
+    )
+    if any(brief[field] != normalized[field] for field in _REQUEST_FIELDS):
+        raise TaskError(f"task brief request is not canonical: {task_id}")
+    _validate_hash(brief["request_sha256"], "task brief request_sha256")
+    if brief["request_sha256"] != json_sha256(normalized):
+        raise TaskError(f"task brief request hash mismatch: {task_id}")
+    return brief
+
+
+def _read_reviewed_task_return(
+    git: _TaskGitOperations,
+    brief: dict[str, object],
+    return_commit: str,
+) -> dict[str, object]:
+    task_id = str(brief["task_id"])
+    parent_line = git._safe_git_text(
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        return_commit,
+    ).split()
+    if len(parent_line) != 2 or parent_line[0] != return_commit:
+        raise TaskError(f"task return HEAD must have exactly one parent: {task_id}")
+    child_commit = parent_line[1]
+    if _COMMIT.fullmatch(child_commit) is None or not git._is_commit(child_commit):
+        raise TaskError(f"task child commit is invalid: {task_id}")
+    base_commit = str(brief["base_commit"])
+    if not git._safe_git_success(
+        "merge-base",
+        "--is-ancestor",
+        base_commit,
+        child_commit,
+    ):
+        raise TaskError(f"task child commit does not descend from base: {task_id}")
+
+    relative = f"tasks/{task_id}/return.json"
+    prior = git._safe_git_result("cat-file", "-e", f"{child_commit}:{relative}")
+    if prior.returncode == 0:
+        raise TaskError(f"task child commit already contains its return: {task_id}")
+    changed_in_return = git._safe_git_bytes(
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--name-only",
+        "-z",
+        child_commit,
+        return_commit,
+        "--",
+    )
+    if changed_in_return != relative.encode("utf-8") + b"\0":
+        raise TaskError(f"task return commit must change only {relative}")
+    tree = git._safe_git_bytes(
+        "ls-tree",
+        "-z",
+        return_commit,
+        "--",
+        relative,
+    )
+    entries = tree.split(b"\0")
+    if len(entries) != 2 or entries[1] or not entries[0]:
+        raise TaskError(f"task return path is ambiguous in Git tree: {task_id}")
+    metadata, separator, path = entries[0].partition(b"\t")
+    fields = metadata.split(b" ")
+    if (
+        not separator
+        or len(fields) != 3
+        or path != relative.encode("utf-8")
+        or fields[0] not in {b"100644", b"100755"}
+        or fields[1] != b"blob"
+    ):
+        raise TaskError(f"task return path must be a regular Git file: {task_id}")
+    blob = git._safe_git_bytes(
+        "cat-file",
+        "blob",
+        f"{return_commit}:{relative}",
+    )
+    try:
+        value = json.loads(blob.decode("utf-8"))
+    except (UnicodeError, ValueError) as error:
+        raise TaskError(f"unable to read task return blob: {task_id}") from error
+    if not isinstance(value, dict):
+        raise TaskError(f"invalid task return: {task_id}")
+    returned: dict[str, object] = value
+    changed_files = _task_changed_files(git, base_commit, child_commit)
+    _validate_task_return(returned, brief, child_commit, changed_files)
+    return {
+        "child_commit": child_commit,
+        "return_commit": return_commit,
+        "return": returned,
+    }
+
+
+def _validate_task_return(
+    returned: dict[str, object],
+    brief: dict[str, object],
+    child_commit: str,
+    changed_files: list[str],
+) -> None:
+    task_id = str(brief["task_id"])
+    if (
+        set(returned) != _RETURN_FIELDS
+        or type(returned.get("schema_version")) is not int
+    ):
+        raise TaskError(f"invalid task return schema: {task_id}")
+    if returned["schema_version"] != 1 or returned["task_id"] != task_id:
+        raise TaskError(f"task return identity mismatch: {task_id}")
+    _validate_hash(returned["brief_sha256"], "task return brief_sha256")
+    if (
+        returned["brief_sha256"] != brief["brief_sha256"]
+        or returned["base_commit"] != brief["base_commit"]
+        or returned["child_commit"] != child_commit
+    ):
+        raise TaskError(f"task return lineage mismatch: {task_id}")
+    summary = _validate_text(returned["summary"], "task return summary")
+    if summary != returned["summary"]:
+        raise TaskError(f"task return summary is not canonical: {task_id}")
+    for field in (
+        "work_performed",
+        "changed_files",
+        "evidence",
+        "deviations",
+        "uncertainty",
+        "follow_up",
+    ):
+        _validate_string_list(returned[field], f"task return {field}")
+    if returned["changed_files"] != changed_files:
+        raise TaskError(f"task return changed_files mismatch: {task_id}")
+    _validate_hash(returned["return_sha256"], "task return return_sha256")
+    if returned["return_sha256"] != _record_sha256(
+        returned,
+        "return_sha256",
+    ):
+        raise TaskError(f"task return hash mismatch: {task_id}")
+
+
+def _task_changed_files(
+    git: _TaskGitOperations,
+    base_commit: str,
+    child_commit: str,
+) -> list[str]:
+    raw = git._safe_git_bytes(
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--name-only",
+        "-z",
+        base_commit,
+        child_commit,
+        "--",
+    )
+    if raw and not raw.endswith(b"\0"):
+        raise TaskError("Git returned an ambiguous changed-files list")
+    encoded = [item for item in raw.split(b"\0") if item]
+    try:
+        return [item.decode("utf-8") for item in sorted(encoded)]
+    except UnicodeError as error:
+        raise TaskError("task changed files must be valid UTF-8") from error
+
+
+def _validate_task_collection_header(
+    collected: dict[str, object],
+    task_id: str,
+) -> None:
+    if (
+        set(collected) != _COLLECTED_FIELDS
+        or type(collected.get("schema_version")) is not int
+    ):
+        raise TaskError(f"invalid task collection schema: {task_id}")
+    if collected["schema_version"] != 1 or collected["task_id"] != task_id:
+        raise TaskError(f"task collection identity mismatch: {task_id}")
+    for field in (
+        "brief_sha256",
+        "ownership_sha256",
+        "final_sha256",
+        "collected_sha256",
+    ):
+        _validate_hash(collected[field], f"task collection {field}")
+
+
+def _validate_task_collection(
+    collected: dict[str, object],
+    brief: dict[str, object],
+    snapshot: dict[str, object],
+) -> dict[str, object]:
+    task_id = str(brief["task_id"])
+    _validate_task_collection_header(collected, task_id)
+    expected = {
+        "brief_sha256": brief["brief_sha256"],
+        "ownership_sha256": snapshot["ownership_sha256"],
+        "branch_ref": snapshot["branch_ref"],
+        "base_commit": brief["base_commit"],
+        "child_commit": snapshot["child_commit"],
+        "return_commit": snapshot["return_commit"],
+        "final_state": snapshot["final_state"],
+        "final_sha256": snapshot["final_sha256"],
+        "return": snapshot["return"],
+    }
+    if any(collected[field] != value for field, value in expected.items()):
+        raise TaskError(f"task collection binding conflict: {task_id}")
+    _validate_timestamp(collected["collected_at"], "task collection collected_at")
+    if collected["collected_sha256"] != _record_sha256(
+        collected,
+        "collected_sha256",
+    ):
+        raise TaskError(f"task collection hash mismatch: {task_id}")
+    return collected
+
+
+class _TaskCollectionReader:
+    """Validate versioned Task lineage without constructing the runtime service."""
 
     def __init__(self, root: str | Path, *, reader: _JsonReader):
         try:
@@ -3436,19 +3544,27 @@ class _TaskCollectionReader(TaskService):
         except worktrees_module.WorktreeError as error:
             raise TaskError(f"invalid task collection workspace: {root}") from error
         self.root = repository.root
-        self._git_dir = repository.git_dir
-        self._git_common_dir = repository.common_dir
+        self._git = _PureTaskGit(repository)
         self._reader = reader
 
     def read(self, task_id: str) -> dict[str, object]:
-        brief = self._load_brief(task_id, reader=self._reader)
-        path = self._collected_path(task_id)
+        if not _valid_task_id(task_id):
+            raise TaskError(f"invalid task ID: {task_id!r}")
+        _require_plain_directory(self.root / "tasks", "versioned tasks directory")
+        directory = self.root / "tasks" / task_id
+        _require_plain_directory(directory, "task brief directory")
+        brief = _validate_task_brief(
+            _read_object(
+                directory / "brief.json",
+                "task brief",
+                reader=self._reader,
+            ),
+            task_id,
+        )
+        path = directory / "collected.json"
+        _require_single_link_plain_file(path, "task collection")
         collected = _read_object(path, "task collection", reader=self._reader)
-        if (
-            set(collected) != _COLLECTED_FIELDS
-            or type(collected.get("schema_version")) is not int
-        ):
-            raise TaskError(f"invalid task collection schema: {task_id}")
+        _validate_task_collection_header(collected, task_id)
         return_commit = collected["return_commit"]
         if (
             not isinstance(return_commit, str)
@@ -3459,11 +3575,7 @@ class _TaskCollectionReader(TaskService):
             raise TaskError(f"task collection branch binding conflict: {task_id}")
         if collected["final_state"] not in _TERMINAL_STATES:
             raise TaskError(f"invalid task collection final state: {task_id}")
-        reviewed = self._load_reviewed_return(
-            brief,
-            {},
-            return_commit=return_commit,
-        )
+        reviewed = _read_reviewed_task_return(self._git, brief, return_commit)
         snapshot = {
             "ownership_sha256": collected["ownership_sha256"],
             "branch_ref": collected["branch_ref"],
@@ -3473,10 +3585,10 @@ class _TaskCollectionReader(TaskService):
             "final_sha256": collected["final_sha256"],
             "return": reviewed["return"],
         }
-        recorded = self._load_collected(
+        recorded = _validate_task_collection(
+            _read_object(path, "task collection", reader=self._reader),
             brief,
             snapshot,
-            reader=self._reader,
         )
         if recorded != collected:
             raise TaskError(f"task collection changed while reading: {task_id}")

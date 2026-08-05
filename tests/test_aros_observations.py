@@ -32,6 +32,7 @@ from arbor.aros.store import (
     atomic_write_json,
     final_identity,
     json_sha256,
+    manifest_sha256,
     read_json_strict_no_repair,
 )
 from arbor.aros.tasks import TaskService, read_validated_task_collection
@@ -356,6 +357,26 @@ def test_task_collection_reader_is_side_effect_free(
     assert service.root == tmp_path
 
 
+def test_task_collection_reader_is_independent_of_task_service_methods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _service, task_id, collected = _collected_task(tmp_path)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("pure reader used a TaskService method")
+
+    for method in (
+        "_load_brief",
+        "_load_reviewed_return",
+        "_load_collected",
+        "_safe_git_result",
+    ):
+        monkeypatch.setattr(TaskService, method, forbidden)
+
+    assert read_validated_task_collection(tmp_path, task_id) == collected
+
+
 def test_run_final_reader_returns_canonical_record_hash(tmp_path: Path) -> None:
     service, manifest, final = _install_run_final(tmp_path)
     run_id = str(manifest["run_id"])
@@ -378,6 +399,27 @@ def test_run_final_reader_returns_canonical_record_hash(tmp_path: Path) -> None:
         reader=read_json_strict_no_repair,
     )
     assert _snapshot_tree(tmp_path) == before
+
+
+def test_malformed_run_manifest_is_reported_as_observation_error(
+    tmp_path: Path,
+) -> None:
+    _service, manifest, _final = _install_run_final(tmp_path)
+    run_id = str(manifest["run_id"])
+    manifest_path = tmp_path / "runs" / run_id / "manifest.json"
+    prelaunch_path = tmp_path / ".aros" / "receipts" / f"{run_id}-prelaunch.json"
+    malformed = dict(manifest)
+    malformed.pop("actor")
+    malformed["manifest_sha256"] = manifest_sha256(malformed)
+    prelaunch = read_json_strict_no_repair(prelaunch_path)
+    assert isinstance(prelaunch, dict)
+    prelaunch["manifest_sha256"] = malformed["manifest_sha256"]
+    prelaunch["receipt_sha256"] = record_sha256(prelaunch, "receipt_sha256")
+    atomic_write_json(manifest_path, malformed)
+    atomic_write_json(prelaunch_path, prelaunch)
+
+    with pytest.raises(ObservationError, match="observation|manifest|lineage"):
+        ObservationCatalog(tmp_path).resolve(f"runs/{run_id}/final.json")
 
 
 @pytest.mark.parametrize("missing", ("run_link", "final", "output"))
@@ -412,6 +454,27 @@ def test_eval_linked_run_is_not_a_second_observation(tmp_path: Path) -> None:
         f"runs/{installed['run_id']}/manifest.json",
         f"runs/{installed['run_id']}/final.json",
     )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "tasks/not-a-task/collected.json",
+        "runs/not-a-run/final.json",
+        "eval/evaluations/not-an-eval/receipt.json",
+    ),
+)
+def test_enumeration_rejects_invalid_identity_terminal_records(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    _init_repo(tmp_path)
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ObservationError, match="identity|terminal|observation"):
+        ObservationCatalog(tmp_path).enumerate_terminal()
 
 
 def test_eval_receipt_reader_ignores_missing_mutable_run_status(

@@ -179,6 +179,7 @@ class ObservationCatalog:
                     r"(?:[A-Za-z0-9-]*[A-Za-z0-9])?$"
                 ),
                 "collected.json",
+                ignored_entries=frozenset({".staging"}),
             )
         )
         candidates.extend(
@@ -202,6 +203,8 @@ class ObservationCatalog:
         relative_root: Path,
         identity: re.Pattern[str],
         filename: str,
+        *,
+        ignored_entries: frozenset[str] = frozenset(),
     ) -> list[str]:
         directory = self.root / relative_root
         try:
@@ -224,14 +227,33 @@ class ObservationCatalog:
             ) from error
         refs: list[str] = []
         for entry in entries:
-            if identity.fullmatch(entry.name) is None:
-                continue
             try:
                 entry_metadata = entry.lstat()
             except OSError as error:
                 raise ObservationError(
                     f"unable to inspect observation identity: {entry}"
                 ) from error
+            if identity.fullmatch(entry.name) is None:
+                if entry.name in ignored_entries:
+                    continue
+                if stat.S_ISLNK(entry_metadata.st_mode):
+                    raise ObservationError(
+                        f"terminal observation has invalid identity: {entry}"
+                    )
+                if stat.S_ISDIR(entry_metadata.st_mode):
+                    candidate = entry / filename
+                    try:
+                        candidate.lstat()
+                    except FileNotFoundError:
+                        continue
+                    except OSError as error:
+                        raise ObservationError(
+                            f"unable to inspect terminal observation: {candidate}"
+                        ) from error
+                    raise ObservationError(
+                        f"terminal observation has invalid identity: {candidate}"
+                    )
+                continue
             if stat.S_ISLNK(entry_metadata.st_mode) or not stat.S_ISDIR(
                 entry_metadata.st_mode
             ):

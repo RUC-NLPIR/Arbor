@@ -28,6 +28,8 @@ _CLAIM_PATH = re.compile(r"knowledge/claims/(C-[^/]+)\.md")
 _IDEA_PATH = re.compile(r"ideas/(I-[^/]+)\.md")
 _ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*$")
 _FENCE_START = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})")
+MAX_FRONTMATTER_DEPTH = 64
+MAX_FRONTMATTER_NODES = 10_000
 
 _QUESTION_SECTIONS = (
     "Question",
@@ -60,6 +62,10 @@ class ResearchFileError(ValueError):
 
 class ResearchFileLimitError(ResearchFileError):
     """A semantic file exceeds a caller-supplied mechanical link bound."""
+
+
+class ResearchFileStructureError(ResearchFileError):
+    """Semantic frontmatter exceeds explicit structural bounds."""
 
 
 @dataclass(frozen=True)
@@ -245,6 +251,10 @@ def _split_frontmatter(
 
     try:
         loaded = yaml.load("".join(lines[1:closing]), Loader=_UniqueSafeLoader)
+    except RecursionError as error:
+        raise ResearchFileStructureError(
+            f"frontmatter recursion limit exceeded: {relative}"
+        ) from error
     except (TypeError, ValueError, yaml.YAMLError) as error:
         raise ResearchFileError(f"invalid frontmatter in {relative}: {error}") from error
     if loaded is None:
@@ -253,9 +263,43 @@ def _split_frontmatter(
         frontmatter = loaded
     else:
         raise ResearchFileError(f"frontmatter must be a mapping: {relative}")
+    _validate_frontmatter_shape(frontmatter, relative)
     if any(not isinstance(key, str) for key in frontmatter):
         raise ResearchFileError(f"frontmatter keys must be strings: {relative}")
     return cast(dict[str, object], frontmatter), "".join(lines[closing + 1 :])
+
+
+def _validate_frontmatter_shape(value: object, relative: str) -> None:
+    pending: list[tuple[object, int]] = [(value, 1)]
+    seen_containers: set[int] = set()
+    nodes = 0
+    while pending:
+        item, depth = pending.pop()
+        nodes += 1
+        if nodes > MAX_FRONTMATTER_NODES:
+            raise ResearchFileStructureError(
+                f"frontmatter nodes exceed {MAX_FRONTMATTER_NODES}: {relative}"
+            )
+        if depth > MAX_FRONTMATTER_DEPTH:
+            raise ResearchFileStructureError(
+                f"frontmatter depth exceeds {MAX_FRONTMATTER_DEPTH}: {relative}"
+            )
+        if isinstance(item, Mapping):
+            identity = id(item)
+            if identity in seen_containers:
+                raise ResearchFileStructureError(
+                    f"frontmatter contains recursive or aliased containers: {relative}"
+                )
+            seen_containers.add(identity)
+            pending.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, (list, tuple, set)):
+            identity = id(item)
+            if identity in seen_containers:
+                raise ResearchFileStructureError(
+                    f"frontmatter contains recursive or aliased containers: {relative}"
+                )
+            seen_containers.add(identity)
+            pending.extend((child, depth + 1) for child in item)
 
 
 def _validate_navigation_identity(
@@ -411,8 +455,11 @@ def _recommended_sections(relative: str) -> tuple[str, ...]:
 __all__ = [
     "EvidenceLink",
     "EvidenceLinkOccurrence",
+    "MAX_FRONTMATTER_DEPTH",
+    "MAX_FRONTMATTER_NODES",
     "ResearchFileError",
     "ResearchFileLimitError",
+    "ResearchFileStructureError",
     "SemanticDocument",
     "parse_semantic_document_bytes",
     "read_semantic_document",

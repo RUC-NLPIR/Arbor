@@ -2338,6 +2338,79 @@ def test_assimilated_run_json_is_prebounded_before_owner_decode(
     assert any("resource_limit" in issue["code"] for issue in audit["issues"])
 
 
+def test_deep_proposal_owner_json_and_yaml_return_exact_invalid_audits(
+    tmp_path: Path,
+) -> None:
+    nested_json = "[" * 70 + "0" + "]" * 70
+
+    proposal_root = tmp_path / "proposal"
+    proposal_base = _init_workspace(proposal_root)
+    proposal_ref = "transitions/T-deep-structure/proposal.json"
+    proposal_path = proposal_root / proposal_ref
+    proposal_path.parent.mkdir(parents=True)
+    proposal_path.write_text(
+        "{"
+        '"schema_version":1,'
+        f'"base_commit":"{proposal_base}",'
+        f'"workspace_paths":{nested_json},'
+        '"assimilations":[]'
+        "}",
+        encoding="utf-8",
+    )
+
+    owner_root = tmp_path / "owner"
+    _service, manifest, _final = observation_support._install_run_final(owner_root)
+    owner_base = _git(owner_root, "rev-parse", "HEAD")
+    run_id = str(manifest["run_id"])
+    observation_ref = f"runs/{run_id}/final.json"
+    (owner_root / "runs" / run_id / "manifest.json").write_text(
+        f'{{"nested":{nested_json}}}',
+        encoding="utf-8",
+    )
+    (owner_root / "memory").mkdir()
+    (owner_root / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nDeep owner JSON.\n",
+        encoding="utf-8",
+    )
+    owner_proposal = _write_proposal(
+        owner_root,
+        "T-deep-owner",
+        base_commit=owner_base,
+        workspace_paths=["memory/NOW.md"],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": ["memory/NOW.md"],
+                "rationale": "memory/NOW.md#Findings",
+            }
+        ],
+    )
+
+    semantic_root = tmp_path / "semantic"
+    semantic_base = _init_workspace(semantic_root)
+    semantic_path = semantic_root / "memory" / "DEEP.md"
+    semantic_path.write_text(
+        f"---\nnested: {nested_json}\n---\n# Deep\n",
+        encoding="utf-8",
+    )
+    semantic_proposal = _write_proposal(
+        semantic_root,
+        "T-deep-yaml",
+        base_commit=semantic_base,
+        workspace_paths=["memory/DEEP.md"],
+    )
+
+    for audit in (
+        _audit(proposal_root, proposal_ref),
+        _audit(owner_root, owner_proposal),
+        _audit(semantic_root, semantic_proposal),
+    ):
+        assert set(audit) == AUDIT_FIELDS
+        assert audit["mechanically_valid"] is False
+        assert canonical_json_bytes(audit)
+        assert any("resource_limit" in issue["code"] for issue in audit["issues"])
+
+
 def test_evidence_link_per_file_and_aggregate_counts_are_bounded(
     tmp_path: Path,
 ) -> None:

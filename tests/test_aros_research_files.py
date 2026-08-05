@@ -75,6 +75,42 @@ def test_frontmatter_rejects_duplicate_keys(tmp_path: Path) -> None:
         read_semantic_document(tmp_path, relative)
 
 
+@pytest.mark.parametrize("shape", ("depth", "nodes", "recursion"))
+def test_frontmatter_structure_is_explicitly_bounded(
+    tmp_path: Path,
+    shape: str,
+) -> None:
+    if shape == "depth":
+        value = "[" * 70 + "0" + "]" * 70
+    elif shape == "nodes":
+        value = "[" + ",".join("0" for _ in range(10_001)) + "]"
+    else:
+        value = "[" * 2_000 + "0" + "]" * 2_000
+    relative = _write(
+        tmp_path,
+        "memory/DEEP.md",
+        f"---\nnested: {value}\n---\n# Deep\n",
+    )
+
+    with pytest.raises(ResearchFileError, match="depth|nodes|recursive|recursion"):
+        read_semantic_document(tmp_path, relative)
+
+
+def test_evidence_link_json_recursion_is_normalized(tmp_path: Path) -> None:
+    nested = "[" * 2_000 + "0" + "]" * 2_000
+    relative = _write_claim(
+        tmp_path,
+        "{"
+        '"observation_ref":"runs/RUN-deep/final.json",'
+        '"relation":"context",'
+        f'"scope":{nested}'
+        "}",
+    )
+
+    with pytest.raises(ResearchFileError, match="EvidenceLink|depth|recursive|recursion"):
+        read_semantic_document(tmp_path, relative)
+
+
 def test_semantic_bytes_parser_matches_filesystem_owner_validation(
     tmp_path: Path,
 ) -> None:

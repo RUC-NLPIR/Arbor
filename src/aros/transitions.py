@@ -23,6 +23,7 @@ from .research_files import (
     EvidenceLinkOccurrence,
     ResearchFileError,
     ResearchFileLimitError,
+    ResearchFileStructureError,
     SemanticDocument,
     parse_semantic_document_bytes,
 )
@@ -30,9 +31,12 @@ from .runs import RunError, read_validated_run_final, read_validated_run_manifes
 from .store import (
     AnchoredReadError,
     AnchoredReadLimitError,
+    AnchoredReadStructureError,
     AnchoredWorkspaceReader,
+    JsonStructureError,
     _strict_json_loads,
     json_sha256,
+    validate_json_shape,
 )
 from .tasks import TaskError, read_validated_task_collection
 from .worktrees import RepositoryBinding, WorktreeError
@@ -80,6 +84,8 @@ MAX_PATH_COMPONENTS = 16
 MAX_VERSIONED_FILE_BYTES = 16_777_216
 MAX_EVIDENCE_LINKS_PER_FILE = 1_024
 MAX_EVIDENCE_LINKS_AGGREGATE = 4_096
+MAX_JSON_DEPTH = 64
+MAX_JSON_NODES = 10_000
 
 
 class TransitionError(ValueError):
@@ -250,6 +256,8 @@ class TransitionAuditService:
         with AnchoredWorkspaceReader(
             self.root,
             max_json_bytes=MAX_VERSIONED_FILE_BYTES,
+            max_json_depth=MAX_JSON_DEPTH,
+            max_json_nodes=MAX_JSON_NODES,
         ) as reader:
             repository = _worktrees.bind_repository(reader.root)
             if repository != self.repository:
@@ -598,6 +606,16 @@ class TransitionAuditService:
                         issues,
                         "error",
                         "resource_limit_evidence_links",
+                        path,
+                        str(error),
+                    )
+                    continue
+                except ResearchFileStructureError as error:
+                    evidence_resource_limited = True
+                    _add_issue(
+                        issues,
+                        "error",
+                        "resource_limit_semantic_structure",
                         path,
                         str(error),
                     )
@@ -1042,6 +1060,16 @@ def _parse_proposal(raw: bytes) -> TransitionProposal:
         value = _strict_json_loads(raw)
     except (TypeError, UnicodeError, ValueError) as error:
         raise TransitionError(f"proposal must be strict UTF-8 JSON: {error}") from error
+    try:
+        validate_json_shape(
+            value,
+            max_depth=MAX_JSON_DEPTH,
+            max_nodes=MAX_JSON_NODES,
+        )
+    except JsonStructureError as error:
+        raise _ResourceLimitError(
+            f"proposal JSON structure exceeds limits: {error}"
+        ) from error
     if not isinstance(value, dict) or set(value) != _PROPOSAL_FIELDS:
         raise TransitionError("proposal must contain exactly the four required fields")
     if type(value["schema_version"]) is not int or value["schema_version"] != 1:
@@ -1562,7 +1590,10 @@ def _caused_by_anchored_limit(error: BaseException) -> bool:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        if isinstance(current, AnchoredReadLimitError):
+        if isinstance(
+            current,
+            (AnchoredReadLimitError, AnchoredReadStructureError),
+        ):
             return True
         for related in (
             current.__cause__,
@@ -1688,6 +1719,8 @@ __all__ = [
     "MAX_EVIDENCE_SCOPE_BYTES",
     "MAX_EVIDENCE_LINKS_AGGREGATE",
     "MAX_EVIDENCE_LINKS_PER_FILE",
+    "MAX_JSON_DEPTH",
+    "MAX_JSON_NODES",
     "MAX_OBSERVATION_CLOSURE_PATHS",
     "MAX_PATH_BYTES",
     "MAX_PROPOSAL_BYTES",

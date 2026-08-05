@@ -185,6 +185,14 @@ class AnchoredReadLimitError(AnchoredReadError):
     """Raised before capture when a bounded JSON authority is too large."""
 
 
+class AnchoredReadStructureError(AnchoredReadError):
+    """Raised when decoded JSON exceeds structural bounds."""
+
+
+class JsonStructureError(ValueError):
+    """Decoded JSON is too deep, too broad, or contains a non-JSON value."""
+
+
 class AnchoredWorkspaceReader:
     """Hold one descriptor-anchored multi-file workspace transaction."""
 
@@ -193,6 +201,8 @@ class AnchoredWorkspaceReader:
         root: str | Path,
         *,
         max_json_bytes: int | None = None,
+        max_json_depth: int | None = None,
+        max_json_nodes: int | None = None,
     ):
         if max_json_bytes is not None and (
             type(max_json_bytes) is not int or max_json_bytes < 0
@@ -200,6 +210,12 @@ class AnchoredWorkspaceReader:
             raise AnchoredReadError(
                 "max_json_bytes must be nonnegative or null"
             )
+        for value, field in (
+            (max_json_depth, "max_json_depth"),
+            (max_json_nodes, "max_json_nodes"),
+        ):
+            if value is not None and (type(value) is not int or value < 0):
+                raise AnchoredReadError(f"{field} must be nonnegative or null")
         supplied = Path(root).expanduser()
         if not supplied.is_absolute():
             supplied = Path.cwd() / supplied
@@ -217,6 +233,8 @@ class AnchoredWorkspaceReader:
         self._root_descriptor: int | None = None
         self._closed = False
         self._max_json_bytes = max_json_bytes
+        self._max_json_depth = max_json_depth
+        self._max_json_nodes = max_json_nodes
         flags = _anchored_directory_flags()
         try:
             self._slash_descriptor = os.open(os.sep, flags)
@@ -309,6 +327,15 @@ class AnchoredWorkspaceReader:
             )
         assert payload is not None
         value = _strict_json_loads(payload)
+        if self._max_json_depth is not None or self._max_json_nodes is not None:
+            try:
+                validate_json_shape(
+                    value,
+                    max_depth=self._max_json_depth,
+                    max_nodes=self._max_json_nodes,
+                )
+            except JsonStructureError as error:
+                raise AnchoredReadStructureError(str(error)) from error
         self._json[key] = value
         return value
 
@@ -756,12 +783,53 @@ def _read_json(
 def _strict_json_loads(raw: str | bytes | bytearray) -> Any:
     if isinstance(raw, (bytes, bytearray)):
         raw = bytes(raw).decode("utf-8")
-    return json.loads(
-        raw,
-        object_pairs_hook=_unique_json_object,
-        parse_constant=_reject_json_constant,
-        parse_float=_strict_json_float,
-    )
+    try:
+        return json.loads(
+            raw,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+            parse_float=_strict_json_float,
+        )
+    except RecursionError as error:
+        raise ValueError("JSON recursion or depth limit exceeded") from error
+
+
+def validate_json_shape(
+    value: object,
+    *,
+    max_depth: int | None,
+    max_nodes: int | None,
+) -> None:
+    """Iteratively validate optional decoded-JSON depth and node bounds."""
+    for limit, field in ((max_depth, "max_depth"), (max_nodes, "max_nodes")):
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError(f"{field} must be nonnegative or null")
+    pending: list[tuple[object, int]] = [(value, 1)]
+    nodes = 0
+    while pending:
+        item, depth = pending.pop()
+        nodes += 1
+        if max_nodes is not None and nodes > max_nodes:
+            raise JsonStructureError(
+                f"JSON nodes exceed {max_nodes}"
+            )
+        if max_depth is not None and depth > max_depth:
+            raise JsonStructureError(
+                f"JSON depth exceeds {max_depth}"
+            )
+        if isinstance(item, dict):
+            if any(not isinstance(key, str) for key in item):
+                raise JsonStructureError("JSON object key is not a string")
+            pending.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item)
+        elif item is not None and not isinstance(
+            item,
+            (bool, int, float, str),
+        ):
+            raise JsonStructureError(
+                f"decoded value is not JSON-compatible: {type(item).__name__}"
+            )
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

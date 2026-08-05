@@ -416,6 +416,41 @@ def test_strict_json_bytes_reject_utf16_and_utf32(encoding: str) -> None:
         store_module._strict_json_loads(payload)
 
 
+def test_strict_json_normalizes_decoder_recursion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def recursive_decoder(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("decoder recursion")
+
+    monkeypatch.setattr(store_module.json, "loads", recursive_decoder)
+
+    with pytest.raises(ValueError, match="depth|recursive|recursion"):
+        store_module._strict_json_loads("[]")
+
+
+def test_anchored_json_shape_limits_are_iterative_and_opt_in(
+    tmp_path: Path,
+) -> None:
+    deep = tmp_path / "deep.json"
+    deep.write_text("[" * 70 + "0" + "]" * 70, encoding="utf-8")
+    wide = tmp_path / "wide.json"
+    wide.write_text("[" + ",".join("0" for _ in range(10_001)) + "]", encoding="utf-8")
+
+    with store_module.AnchoredWorkspaceReader(tmp_path) as reader:
+        assert isinstance(reader.read_json("deep.json"), list)
+        assert isinstance(reader.read_json("wide.json"), list)
+
+    with store_module.AnchoredWorkspaceReader(
+        tmp_path,
+        max_json_depth=64,
+        max_json_nodes=10_000,
+    ) as reader:
+        with pytest.raises(store_module.AnchoredReadStructureError, match="depth|64"):
+            reader.read_json("deep.json")
+        with pytest.raises(store_module.AnchoredReadStructureError, match="nodes|10000"):
+            reader.read_json("wide.json")
+
+
 def test_read_json_rejects_path_replaced_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

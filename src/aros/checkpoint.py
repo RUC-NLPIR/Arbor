@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import stat
 import subprocess
 import tempfile
@@ -40,11 +41,13 @@ from .transitions import (
 )
 from .worktrees import (
     RepositoryBinding,
+    RepositoryTreeEntry,
     WorktreeError,
     WorktreeLimitError,
     bind_repository,
     read_tree_into_index,
     read_repository_refs_snapshot,
+    read_repository_blob,
     read_repository_snapshot,
     read_repository_tree_entries,
     resolve_repository_commit,
@@ -151,6 +154,27 @@ _FINALIZE_FENCE_FIELDS = {
     "expiresAt",
     "fenceSHA256",
 }
+_PROJECTION_INTENT_FIELDS = {
+    "schema_version",
+    "transition_id",
+    "prepared_ref",
+    "base_commit",
+    "commit",
+    "canonical_ref",
+    "receipt_sha256",
+    "projection_sha256",
+}
+_ADMITTED_EVENT_FIELDS = {
+    "schema_version",
+    "event_id",
+    "kind",
+    "transition_id",
+    "base_commit",
+    "commit",
+    "canonical_ref",
+    "receipt_sha256",
+    "event_sha256",
+}
 _BUDGET_SNAPSHOT_FIELDS = {"turns", "actions", "deadline"}
 _BUDGET_COUNTER_FIELDS = {"limit", "used", "remaining"}
 _FENCE_RECEIPT_BINDINGS = {
@@ -172,10 +196,111 @@ MAX_FINALIZE_FENCE_BYTES = 65_536
 MAX_FETCH_HEAD_BYTES = 1_048_576
 MAX_CANONICAL_REFS = 20_000
 MAX_CANONICAL_REF_SNAPSHOT_BYTES = 4_194_304
+MAX_PROJECTION_INTENT_BYTES = 65_536
+CHECKPOINT_BARRIER_POINTS = frozenset(
+    {
+        "after_audit",
+        "after_tree",
+        "after_allow",
+        "after_commit_object",
+        "after_cas",
+        "after_index_repair",
+    }
+)
 
 
 class CheckpointError(ValueError):
     """An audited checkpoint candidate cannot be prepared exactly."""
+
+
+class _StaleCanonicalTip(CheckpointError):
+    """The canonical ref does not name a commit intended by this preparation."""
+
+
+class CheckpointBarrier(Protocol):
+    """Host-injected observation point outside model-visible method inputs."""
+
+    def reach(self, point: str) -> None: ...
+
+
+class _NoopCheckpointBarrier:
+    def reach(self, point: str) -> None:
+        if point not in CHECKPOINT_BARRIER_POINTS:
+            raise CheckpointError("checkpoint barrier point is invalid")
+
+
+class HostCheckpointBarrier:
+    """Create one durable marker and await one broker acknowledgement byte."""
+
+    def __init__(
+        self,
+        checkpoint_runtime: str | Path,
+        *,
+        point: str,
+        control_fd: int,
+        timeout_seconds: float = 10.0,
+    ):
+        try:
+            runtime = Path(checkpoint_runtime).absolute()
+            metadata = runtime.lstat()
+            if (
+                runtime.resolve(strict=True) != runtime
+                or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
+                raise ValueError("checkpoint runtime must be an exact directory")
+            if point not in CHECKPOINT_BARRIER_POINTS:
+                raise ValueError("checkpoint barrier point is invalid")
+            if isinstance(control_fd, bool) or not isinstance(control_fd, int):
+                raise TypeError("checkpoint barrier control FD must be an integer")
+            descriptor = os.fstat(control_fd)
+            if not (
+                stat.S_ISFIFO(descriptor.st_mode)
+                or stat.S_ISSOCK(descriptor.st_mode)
+            ):
+                raise ValueError("checkpoint barrier control FD must be a pipe or socket")
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or not 0 < timeout_seconds <= 60
+            ):
+                raise ValueError("checkpoint barrier timeout is invalid")
+        except (OSError, TypeError, ValueError) as error:
+            raise CheckpointError(
+                f"invalid checkpoint barrier point or control FD context: {error}"
+            ) from error
+        self.runtime = runtime
+        self.point = point
+        self.control_fd = control_fd
+        self.timeout_seconds = float(timeout_seconds)
+
+    def reach(self, point: str) -> None:
+        if point not in CHECKPOINT_BARRIER_POINTS:
+            raise CheckpointError("checkpoint barrier point is invalid")
+        if point != self.point:
+            return
+        _create_once_exact_file(
+            self.runtime / f"{point}.marker",
+            f"{point}\n".encode("ascii"),
+            mode=0o600,
+        )
+        try:
+            readable, _writable, _exceptional = select.select(
+                [self.control_fd],
+                [],
+                [],
+                self.timeout_seconds,
+            )
+            acknowledgement = os.read(self.control_fd, 1) if readable else b""
+        except OSError as error:
+            raise CheckpointError(
+                "checkpoint barrier acknowledgement failed"
+            ) from error
+        if len(acknowledgement) != 1:
+            raise CheckpointError("checkpoint barrier acknowledgement timed out")
+
+
+_NOOP_CHECKPOINT_BARRIER = _NoopCheckpointBarrier()
 
 
 class AdmissionGateway(Protocol):
@@ -246,6 +371,154 @@ class _FinalizationState:
     observation_updates: tuple[tuple[str, str], ...]
 
 
+@dataclass(frozen=True)
+class _AdmittedCheckpoint:
+    record: dict[str, object]
+    prepared_bytes: bytes
+    receipts: tuple[CandidatePathReceipt, ...]
+    admission_receipt: bytes
+    admission: dict[str, object]
+    admission_path_receipt: CandidatePathReceipt
+    commit: str
+
+
+@dataclass(frozen=True)
+class _ProjectionSnapshot:
+    user_index: _FileSnapshot
+    current_entries: Mapping[str, tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class CheckpointProjectionState:
+    state: str
+    prepared_ref: str | None
+    intended_commit: str | None
+
+
+@dataclass(frozen=True)
+class _ExpectedAdmittedEvent:
+    runtime_root: Path
+    path: Path
+    value: Mapping[str, object]
+    content: bytes
+    mode: int = 0o600
+
+
+def read_checkpoint_projection_state(
+    candidate_repository: RepositoryBinding,
+    *,
+    canonical_commit: str,
+    canonical_ref: str,
+) -> CheckpointProjectionState:
+    """Read bounded runtime projection intent/completion state without repair."""
+    if not isinstance(candidate_repository, RepositoryBinding):
+        raise CheckpointError("candidate repository binding is required")
+    _required_commit(canonical_commit, "projection canonical commit")
+    if (
+        not isinstance(canonical_ref, str)
+        or not canonical_ref.startswith("refs/")
+        or "\x00" in canonical_ref
+    ):
+        raise CheckpointError("projection canonical ref is invalid")
+    intent_path = (
+        candidate_repository.root
+        / ".aros"
+        / "projections"
+        / f"{canonical_commit}.json"
+    )
+    try:
+        intent = _read_projection_intent(intent_path, canonical_commit, canonical_ref)
+    except FileNotFoundError:
+        return CheckpointProjectionState("current", None, None)
+    if intent["base_commit"] == canonical_commit:
+        return CheckpointProjectionState("current", None, None)
+
+    transition_id = str(intent["transition_id"])
+    event_path = (
+        candidate_repository.root
+        / ".aros"
+        / "events"
+        / f"EVT-{transition_id}-admitted.json"
+    )
+    if not _projection_event_completes(event_path, intent):
+        return CheckpointProjectionState(
+            "projection_pending",
+            str(intent["prepared_ref"]),
+            canonical_commit,
+        )
+    return CheckpointProjectionState("current", None, canonical_commit)
+
+
+def _read_projection_intent(
+    path: Path,
+    expected_commit: str,
+    canonical_ref: str,
+) -> dict[str, object]:
+    raw = _read_plain_file(path, max_bytes=MAX_PROJECTION_INTENT_BYTES)
+    try:
+        value = _strict_json_loads(raw)
+        validate_json_shape(value, max_depth=4, max_nodes=32)
+    except (JsonStructureError, TypeError, UnicodeError, ValueError) as error:
+        raise CheckpointError("projection intent is invalid") from error
+    if (
+        not isinstance(value, dict)
+        or set(value) != _PROJECTION_INTENT_FIELDS
+        or raw != _stored_json_bytes(value)
+    ):
+        raise CheckpointError("projection intent shape or bytes are invalid")
+    _required_commit(value["base_commit"], "projection intent base")
+    commit = _required_commit(value["commit"], "projection intent commit")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or commit != expected_commit
+        or value["canonical_ref"] != canonical_ref
+    ):
+        raise CheckpointError("projection intent binding is invalid")
+    _required_sha256(value["receipt_sha256"], "projection intent receipt hash")
+    transition_id = _prepared_identity(value["prepared_ref"])
+    if value["transition_id"] != transition_id:
+        raise CheckpointError("projection intent transition binding is invalid")
+    unhashed = {key: item for key, item in value.items() if key != "projection_sha256"}
+    if value["projection_sha256"] != json_sha256(unhashed):
+        raise CheckpointError("projection intent self-hash is invalid")
+    return value
+
+
+def _projection_event_completes(
+    path: Path,
+    intent: Mapping[str, object],
+) -> bool:
+    try:
+        metadata = path.lstat()
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            return False
+        raw = _read_plain_file(path, max_bytes=65_536)
+        value = _strict_json_loads(raw)
+        validate_json_shape(value, max_depth=4, max_nodes=32)
+    except (FileNotFoundError, JsonStructureError, OSError, TypeError, UnicodeError, ValueError):
+        return False
+    if (
+        not isinstance(value, dict)
+        or set(value) != _ADMITTED_EVENT_FIELDS
+        or raw != _stored_json_bytes(value)
+    ):
+        return False
+    unhashed = {key: item for key, item in value.items() if key != "event_sha256"}
+    return bool(
+        type(value["schema_version"]) is int
+        and value["schema_version"] == 1
+        and value["event_id"] == f"EVT-{intent['transition_id']}-admitted"
+        and value["kind"] == "transition_admitted"
+        and value["transition_id"] == intent["transition_id"]
+        and value["base_commit"] == intent["base_commit"]
+        and value["commit"] == intent["commit"]
+        and value["canonical_ref"] == intent["canonical_ref"]
+        and value["receipt_sha256"] == intent["receipt_sha256"]
+        and value["event_sha256"] == json_sha256(unhashed)
+    )
+
+
 class CheckpointService:
     """Prepare one immutable candidate tree from a valid transition audit."""
 
@@ -257,6 +530,7 @@ class CheckpointService:
         canonical_ref: str,
         audit_service: TransitionAuditService | None = None,
         gateway: AdmissionGateway | None = None,
+        barrier: CheckpointBarrier | None = None,
         clock: Callable[[], int] | None = None,
     ):
         try:
@@ -289,6 +563,11 @@ class CheckpointService:
                 )
             if clock is not None and not callable(clock):
                 raise TypeError("checkpoint clock must be callable")
+            selected_barrier = (
+                _NOOP_CHECKPOINT_BARRIER if barrier is None else barrier
+            )
+            if not callable(getattr(selected_barrier, "reach", None)):
+                raise TypeError("checkpoint barrier must expose reach(point)")
         except (OSError, TypeError, UnicodeError, ValueError, WorktreeError) as error:
             raise CheckpointError(f"invalid checkpoint host context: {error}") from error
         self.candidate_repository = candidate
@@ -296,6 +575,7 @@ class CheckpointService:
         self.canonical_ref = canonical_ref
         self.audit_service = service
         self.gateway = gateway
+        self.barrier = selected_barrier
         self.clock = clock or _epoch_milliseconds
 
     def prepare(self, proposal_ref: str, message: str) -> PreparedCheckpoint:
@@ -328,6 +608,9 @@ class CheckpointService:
 
     def checkpoint(self, proposal_ref: str, message: str) -> dict[str, object]:
         """Prepare, admit once, revalidate once, and finalize one transition."""
+        recovered = self._recover_checkpoint_retry(proposal_ref, message)
+        if recovered is not None:
+            return recovered
         if self.gateway is None:
             raise CheckpointError("checkpoint requires an injected admission gateway")
         prepared = self.prepare(proposal_ref, message)
@@ -342,6 +625,40 @@ class CheckpointService:
         if not isinstance(fence, bytes):
             raise CheckpointError("admission gateway must return exact fence bytes")
         return self.finalize(prepared.prepared_ref, receipt, fence)
+
+    def _recover_checkpoint_retry(
+        self,
+        proposal_ref: str,
+        message: str,
+    ) -> dict[str, object] | None:
+        transition_id = _proposal_identity(proposal_ref)
+        prepared_ref = f".aros/checkpoints/{transition_id}/prepared.json"
+        prepared_path = self.candidate_repository.root / prepared_ref
+        if _read_prepared_if_present(prepared_path) is None:
+            return None
+        message_sha256 = hashlib.sha256(_message_bytes(message)).hexdigest()
+        with _checkpoint_lock(self.candidate_repository.root, transition_id):
+            record, _raw, _receipts = _load_prepared_record(
+                self,
+                prepared_ref,
+                transition_id,
+            )
+            if (
+                record["proposal_ref"] != proposal_ref
+                or record["message_sha256"] != message_sha256
+            ):
+                raise CheckpointError(
+                    "checkpoint retry conflicts with prepared transition"
+                )
+            if (
+                resolve_repository_commit(
+                    self.canonical_repository,
+                    self.canonical_ref,
+                )
+                == record["base_commit"]
+            ):
+                return None
+            return self._reconcile_locked(prepared_ref, transition_id)
 
     def finalize(
         self,
@@ -374,6 +691,41 @@ class CheckpointService:
                 f"checkpoint finalization failed: {type(error).__name__}: {error}"
             ) from error
 
+    def reconcile(self, prepared_ref: str) -> dict[str, object]:
+        """Complete one canonically admitted candidate projection."""
+        transition_id = _prepared_identity(prepared_ref)
+        try:
+            with _checkpoint_lock(self.candidate_repository.root, transition_id):
+                return self._reconcile_locked(prepared_ref, transition_id)
+        except CheckpointError:
+            raise
+        except (
+            AnchoredReadError,
+            JsonStructureError,
+            OSError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            WorktreeError,
+        ) as error:
+            raise CheckpointError(
+                f"checkpoint reconciliation failed: {type(error).__name__}: {error}"
+            ) from error
+
+    def _reconcile_locked(
+        self,
+        prepared_ref: str,
+        transition_id: str,
+    ) -> dict[str, object]:
+        try:
+            admitted = _load_reconcile_admitted(self, prepared_ref, transition_id)
+        except _StaleCanonicalTip as error:
+            raise CheckpointError(
+                "canonical stale-base conflict: HEAD is not the exact admitted "
+                "transition"
+            ) from error
+        return _project_admitted_checkpoint(self, admitted)
+
     def _finalize_locked(
         self,
         transition_id: str,
@@ -381,6 +733,34 @@ class CheckpointService:
         admission_receipt: bytes,
         finalize_fence: bytes,
     ) -> dict[str, object]:
+        record, _prepared_bytes, _receipts = _load_prepared_record(
+            self,
+            prepared_ref,
+            transition_id,
+        )
+        base_commit = str(record["base_commit"])
+        if (
+            resolve_repository_commit(
+                self.canonical_repository,
+                self.canonical_ref,
+            )
+            != base_commit
+        ):
+            admitted = _load_reconcile_admitted(
+                self,
+                prepared_ref,
+                transition_id,
+            )
+            if admission_receipt != admitted.admission_receipt:
+                raise CheckpointError(
+                    "finalize retry receipt differs from canonical admission"
+                )
+            if (
+                not isinstance(finalize_fence, bytes)
+                or len(finalize_fence) > MAX_FINALIZE_FENCE_BYTES
+            ):
+                raise CheckpointError("finalize retry fence bytes are invalid")
+            return _project_admitted_checkpoint(self, admitted)
         state = _load_finalization_state(self, prepared_ref, transition_id)
         receipt = _decode_admission_receipt(admission_receipt)
         _require_receipt_binding(receipt, state.record, self.canonical_ref)
@@ -389,6 +769,7 @@ class CheckpointService:
             receipt=receipt,
             now_ms=self.clock(),
         )
+        self.barrier.reach("after_allow")
 
         admission_ref = f"transitions/{transition_id}/admission.json"
         final_index = (
@@ -470,6 +851,8 @@ class CheckpointService:
             final_index_snapshot.content,
             final_tree,
         )
+        _write_projection_intent(self, repeated.record, commit, receipt)
+        self.barrier.reach("after_commit_object")
 
         def require_current_fence() -> None:
             _decode_finalize_fence(
@@ -486,13 +869,11 @@ class CheckpointService:
             observation_updates=state.observation_updates,
             validate_current_fence=require_current_fence,
         )
-        return {
-            "schema_version": 1,
-            "transition_id": transition_id,
-            "canonical_ref": self.canonical_ref,
-            "commit": commit,
-            "state": "projection_pending",
-        }
+        self.barrier.reach("after_cas")
+        admitted = _load_admitted_checkpoint(self, prepared_ref, transition_id)
+        if admitted.commit != commit:
+            raise CheckpointError("canonical admission commit changed after CAS")
+        return _project_admitted_checkpoint(self, admitted)
 
     def _prepare_locked(
         self,
@@ -512,6 +893,19 @@ class CheckpointService:
             self.canonical_repository,
             self.canonical_ref,
         )
+        projection = read_checkpoint_projection_state(
+            self.candidate_repository,
+            canonical_commit=canonical_ref,
+            canonical_ref=self.canonical_ref,
+        )
+        if projection.state == "projection_pending":
+            raise CheckpointError(
+                "candidate projection_pending; reconcile before prepare"
+            )
+        if candidate_ref != canonical_ref:
+            raise CheckpointError(
+                "candidate projection_pending or ref conflict; reconcile before prepare"
+            )
         user_index = _snapshot_file(
             self.candidate_repository.git_dir / "index",
             max_bytes=MAX_CHECKPOINT_INDEX_BYTES,
@@ -546,6 +940,7 @@ class CheckpointService:
             base_commit,
             user_index,
         )
+        self.barrier.reach("after_audit")
 
         audit_bytes = _stored_json_bytes(audit)
         if len(audit_bytes) > MAX_AUDIT_FILE_BYTES:
@@ -879,6 +1274,7 @@ class CheckpointService:
                 index_ref=index_ref,
                 index_sha256=index_sha256,
             )
+        self.barrier.reach("after_tree")
         return prepared
 
     def _require_bindings(self) -> None:
@@ -1028,6 +1424,780 @@ def _validate_prepared_record(
         {item.path for item in ordered},
     )
     return ordered
+
+
+def _load_prepared_record(
+    service: CheckpointService,
+    prepared_ref: str,
+    transition_id: str,
+) -> tuple[dict[str, object], bytes, tuple[CandidatePathReceipt, ...]]:
+    service._require_bindings()
+    prepared_path = service.candidate_repository.root / prepared_ref
+    loaded = _read_prepared_if_present(prepared_path)
+    if loaded is None:
+        raise CheckpointError("prepared checkpoint record is missing")
+    record, prepared_bytes = loaded
+    receipts = _validate_prepared_record(
+        record,
+        prepared_bytes,
+        prepared_ref=prepared_ref,
+        transition_id=transition_id,
+        canonical_ref=service.canonical_ref,
+    )
+    return record, prepared_bytes, receipts
+
+
+def _load_reconcile_admitted(
+    service: CheckpointService,
+    prepared_ref: str,
+    transition_id: str,
+) -> _AdmittedCheckpoint:
+    record, _raw, _receipts = _load_prepared_record(
+        service,
+        prepared_ref,
+        transition_id,
+    )
+    canonical_commit = resolve_repository_commit(
+        service.canonical_repository,
+        service.canonical_ref,
+    )
+    if canonical_commit != record["base_commit"]:
+        path = (
+            service.candidate_repository.root
+            / ".aros"
+            / "projections"
+            / f"{canonical_commit}.json"
+        )
+        try:
+            intent = _read_projection_intent(
+                path,
+                canonical_commit,
+                service.canonical_ref,
+            )
+        except FileNotFoundError as error:
+            raise _StaleCanonicalTip(
+                "canonical tip has no projection intent"
+            ) from error
+        if intent["prepared_ref"] != prepared_ref:
+            raise _StaleCanonicalTip(
+                "canonical tip belongs to another projection intent"
+            )
+    return _load_admitted_checkpoint(service, prepared_ref, transition_id)
+
+
+def _load_admitted_checkpoint(
+    service: CheckpointService,
+    prepared_ref: str,
+    transition_id: str,
+) -> _AdmittedCheckpoint:
+    record, prepared_bytes, receipts = _load_prepared_record(
+        service,
+        prepared_ref,
+        transition_id,
+    )
+    base_commit = str(record["base_commit"])
+    canonical_snapshot = read_repository_snapshot(service.canonical_repository)
+    canonical_commit = resolve_repository_commit(
+        service.canonical_repository,
+        service.canonical_ref,
+    )
+    if canonical_commit == base_commit:
+        raise CheckpointError("canonical transition is not admitted")
+    if (
+        canonical_snapshot.get("head") != canonical_commit
+        or canonical_snapshot.get("ref") != service.canonical_ref
+    ):
+        raise CheckpointError("canonical HEAD/ref is not the admitted transition")
+
+    prepared_path = service.candidate_repository.root / prepared_ref
+    checkpoint_root = prepared_path.parent
+    message_path = checkpoint_root / "message"
+    message_bytes = _read_message_if_present(message_path)
+    if message_bytes is None:
+        raise CheckpointError("prepared checkpoint message artifact is missing")
+    _require_exact_message(
+        message_path,
+        message_bytes,
+        str(record["message_sha256"]),
+    )
+
+    final_tree = _commit_tree(service.canonical_repository, canonical_commit)
+    candidate_tree = str(record["candidate_tree"])
+    _verify_final_commit(
+        service.canonical_repository,
+        canonical_commit,
+        final_tree,
+        base_commit,
+        message_bytes,
+    )
+    _verify_candidate_tree(
+        service.canonical_repository,
+        base_commit,
+        candidate_tree,
+        receipts,
+        transition_id,
+    )
+
+    admission_ref = f"transitions/{transition_id}/admission.json"
+    admission_entry, admission_receipt = _read_tree_blob(
+        service.canonical_repository,
+        final_tree,
+        admission_ref,
+        max_bytes=MAX_ADMISSION_RECEIPT_BYTES,
+    )
+    admission_path_receipt = CandidatePathReceipt(
+        path=admission_ref,
+        mode=admission_entry.mode,
+        blob_oid=admission_entry.oid,
+        content_sha256=hashlib.sha256(admission_receipt).hexdigest(),
+    )
+    if admission_path_receipt.mode != "100644":
+        raise CheckpointError("canonical admission receipt mode is invalid")
+    _verify_final_tree(
+        service.canonical_repository,
+        candidate_tree,
+        final_tree,
+        admission_path_receipt,
+    )
+    admission = _decode_admission_receipt(admission_receipt)
+    _require_receipt_binding(admission, record, service.canonical_ref)
+
+    audit_ref = f"transitions/{transition_id}/audit.json"
+    _audit_entry, audit_bytes = _read_tree_blob(
+        service.canonical_repository,
+        final_tree,
+        audit_ref,
+        max_bytes=MAX_AUDIT_FILE_BYTES,
+    )
+    if hashlib.sha256(audit_bytes).hexdigest() != record["audit_file_sha256"]:
+        raise CheckpointError("canonical audit file hash does not match prepared state")
+    try:
+        audit_value = _strict_json_loads(audit_bytes)
+        validate_json_shape(
+            audit_value,
+            max_depth=MAX_JSON_DEPTH,
+            max_nodes=max(MAX_JSON_NODES, 50_000),
+        )
+    except (JsonStructureError, TypeError, UnicodeError, ValueError) as error:
+        raise CheckpointError("canonical admitted audit is invalid") from error
+    if (
+        not isinstance(audit_value, dict)
+        or audit_bytes != _stored_json_bytes(audit_value)
+    ):
+        raise CheckpointError("canonical admitted audit bytes are not exact")
+    audit: dict[str, object] = audit_value
+    _validate_audit_testimony(audit, transition_id)
+    if (
+        audit["mechanically_valid"] is not True
+        or audit["base_commit"] != base_commit
+        or audit["current_head"] != base_commit
+        or audit["proposal_blob_sha256"] != record["proposal_blob_sha256"]
+        or audit["audit_payload_sha256"] != record["audit_payload_sha256"]
+        or audit["candidate_subject_sha256"]
+        != record["candidate_subject_sha256"]
+    ):
+        raise CheckpointError("canonical admitted audit binding does not match")
+
+    index_path = service.candidate_repository.root / str(record["index_ref"])
+    index_snapshot = _snapshot_file(
+        index_path,
+        max_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+    )
+    if index_snapshot.content is None or hashlib.sha256(
+        index_snapshot.content
+    ).hexdigest() != record["index_sha256"]:
+        raise CheckpointError("prepared checkpoint index bytes or hash changed")
+    _verify_index_snapshot_tree(
+        service.canonical_repository,
+        checkpoint_root,
+        index_snapshot.content,
+        candidate_tree,
+    )
+
+    captured = _canonical_observation_records(
+        service.canonical_repository,
+        final_tree,
+        audit,
+    )
+    observation_updates = _observation_ref_updates(
+        audit,
+        captured,
+        candidate_repository=service.candidate_repository,
+        canonical_repository=service.canonical_repository,
+    )
+    _verify_observation_refs(service.canonical_repository, observation_updates)
+    if (
+        _read_prepared_if_present(prepared_path) != (record, prepared_bytes)
+        or read_repository_snapshot(service.canonical_repository)
+        != canonical_snapshot
+        or resolve_repository_commit(
+            service.canonical_repository,
+            service.canonical_ref,
+        )
+        != canonical_commit
+    ):
+        raise CheckpointError("canonical admission changed during reconciliation")
+    _require_exact_message(
+        message_path,
+        message_bytes,
+        str(record["message_sha256"]),
+    )
+    service._require_bindings()
+    return _AdmittedCheckpoint(
+        record=record,
+        prepared_bytes=prepared_bytes,
+        receipts=receipts,
+        admission_receipt=admission_receipt,
+        admission=admission,
+        admission_path_receipt=admission_path_receipt,
+        commit=canonical_commit,
+    )
+
+
+def _commit_tree(repository: RepositoryBinding, commit: str) -> str:
+    result = _git_success(
+        run_git(repository, "rev-parse", "--verify", f"{commit}^{{tree}}"),
+        "read admitted checkpoint tree",
+    )
+    try:
+        tree = result.stdout.decode("ascii").strip()
+    except UnicodeError as error:
+        raise CheckpointError("admitted checkpoint tree is not ASCII") from error
+    return _required_commit(tree, "admitted checkpoint tree")
+
+
+def _read_tree_blob(
+    repository: RepositoryBinding,
+    tree: str,
+    path: str,
+    *,
+    max_bytes: int,
+) -> tuple[RepositoryTreeEntry, bytes]:
+    entries = read_repository_tree_entries(repository, tree, (path,))
+    if len(entries) != 1:
+        raise CheckpointError(f"canonical admitted path is missing: {path}")
+    entry = entries[0]
+    if entry.path != path or entry.kind != "blob" or entry.mode not in {
+        "100644",
+        "100755",
+    }:
+        raise CheckpointError(f"canonical admitted path is not a regular blob: {path}")
+    return entry, read_repository_blob(repository, entry.oid, max_bytes=max_bytes)
+
+
+def _canonical_observation_records(
+    repository: RepositoryBinding,
+    tree: str,
+    audit: dict[str, object],
+) -> dict[str, bytes]:
+    closure = audit["observation_closure"]
+    if not isinstance(closure, list):
+        raise CheckpointError("canonical audit observation closure is invalid")
+    captured: dict[str, bytes] = {}
+    for item in closure:
+        if not isinstance(item, dict):
+            raise CheckpointError("canonical audit observation record is invalid")
+        path = _candidate_path(item.get("observation_ref"))
+        if path in captured:
+            continue
+        _entry, captured[path] = _read_tree_blob(
+            repository,
+            tree,
+            path,
+            max_bytes=MAX_VERSIONED_FILE_BYTES,
+        )
+    return captured
+
+
+def _verify_observation_refs(
+    repository: RepositoryBinding,
+    updates: tuple[tuple[str, str], ...],
+) -> None:
+    for ref, target in updates:
+        result = _git_success(
+            run_git(repository, "show-ref", "--hash", "--verify", ref),
+            f"verify immutable observation ref during reconcile: {ref}",
+        )
+        if result.stdout.strip() != target.encode("ascii"):
+            raise CheckpointError(
+                f"immutable observation ref differs during reconcile: {ref}"
+            )
+
+
+def _project_admitted_checkpoint(
+    service: CheckpointService,
+    admitted: _AdmittedCheckpoint,
+) -> dict[str, object]:
+    expected_event = _expected_admitted_event(service, admitted)
+    _require_event_absent_or_exact(expected_event)
+    _validate_projection_overlap(service, admitted)
+    _import_admitted_commit(
+        service.candidate_repository,
+        service.canonical_repository,
+        admitted.commit,
+    )
+    _validate_projection_overlap(service, admitted)
+
+    base_commit = str(admitted.record["base_commit"])
+    candidate_commit = resolve_repository_commit(
+        service.candidate_repository,
+        service.canonical_ref,
+    )
+    if candidate_commit == base_commit:
+        _git_success(
+            run_git(
+                service.candidate_repository,
+                "update-ref",
+                service.canonical_ref,
+                admitted.commit,
+                base_commit,
+            ),
+            "candidate projection CAS",
+        )
+    elif candidate_commit != admitted.commit:
+        raise CheckpointError("candidate projection ref conflicts with admission")
+    if (
+        resolve_repository_commit(
+            service.candidate_repository,
+            service.canonical_ref,
+        )
+        != admitted.commit
+    ):
+        raise CheckpointError("candidate projection ref differs after CAS")
+
+    _repair_candidate_index(service, admitted)
+    _create_once_exact_file(
+        service.candidate_repository.root / admitted.admission_path_receipt.path,
+        admitted.admission_receipt,
+        mode=0o644,
+    )
+    repaired = _validate_projection_overlap(service, admitted)
+    expected_entries = _admitted_index_entries(admitted)
+    if any(
+        repaired.current_entries.get(path) != entry
+        for path, entry in expected_entries.items()
+    ):
+        raise CheckpointError("candidate admitted index repair is incomplete")
+    service.barrier.reach("after_index_repair")
+    _write_admitted_event(expected_event)
+    return {
+        "schema_version": 1,
+        "transition_id": str(admitted.record["transition_id"]),
+        "canonical_ref": service.canonical_ref,
+        "commit": admitted.commit,
+        "state": "admitted",
+    }
+
+
+def _validate_projection_overlap(
+    service: CheckpointService,
+    admitted: _AdmittedCheckpoint,
+) -> _ProjectionSnapshot:
+    service._require_bindings()
+    base_commit = str(admitted.record["base_commit"])
+    candidate_snapshot = read_repository_snapshot(service.candidate_repository)
+    candidate_commit = resolve_repository_commit(
+        service.candidate_repository,
+        service.canonical_ref,
+    )
+    if (
+        candidate_snapshot.get("ref") != service.canonical_ref
+        or candidate_snapshot.get("head") != candidate_commit
+    ):
+        raise CheckpointError("candidate HEAD/ref is invalid for projection")
+    if candidate_commit not in {base_commit, admitted.commit}:
+        raise CheckpointError("candidate projection ref conflicts with admission")
+    with AnchoredWorkspaceReader(
+        service.candidate_repository.root,
+        max_capture_bytes=MAX_AUDIT_CAPTURE_BYTES,
+    ) as reader:
+        reader.require_repository(
+            service.candidate_repository.root,
+            service.candidate_repository.git_dir,
+            service.candidate_repository.common_dir,
+        )
+        for receipt in admitted.receipts:
+            raw, mode = _read_anchored_candidate(reader, receipt.path)
+            if (
+                mode != receipt.mode
+                or _blob_oid(raw) != receipt.blob_oid
+                or hashlib.sha256(raw).hexdigest() != receipt.content_sha256
+            ):
+                raise CheckpointError(
+                    f"candidate worktree overlaps admitted path: {receipt.path}"
+                )
+        reader.revalidate()
+
+    admission_path = (
+        service.candidate_repository.root / admitted.admission_path_receipt.path
+    )
+    try:
+        admission_metadata = admission_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if (
+            not stat.S_ISREG(admission_metadata.st_mode)
+            or stat.S_ISLNK(admission_metadata.st_mode)
+            or stat.S_IMODE(admission_metadata.st_mode) != 0o644
+            or _read_plain_file(
+                admission_path,
+                max_bytes=MAX_ADMISSION_RECEIPT_BYTES,
+            )
+            != admitted.admission_receipt
+        ):
+            raise CheckpointError(
+                "candidate worktree overlaps admitted admission receipt"
+            )
+
+    checkpoint_root = (
+        service.candidate_repository.root
+        / ".aros"
+        / "checkpoints"
+        / str(admitted.record["transition_id"])
+    )
+    user_index = _snapshot_file(
+        service.candidate_repository.git_dir / "index",
+        max_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+    )
+    admitted_entries = _admitted_index_entries(admitted)
+    current_list = _ordinary_index_entries(
+        service.candidate_repository,
+        user_index,
+        set(admitted_entries),
+        checkpoint_root,
+    )
+    current_entries = {
+        str(item["path"]): (str(item["mode"]), str(item["blob_oid"]))
+        for item in current_list
+    }
+    old_entries = {
+        str(item["path"]): (str(item["mode"]), str(item["blob_oid"]))
+        for item in _validate_ordinary_index_entries(
+            admitted.record["ordinary_index_entries"],
+            {receipt.path for receipt in admitted.receipts},
+        )
+    }
+    for path, admitted_entry in admitted_entries.items():
+        current = current_entries.get(path)
+        if current not in {old_entries.get(path), admitted_entry}:
+            raise CheckpointError(
+                f"candidate ordinary index overlaps admitted path: {path}"
+            )
+    if (
+        _read_prepared_if_present(
+            service.candidate_repository.root
+            / str(admitted.record["prepared_ref"])
+        )
+        != (admitted.record, admitted.prepared_bytes)
+        or resolve_repository_commit(
+            service.canonical_repository,
+            service.canonical_ref,
+        )
+        != admitted.commit
+    ):
+        raise CheckpointError("admitted projection authority changed")
+    return _ProjectionSnapshot(
+        user_index=user_index,
+        current_entries=MappingProxyType(current_entries),
+    )
+
+
+def _admitted_index_entries(
+    admitted: _AdmittedCheckpoint,
+) -> dict[str, tuple[str, str]]:
+    return {
+        receipt.path: (receipt.mode, receipt.blob_oid)
+        for receipt in (*admitted.receipts, admitted.admission_path_receipt)
+    }
+
+
+def _import_admitted_commit(
+    candidate: RepositoryBinding,
+    canonical: RepositoryBinding,
+    commit: str,
+) -> None:
+    _import_exact_commits(
+        destination=candidate,
+        source=canonical,
+        commits=(commit,),
+        description="admitted checkpoint",
+    )
+
+
+def _repair_candidate_index(
+    service: CheckpointService,
+    admitted: _AdmittedCheckpoint,
+) -> None:
+    projection = _validate_projection_overlap(service, admitted)
+    admitted_entries = _admitted_index_entries(admitted)
+    if all(
+        projection.current_entries.get(path) == entry
+        for path, entry in admitted_entries.items()
+    ):
+        return
+
+    checkpoint_root = (
+        service.candidate_repository.root
+        / ".aros"
+        / "checkpoints"
+        / str(admitted.record["transition_id"])
+    )
+    projection_index = checkpoint_root / "index-projection"
+    try:
+        if projection.user_index.content is None:
+            _initialize_index(
+                service.candidate_repository,
+                projection_index,
+                None,
+            )
+        else:
+            _replace_runtime_file(projection_index, projection.user_index.content)
+        for path, (mode, oid) in admitted_entries.items():
+            _git_success(
+                update_index_cacheinfo(
+                    service.candidate_repository,
+                    index_file=projection_index,
+                    mode=mode,
+                    oid=oid,
+                    path=path,
+                ),
+                f"repair candidate index entry: {path}",
+            )
+        projection_index.chmod(0o600)
+        _fsync_file(projection_index)
+        _fsync_directory(projection_index.parent)
+        projection_bytes = _read_plain_file(
+            projection_index,
+            max_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+        )
+        _publish_git_index(
+            service.candidate_repository,
+            expected=projection.user_index,
+            content=projection_bytes,
+        )
+    finally:
+        try:
+            projection_index.unlink()
+        except FileNotFoundError:
+            pass
+        _fsync_directory(checkpoint_root)
+
+
+def _publish_git_index(
+    repository: RepositoryBinding,
+    *,
+    expected: _FileSnapshot,
+    content: bytes,
+) -> None:
+    index_path = repository.git_dir / "index"
+    lock_path = repository.git_dir / "index.lock"
+    mode = (
+        stat.S_IMODE(expected.identity[2])
+        if expected.identity is not None
+        else 0o600
+    )
+    descriptor = os.open(
+        lock_path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        mode,
+    )
+    replaced = False
+    owned_identity: tuple[int, int, int, int] | None = None
+    try:
+        os.fchmod(descriptor, mode)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise CheckpointError("candidate index lock is not a plain file")
+        owned_identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+        )
+        _write_all(descriptor, content)
+        os.fsync(descriptor)
+        if _snapshot_file(
+            index_path,
+            max_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+        ) != expected:
+            raise CheckpointError("ordinary index changed before atomic repair")
+        opened = os.fstat(descriptor)
+        observed = lock_path.lstat()
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink)
+            != owned_identity
+            or (observed.st_dev, observed.st_ino, observed.st_mode, observed.st_nlink)
+            != owned_identity
+        ):
+            raise CheckpointError("candidate index lock identity changed")
+        os.replace(lock_path, index_path)
+        replaced = True
+        _fsync_directory(repository.git_dir)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not replaced and owned_identity is not None:
+            try:
+                observed = lock_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if (
+                    observed.st_dev,
+                    observed.st_ino,
+                    observed.st_mode,
+                    observed.st_nlink,
+                ) == owned_identity:
+                    lock_path.unlink()
+                    _fsync_directory(repository.git_dir)
+
+
+def _create_once_exact_file(path: Path, content: bytes, *, mode: int) -> None:
+    prefix = f".aros-checkpoint-{hashlib.sha256(os.fsencode(path.name)).hexdigest()}."
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None and metadata.st_nlink > 1:
+        identity = (metadata.st_dev, metadata.st_ino)
+        for candidate in path.parent.iterdir():
+            if not candidate.name.startswith(prefix) or not candidate.name.endswith(
+                ".tmp"
+            ):
+                continue
+            try:
+                alias = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if (alias.st_dev, alias.st_ino) == identity and stat.S_ISREG(alias.st_mode):
+                candidate.unlink()
+        _fsync_directory(path.parent)
+    if path.exists():
+        existing = _read_plain_file(path, max_bytes=len(content))
+        if (
+            existing != content
+            or stat.S_IMODE(path.stat().st_mode) != mode
+        ):
+            raise CheckpointError("existing admitted working file conflicts")
+        return
+
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(descriptor, mode)
+        _write_all(descriptor, content)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            os.link(temporary_path, path, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        _fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
+    existing = _read_plain_file(path, max_bytes=len(content))
+    if existing != content or stat.S_IMODE(path.stat().st_mode) != mode:
+        raise CheckpointError("admitted working file publication conflicts")
+
+
+def _expected_admitted_event(
+    service: CheckpointService,
+    admitted: _AdmittedCheckpoint,
+) -> _ExpectedAdmittedEvent:
+    transition_id = str(admitted.record["transition_id"])
+    event_id = f"EVT-{transition_id}-admitted"
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "event_id": event_id,
+        "kind": "transition_admitted",
+        "transition_id": transition_id,
+        "base_commit": admitted.record["base_commit"],
+        "commit": admitted.commit,
+        "canonical_ref": service.canonical_ref,
+        "receipt_sha256": admitted.admission["receiptSHA256"],
+    }
+    event = {**payload, "event_sha256": json_sha256(payload)}
+    return _ExpectedAdmittedEvent(
+        runtime_root=service.candidate_repository.root,
+        path=(
+            service.candidate_repository.root
+            / ".aros"
+            / "events"
+            / f"{event_id}.json"
+        ),
+        value=MappingProxyType(event),
+        content=_stored_json_bytes(event),
+    )
+
+
+def _require_event_absent_or_exact(expected: _ExpectedAdmittedEvent) -> None:
+    try:
+        metadata = expected.path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != expected.mode
+        or _read_plain_file(expected.path, max_bytes=len(expected.content))
+        != expected.content
+    ):
+        raise CheckpointError("existing admitted event conflicts")
+
+
+def _write_admitted_event(expected: _ExpectedAdmittedEvent) -> None:
+    _ensure_runtime_directory(expected.runtime_root, (".aros", "events"))
+    _create_once_exact_file(
+        expected.path,
+        expected.content,
+        mode=expected.mode,
+    )
+    _require_event_absent_or_exact(expected)
+
+
+def _write_projection_intent(
+    service: CheckpointService,
+    record: Mapping[str, object],
+    commit: str,
+    receipt: Mapping[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "transition_id": record["transition_id"],
+        "prepared_ref": record["prepared_ref"],
+        "base_commit": record["base_commit"],
+        "commit": commit,
+        "canonical_ref": service.canonical_ref,
+        "receipt_sha256": receipt["receiptSHA256"],
+    }
+    intent = {**payload, "projection_sha256": json_sha256(payload)}
+    path = (
+        service.candidate_repository.root
+        / ".aros"
+        / "projections"
+        / f"{commit}.json"
+    )
+    created = create_json(path, intent)
+    try:
+        observed = _read_projection_intent(path, commit, service.canonical_ref)
+    except CheckpointError as error:
+        conflict = "published" if created else "existing"
+        raise CheckpointError(f"{conflict} projection intent conflicts") from error
+    if observed != intent:
+        raise CheckpointError("projection intent differs after publication")
 
 
 def _validate_ordinary_index_entries(
@@ -1870,7 +3040,7 @@ def _read_anchored_candidate(
 def _initialize_index(
     repository: RepositoryBinding,
     index_path: Path,
-    base_commit: str,
+    base_commit: str | None,
 ) -> None:
     try:
         metadata = index_path.lstat()
@@ -1885,14 +3055,21 @@ def _initialize_index(
             raise CheckpointError("checkpoint index is not a single-link plain file")
         index_path.unlink()
         _fsync_directory(index_path.parent)
-    _git_success(
+    result = (
         read_tree_into_index(
             repository,
             base_commit,
             index_file=index_path,
-        ),
-        "initialize checkpoint index",
+        )
+        if base_commit is not None
+        else run_git(
+            repository,
+            "read-tree",
+            "--empty",
+            index_file=index_path,
+        )
     )
+    _git_success(result, "initialize checkpoint index")
     metadata = index_path.lstat()
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         raise CheckpointError("Git did not create a plain checkpoint index")
@@ -2275,43 +3452,67 @@ def _import_commit_objects(
     candidate: RepositoryBinding,
     commits: tuple[str, ...],
 ) -> None:
-    if not commits:
-        return
+    _import_exact_commits(
+        destination=canonical,
+        source=candidate,
+        commits=commits,
+        description="audited",
+    )
+
+
+def _import_exact_commits(
+    *,
+    destination: RepositoryBinding,
+    source: RepositoryBinding,
+    commits: tuple[str, ...],
+    description: str,
+) -> None:
     for oid in commits:
-        _require_exact_commit(candidate, oid)
-    if canonical.common_dir == candidate.common_dir:
+        _require_exact_commit(source, oid)
+    if not commits or destination.common_dir == source.common_dir:
         for oid in commits:
-            _require_exact_commit(canonical, oid)
+            _require_exact_commit(destination, oid)
         return
-    refs_before = _snapshot_canonical_refs(canonical, "snapshot canonical refs")
-    fetch_paths = {canonical.git_dir / "FETCH_HEAD", canonical.common_dir / "FETCH_HEAD"}
+    refs_before = _snapshot_canonical_refs(
+        destination,
+        f"snapshot {description} destination refs",
+    )
+    fetch_paths = {
+        destination.git_dir / "FETCH_HEAD",
+        destination.common_dir / "FETCH_HEAD",
+    }
     fetch_before = {
         path: _snapshot_file(path, max_bytes=MAX_FETCH_HEAD_BYTES)
         for path in fetch_paths
     }
     for oid in commits:
-        present = run_git(canonical, "cat-file", "-e", f"{oid}^{{commit}}")
+        present = run_git(destination, "cat-file", "-e", f"{oid}^{{commit}}")
         if present.returncode == 0:
-            _require_exact_commit(canonical, oid)
+            _require_exact_commit(destination, oid)
             continue
         _git_success(
             run_git(
-                canonical,
+                destination,
                 "fetch",
                 "--no-tags",
                 "--no-write-fetch-head",
-                str(candidate.root),
+                str(source.root),
                 oid,
             ),
-            f"import audited commit object: {oid}",
+            f"import {description} commit object: {oid}",
         )
-        _require_exact_commit(canonical, oid)
-    refs_after = _snapshot_canonical_refs(canonical, "verify canonical refs")
+        _require_exact_commit(destination, oid)
+    refs_after = _snapshot_canonical_refs(
+        destination,
+        f"verify {description} destination refs",
+    )
     if refs_after != refs_before or any(
         _snapshot_file(path, max_bytes=MAX_FETCH_HEAD_BYTES) != snapshot
         for path, snapshot in fetch_before.items()
     ):
-        raise CheckpointError("audited object import changed a ref or FETCH_HEAD")
+        raise CheckpointError(
+            f"{description} object import changed a ref or FETCH_HEAD"
+        )
 
 
 def _snapshot_canonical_refs(
@@ -2873,7 +4074,9 @@ def _freeze_mapping(value: dict[str, object]) -> Mapping[str, object]:
 __all__ = [
     "AdmissionGateway",
     "CandidatePathReceipt",
+    "CheckpointBarrier",
     "CheckpointError",
     "CheckpointService",
+    "HostCheckpointBarrier",
     "PreparedCheckpoint",
 ]

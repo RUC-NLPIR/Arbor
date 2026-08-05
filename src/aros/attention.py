@@ -17,6 +17,7 @@ from .attention_fit import (
     freeze_json,
     packet_json,
 )
+from .checkpoint import CheckpointError, read_checkpoint_projection_state
 from .eval import EvalError, read_eval_inventory
 from .observations import ObservationCatalog, ObservationError, ObservationRecord
 from .research_files import (
@@ -220,11 +221,21 @@ class ResearchAttentionService:
             warnings,
             omitted,
         )
+        projection_state = _projection_state(
+            self.candidate_repository,
+            self.canonical_repository,
+            candidate_facts["head"],
+            canonical_facts["head"],
+            canonical_facts["ref"],
+        )
+        if projection_state == "projection_pending":
+            _warn(warnings, "projection_pending")
         snapshot = {
             "canonical": canonical_facts["head"],
             "canonical_ref": canonical_facts["ref"],
             "canonical_branch": canonical_facts["branch"],
             "canonical_repository": canonical_facts["repository"],
+            "projection_state": projection_state,
             "candidate": {**candidate_facts, **candidate_state},
         }
         canonical_head = canonical_facts["head"]
@@ -393,6 +404,45 @@ def _require_initialized_candidate(repository: RepositoryBinding) -> None:
 
 def _repository_facts(repository: RepositoryBinding) -> dict[str, object]:
     return read_repository_snapshot(repository)
+
+
+def _projection_state(
+    candidate: RepositoryBinding,
+    canonical: RepositoryBinding,
+    candidate_head: object,
+    canonical_head: object,
+    canonical_ref: object,
+) -> str:
+    if (
+        not isinstance(candidate_head, str)
+        or not isinstance(canonical_head, str)
+        or not isinstance(canonical_ref, str)
+    ):
+        return "unavailable"
+    try:
+        runtime = read_checkpoint_projection_state(
+            candidate,
+            canonical_commit=canonical_head,
+            canonical_ref=canonical_ref,
+        )
+    except (CheckpointError, OSError, ValueError):
+        return "unavailable"
+    if runtime.state == "projection_pending":
+        return "projection_pending"
+    if candidate.common_dir == canonical.common_dir:
+        return "current"
+    if candidate_head == canonical_head:
+        return "current"
+    result = _worktrees._git_result(
+        canonical,
+        "merge-base",
+        "--is-ancestor",
+        candidate_head,
+        canonical_head,
+    )
+    if result.returncode == 0:
+        return "projection_pending"
+    return "conflict" if result.returncode == 1 else "unavailable"
 
 
 def _candidate_state(

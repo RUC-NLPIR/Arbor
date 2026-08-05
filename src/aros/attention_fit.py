@@ -160,7 +160,7 @@ def fit_packet(packet: dict[str, object], max_chars: int) -> None:
     retained = [
         warning
         for warning in warnings
-        if warning in {"index_incomplete", "truncated"}
+        if warning in {"index_incomplete", "projection_pending", "truncated"}
     ]
     for warning in warnings:
         if warning not in retained:
@@ -250,6 +250,7 @@ def _install_minimal_packet(packet: dict[str, object]) -> None:
         + _fact_count(packet["blocked_reasons"])
     )
     total = sum(int(count) for count in omitted.values()) + dropped
+    projection_state = snapshot.get("projection_state")
     packet["snapshot"] = {
         "canonical": snapshot.get("canonical"),
         "candidate": {},
@@ -263,7 +264,14 @@ def _install_minimal_packet(packet: dict[str, object]) -> None:
     packet["authority"] = {"state": authority.get("state")}
     packet["remaining_budget"] = {"state": budget.get("state")}
     packet["blocked_reasons"] = []
-    packet["warnings"] = ["index_incomplete", "truncated"]
+    packet["warnings"] = [
+        (
+            "projection_pending"
+            if projection_state == "projection_pending"
+            else "index_incomplete"
+        ),
+        "truncated",
+    ]
     packet["omitted"] = {"aros boot": max(1, total)}
 
 

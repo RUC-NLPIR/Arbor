@@ -615,10 +615,11 @@ def test_attention_combines_canonical_head_with_candidate_pending_state(
     )
     _write_question_views(candidate, marker="dirty candidate")
 
-    packet = ResearchAttentionService(
+    service = ResearchAttentionService(
         candidate,
         canonical_repository=bind_repository(canonical),
-    ).build()
+    )
+    packet = service.build()
 
     assert packet["snapshot"]["canonical"] == canonical_head
     assert packet["snapshot"]["canonical_repository"] == str(canonical.resolve())
@@ -631,6 +632,45 @@ def test_attention_combines_canonical_head_with_candidate_pending_state(
     assert [item["ref"] for item in packet["pending_measurements"]] == [
         f"runs/{manifest['run_id']}/manifest.json"
     ]
+
+
+def test_attention_reports_projection_pending_with_canonical_meaning(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    candidate = tmp_path / "candidate"
+    canonical.mkdir()
+    base = _init_workspace(canonical)
+    subprocess.run(["git", "clone", "-q", str(canonical), str(candidate)], check=True)
+    _git(candidate, "config", "user.email", "candidate@example.invalid")
+    _git(candidate, "config", "user.name", "Candidate Test")
+    runs = RunService(candidate)
+    manifest = runs.prepare(
+        [sys.executable, "-c", "pass"],
+        idempotency_key="projection-pending-run",
+        actor="principal",
+        security_profile="trusted-local",
+    )
+    _write_question_views(canonical, marker="newly admitted")
+    admitted = _commit_workspace(canonical, "admit canonical projection")
+
+    service = ResearchAttentionService(
+        candidate,
+        canonical_repository=bind_repository(canonical),
+    )
+    packet = service.build()
+
+    assert set(packet) == TOP_LEVEL_KEYS
+    assert packet["snapshot"]["canonical"] == admitted
+    assert packet["snapshot"]["candidate"]["head"] == base
+    assert packet["snapshot"]["projection_state"] == "projection_pending"
+    assert "projection_pending" in packet["warnings"]
+    assert "Exact newly admitted answer." in _compact_json(packet)
+    assert [item["ref"] for item in packet["pending_measurements"]] == [
+        f"runs/{manifest['run_id']}/manifest.json"
+    ]
+    bounded = service.build(max_chars=512)
+    assert "projection_pending" in bounded["warnings"]
 
 
 def test_attention_run_inventory_failure_is_unavailable_and_read_only(

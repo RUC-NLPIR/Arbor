@@ -8,13 +8,21 @@ import json
 import os
 import stat
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 import arbor.aros.checkpoint as checkpoint_module
+import arbor.aros.transitions as transitions_module
 import arbor.aros.worktrees as worktrees_module
-from arbor.aros.checkpoint import CheckpointError, CheckpointService
+from arbor.aros.attention import ResearchAttentionService
+from arbor.aros.checkpoint import (
+    CheckpointError,
+    CheckpointService,
+    PreparedCheckpoint,
+)
 from arbor.aros.store import canonical_json_bytes
 from arbor.aros.worktrees import bind_repository
 from tests import test_aros_observations as observation_support
@@ -115,6 +123,104 @@ def _valid_service(
 
 def _index_bytes(root: Path) -> bytes:
     return (Path(_git_text(root, "rev-parse", "--absolute-git-dir")) / "index").read_bytes()
+
+
+def _index_projection(
+    root: Path,
+    *paths: str,
+) -> dict[str, tuple[str, str]]:
+    projected: dict[str, tuple[str, str]] = {}
+    raw = _git(root, "ls-files", "--stage", "-z", "--", *paths).stdout
+    for record in (item for item in raw.split(b"\0") if item):
+        metadata, separator, raw_path = record.partition(b"\t")
+        assert separator
+        mode, oid, stage = metadata.decode("ascii").split(" ")
+        assert stage == "0"
+        projected[raw_path.decode("utf-8")] = (mode, oid)
+    return projected
+
+
+class _PostCasCrash(RuntimeError):
+    pass
+
+
+class _BarrierCrash(RuntimeError):
+    pass
+
+
+class _RecordingBarrier:
+    def __init__(self, fail_at: str | None = None):
+        self.fail_at = fail_at
+        self.points: list[str] = []
+
+    def reach(self, point: str) -> None:
+        self.points.append(point)
+        if point == self.fail_at:
+            raise _BarrierCrash(point)
+
+
+class _AllowingGateway:
+    def __init__(self, canonical_ref: str):
+        self.canonical_ref = canonical_ref
+        self.calls: list[str] = []
+
+    def admit_transition(
+        self,
+        *,
+        candidate_subject_sha256: str,
+        audit_payload_sha256: str,
+        audit_testimony: object,
+    ) -> bytes:
+        del audit_testimony
+        self.calls.append("admit")
+        return _allow_receipt_bytes(
+            candidate_subject_sha256=candidate_subject_sha256,
+            audit_payload_sha256=audit_payload_sha256,
+            canonical_ref=self.canonical_ref,
+        )
+
+    def revalidate_transition(self, receipt: bytes) -> bytes:
+        self.calls.append("revalidate")
+        return _fence_bytes(_decoded(receipt))
+
+
+def _leave_projection_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    service: CheckpointService,
+    prepared: PreparedCheckpoint,
+    receipt: bytes,
+    fence: bytes,
+) -> str:
+    project = getattr(checkpoint_module, "_project_admitted_checkpoint", None)
+    if project is None:
+        result = service.finalize(
+            prepared.prepared_ref,
+            receipt,
+            fence,
+        )
+        assert result["state"] == "projection_pending"
+    else:
+        with monkeypatch.context() as crash:
+            crash.setattr(
+                checkpoint_module,
+                "_project_admitted_checkpoint",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(_PostCasCrash()),
+            )
+            with pytest.raises(_PostCasCrash):
+                service.finalize(
+                    prepared.prepared_ref,
+                    receipt,
+                    fence,
+                )
+    return _git_text(
+        service.canonical_repository.root,
+        "rev-parse",
+        prepared.canonical_ref,
+    )
+
+
+def _event_path(candidate: Path, transition_id: str) -> Path:
+    return candidate / ".aros" / "events" / f"EVT-{transition_id}-admitted.json"
 
 
 def _write_sparse_file(path: Path, size: int) -> None:
@@ -314,6 +420,38 @@ def _finalize_fixture(
         base,
         message,
     )
+
+
+def _barrier_fixture(
+    root: Path,
+    barrier: _RecordingBarrier,
+) -> tuple[CheckpointService, str, str, str, Path, Path, _AllowingGateway]:
+    candidate = root / "candidate"
+    canonical = root / "canonical"
+    base, canonical_ref = _init_repository(candidate)
+    _git(root, "clone", "-q", str(candidate), str(canonical))
+    _git(canonical, "config", "user.email", "checkpoint@example.invalid")
+    _git(canonical, "config", "user.name", "Checkpoint Test")
+    (candidate / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nBarrier finding.\n",
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        candidate,
+        "T-barrier",
+        base,
+        ["memory/NOW.md"],
+    )
+    gateway = _AllowingGateway(canonical_ref)
+    service = CheckpointService(
+        candidate,
+        canonical_repository=bind_repository(canonical),
+        canonical_ref=canonical_ref,
+        gateway=gateway,
+        barrier=barrier,
+        clock=lambda: 1_500,
+    )
+    return service, proposal_ref, base, canonical_ref, candidate, canonical, gateway
 
 
 def _task_finalize_fixture(
@@ -640,7 +778,7 @@ def test_finalize_writes_exact_receipt_tree_message_and_sole_parent(
         encoding="utf-8",
     )
     _git(candidate, "add", "unrelated.txt")
-    candidate_index = _index_bytes(candidate)
+    unrelated_index = _index_projection(candidate, "unrelated.txt")
 
     def forbidden_audit(_proposal_ref: str) -> dict[str, object]:
         raise AssertionError("finalize reran TransitionAudit")
@@ -655,10 +793,10 @@ def test_finalize_writes_exact_receipt_tree_message_and_sole_parent(
         "transition_id": prepared.transition_id,
         "canonical_ref": prepared.canonical_ref,
         "commit": commit,
-        "state": "projection_pending",
+        "state": "admitted",
     }
     assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == commit
-    assert _git_text(candidate, "rev-parse", prepared.canonical_ref) == base
+    assert _git_text(candidate, "rev-parse", prepared.canonical_ref) == commit
     parent_line = _git_text(canonical, "rev-list", "--parents", "-n", "1", commit)
     assert parent_line.split() == [commit, base]
     commit_object = _git(canonical, "cat-file", "commit", commit).stdout
@@ -673,9 +811,9 @@ def test_finalize_writes_exact_receipt_tree_message_and_sole_parent(
         path: entry for path, entry in final_tree.items() if path != admission_ref
     } == candidate_tree
     assert _blob(canonical, final_tree_oid, admission_ref) == receipt
-    assert not (candidate / admission_ref).exists()
+    assert (candidate / admission_ref).read_bytes() == receipt
     assert not any("fence" in path for path in final_tree)
-    assert _index_bytes(candidate) == candidate_index
+    assert _index_projection(candidate, "unrelated.txt") == unrelated_index
 
 
 def test_finalize_passes_non_newline_principal_message_exactly_to_commit_tree(
@@ -856,7 +994,7 @@ def test_late_fence_failure_leaves_no_working_admission_and_new_receipt_retries(
 
     commit = str(result["commit"])
     assert _blob(canonical, commit, admission_ref) == second_receipt
-    assert not (candidate / admission_ref).exists()
+    assert (candidate / admission_ref).read_bytes() == second_receipt
 
 
 @pytest.mark.parametrize(
@@ -980,7 +1118,7 @@ def test_finalize_reuses_preexisting_exact_observation_ref(
 
     result = service.finalize(prepared.prepared_ref, receipt, fence)
 
-    assert result["state"] == "projection_pending"
+    assert result["state"] == "admitted"
     assert _git_text(canonical, "rev-parse", observation_ref) == return_commit
 
 
@@ -2253,3 +2391,1176 @@ def test_checkpoint_prepare_has_no_admission_finalize_or_user_index_commands(
 
     verbs = {args[0] for args in calls if args}
     assert verbs.isdisjoint({"add", "commit", "commit-tree", "reset", "update-ref"})
+
+
+def test_finalize_projects_distinct_repository_after_canonical_cas_without_remote(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-distinct-projection")
+    config_before = (candidate / ".git" / "config").read_bytes()
+    fetch_head = candidate / ".git" / "FETCH_HEAD"
+    fetch_head_before = fetch_head.read_bytes() if fetch_head.exists() else None
+    refs_before = _git(candidate, "for-each-ref", "--format=%(refname)%00%(objectname)").stdout
+    calls: list[tuple[Path, tuple[str, ...]]] = []
+    real_git_result = worktrees_module._git_result
+
+    def record_git(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append((repository.root, args))  # type: ignore[attr-defined]
+        return real_git_result(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_result", record_git)
+
+    result = service.finalize(prepared.prepared_ref, receipt, fence)
+
+    commit = str(result["commit"])
+    assert result["state"] == "admitted"
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == commit
+    assert _git_text(candidate, "rev-parse", prepared.canonical_ref) == commit
+    canonical_cas = next(
+        index
+        for index, (root, args) in enumerate(calls)
+        if root == canonical and args[:2] == ("update-ref", "--stdin")
+    )
+    candidate_fetch = next(
+        index
+        for index, (root, args) in enumerate(calls)
+        if root == candidate and args[:4] == (
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            str(canonical),
+        )
+    )
+    candidate_cas = next(
+        index
+        for index, (root, args) in enumerate(calls)
+        if root == candidate
+        and args[:2] == ("update-ref", prepared.canonical_ref)
+    )
+    assert canonical_cas < candidate_fetch < candidate_cas
+    assert calls[candidate_fetch][1][-1] == commit
+    assert (candidate / ".git" / "config").read_bytes() == config_before
+    assert (fetch_head.read_bytes() if fetch_head.exists() else None) == fetch_head_before
+    refs_after = _git(candidate, "for-each-ref", "--format=%(refname)%00%(objectname)").stdout
+    assert refs_after != refs_before
+    assert _git(candidate, "remote").stdout == b""
+    admission_ref = f"transitions/{prepared.transition_id}/admission.json"
+    assert (candidate / admission_ref).read_bytes() == receipt
+    assert _index_projection(candidate, admission_ref)[admission_ref] == (
+        "100644",
+        _tree(candidate, commit)[admission_ref][1],
+    )
+    assert base != commit
+
+
+def test_finalize_shared_common_dir_projects_without_fetch_or_redundant_ref_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, proposal_ref, base = _valid_service(tmp_path)
+    service.clock = lambda: 1_500
+    prepared = service.prepare(proposal_ref, "shared projection")
+    receipt = _allow_receipt_bytes(
+        candidate_subject_sha256=prepared.candidate_subject_sha256,
+        audit_payload_sha256=prepared.audit_payload_sha256,
+        canonical_ref=prepared.canonical_ref,
+    )
+    fence = _fence_bytes(_decoded(receipt))
+    calls: list[tuple[str, ...]] = []
+    real_git_result = worktrees_module._git_result
+
+    def record_git(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(args)
+        return real_git_result(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_result", record_git)
+
+    result = service.finalize(prepared.prepared_ref, receipt, fence)
+
+    commit = str(result["commit"])
+    assert result["state"] == "admitted"
+    assert _git_text(tmp_path, "rev-parse", "HEAD") == commit != base
+    assert not any(args and args[0] == "fetch" for args in calls)
+    updates = [args for args in calls if args and args[0] == "update-ref"]
+    assert updates == [("update-ref", "--stdin")]
+
+
+def test_projection_repairs_only_admitted_paths_with_git_index_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        _canonical,
+        _base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-surgical-repair")
+    (candidate / "unrelated.txt").write_bytes(b"unrelated staged bytes\n")
+    _git(candidate, "add", "unrelated.txt")
+    unrelated_index = _index_projection(candidate, "unrelated.txt")
+    scratch = candidate / "scratch.bin"
+    scratch.write_bytes(b"unstaged\x00canary\n")
+    ordinary_index = service.candidate_repository.git_dir / "index"
+    replacements: list[tuple[Path, Path]] = []
+    real_replace = checkpoint_module.os.replace
+
+    def record_replace(source: object, target: object) -> None:
+        source_path = Path(source)
+        target_path = Path(target)
+        if target_path == ordinary_index:
+            replacements.append((source_path, target_path))
+        real_replace(source, target)
+
+    monkeypatch.setattr(checkpoint_module.os, "replace", record_replace)
+
+    result = service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert result["state"] == "admitted"
+    assert replacements == [(ordinary_index.with_name("index.lock"), ordinary_index)]
+    assert not ordinary_index.with_name("index.lock").exists()
+    assert _index_projection(candidate, "unrelated.txt") == unrelated_index
+    assert (candidate / "unrelated.txt").read_bytes() == b"unrelated staged bytes\n"
+    assert scratch.read_bytes() == b"unstaged\x00canary\n"
+    assert _git(candidate, "diff", "--cached", "--quiet", "--", "unrelated.txt", check=False).returncode == 1
+
+
+def test_projection_index_lock_revalidates_original_snapshot_before_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        _base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-index-lock-race")
+    index_path = service.candidate_repository.git_dir / "index"
+    lock_path = service.candidate_repository.git_dir / "index.lock"
+    original = index_path.read_bytes()
+    drifted = original + b"uncooperative-index-drift"
+    injected = False
+    real_write_all = checkpoint_module._write_all
+
+    def inject_after_lock_write(descriptor: int, content: bytes) -> None:
+        nonlocal injected
+        real_write_all(descriptor, content)
+        target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        if not injected and target == lock_path:
+            index_path.write_bytes(drifted)
+            injected = True
+
+    monkeypatch.setattr(checkpoint_module, "_write_all", inject_after_lock_write)
+
+    with pytest.raises(CheckpointError, match="index.*changed|atomic.*repair"):
+        service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert injected is True
+    assert index_path.read_bytes() == drifted
+    assert not lock_path.exists()
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) != prepared.base_commit
+    assert not (
+        candidate / f"transitions/{prepared.transition_id}/admission.json"
+    ).exists()
+
+
+def test_projection_index_lock_replacement_never_publishes_or_deletes_foreign_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        _canonical,
+        _base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-index-lock-replaced")
+    index_path = service.candidate_repository.git_dir / "index"
+    lock_path = service.candidate_repository.git_dir / "index.lock"
+    original_index = index_path.read_bytes()
+    foreign = b"foreign-index-lock-bytes"
+    replaced = False
+    real_write_all = checkpoint_module._write_all
+
+    def replace_lock_after_open(descriptor: int, content: bytes) -> None:
+        nonlocal replaced
+        real_write_all(descriptor, content)
+        target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        if not replaced and target == lock_path:
+            lock_path.unlink()
+            lock_path.write_bytes(foreign)
+            replaced = True
+
+    monkeypatch.setattr(checkpoint_module, "_write_all", replace_lock_after_open)
+
+    with pytest.raises(CheckpointError, match="lock|identity|changed"):
+        service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert replaced is True
+    assert index_path.read_bytes() == original_index
+    assert lock_path.read_bytes() == foreign
+    assert not (
+        candidate / f"transitions/{prepared.transition_id}/admission.json"
+    ).exists()
+
+
+def test_projection_missing_index_adds_only_admitted_entries(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate"
+    canonical = tmp_path / "canonical"
+    base, canonical_ref = _init_repository(candidate)
+    _git(tmp_path, "clone", "-q", str(candidate), str(canonical))
+    _git(canonical, "config", "user.email", "checkpoint@example.invalid")
+    _git(canonical, "config", "user.name", "Checkpoint Test")
+    (candidate / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nMissing index finding.\n",
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        candidate,
+        "T-missing-index",
+        base,
+        ["memory/NOW.md"],
+    )
+    index_path = bind_repository(candidate).git_dir / "index"
+    index_path.unlink()
+    service = CheckpointService(
+        candidate,
+        canonical_repository=bind_repository(canonical),
+        canonical_ref=canonical_ref,
+        clock=lambda: 1_500,
+    )
+    prepared = service.prepare(proposal_ref, "missing index")
+    receipt = _allow_receipt_bytes(
+        candidate_subject_sha256=prepared.candidate_subject_sha256,
+        audit_payload_sha256=prepared.audit_payload_sha256,
+        canonical_ref=canonical_ref,
+    )
+
+    result = service.finalize(
+        prepared.prepared_ref,
+        receipt,
+        _fence_bytes(_decoded(receipt)),
+    )
+
+    admission_ref = f"transitions/{prepared.transition_id}/admission.json"
+    expected = {item.path for item in prepared.candidate_paths} | {admission_ref}
+    assert set(_index_projection(candidate)) == expected
+    assert ".gitignore" not in expected
+    assert "unrelated.txt" not in expected
+    assert (candidate / "unrelated.txt").read_bytes() == b"base unrelated\n"
+    assert result["state"] == "admitted"
+
+
+@pytest.mark.parametrize("overlap", ("worktree", "index"))
+def test_reconcile_rejects_unexpected_admitted_path_overlap_without_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overlap: str,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id=f"T-overlap-{overlap}")
+    commit = _leave_projection_pending(monkeypatch, service, prepared, receipt, fence)
+    unexpected = b"unexpected overlap bytes\n"
+    if overlap == "worktree":
+        (candidate / "memory/NOW.md").write_bytes(unexpected)
+    else:
+        blob_source = tmp_path / "unexpected-index-blob"
+        blob_source.write_bytes(unexpected)
+        blob = _git(candidate, "hash-object", "-w", str(blob_source))
+        _git(
+            candidate,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"100644,{blob.stdout.decode('ascii').strip()},memory/NOW.md",
+        )
+
+    before_worktree = (candidate / "memory/NOW.md").read_bytes()
+    before_index = _index_projection(candidate, "memory/NOW.md")
+
+    with pytest.raises(CheckpointError, match="overlap|index|worktree|conflict"):
+        service.reconcile(prepared.prepared_ref)
+
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == commit
+    assert _git_text(candidate, "rev-parse", prepared.canonical_ref) == base
+    assert (candidate / "memory/NOW.md").read_bytes() == before_worktree
+    assert _index_projection(candidate, "memory/NOW.md") == before_index
+
+
+def test_reconcile_rejects_admission_mode_before_projection_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-admission-mode")
+    commit = _leave_projection_pending(monkeypatch, service, prepared, receipt, fence)
+    admission_ref = f"transitions/{prepared.transition_id}/admission.json"
+    admission_path = candidate / admission_ref
+    admission_path.write_bytes(receipt)
+    admission_path.chmod(0o600)
+    index_before = _index_bytes(candidate)
+
+    with pytest.raises(CheckpointError, match="admission|admitted|mode|0644"):
+        service.reconcile(prepared.prepared_ref)
+
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == commit
+    assert _git_text(candidate, "rev-parse", prepared.canonical_ref) == base
+    assert _git(candidate, "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode != 0
+    assert _index_bytes(candidate) == index_before
+    assert admission_path.read_bytes() == receipt
+    assert stat.S_IMODE(admission_path.stat().st_mode) == 0o600
+    assert not _event_path(candidate, prepared.transition_id).exists()
+
+    admission_path.chmod(0o644)
+    assert service.reconcile(prepared.prepared_ref)["state"] == "admitted"
+
+
+def test_reconcile_rejects_conflicting_event_before_projection_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-event-conflict")
+    commit = _leave_projection_pending(monkeypatch, service, prepared, receipt, fence)
+    event_path = _event_path(candidate, prepared.transition_id)
+    event_path.parent.mkdir(exist_ok=True)
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "event_id": f"EVT-{prepared.transition_id}-admitted",
+        "kind": "transition_admitted",
+        "transition_id": prepared.transition_id,
+        "base_commit": base,
+        "commit": base,
+        "canonical_ref": prepared.canonical_ref,
+        "receipt_sha256": _decoded(receipt)["receiptSHA256"],
+    }
+    conflicting = {
+        **payload,
+        "event_sha256": hashlib.sha256(canonical_json_bytes(payload)).hexdigest(),
+    }
+    event_bytes = (
+        json.dumps(conflicting, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    event_path.write_bytes(event_bytes)
+    event_path.chmod(0o600)
+    index_before = _index_bytes(candidate)
+
+    with pytest.raises(CheckpointError, match="event|conflict"):
+        service.reconcile(prepared.prepared_ref)
+
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == commit
+    assert _git_text(candidate, "rev-parse", prepared.canonical_ref) == base
+    assert _git(candidate, "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode != 0
+    assert _index_bytes(candidate) == index_before
+    assert event_path.read_bytes() == event_bytes
+    assert not (
+        candidate / f"transitions/{prepared.transition_id}/admission.json"
+    ).exists()
+
+    event_path.unlink()
+    result = service.reconcile(prepared.prepared_ref)
+    assert result["commit"] == commit
+    assert json.loads(event_path.read_bytes())["commit"] == commit
+
+
+def test_reconcile_repairs_mixed_partial_projection_idempotently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-mixed-repair")
+    commit = _leave_projection_pending(monkeypatch, service, prepared, receipt, fence)
+    _git(
+        candidate,
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        str(canonical),
+        commit,
+    )
+    _git(candidate, "update-ref", prepared.canonical_ref, commit, base)
+    admitted = _tree(candidate, commit)["memory/NOW.md"]
+    _git(
+        candidate,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"{admitted[0]},{admitted[1]},memory/NOW.md",
+    )
+    admission_ref = f"transitions/{prepared.transition_id}/admission.json"
+    assert not (candidate / admission_ref).exists()
+
+    first = service.reconcile(prepared.prepared_ref)
+    first_index = _index_bytes(candidate)
+    first_event = _event_path(candidate, prepared.transition_id).read_bytes()
+    second = service.reconcile(prepared.prepared_ref)
+
+    assert first == second
+    assert first["state"] == "admitted"
+    assert (candidate / admission_ref).read_bytes() == receipt
+    assert _index_bytes(candidate) == first_index
+    assert _event_path(candidate, prepared.transition_id).read_bytes() == first_event
+
+
+def test_reconcile_uses_canonical_git_only_and_reconstructs_admitted_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        base,
+        observation_ref,
+        return_commit,
+    ) = _task_finalize_fixture(tmp_path)
+    commit = _leave_projection_pending(monkeypatch, service, prepared, receipt, fence)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("reconcile reran audit or a Task/Run/Eval validator")
+
+    monkeypatch.setattr(service.audit_service, "audit", forbidden)
+    monkeypatch.setattr(transitions_module, "read_validated_task_collection", forbidden)
+    monkeypatch.setattr(transitions_module, "read_validated_run_manifest", forbidden)
+    monkeypatch.setattr(transitions_module, "read_validated_run_final", forbidden)
+    monkeypatch.setattr(transitions_module, "read_validated_eval_receipt", forbidden)
+
+    result = service.reconcile(prepared.prepared_ref)
+
+    assert result == {
+        "schema_version": 1,
+        "transition_id": prepared.transition_id,
+        "canonical_ref": prepared.canonical_ref,
+        "commit": commit,
+        "state": "admitted",
+    }
+    assert _git_text(candidate, "rev-parse", prepared.canonical_ref) == commit
+    assert _git_text(canonical, "rev-parse", observation_ref) == return_commit
+    event_path = _event_path(candidate, prepared.transition_id)
+    event = json.loads(event_path.read_bytes())
+    assert set(event) == {
+        "schema_version",
+        "event_id",
+        "kind",
+        "transition_id",
+        "base_commit",
+        "commit",
+        "canonical_ref",
+        "receipt_sha256",
+        "event_sha256",
+    }
+    assert event["transition_id"] == prepared.transition_id
+    assert event["base_commit"] == base
+    assert event["commit"] == commit
+    assert event["canonical_ref"] == prepared.canonical_ref
+    assert event["receipt_sha256"] == _decoded(receipt)["receiptSHA256"]
+    unhashed = {key: value for key, value in event.items() if key != "event_sha256"}
+    assert event["event_sha256"] == hashlib.sha256(
+        canonical_json_bytes(unhashed)
+    ).hexdigest()
+    exact_event = event_path.read_bytes()
+    event_path.unlink()
+
+    assert service.reconcile(prepared.prepared_ref) == result
+    assert event_path.read_bytes() == exact_event
+
+
+def test_finalize_exact_post_cas_retry_ignores_expired_old_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        _canonical,
+        _base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-expired-retry")
+    commit = _leave_projection_pending(monkeypatch, service, prepared, receipt, fence)
+    service.clock = lambda: 9_999
+    monkeypatch.setattr(
+        service.audit_service,
+        "audit",
+        lambda _ref: (_ for _ in ()).throw(AssertionError("retry reran audit")),
+    )
+
+    result = service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert result["commit"] == commit
+    assert result["state"] == "admitted"
+    assert _git_text(candidate, "rev-parse", prepared.canonical_ref) == commit
+
+
+def test_prepare_fails_explicitly_while_known_projection_is_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        _candidate,
+        _canonical,
+        _base,
+        message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-known-pending")
+    _leave_projection_pending(monkeypatch, service, prepared, receipt, fence)
+    monkeypatch.setattr(
+        service.audit_service,
+        "audit",
+        lambda _ref: (_ for _ in ()).throw(
+            AssertionError("pending prepare reran audit")
+        ),
+    )
+
+    with pytest.raises(CheckpointError, match="projection_pending|reconcile"):
+        service.prepare(prepared.proposal_ref, message)
+
+
+def test_checkpoint_exact_post_cas_retry_reconciles_without_recharging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate"
+    canonical = tmp_path / "canonical"
+    base, canonical_ref = _init_repository(candidate)
+    _git(tmp_path, "clone", "-q", str(candidate), str(canonical))
+    _git(canonical, "config", "user.email", "checkpoint@example.invalid")
+    _git(canonical, "config", "user.name", "Checkpoint Test")
+    (candidate / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nComposite retry.\n",
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        candidate,
+        "T-composite-retry",
+        base,
+        ["memory/NOW.md"],
+    )
+    calls: list[str] = []
+
+    class Gateway:
+        def admit_transition(
+            self,
+            *,
+            candidate_subject_sha256: str,
+            audit_payload_sha256: str,
+            audit_testimony: object,
+        ) -> bytes:
+            del audit_testimony
+            calls.append("admit")
+            return _allow_receipt_bytes(
+                candidate_subject_sha256=candidate_subject_sha256,
+                audit_payload_sha256=audit_payload_sha256,
+                canonical_ref=canonical_ref,
+            )
+
+        def revalidate_transition(self, receipt: bytes) -> bytes:
+            calls.append("revalidate")
+            return _fence_bytes(_decoded(receipt))
+
+    service = CheckpointService(
+        candidate,
+        canonical_repository=bind_repository(canonical),
+        canonical_ref=canonical_ref,
+        gateway=Gateway(),
+        clock=lambda: 1_500,
+    )
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            checkpoint_module,
+            "_project_admitted_checkpoint",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(_PostCasCrash()),
+        )
+        with pytest.raises(_PostCasCrash):
+            service.checkpoint(proposal_ref, "composite retry")
+    commit = _git_text(canonical, "rev-parse", canonical_ref)
+    assert commit != base
+    assert calls == ["admit", "revalidate"]
+    service.clock = lambda: 9_999
+    monkeypatch.setattr(
+        service.audit_service,
+        "audit",
+        lambda _ref: (_ for _ in ()).throw(AssertionError("retry reran audit")),
+    )
+
+    result = service.checkpoint(proposal_ref, "composite retry")
+
+    assert result["commit"] == commit
+    assert result["state"] == "admitted"
+    assert calls == ["admit", "revalidate"]
+
+
+def test_reconcile_third_commit_is_stale_and_creates_no_observation_ref(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        prepared,
+        _receipt,
+        _fence,
+        _candidate,
+        canonical,
+        base,
+        observation_ref,
+        _return_commit,
+    ) = _task_finalize_fixture(tmp_path)
+    tree = _git_text(canonical, "rev-parse", f"{base}^{{tree}}")
+    winner = _git_text(
+        canonical,
+        "commit-tree",
+        tree,
+        "-p",
+        base,
+        "-m",
+        "concurrent winner",
+    )
+    _git(canonical, "update-ref", prepared.canonical_ref, winner, base)
+
+    with pytest.raises(CheckpointError, match="stale|conflict|canonical"):
+        service.reconcile(prepared.prepared_ref)
+
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == winner
+    assert _git(canonical, "show-ref", "--verify", observation_ref, check=False).returncode != 0
+
+
+def test_reconcile_candidate_projection_conflict_does_not_import_or_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-candidate-conflict")
+    admitted = _leave_projection_pending(
+        monkeypatch,
+        service,
+        prepared,
+        receipt,
+        fence,
+    )
+    tree = _git_text(candidate, "rev-parse", f"{base}^{{tree}}")
+    third = _git_text(
+        candidate,
+        "commit-tree",
+        tree,
+        "-p",
+        base,
+        "-m",
+        "candidate third commit",
+    )
+    _git(candidate, "update-ref", prepared.canonical_ref, third, base)
+    assert _git(candidate, "cat-file", "-e", f"{admitted}^{{commit}}", check=False).returncode != 0
+
+    with pytest.raises(CheckpointError, match="projection|conflict"):
+        service.reconcile(prepared.prepared_ref)
+
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == admitted
+    assert _git_text(candidate, "rev-parse", prepared.canonical_ref) == third
+    assert _git(candidate, "cat-file", "-e", f"{admitted}^{{commit}}", check=False).returncode != 0
+    assert not (
+        candidate / f"transitions/{prepared.transition_id}/admission.json"
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    (
+        ("prepared", "prepared"),
+        ("message", "message"),
+        ("index", "index"),
+        ("receipt", "receipt"),
+        ("audit", "audit"),
+        ("object", "object"),
+        ("observation-ref", "observation"),
+    ),
+)
+def test_reconcile_exact_intended_tip_preserves_integrity_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    expected: str,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        _canonical,
+        _base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id=f"T-integrity-{target}")
+    _leave_projection_pending(monkeypatch, service, prepared, receipt, fence)
+    if target == "prepared":
+        path = candidate / prepared.prepared_ref
+        path.write_bytes(path.read_bytes() + b" ")
+    elif target == "message":
+        (candidate / prepared.prepared_ref).with_name("message").write_bytes(
+            b"drifted message"
+        )
+    elif target == "index":
+        path = candidate / prepared.index_ref
+        path.write_bytes(path.read_bytes() + b"drifted index")
+    elif target == "receipt":
+        monkeypatch.setattr(
+            checkpoint_module,
+            "_decode_admission_receipt",
+            lambda _raw: (_ for _ in ()).throw(
+                CheckpointError("canonical receipt integrity failure")
+            ),
+        )
+    elif target == "audit":
+        monkeypatch.setattr(
+            checkpoint_module,
+            "_validate_audit_testimony",
+            lambda *_args: (_ for _ in ()).throw(
+                CheckpointError("canonical audit integrity failure")
+            ),
+        )
+    elif target == "object":
+        monkeypatch.setattr(
+            checkpoint_module,
+            "_verify_final_commit",
+            lambda *_args: (_ for _ in ()).throw(
+                CheckpointError("canonical object integrity failure")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            checkpoint_module,
+            "_verify_observation_refs",
+            lambda *_args: (_ for _ in ()).throw(
+                CheckpointError("canonical observation ref integrity failure")
+            ),
+        )
+
+    with pytest.raises(CheckpointError) as caught:
+        service.reconcile(prepared.prepared_ref)
+
+    assert expected in str(caught.value).lower()
+    assert "stale-base" not in str(caught.value).lower()
+
+
+def test_reconcile_true_third_canonical_tip_is_typed_stale_before_integrity_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        _candidate,
+        canonical,
+        _base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-typed-stale")
+    admitted = _leave_projection_pending(
+        monkeypatch,
+        service,
+        prepared,
+        receipt,
+        fence,
+    )
+    tree = _git_text(canonical, "rev-parse", f"{admitted}^{{tree}}")
+    third = _git_text(
+        canonical,
+        "commit-tree",
+        tree,
+        "-p",
+        admitted,
+        "-m",
+        "third canonical tip",
+    )
+    _git(canonical, "update-ref", prepared.canonical_ref, third, admitted)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_admitted_checkpoint",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("stale tip reached integrity loader")
+        ),
+    )
+
+    with pytest.raises(CheckpointError, match="stale-base|stale.*tip"):
+        service.reconcile(prepared.prepared_ref)
+
+
+def test_checkpoint_host_barrier_creates_exact_marker_then_waits_for_ack(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "checkpoint-runtime"
+    runtime.mkdir()
+    read_fd, write_fd = os.pipe()
+    try:
+        barrier = checkpoint_module.HostCheckpointBarrier(
+            runtime,
+            point="after_cas",
+            control_fd=read_fd,
+            timeout_seconds=1.0,
+        )
+        failures: list[BaseException] = []
+
+        def reach() -> None:
+            try:
+                barrier.reach("after_cas")
+            except BaseException as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=reach)
+        thread.start()
+        marker = runtime / "after_cas.marker"
+        deadline = time.monotonic() + 1.0
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.read_bytes() == b"after_cas\n"
+        metadata = marker.stat()
+        assert stat.S_IMODE(metadata.st_mode) == 0o600
+        assert metadata.st_nlink == 1
+        assert thread.is_alive()
+        os.write(write_fd, b"A")
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert failures == []
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_checkpoint_host_barrier_validates_point_fd_and_bounded_wait(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "checkpoint-runtime"
+    runtime.mkdir()
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        with pytest.raises(CheckpointError, match="point"):
+            checkpoint_module.HostCheckpointBarrier(
+                runtime,
+                point="model-selected",
+                control_fd=write_fd,
+            )
+        with pytest.raises(CheckpointError, match="descriptor|FD|control"):
+            checkpoint_module.HostCheckpointBarrier(
+                runtime,
+                point="after_tree",
+                control_fd=read_fd,
+            )
+    finally:
+        os.close(write_fd)
+
+    read_fd, write_fd = os.pipe()
+    try:
+        barrier = checkpoint_module.HostCheckpointBarrier(
+            runtime,
+            point="after_tree",
+            control_fd=read_fd,
+            timeout_seconds=0.01,
+        )
+        with pytest.raises(CheckpointError, match="acknowledgement|timeout"):
+            barrier.reach("after_tree")
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_checkpoint_barrier_points_follow_actual_durable_order(
+    tmp_path: Path,
+) -> None:
+    barrier = _RecordingBarrier()
+    (
+        service,
+        proposal_ref,
+        _base,
+        canonical_ref,
+        _candidate,
+        _canonical,
+        _gateway,
+    ) = _barrier_fixture(tmp_path, barrier)
+
+    prepared = service.prepare(proposal_ref, "barrier order")
+
+    assert barrier.points == ["after_audit", "after_tree"]
+    receipt = _allow_receipt_bytes(
+        candidate_subject_sha256=prepared.candidate_subject_sha256,
+        audit_payload_sha256=prepared.audit_payload_sha256,
+        canonical_ref=canonical_ref,
+    )
+    barrier.points.clear()
+
+    result = service.finalize(
+        prepared.prepared_ref,
+        receipt,
+        _fence_bytes(_decoded(receipt)),
+    )
+
+    assert result["state"] == "admitted"
+    assert barrier.points == [
+        "after_allow",
+        "after_commit_object",
+        "after_cas",
+        "after_index_repair",
+    ]
+
+
+@pytest.mark.parametrize(
+    "point",
+    (
+        "after_audit",
+        "after_tree",
+        "after_allow",
+        "after_commit_object",
+        "after_cas",
+        "after_index_repair",
+    ),
+)
+def test_checkpoint_fault_at_each_durable_point_is_old_or_reconcilable(
+    tmp_path: Path,
+    point: str,
+) -> None:
+    barrier = _RecordingBarrier(fail_at=point)
+    (
+        service,
+        proposal_ref,
+        base,
+        canonical_ref,
+        candidate,
+        canonical,
+        gateway,
+    ) = _barrier_fixture(tmp_path, barrier)
+
+    with pytest.raises(_BarrierCrash, match=point):
+        service.checkpoint(proposal_ref, "barrier fault")
+
+    canonical_head = _git_text(canonical, "rev-parse", canonical_ref)
+    before_cas = {
+        "after_audit",
+        "after_tree",
+        "after_allow",
+        "after_commit_object",
+    }
+    if point in before_cas:
+        assert canonical_head == base
+        assert _git_text(candidate, "rev-parse", canonical_ref) == base
+        assert not _event_path(candidate, "T-barrier").exists()
+        return
+
+    assert canonical_head != base
+    assert gateway.calls == ["admit", "revalidate"]
+    assert not _event_path(candidate, "T-barrier").exists()
+    if point == "after_cas":
+        assert _git_text(candidate, "rev-parse", canonical_ref) == base
+    else:
+        assert _git_text(candidate, "rev-parse", canonical_ref) == canonical_head
+
+    recovered = CheckpointService(
+        candidate,
+        canonical_repository=bind_repository(canonical),
+        canonical_ref=canonical_ref,
+    )
+    recovered.audit_service.audit = lambda _ref: (_ for _ in ()).throw(
+        AssertionError("reconcile reran audit")
+    )
+
+    result = recovered.reconcile(
+        ".aros/checkpoints/T-barrier/prepared.json"
+    )
+
+    assert result["commit"] == canonical_head
+    assert result["state"] == "admitted"
+    assert _git_text(candidate, "rev-parse", canonical_ref) == canonical_head
+    assert _event_path(candidate, "T-barrier").exists()
+    assert gateway.calls == ["admit", "revalidate"]
+
+
+def test_shared_after_cas_intent_reports_pending_and_blocks_prepare_before_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base, canonical_ref = _init_repository(tmp_path)
+    (tmp_path / "AROS.md").write_text("# AROS Workspace\n", encoding="utf-8")
+    (tmp_path / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nShared pending.\n",
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-shared-pending",
+        base,
+        ["memory/NOW.md"],
+    )
+    gateway = _AllowingGateway(canonical_ref)
+    service = CheckpointService(
+        tmp_path,
+        canonical_repository=bind_repository(tmp_path),
+        canonical_ref=canonical_ref,
+        gateway=gateway,
+        barrier=_RecordingBarrier(fail_at="after_cas"),
+        clock=lambda: 1_500,
+    )
+
+    with pytest.raises(_BarrierCrash, match="after_cas"):
+        service.checkpoint(proposal_ref, "shared pending")
+
+    commit = _git_text(tmp_path, "rev-parse", canonical_ref)
+    assert commit != base
+    intent_path = tmp_path / ".aros" / "projections" / f"{commit}.json"
+    intent = json.loads(intent_path.read_bytes())
+    assert set(intent) == {
+        "schema_version",
+        "transition_id",
+        "prepared_ref",
+        "base_commit",
+        "commit",
+        "canonical_ref",
+        "receipt_sha256",
+        "projection_sha256",
+    }
+    assert intent["transition_id"] == "T-shared-pending"
+    assert intent["base_commit"] == base
+    assert intent["commit"] == commit
+    unhashed = {
+        key: value for key, value in intent.items() if key != "projection_sha256"
+    }
+    assert intent["projection_sha256"] == hashlib.sha256(
+        canonical_json_bytes(unhashed)
+    ).hexdigest()
+    assert not _event_path(tmp_path, "T-shared-pending").exists()
+    packet = ResearchAttentionService(tmp_path).build()
+    assert packet["snapshot"]["projection_state"] == "projection_pending"
+    assert "projection_pending" in packet["warnings"]
+
+    monkeypatch.setattr(
+        service.audit_service,
+        "audit",
+        lambda _ref: (_ for _ in ()).throw(
+            AssertionError("shared pending prepare reran audit")
+        ),
+    )
+    with pytest.raises(CheckpointError, match="projection_pending|reconcile"):
+        service.prepare(proposal_ref, "shared pending")
+
+    recovered = CheckpointService(
+        tmp_path,
+        canonical_repository=bind_repository(tmp_path),
+        canonical_ref=canonical_ref,
+    ).reconcile(intent["prepared_ref"])
+    assert recovered["commit"] == commit
+    assert ResearchAttentionService(tmp_path).build()["snapshot"][
+        "projection_state"
+    ] == "current"
+
+
+def test_pre_cas_projection_intents_coexist_by_intended_commit(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        prepared,
+        first_receipt,
+        first_fence,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-intent-coexist")
+    service.barrier = _RecordingBarrier(fail_at="after_commit_object")
+
+    with pytest.raises(_BarrierCrash, match="after_commit_object"):
+        service.finalize(prepared.prepared_ref, first_receipt, first_fence)
+
+    second_receipt = _allow_receipt_bytes(
+        candidate_subject_sha256=prepared.candidate_subject_sha256,
+        audit_payload_sha256=prepared.audit_payload_sha256,
+        canonical_ref=prepared.canonical_ref,
+        revision=2,
+    )
+    with pytest.raises(_BarrierCrash, match="after_commit_object"):
+        service.finalize(
+            prepared.prepared_ref,
+            second_receipt,
+            _fence_bytes(_decoded(second_receipt)),
+        )
+
+    intents = sorted((candidate / ".aros" / "projections").glob("*.json"))
+    assert len(intents) == 2
+    commits = {path.stem for path in intents}
+    assert len(commits) == 2
+    assert all(json.loads(path.read_bytes())["commit"] == path.stem for path in intents)
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == base

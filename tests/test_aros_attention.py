@@ -13,6 +13,7 @@ import pytest
 
 import arbor.aros.attention as attention_module
 import arbor.aros.store as store_module
+from arbor.aros.eval import EvalService
 from arbor.aros.attention import (
     AttentionAuthorityContext,
     ResearchAttentionService,
@@ -22,6 +23,7 @@ from arbor.aros.store import atomic_write_json
 from arbor.aros.workspace import boot_packet, boot_workspace, init_workspace
 from arbor.aros.worktrees import bind_repository
 from tests import test_aros_observations as observation_support
+from tests import test_aros_eval as eval_support
 
 
 TOP_LEVEL_KEYS = {
@@ -796,6 +798,56 @@ def test_attention_unstable_operational_snapshot_becomes_unavailable(
     assert any(
         blocker["layer"] == "operational"
         and blocker["reason"] == "snapshot_unstable"
+        for blocker in packet["blocked_reasons"]
+    )
+
+
+@eval_support.requires_linux_claims
+def test_attention_retains_lost_eval_run_lineage_without_generic_run(
+    tmp_path: Path,
+) -> None:
+    _manifest, _tree, candidate_commit = eval_support._init_evaluator_repository(
+        tmp_path
+    )
+    service = EvalService(tmp_path)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        "attention-lost-linked-run",
+    )
+    assert isinstance(lease, eval_support.eval_module.ExecutionLease)
+    _receipt = eval_support._terminal_receipt(
+        tmp_path,
+        lease.request,
+        lease.execution,
+    )
+    run_link = json.loads(
+        (
+            tmp_path
+            / ".aros"
+            / "evaluations"
+            / str(lease.request["eval_id"])
+            / "run.json"
+        ).read_text(encoding="utf-8")
+    )
+    lease.close()
+    init_workspace(tmp_path, "Inspect lost Eval lineage.")
+    _commit_workspace(tmp_path, "store lost Eval Run lineage")
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    assert packet["unassimilated_returns"] == []
+    assert [item["kind"] for item in packet["pending_measurements"]] == ["eval"]
+    pending = packet["pending_measurements"][0]
+    assert pending["evaluation_state"] == "lost"
+    assert pending["run_id"] == run_link["run_id"]
+    assert pending["process_state"] == "completed"
+    assert any(
+        blocker["layer"] == "operational"
+        and blocker["ref"] == pending["ref"]
         for blocker in packet["blocked_reasons"]
     )
 

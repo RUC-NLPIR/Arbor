@@ -286,9 +286,14 @@ class ResearchAttentionService:
         candidate_snapshot = snapshot["candidate"]
         assert isinstance(candidate_snapshot, dict)
         candidate_snapshot["availability"] = availability
+        visible_terminal = (
+            _visible_terminal_observations(terminal, eval_inventory)
+            if terminal is not None
+            else ()
+        )
         unassimilated = (
             bound_items(
-                [_observation_item(record) for record in terminal],
+                [_observation_item(record) for record in visible_terminal],
                 _MAX_RETURNS,
                 "terminal observations",
                 omitted,
@@ -782,6 +787,26 @@ def _eval_inventory(
         return None, {"state": "unavailable", "error": "read_failed"}
 
 
+def _visible_terminal_observations(
+    terminal: tuple[ObservationRecord, ...],
+    eval_inventory: tuple[dict[str, object], ...] | None,
+) -> tuple[ObservationRecord, ...]:
+    linked_runs = {
+        str(item["run_id"])
+        for item in (eval_inventory or ())
+        if isinstance(item.get("run_id"), str)
+    }
+    return tuple(
+        record
+        for record in terminal
+        if not (
+            record.kind == "run_final"
+            and isinstance(record.payload.get("run_id"), str)
+            and record.payload["run_id"] in linked_runs
+        )
+    )
+
+
 def _observation_item(record: ObservationRecord) -> dict[str, object]:
     pointers: list[dict[str, object]] = [
         {"path": path} for path in record.versioned_paths
@@ -825,6 +850,18 @@ def _pending_measurements(
             continue
         eval_id = str(status["eval_id"])
         terminal_missing = status.get("evaluation_state") == "completed"
+        retrieval_pointers = [
+            {"path": f".aros/evaluations/{eval_id}/request.json"},
+            {"path": receipt_ref},
+        ]
+        if isinstance(run_id, str):
+            retrieval_pointers.extend(
+                (
+                    {"path": f"runs/{run_id}/manifest.json"},
+                    {"path": f".aros/runs/{run_id}/status.json"},
+                    {"path": f"runs/{run_id}/final.json"},
+                )
+            )
         pending_evals.append(
             {
                 "kind": "eval",
@@ -838,16 +875,14 @@ def _pending_measurements(
                 ),
                 "process_state": status.get("referenced_process_state"),
                 "evaluation_state": status.get("evaluation_state"),
+                "run_id": run_id,
                 "reason": (
                     "terminal_observation_missing"
                     if terminal_missing
                     else status.get("reason")
                 ),
                 "versioned_paths": [],
-                "retrieval_pointers": [
-                    {"path": f".aros/evaluations/{eval_id}/request.json"},
-                    {"path": receipt_ref},
-                ],
+                "retrieval_pointers": retrieval_pointers,
             }
         )
     pending_runs: list[dict[str, object]] = []
@@ -930,9 +965,11 @@ def _blocked_reasons(
         {"layer": "semantic", "ref": item} for item in semantic
     ]
     for item in pending:
-        if item.get("process_state") in {"lost", "missing"} or item.get(
-            "measurement_state"
-        ) == "terminal_observation_missing":
+        if (
+            item.get("evaluation_state") == "lost"
+            or item.get("process_state") in {"lost", "missing"}
+            or item.get("measurement_state") == "terminal_observation_missing"
+        ):
             blocked.append(
                 {
                     "layer": "operational",

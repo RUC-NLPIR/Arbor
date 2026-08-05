@@ -845,6 +845,56 @@ def test_read_eval_inventory_uses_execution_claim_liveness(tmp_path: Path) -> No
     assert lost["updated_at"] == lease.execution["claimed_at"]
 
 
+@requires_linux_claims
+def test_read_eval_inventory_retains_run_lineage_after_claim_is_lost(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        "inventory-lost-linked-run",
+    )
+    assert isinstance(lease, eval_module.ExecutionLease)
+    _receipt = _terminal_receipt(root, lease.request, lease.execution)
+    run_link = json.loads(
+        (
+            root
+            / ".aros"
+            / "evaluations"
+            / str(lease.request["eval_id"])
+            / "run.json"
+        ).read_text(encoding="utf-8")
+    )
+    run_status = json.loads(
+        (
+            root / ".aros" / "runs" / str(run_link["run_id"]) / "status.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert not (
+        root
+        / "eval"
+        / "evaluations"
+        / str(lease.request["eval_id"])
+        / "receipt.json"
+    ).exists()
+    lease.close()
+
+    lost = eval_module.read_eval_inventory(root)[0]
+
+    assert lost["evaluation_state"] == "lost"
+    assert lost["run_id"] == run_link["run_id"]
+    assert lost["referenced_process_state"] == "completed"
+    assert lost["measurement_state"] == "not_available"
+    assert lost["reason"] == "execution claim lock was released"
+    assert lost["updated_at"] == run_status["updated_at"]
+
+
 @pytest.mark.parametrize("tamper", ["invalid_id", "malformed", "nan"])
 def test_read_eval_inventory_rejects_invalid_identity_and_json(
     tmp_path: Path,

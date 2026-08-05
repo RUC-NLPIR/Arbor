@@ -242,22 +242,36 @@ def _read_eval_inventory_item(
         request,
         execution,
     )
+    run_link = service._load_run_link(request, execution, reader=reader)
     if not live:
+        if run_link is None:
+            process_state: object = "lost"
+            run_id: object = None
+            updated_at = execution["claimed_at"]
+        else:
+            run_status = service._linked_run_status(
+                request,
+                run_link,
+                reconcile=False,
+                reader=reader,
+            )
+            process_state = run_status["state"]
+            run_id = run_link["run_id"]
+            updated_at = run_status.get("updated_at", execution["claimed_at"])
         return _validate_eval_inventory_status(
             {
                 "eval_id": eval_id,
                 "evaluation_state": "lost",
-                "referenced_process_state": "lost",
+                "referenced_process_state": process_state,
                 "measurement_state": "not_available",
-                "run_id": None,
+                "run_id": run_id,
                 "receipt_ref": None,
                 "reason": liveness_reason,
-                "updated_at": execution["claimed_at"],
+                "updated_at": updated_at,
                 "candidate_commit": request["candidate_commit"],
                 "evaluator_ref": evaluator_ref,
             }
         )
-    run_link = service._load_run_link(request, execution, reader=reader)
     if run_link is None:
         process_state = "prepared"
         evaluation_state = "running"
@@ -314,7 +328,16 @@ def _validate_eval_inventory_status(status: dict[str, object]) -> dict[str, obje
     allowed = {
         "running": {"prepared", "launched", "running"},
         "finalizing": {"completed", "failed_process", "timed_out", "cancelled"},
-        "lost": {"lost"},
+        "lost": {
+            "prepared",
+            "launched",
+            "running",
+            "lost",
+            "completed",
+            "failed_process",
+            "timed_out",
+            "cancelled",
+        },
         "completed": {"completed", "failed_process", "timed_out", "cancelled"},
     }
     if (

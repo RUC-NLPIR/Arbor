@@ -934,6 +934,149 @@ def test_audit_binds_only_new_evidence_link_delta(
     ]
 
 
+def test_new_evidence_link_without_declared_assimilation_is_invalid(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    claim = tmp_path / "knowledge" / "claims" / "C-undeclared-link.md"
+    claim.parent.mkdir(parents=True)
+    claim.write_text(_claim_document("C-undeclared-link", []), encoding="utf-8")
+    _git(tmp_path, "add", "knowledge/claims/C-undeclared-link.md")
+    _git(tmp_path, "commit", "-qm", "add undeclared link claim")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    claim.write_text(
+        _claim_document(
+            "C-undeclared-link",
+            [
+                {
+                    "observation_ref": "tasks/TASK-20260805-forged/collected.json",
+                    "relation": "supports",
+                    "scope": "Forged evidence bypass.",
+                }
+            ],
+        ),
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-undeclared-link",
+        base_commit=base,
+        workspace_paths=["knowledge/claims/C-undeclared-link.md"],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert audit["assimilation_links"] == []
+    assert any("evidence_delta" in str(issue["code"]) for issue in audit["issues"])
+
+
+def test_evidence_link_reorder_is_an_ordinal_delta_requiring_assimilation(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    claim = tmp_path / "knowledge" / "claims" / "C-reorder.md"
+    claim.parent.mkdir(parents=True)
+    first = {
+        "observation_ref": "tasks/TASK-20260805-first/collected.json",
+        "relation": "context",
+        "scope": "First link.",
+    }
+    second = {
+        "observation_ref": "tasks/TASK-20260805-second/collected.json",
+        "relation": "context",
+        "scope": "Second link.",
+    }
+    claim.write_text(
+        _claim_document("C-reorder", [first, second]),
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", "knowledge/claims/C-reorder.md")
+    _git(tmp_path, "commit", "-qm", "record EvidenceLink order")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    claim.write_text(
+        _claim_document("C-reorder", [second, first]),
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-reordered-links",
+        base_commit=base,
+        workspace_paths=["knowledge/claims/C-reorder.md"],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    deltas = [
+        issue for issue in audit["issues"] if "evidence_delta" in issue["code"]
+    ]
+    assert len(deltas) == 2
+
+
+def test_valid_current_claim_can_repair_invalid_base_semantic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    claim = tmp_path / "knowledge" / "claims" / "C-repair.md"
+    claim.parent.mkdir(parents=True)
+    claim.write_text(
+        "---\nid: C-repair\n---\n# Claim\n\n## Evidence links\n\n{invalid}\n",
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", "knowledge/claims/C-repair.md")
+    _git(tmp_path, "commit", "-qm", "record invalid historical Claim")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    observation_ref = f"eval/evaluations/EVAL-{'9' * 64}/receipt.json"
+    claim.write_text(
+        _claim_document(
+            "C-repair",
+            [
+                {
+                    "observation_ref": observation_ref,
+                    "relation": "supports",
+                    "scope": "Repair with explicit measurement.",
+                }
+            ],
+            statement="Repaired current Claim.",
+        ),
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-repair-base",
+        base_commit=base,
+        workspace_paths=["knowledge/claims/C-repair.md"],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": ["knowledge/claims/C-repair.md"],
+                "rationale": "knowledge/claims/C-repair.md#Evidence links",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            observation_ref,
+            kind="measurement",
+            candidate_commit="9" * 40,
+            measurement_state="valid",
+        ),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    assert len(audit["assimilation_links"]) == 1
+    assert any(
+        issue["severity"] == "warning" and issue["code"] == "invalid_base_semantic"
+        for issue in audit["issues"]
+    )
+
+
 def test_two_assimilations_share_evidence_section_without_cross_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

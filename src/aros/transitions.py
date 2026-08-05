@@ -547,16 +547,6 @@ class TransitionAuditService:
             if owner == "semantic":
                 try:
                     document = parse_semantic_document_bytes(path, raw)
-                    base = _base_repository_file(
-                        repository,
-                        path,
-                        base_entries,
-                    )
-                    base_document = (
-                        parse_semantic_document_bytes(path, base.content)
-                        if base is not None
-                        else None
-                    )
                 except (ResearchFileError, TypeError, UnicodeError) as error:
                     _add_issue(
                         issues,
@@ -566,6 +556,12 @@ class TransitionAuditService:
                         str(error),
                     )
                     continue
+                try:
+                    base = _base_repository_file(
+                        repository,
+                        path,
+                        base_entries,
+                    )
                 except WorktreeError as error:
                     _add_issue(
                         issues,
@@ -575,6 +571,21 @@ class TransitionAuditService:
                         str(error),
                     )
                     continue
+                base_document: SemanticDocument | None = None
+                if base is not None:
+                    try:
+                        base_document = parse_semantic_document_bytes(
+                            path,
+                            base.content,
+                        )
+                    except (ResearchFileError, TypeError, UnicodeError) as error:
+                        _add_issue(
+                            issues,
+                            "warning",
+                            "invalid_base_semantic",
+                            path,
+                            f"base semantic baseline ignored: {error}",
+                        )
                 documents[path] = _SemanticState(
                     document=document,
                     added_links=_added_evidence_links(document, base_document),
@@ -665,13 +676,8 @@ class TransitionAuditService:
         links: list[dict[str, object]],
         issues: list[dict[str, str]],
     ) -> list[ObservationRecord]:
-        if not proposal.assimilations:
-            return []
-        groups: dict[
-            tuple[str, str],
-            list[tuple[Assimilation, ObservationRecord | None]],
-        ] = defaultdict(list)
         assimilated_records: list[ObservationRecord] = []
+        record_by_assimilation: dict[Assimilation, ObservationRecord] = {}
         for assimilation in proposal.assimilations:
             target_path, anchor = _rationale_parts(assimilation.rationale)
             for affected in assimilation.affected_paths:
@@ -719,6 +725,7 @@ class TransitionAuditService:
             record = records.get(assimilation.observation_ref)
             if record is not None:
                 assimilated_records.append(record)
+                record_by_assimilation[assimilation] = record
             if record is not None and record.kind == "measurement" and (
                 record.measurement_state not in {
                 "valid",
@@ -734,67 +741,66 @@ class TransitionAuditService:
                 )
             if state is None or anchor not in state.document.sections:
                 continue
-            groups[(target_path, anchor)].append((assimilation, record))
 
-        for (target_path, anchor), group in sorted(groups.items()):
-            state = documents[target_path]
-            occurrences = [
-                occurrence
-                for occurrence in state.added_links
-                if occurrence.anchor == anchor
-            ]
-            expected_refs = {
-                assimilation.observation_ref for assimilation, _record in group
-            }
-            for occurrence in occurrences:
-                if occurrence.link.observation_ref not in expected_refs:
+        matched: Counter[Assimilation] = Counter()
+        for path, state in sorted(documents.items()):
+            for occurrence in state.added_links:
+                matches = [
+                    assimilation
+                    for assimilation in proposal.assimilations
+                    if path in assimilation.affected_paths
+                    and _rationale_parts(assimilation.rationale)
+                    == (path, occurrence.anchor)
+                    and assimilation.observation_ref
+                    == occurrence.link.observation_ref
+                ]
+                if len(matches) != 1:
                     _add_issue(
                         issues,
                         "error",
-                        "evidence_link_mismatch",
-                        f"{target_path}#{anchor}",
-                        "new EvidenceLink observation_ref has no matching assimilation",
+                        "evidence_delta_link_declaration_mismatch",
+                        f"{path}#{occurrence.anchor}:{occurrence.ordinal}",
+                        "EvidenceLink delta must match exactly one declared assimilation",
                     )
-            for assimilation, record in group:
-                matching = [
-                    occurrence
-                    for occurrence in occurrences
-                    if occurrence.link.observation_ref
-                    == assimilation.observation_ref
-                ]
-                if record is not None:
-                    for occurrence in matching:
-                        if (
-                            record.kind in {"run_final", "eval_outcome"}
-                            and occurrence.link.relation != "context"
-                        ):
-                            _add_issue(
-                                issues,
-                                "error",
-                                "nonmeasurement_evidence",
-                                assimilation.rationale,
-                                "process or evaluation outcomes may only be context",
-                            )
-                        links.append(
-                            _link_receipt(
-                                transition_id,
-                                assimilation.observation_ref,
-                                occurrence,
-                            )
-                        )
+                    continue
+                assimilation = matches[0]
+                matched[assimilation] += 1
+                record = record_by_assimilation.get(assimilation)
+                if record is None:
+                    continue
                 if (
-                    record is not None
-                    and record.kind == "measurement"
-                    and target_path.startswith("knowledge/claims/")
-                    and not matching
+                    record.kind in {"run_final", "eval_outcome"}
+                    and occurrence.link.relation != "context"
                 ):
                     _add_issue(
                         issues,
                         "error",
-                        "measurement_evidence_link_missing",
+                        "nonmeasurement_evidence",
                         assimilation.rationale,
-                        "measurement Claim assimilation requires a new matching EvidenceLink",
+                        "process or evaluation outcomes may only be context",
                     )
+                links.append(
+                    _link_receipt(
+                        transition_id,
+                        assimilation.observation_ref,
+                        occurrence,
+                    )
+                )
+
+        for assimilation, record in record_by_assimilation.items():
+            target_path, _anchor = _rationale_parts(assimilation.rationale)
+            if (
+                record.kind == "measurement"
+                and target_path.startswith("knowledge/claims/")
+                and matched[assimilation] == 0
+            ):
+                _add_issue(
+                    issues,
+                    "error",
+                    "measurement_evidence_link_missing",
+                    assimilation.rationale,
+                    "measurement Claim assimilation requires a new matching EvidenceLink",
+                )
         return assimilated_records
 
     def _observation_closure(
@@ -1253,12 +1259,12 @@ def _added_evidence_links(
 
 def _evidence_identity(
     occurrence: EvidenceLinkOccurrence,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str, int, str]:
     return (
+        occurrence.path,
         occurrence.anchor,
-        occurrence.link.observation_ref,
-        occurrence.link.relation,
-        occurrence.link.scope,
+        occurrence.ordinal,
+        occurrence.canonical_sha256,
     )
 
 

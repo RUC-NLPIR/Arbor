@@ -820,6 +820,87 @@ def test_run_read_only_loaders_preserve_crash_aliases(
     assert path.stat().st_nlink == 1
 
 
+def test_read_run_inventory_preserves_crash_alias_without_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key="inventory-crash-alias")
+    run_id = str(manifest["run_id"])
+    status = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    alias = _install_json_crash_alias(status)
+    before = {
+        path: (path.lstat().st_ino, path.lstat().st_nlink, path.read_bytes())
+        for path in (status, alias)
+    }
+    synced: list[Path] = []
+    monkeypatch.setattr(store_module, "_fsync_directory", synced.append)
+
+    with pytest.raises(RunError, match="inventory|status|single-link"):
+        runs_module.read_run_inventory(tmp_path)
+
+    assert synced == []
+    assert {
+        path: (path.lstat().st_ino, path.lstat().st_nlink, path.read_bytes())
+        for path in (status, alias)
+    } == before
+
+
+def test_read_run_inventory_rejects_invalid_state_instead_of_hiding_run(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key="inventory-invalid-state")
+    run_id = str(manifest["run_id"])
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    status = service.status(run_id, reconcile=False)
+    status["state"] = "scientific_negative"
+    atomic_write_json(status_path, status)
+
+    with pytest.raises(RunError, match="state|status"):
+        runs_module.read_run_inventory(tmp_path)
+
+
+def test_read_run_inventory_is_deterministic_in_run_id_order(tmp_path: Path) -> None:
+    _init_clean_repo(tmp_path)
+    service, first = _prepare(tmp_path, key="inventory-order-first")
+    second = service.prepare(
+        [sys.executable, "-c", "pass"],
+        idempotency_key="inventory-order-second",
+        actor="test-principal",
+        security_profile="trusted-local",
+    )
+
+    inventory = runs_module.read_run_inventory(tmp_path)
+
+    assert inventory == runs_module.read_run_inventory(tmp_path)
+    assert [item["run_id"] for item in inventory] == sorted(
+        [str(first["run_id"]), str(second["run_id"])]
+    )
+
+
+@pytest.mark.parametrize("tamper", ["invalid_id", "nan"])
+def test_read_run_inventory_rejects_invalid_identity_and_nonfinite_json(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key=f"inventory-{tamper}")
+    run_id = str(manifest["run_id"])
+    if tamper == "invalid_id":
+        invalid = tmp_path / "runs" / "RUN-invalid_id"
+        invalid.mkdir()
+        (invalid / "manifest.json").write_text("{}\n", encoding="utf-8")
+    else:
+        status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+        status = service.status(run_id, reconcile=False)
+        status["updated_at"] = float("nan")
+        status_path.write_text(json.dumps(status) + "\n", encoding="utf-8")
+
+    with pytest.raises(RunError, match="inventory|identity|JSON|status"):
+        runs_module.read_run_inventory(tmp_path)
+
+
 @pytest.mark.parametrize(
     "tamper",
     (

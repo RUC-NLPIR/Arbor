@@ -83,6 +83,40 @@ def _binding_for_checkout(
     )
 
 
+def test_read_worktree_inventory_is_strict_read_only_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    commit, _tree = _init_repository(root)
+    repository = bind_repository(root)
+    calls: list[tuple[str, ...]] = []
+    real_git_bytes = worktrees_module._git_bytes
+
+    def recording_git_bytes(
+        repo: RepositoryBinding,
+        *args: str,
+        **kwargs: object,
+    ) -> bytes:
+        calls.append(args)
+        return real_git_bytes(repo, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_bytes", recording_git_bytes)
+
+    inventory = worktrees_module.read_worktree_inventory(repository)
+
+    assert inventory == (
+        {
+            "path": str(root.resolve()),
+            "head": commit,
+            "branch": "master",
+            "detached": False,
+        },
+    )
+    assert ("worktree", "list", "--porcelain", "-z") in calls
+    assert all("--expire=now" not in call for call in calls)
+
+
 def test_detached_checkout_is_exact_clean_and_hermetic(
     tmp_path: Path,
     monkeypatch,

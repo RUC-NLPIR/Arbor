@@ -785,6 +785,73 @@ def test_same_key_different_request_rejects_without_materialization(
     assert not (root / ".aros" / "runs").exists()
 
 
+def test_read_eval_inventory_keeps_lost_request_without_receipt_pending(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    request, _created = service._publish_request(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        "inventory-lost-request",
+    )
+
+    inventory = eval_module.read_eval_inventory(root)
+
+    assert inventory == (
+        {
+            "eval_id": request["eval_id"],
+            "evaluation_state": "lost",
+            "referenced_process_state": "lost",
+            "measurement_state": "not_available",
+            "run_id": None,
+            "receipt_ref": None,
+            "reason": "request has no execution claim",
+            "updated_at": request["created_at"],
+            "candidate_commit": candidate_commit,
+            "evaluator_ref": "eval/suites/quality/1/manifest.json",
+        },
+    )
+
+
+@pytest.mark.parametrize("tamper", ["invalid_id", "malformed", "nan"])
+def test_read_eval_inventory_rejects_invalid_identity_and_json(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    root = tmp_path / "repository"
+    _manifest, _tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    request, _created = service._publish_request(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        "inventory-invalid-request",
+    )
+    request_path = (
+        root / ".aros" / "evaluations" / str(request["eval_id"]) / "request.json"
+    )
+    if tamper == "invalid_id":
+        invalid = root / ".aros" / "evaluations" / "not-an-eval"
+        invalid.mkdir()
+        (invalid / "request.json").write_text("{}\n", encoding="utf-8")
+    elif tamper == "malformed":
+        request_path.write_text("{}\n", encoding="utf-8")
+    else:
+        payload = dict(request)
+        payload["created_at"] = float("nan")
+        request_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(EvalError, match="inventory|identity|request|JSON"):
+        eval_module.read_eval_inventory(root)
+
+
 @requires_linux_claims
 def test_existing_request_replay_does_not_reresolve_git_or_descriptor(
     tmp_path: Path,

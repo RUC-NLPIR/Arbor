@@ -108,6 +108,36 @@ _ALLOWED_SIGNALS = {
     "KILL": signal.SIGKILL,
     "INT": signal.SIGINT,
 }
+_INVENTORY_STATUS_FIELDS = {
+    "schema_version",
+    "run_id",
+    "state",
+    "manifest_sha256",
+    "updated_at",
+    "actor",
+    "carrier",
+    "tmux_session",
+    "host",
+    "launch_receipt_sha256",
+    "launched_at",
+    "runner_pid",
+    "process_pid",
+    "process_pgid",
+    "process_start_token",
+    "started_at",
+    "heartbeat_at",
+    "exit_code",
+    "finished_at",
+    "final_ref",
+    "reason",
+}
+_INVENTORY_BASE_FIELDS = {
+    "schema_version",
+    "run_id",
+    "state",
+    "manifest_sha256",
+    "updated_at",
+}
 class RunError(ValueError):
     """Raised when a durable run request is invalid or unsafe."""
 
@@ -168,6 +198,140 @@ def read_validated_run_final(
         except (AnchoredReadError, OSError, WorktreeError) as error:
             raise RunError(f"invalid Run workspace: {root}") from error
     return _pure_run_service(root).read_validated_final(run_id, reader=reader)
+
+
+def read_run_inventory(root: str | Path) -> tuple[dict[str, object], ...]:
+    """Read every Run manifest/status under one strict non-repairing anchor."""
+    try:
+        with AnchoredWorkspaceReader(root) as reader:
+            repository = bind_repository(reader.root)
+            reader.require_repository(
+                repository.root,
+                repository.git_dir,
+                repository.common_dir,
+            )
+            versioned = _inventory_run_ids(
+                reader,
+                "runs",
+                "manifest.json",
+            )
+            runtime = _inventory_run_ids(
+                reader,
+                ".aros/runs",
+                "status.json",
+                ignored=frozenset({"idempotency"}),
+            )
+            if versioned != runtime:
+                raise RunError("Run inventory identity mismatch")
+            service = RunService(repository.root)
+            inventory: list[dict[str, object]] = []
+            for run_id in sorted(versioned):
+                manifest_ref = f"runs/{run_id}/manifest.json"
+                status_ref = f".aros/runs/{run_id}/status.json"
+                reader.require_file(manifest_ref)
+                reader.require_file(status_ref)
+                manifest = service._load_manifest(run_id, reader=reader)
+                status = _read_run_status(
+                    repository.root / status_ref,
+                    reader=reader,
+                )
+                inventory.append(_validate_inventory_status(run_id, manifest, status))
+            _validate_repository_binding(repository)
+            return tuple(inventory)
+    except RunError:
+        raise
+    except (AnchoredReadError, OSError, WorktreeError, ValueError) as error:
+        raise RunError(f"invalid Run inventory: {error}") from error
+
+
+def _inventory_run_ids(
+    reader: AnchoredWorkspaceReader,
+    relative_root: str,
+    record_name: str,
+    *,
+    ignored: frozenset[str] = frozenset(),
+) -> set[str]:
+    parent = Path(relative_root).parent
+    leaf = Path(relative_root).name
+    try:
+        if leaf not in reader.listdir(parent):
+            return set()
+        metadata = reader.lstat(relative_root)
+    except FileNotFoundError:
+        return set()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RunError(f"Run inventory root is invalid: {relative_root}")
+    run_ids: set[str] = set()
+    for name in reader.listdir(relative_root):
+        if name in ignored:
+            continue
+        entry = f"{relative_root}/{name}"
+        metadata = reader.lstat(entry)
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            continue
+        children = reader.listdir(entry)
+        if record_name not in children:
+            if _RUN_ID.fullmatch(name) is not None:
+                raise RunError(f"Run inventory record is missing: {entry}")
+            continue
+        if _RUN_ID.fullmatch(name) is None:
+            raise RunError(f"Run inventory identity is invalid: {entry}")
+        run_ids.add(name)
+    return run_ids
+
+
+def _validate_inventory_status(
+    run_id: str,
+    manifest: dict[str, object],
+    status: dict[str, object],
+) -> dict[str, object]:
+    state = status.get("state")
+    if (
+        not _INVENTORY_BASE_FIELDS <= set(status) <= _INVENTORY_STATUS_FIELDS
+        or type(status.get("schema_version")) is not int
+        or status.get("schema_version") != 1
+        or status.get("run_id") != run_id
+        or state not in (_ACTIVE_STATES | _TERMINAL_STATES | {"prepared"})
+        or status.get("manifest_sha256") != manifest.get("manifest_sha256")
+        or not _valid_utc_timestamp(status.get("updated_at"))
+    ):
+        raise RunError(f"invalid Run inventory status: {run_id}")
+    for field in (
+        "launched_at",
+        "started_at",
+        "heartbeat_at",
+        "finished_at",
+    ):
+        if field in status and not _valid_utc_timestamp(status[field]):
+            raise RunError(f"invalid Run inventory status {field}: {run_id}")
+    for field in ("runner_pid", "process_pid", "process_pgid"):
+        if field in status and (
+            type(status[field]) is not int or int(status[field]) <= 0
+        ):
+            raise RunError(f"invalid Run inventory status {field}: {run_id}")
+    if "exit_code" in status and status["exit_code"] is not None and type(
+        status["exit_code"]
+    ) is not int:
+        raise RunError(f"invalid Run inventory status exit_code: {run_id}")
+    for field in ("manifest_sha256", "launch_receipt_sha256"):
+        if field in status and (
+            not isinstance(status[field], str)
+            or re.fullmatch(r"[0-9a-f]{64}", status[field]) is None
+        ):
+            raise RunError(f"invalid Run inventory status {field}: {run_id}")
+    if state == "prepared" and set(status) != _INVENTORY_BASE_FIELDS:
+        raise RunError(f"invalid prepared Run inventory status: {run_id}")
+    if state == "lost" and (
+        not isinstance(status.get("reason"), str) or not status["reason"]
+    ):
+        raise RunError(f"invalid lost Run inventory status: {run_id}")
+    if state in (_TERMINAL_STATES - {"lost"}) and (
+        status.get("final_ref") != f"runs/{run_id}/final.json"
+        or "finished_at" not in status
+        or "exit_code" not in status
+    ):
+        raise RunError(f"invalid terminal Run inventory status: {run_id}")
+    return dict(status)
 
 
 def _pure_run_service(root: str | Path) -> RunService:

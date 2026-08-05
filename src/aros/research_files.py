@@ -120,6 +120,14 @@ def read_semantic_document(root: Path, relative: str) -> SemanticDocument:
     """Read one contained ordinary UTF-8 semantic document."""
     normalized_relative = _normalized_relative(relative)
     raw = _read_ordinary_contained_file(root, normalized_relative)
+    return parse_semantic_document_bytes(normalized_relative, raw)
+
+
+def parse_semantic_document_bytes(relative_path: str, raw: bytes) -> SemanticDocument:
+    """Parse one exact semantic file payload without filesystem access."""
+    normalized_relative = _normalized_relative(relative_path)
+    if not isinstance(raw, bytes):
+        raise ResearchFileError("semantic content must be bytes")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -379,5 +387,6 @@ __all__ = [
     "EvidenceLinkOccurrence",
     "ResearchFileError",
     "SemanticDocument",
+    "parse_semantic_document_bytes",
     "read_semantic_document",
 ]

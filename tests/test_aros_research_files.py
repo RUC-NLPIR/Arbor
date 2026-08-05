@@ -75,6 +75,27 @@ def test_frontmatter_rejects_duplicate_keys(tmp_path: Path) -> None:
         read_semantic_document(tmp_path, relative)
 
 
+def test_semantic_bytes_parser_matches_filesystem_owner_validation(
+    tmp_path: Path,
+) -> None:
+    relative = _write(
+        tmp_path,
+        "questions/Q-0001/question.md",
+        "---\nid: Q-0001\n---\n# Question\n\nExact question.\n",
+    )
+    raw = (tmp_path / relative).read_bytes()
+
+    from_bytes = research_files_module.parse_semantic_document_bytes(relative, raw)
+    from_file = read_semantic_document(tmp_path, relative)
+
+    assert from_bytes == from_file
+    with pytest.raises(ResearchFileError, match="duplicate"):
+        research_files_module.parse_semantic_document_bytes(
+            relative,
+            b"---\nid: Q-0001\nid: Q-0001\n---\n# Question\n",
+        )
+
+
 def test_evidence_link_accepts_exact_three_field_json_line(tmp_path: Path) -> None:
     first = {
         "observation_ref": f"eval/evaluations/EVAL-{'a' * 64}/receipt.json",

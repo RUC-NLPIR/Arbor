@@ -42,6 +42,23 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _EVAL_ID = re.compile(r"^EVAL-[0-9a-f]{64}$")
+_RUN_ID = re.compile(r"^RUN-[A-Za-z0-9][A-Za-z0-9-]*$")
+_INVENTORY_TIMESTAMP = re.compile(
+    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+    r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{3}Z$"
+)
+_EVAL_INVENTORY_FIELDS = {
+    "eval_id",
+    "evaluation_state",
+    "referenced_process_state",
+    "measurement_state",
+    "run_id",
+    "receipt_ref",
+    "reason",
+    "updated_at",
+    "candidate_commit",
+    "evaluator_ref",
+}
 _MAX_OBSERVE_BYTES = 65_536
 _JsonReader = Callable[[str | Path], object]
 _DESCRIPTOR_METADATA_FIELDS = {
@@ -121,6 +138,196 @@ def _read_validated_eval_receipt(
         reader=reader,
     )
     return receipt
+
+
+def read_eval_inventory(root: str | Path) -> tuple[dict[str, object], ...]:
+    """Read every Eval request/status under one strict non-repairing anchor."""
+    try:
+        with AnchoredWorkspaceReader(root) as reader:
+            service = EvalService(reader.root)
+            reader.require_repository(
+                service.repository.root,
+                service.repository.git_dir,
+                service.repository.common_dir,
+            )
+            inventory = tuple(
+                _read_eval_inventory_item(service, reader, eval_id)
+                for eval_id in _inventory_eval_ids(reader)
+            )
+            _worktrees._validate_repository_binding(service.repository)
+            return inventory
+    except EvalError:
+        raise
+    except (
+        AnchoredReadError,
+        OSError,
+        ValueError,
+        _worktrees.WorktreeError,
+    ) as error:
+        raise EvalError(f"invalid Eval inventory: {error}") from error
+
+
+def _inventory_eval_ids(reader: AnchoredWorkspaceReader) -> tuple[str, ...]:
+    try:
+        if "evaluations" not in reader.listdir(".aros"):
+            return ()
+        metadata = reader.lstat(".aros/evaluations")
+    except FileNotFoundError:
+        return ()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise EvalError("Eval inventory root is invalid")
+    eval_ids: list[str] = []
+    for name in reader.listdir(".aros/evaluations"):
+        path = f".aros/evaluations/{name}"
+        metadata = reader.lstat(path)
+        if (
+            _EVAL_ID.fullmatch(name) is None
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise EvalError(f"Eval inventory identity is invalid: {path}")
+        if "request.json" not in reader.listdir(path):
+            raise EvalError(f"Eval inventory request is missing: {path}")
+        reader.require_file(f"{path}/request.json")
+        eval_ids.append(name)
+    return tuple(sorted(eval_ids))
+
+
+def _read_eval_inventory_item(
+    service: EvalService,
+    reader: AnchoredWorkspaceReader,
+    eval_id: str,
+) -> dict[str, object]:
+    request = service._load_request(eval_id, reader=reader)
+    receipt_ref = f"eval/evaluations/{eval_id}/receipt.json"
+    evaluator_ref = (
+        f"eval/suites/{request['evaluator_id']}/{request['evaluator_version']}/"
+        "manifest.json"
+    )
+    if _anchored_file_exists(reader, receipt_ref):
+        receipt = _read_validated_eval_receipt(service, eval_id, reader)
+        return _validate_eval_inventory_status(
+            {
+                "eval_id": eval_id,
+                "evaluation_state": "completed",
+                "referenced_process_state": receipt["referenced_process_state"],
+                "measurement_state": receipt["measurement_state"],
+                "run_id": receipt["run_id"],
+                "receipt_ref": receipt_ref,
+                "reason": None,
+                "updated_at": receipt["finished_at"],
+                "candidate_commit": request["candidate_commit"],
+                "evaluator_ref": evaluator_ref,
+            }
+        )
+    execution_ref = f".aros/evaluations/{eval_id}/execution.json"
+    if not _anchored_file_exists(reader, execution_ref):
+        return _validate_eval_inventory_status(
+            {
+                "eval_id": eval_id,
+                "evaluation_state": "lost",
+                "referenced_process_state": "lost",
+                "measurement_state": "not_available",
+                "run_id": None,
+                "receipt_ref": None,
+                "reason": "request has no execution claim",
+                "updated_at": request["created_at"],
+                "candidate_commit": request["candidate_commit"],
+                "evaluator_ref": evaluator_ref,
+            }
+        )
+    execution = service._load_execution(request, reader=reader)
+    run_link = service._load_run_link(request, execution, reader=reader)
+    if run_link is None:
+        process_state = "prepared"
+        evaluation_state = "running"
+        run_id = None
+        updated_at = execution["claimed_at"]
+        reason = "execution claim is live"
+    else:
+        run_status = service._linked_run_status(
+            request,
+            run_link,
+            reconcile=False,
+            reader=reader,
+        )
+        process_state = run_status.get("state")
+        run_id = run_link["run_id"]
+        updated_at = run_status.get("updated_at")
+        if process_state == "lost":
+            evaluation_state = "lost"
+            reason = run_status.get("reason") or "linked Run is lost"
+        elif process_state in {"completed", "failed_process", "timed_out", "cancelled"}:
+            evaluation_state = "finalizing"
+            reason = "terminal Run has no Eval receipt"
+        else:
+            evaluation_state = "running"
+            reason = "execution claim is live"
+    return _validate_eval_inventory_status(
+        {
+            "eval_id": eval_id,
+            "evaluation_state": evaluation_state,
+            "referenced_process_state": process_state,
+            "measurement_state": "not_available",
+            "run_id": run_id,
+            "receipt_ref": None,
+            "reason": reason,
+            "updated_at": updated_at,
+            "candidate_commit": request["candidate_commit"],
+            "evaluator_ref": evaluator_ref,
+        }
+    )
+
+
+def _anchored_file_exists(reader: AnchoredWorkspaceReader, relative: str) -> bool:
+    parent = Path(relative).parent
+    try:
+        return Path(relative).name in reader.listdir(parent)
+    except FileNotFoundError:
+        return False
+
+
+def _validate_eval_inventory_status(status: dict[str, object]) -> dict[str, object]:
+    evaluation_state = status.get("evaluation_state")
+    process_state = status.get("referenced_process_state")
+    measurement_state = status.get("measurement_state")
+    allowed = {
+        "running": {"prepared", "launched", "running"},
+        "finalizing": {"completed", "failed_process", "timed_out", "cancelled"},
+        "lost": {"lost"},
+        "completed": {"completed", "failed_process", "timed_out", "cancelled"},
+    }
+    if (
+        set(status) != _EVAL_INVENTORY_FIELDS
+        or not isinstance(status.get("eval_id"), str)
+        or _EVAL_ID.fullmatch(str(status["eval_id"])) is None
+        or evaluation_state not in allowed
+        or process_state not in allowed[str(evaluation_state)]
+        or measurement_state
+        not in {"not_available", "valid", "underpowered", "invalid_eval"}
+        or not isinstance(status.get("updated_at"), str)
+        or _INVENTORY_TIMESTAMP.fullmatch(str(status["updated_at"])) is None
+        or not isinstance(status.get("candidate_commit"), str)
+        or _COMMIT.fullmatch(str(status["candidate_commit"])) is None
+        or not isinstance(status.get("evaluator_ref"), str)
+    ):
+        raise EvalError("invalid Eval inventory status")
+    run_id = status.get("run_id")
+    if run_id is not None and (
+        not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None
+    ):
+        raise EvalError("invalid Eval inventory Run identity")
+    reason = status.get("reason")
+    if reason is not None and (not isinstance(reason, str) or not reason):
+        raise EvalError("invalid Eval inventory reason")
+    if evaluation_state == "completed":
+        if status.get("receipt_ref") != (
+            f"eval/evaluations/{status['eval_id']}/receipt.json"
+        ):
+            raise EvalError("invalid completed Eval inventory receipt")
+    elif status.get("receipt_ref") is not None or measurement_state != "not_available":
+        raise EvalError("nonterminal Eval inventory cannot contain a measurement")
+    return dict(status)
 
 
 @dataclass(frozen=True)

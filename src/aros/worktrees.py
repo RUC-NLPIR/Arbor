@@ -110,6 +110,56 @@ def bind_repository(root: str | Path) -> RepositoryBinding:
     return binding
 
 
+def read_worktree_inventory(
+    repository: RepositoryBinding,
+) -> tuple[dict[str, object], ...]:
+    """Return one strict read-only projection of registered Git worktrees."""
+    _validate_repository_binding(repository)
+    raw = _git_bytes(repository, "worktree", "list", "--porcelain", "-z")
+    projected: list[dict[str, object]] = []
+    for registration in _parse_worktree_registrations(raw):
+        path = Path(str(registration["worktree"]))
+        try:
+            resolved = path.resolve(strict=True)
+            mode = path.lstat().st_mode
+        except OSError as error:
+            raise WorktreeError(f"invalid Git worktree registration: {path}") from error
+        if path != resolved or stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise WorktreeError(f"ambiguous Git worktree registration path: {path}")
+        if "prunable" in registration:
+            raise WorktreeError(f"stale or prunable Git worktree registration: {path}")
+        head = registration.get("HEAD")
+        if not isinstance(head, str) or (
+            _COMMIT.fullmatch(head) is None and (not head or set(head) != {"0"})
+        ):
+            raise WorktreeError(f"invalid Git worktree HEAD: {path}")
+        branch_ref = registration.get("branch")
+        detached = registration.get("detached") is True
+        if detached == isinstance(branch_ref, str):
+            raise WorktreeError(f"ambiguous Git worktree branch state: {path}")
+        if branch_ref is not None and (
+            not isinstance(branch_ref, str)
+            or not branch_ref.startswith("refs/heads/")
+            or branch_ref == "refs/heads/"
+        ):
+            raise WorktreeError(f"invalid Git worktree branch: {path}")
+        projected.append(
+            {
+                "path": str(resolved),
+                "head": None if set(head) == {"0"} else head,
+                "branch": (
+                    branch_ref.removeprefix("refs/heads/")
+                    if isinstance(branch_ref, str)
+                    else None
+                ),
+                "detached": detached,
+            }
+        )
+    if bind_repository(repository.root) != repository:
+        raise WorktreeError(f"repository binding changed: {repository.root}")
+    return tuple(sorted(projected, key=lambda item: str(item["path"])))
+
+
 def create_detached_checkout(
     repo: RepositoryBinding,
     path: str | Path,

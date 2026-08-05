@@ -89,6 +89,11 @@ MAX_NORMAL_HISTORY_COMMITS = 4_096
 MAX_REBUILD_HISTORY_COMMITS = 20_000
 MAX_CACHE_BYTES = 8_388_608
 MAX_CACHE_NODES = 100_000
+MAX_REBUILD_TRANSITIONS = MAX_REBUILD_HISTORY_COMMITS
+MAX_REBUILD_ASSIMILATIONS = min(
+    MAX_REBUILD_HISTORY_COMMITS,
+    MAX_CACHE_NODES // 8,
+)
 MAX_ADMISSION_LIST_BYTES = 524_288
 MAX_TRANSITION_CAPTURE_BYTES = 67_108_864
 MAX_COMMIT_BYTES = 1_048_576
@@ -186,6 +191,8 @@ class TransitionIndex:
                 head=head,
                 canonical_ref=canonical_ref,
                 history_limit=MAX_NORMAL_HISTORY_COMMITS,
+                transition_limit=MAX_NORMAL_TRANSITIONS,
+                assimilation_limit=MAX_NORMAL_TRANSITIONS,
             )
             if _encode_state(derived) != cache:
                 raise _IndexIncomplete("transition index cache differs from Git")
@@ -203,6 +210,8 @@ class TransitionIndex:
                 head=head,
                 canonical_ref=canonical_ref,
                 history_limit=MAX_REBUILD_HISTORY_COMMITS,
+                transition_limit=MAX_REBUILD_TRANSITIONS,
+                assimilation_limit=MAX_REBUILD_ASSIMILATIONS,
             )
             encoded = _encode_state(state)
             validate_json_shape(
@@ -232,6 +241,8 @@ class TransitionIndex:
         head: str,
         canonical_ref: str,
         history_limit: int,
+        transition_limit: int,
+        assimilation_limit: int,
     ) -> TransitionIndexState:
         snapshot = read_repository_snapshot(self.canonical_repository)
         if snapshot.get("head") != head or snapshot.get("ref") != canonical_ref:
@@ -248,6 +259,7 @@ class TransitionIndex:
             self.canonical_repository,
             head,
             commits,
+            transition_limit=transition_limit,
         )
         budget = _CaptureBudget(MAX_TRANSITION_CAPTURE_BYTES)
         transitions: list[_ValidatedTransition] = []
@@ -269,8 +281,10 @@ class TransitionIndex:
             )
         transitions.sort(key=lambda item: positions[item.commit], reverse=True)
         total_records = sum(len(item.assimilations) for item in transitions)
-        if total_records > MAX_NORMAL_TRANSITIONS:
-            raise _IndexIncomplete("transition index exceeds 256 assimilation entries")
+        if total_records > assimilation_limit:
+            raise _IndexIncomplete(
+                "transition index exceeds its assimilation-entry bound"
+            )
         assimilations: dict[str, list[AssimilationRecord]] = {}
         latest: EvidenceTransitionRecord | None = None
         for transition in transitions:
@@ -445,7 +459,7 @@ def _admission_paths_between(
         _transition_from_admission_path(path)
         paths.append(path)
         if len(paths) > max_entries:
-            raise _IndexIncomplete("transition admissions exceed 256 entries")
+            raise _IndexIncomplete("transition admissions exceed their bound")
     if len(set(paths)) != len(paths):
         raise _IndexIncomplete("transition admission paths are ambiguous")
     return tuple(paths)
@@ -455,13 +469,15 @@ def _historical_admissions(
     repository: RepositoryBinding,
     head: str,
     commits: tuple[str, ...],
+    *,
+    transition_limit: int,
 ) -> tuple[_AdmissionCandidate, ...]:
     result = run_git(
         repository,
         "log",
         "--first-parent",
         "--format=%H",
-        f"--max-count={MAX_NORMAL_TRANSITIONS + 1}",
+        f"--max-count={transition_limit + 1}",
         head,
         "--",
         ":(glob)transitions/T-*/admission.json",
@@ -472,10 +488,10 @@ def _historical_admissions(
         changed_commits = tuple(result.stdout.decode("ascii").splitlines())
     except UnicodeError as error:
         raise _IndexIncomplete("transition admission history is not ASCII") from error
-    if len(changed_commits) > MAX_NORMAL_TRANSITIONS or any(
+    if len(changed_commits) > transition_limit or any(
         _COMMIT.fullmatch(commit) is None for commit in changed_commits
     ):
-        raise _IndexIncomplete("transition admission history exceeds 256 entries")
+        raise _IndexIncomplete("transition admission history exceeds its bound")
     positions = {commit: offset for offset, commit in enumerate(commits)}
     admitted: dict[str, _AdmissionCandidate] = {}
     changes = 0
@@ -488,11 +504,11 @@ def _historical_admissions(
             repository,
             parent,
             commit,
-            max_entries=MAX_NORMAL_TRANSITIONS + 1,
+            max_entries=transition_limit,
         )
         changes += len(paths)
-        if changes > MAX_NORMAL_TRANSITIONS:
-            raise _IndexIncomplete("transition admission history exceeds 256 entries")
+        if changes > transition_limit:
+            raise _IndexIncomplete("transition admission history exceeds its bound")
         before = {
             entry.path: entry
             for entry in (
@@ -1096,6 +1112,8 @@ def _require_safe_cache_parent(root: Path) -> None:
 __all__ = [
     "AssimilationRecord",
     "EvidenceTransitionRecord",
+    "MAX_REBUILD_ASSIMILATIONS",
+    "MAX_REBUILD_TRANSITIONS",
     "MAX_NORMAL_TRANSITIONS",
     "TRANSITION_INDEX_CACHE",
     "TransitionIndex",

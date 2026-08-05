@@ -392,6 +392,48 @@ def test_normal_read_is_bounded_and_never_writes(
     assert _cache_path(fixture).read_bytes() == before
 
 
+def test_rebuild_uses_full_limits_beyond_the_normal_transition_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _admitted_assimilation(tmp_path)
+    later = _admit_followup(fixture, "T-rebuild-second", assimilate=True)
+    module = __import__("arbor.aros.transition_index", fromlist=["unused"])
+    monkeypatch.setattr(module, "MAX_NORMAL_TRANSITIONS", 1)
+    index = _index(fixture)
+
+    rebuilt = index.rebuild()
+
+    assert rebuilt.state == "complete"
+    records = rebuilt.assimilations[fixture.observation_ref]
+    assert [record.transition_id for record in records] == [
+        "T-assimilate-run",
+        "T-rebuild-second",
+    ]
+    assert [record.commit for record in records] == [
+        fixture.assimilation_commit,
+        later,
+    ]
+    latest = rebuilt.latest_evidence_transition
+    assert latest is not None
+    assert latest.transition_id == "T-assimilate-run"
+    assert latest.commit == fixture.assimilation_commit
+    cache = _read_cache(fixture)
+    assert [
+        item["transition_id"]
+        for item in cache["assimilations"][fixture.observation_ref]
+    ] == ["T-assimilate-run", "T-rebuild-second"]
+    assert cache["latest_evidence_transition"]["transition_id"] == (
+        "T-assimilate-run"
+    )
+
+    normal = index.read()
+
+    assert normal.state == "index_incomplete"
+    assert normal.assimilations == {}
+    assert normal.latest_evidence_transition is None
+
+
 def test_more_than_256_admission_paths_fails_closed_without_writing(
     tmp_path: Path,
 ) -> None:

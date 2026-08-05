@@ -171,7 +171,7 @@ def test_checkpoint_prepare_never_uses_or_changes_user_index(
     for args, index_file in calls:
         if args and args[0] in {"read-tree", "update-index"}:
             assert index_file == prepared_index
-        elif args and args[0] == "write-tree":
+        elif "write-tree" in args:
             assert index_file in {
                 prepared_index,
                 prepared_index.with_name("index-verification"),
@@ -489,6 +489,65 @@ def test_checkpoint_prepare_rejects_index_replaced_between_tree_and_snapshot(
         service.prepare(proposal_ref, "reject index snapshot race")
 
     assert replaced is True
+    assert not (tmp_path / "transitions/T-checkpoint/audit.json").exists()
+
+
+def test_checkpoint_prepare_rejects_verification_index_swap_before_write_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    index_path = tmp_path / ".aros/checkpoints/T-checkpoint/index"
+    base_index_bytes = _index_bytes(tmp_path)
+    real_snapshot = checkpoint_module._snapshot_file
+    real_git_result = worktrees_module._git_result
+    good_candidate_bytes: bytes | None = None
+    snapshot_replaced = False
+    verification_replaced = False
+
+    def replace_before_snapshot(path: Path) -> object:
+        nonlocal good_candidate_bytes, snapshot_replaced
+        if path == index_path and path.exists() and not snapshot_replaced:
+            good_candidate_bytes = path.read_bytes()
+            snapshot_replaced = True
+            replacement = path.with_name("replacement-index")
+            replacement.write_bytes(base_index_bytes)
+            os.replace(replacement, path)
+        return real_snapshot(path)
+
+    def replace_before_verification_write_tree(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        nonlocal verification_replaced
+        verification_index = kwargs.get("index_file")
+        if (
+            args
+            and "write-tree" in args
+            and isinstance(verification_index, Path)
+            and verification_index.name == "index-verification"
+            and not verification_replaced
+        ):
+            assert good_candidate_bytes is not None
+            verification_replaced = True
+            replacement = verification_index.with_name("verification-replacement")
+            replacement.write_bytes(good_candidate_bytes)
+            os.replace(replacement, verification_index)
+        return real_git_result(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(checkpoint_module, "_snapshot_file", replace_before_snapshot)
+    monkeypatch.setattr(
+        worktrees_module,
+        "_git_result",
+        replace_before_verification_write_tree,
+    )
+
+    with pytest.raises(CheckpointError, match="identity"):
+        service.prepare(proposal_ref, "reject verification index swap")
+
+    assert snapshot_replaced is True
+    assert verification_replaced is True
     assert not (tmp_path / "transitions/T-checkpoint/audit.json").exists()
 
 

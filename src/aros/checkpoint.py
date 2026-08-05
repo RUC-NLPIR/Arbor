@@ -920,7 +920,12 @@ def _verify_index_snapshot_tree(
     _replace_runtime_file(verification_index, index_bytes)
     try:
         result = _git_success(
-            write_index_tree(repository, index_file=verification_index),
+            run_git(
+                repository,
+                "--no-optional-locks",
+                "write-tree",
+                index_file=verification_index,
+            ),
             "verify snapshotted checkpoint index",
         )
         try:

@@ -314,7 +314,8 @@ def read_repository_tree_entries(
             entry = _parse_repository_tree_entry(record)
             if entry.path not in requested:
                 continue
-            if entry.path in entries:
+            existing = entries.get(entry.path)
+            if existing is not None and existing != entry:
                 raise WorktreeError(
                     f"repository tree query returned an ambiguous path: {entry.path}"
                 )

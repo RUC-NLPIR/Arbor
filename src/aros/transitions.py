@@ -22,6 +22,7 @@ from .observations import (
 from .research_files import (
     EvidenceLinkOccurrence,
     ResearchFileError,
+    ResearchFileLimitError,
     SemanticDocument,
     parse_semantic_document_bytes,
 )
@@ -75,6 +76,9 @@ MAX_RATIONALE_BYTES = 4_096
 MAX_EVIDENCE_SCOPE_BYTES = 4_096
 MAX_OBSERVATION_CLOSURE_PATHS = 1_024
 MAX_PATH_COMPONENTS = 16
+MAX_VERSIONED_FILE_BYTES = 16_777_216
+MAX_EVIDENCE_LINKS_PER_FILE = 1_024
+MAX_EVIDENCE_LINKS_AGGREGATE = 4_096
 
 
 class TransitionError(ValueError):
@@ -82,6 +86,10 @@ class TransitionError(ValueError):
 
 
 class _ExecutableFileError(TransitionError):
+    pass
+
+
+class _ResourceLimitError(TransitionError):
     pass
 
 
@@ -318,6 +326,14 @@ class TransitionAuditService:
                             proposal_ref,
                             f"proposal is not an anchored ordinary file: {type(error).__name__}",
                         )
+                    except _ResourceLimitError as error:
+                        _add_issue(
+                            issues,
+                            "error",
+                            "resource_limit_proposal",
+                            proposal_ref,
+                            str(error),
+                        )
                     except _ExecutableFileError as error:
                         _add_issue(
                             issues,
@@ -344,14 +360,17 @@ class TransitionAuditService:
                         proposal_ref,
                         "proposal base_commit is not the current canonical ref commit",
                     )
-                documents, changed_paths, direct_observation_refs = (
-                    self._audit_workspace_paths(
-                        reader,
-                        repository,
-                        proposal,
-                        path_receipts,
-                        issues,
-                    )
+                (
+                    documents,
+                    changed_paths,
+                    direct_observation_refs,
+                    evidence_resource_limited,
+                ) = self._audit_workspace_paths(
+                    reader,
+                    repository,
+                    proposal,
+                    path_receipts,
+                    issues,
                 )
                 observation_refs = {
                     *direct_observation_refs,
@@ -368,6 +387,7 @@ class TransitionAuditService:
                     documents,
                     changed_paths,
                     records,
+                    evidence_resource_limited,
                     assimilation_links,
                     issues,
                 )
@@ -405,7 +425,6 @@ class TransitionAuditService:
                     observation_closure.extend(
                         self._observation_closure(
                             reader,
-                            repository,
                             proposal,
                             record,
                             closure_base_entries,
@@ -455,10 +474,12 @@ class TransitionAuditService:
         proposal: TransitionProposal,
         receipts: list[dict[str, object]],
         issues: list[dict[str, str]],
-    ) -> tuple[dict[str, _SemanticState], set[str], set[str]]:
+    ) -> tuple[dict[str, _SemanticState], set[str], set[str], bool]:
         documents: dict[str, _SemanticState] = {}
         changed_paths: set[str] = set()
         direct_observation_refs: set[str] = set()
+        evidence_link_count = 0
+        evidence_resource_limited = False
         try:
             base_entries = _read_base_tree_entries(
                 repository,
@@ -497,7 +518,20 @@ class TransitionAuditService:
                     )
                     continue
                 _reject_nested_repository(reader, path)
-                current = _read_anchored_file(reader, path)
+                current = _read_anchored_file(
+                    reader,
+                    path,
+                    max_bytes=MAX_VERSIONED_FILE_BYTES,
+                )
+            except _ResourceLimitError as error:
+                _add_issue(
+                    issues,
+                    "error",
+                    "resource_limit_current_file",
+                    path,
+                    str(error),
+                )
+                continue
             except TransitionError as error:
                 _add_issue(
                     issues,
@@ -546,7 +580,24 @@ class TransitionAuditService:
                 )
             if owner == "semantic":
                 try:
-                    document = parse_semantic_document_bytes(path, raw)
+                    document = parse_semantic_document_bytes(
+                        path,
+                        raw,
+                        max_evidence_links=min(
+                            MAX_EVIDENCE_LINKS_PER_FILE,
+                            MAX_EVIDENCE_LINKS_AGGREGATE - evidence_link_count,
+                        ),
+                    )
+                except ResearchFileLimitError as error:
+                    evidence_resource_limited = True
+                    _add_issue(
+                        issues,
+                        "error",
+                        "resource_limit_evidence_links",
+                        path,
+                        str(error),
+                    )
+                    continue
                 except (ResearchFileError, TypeError, UnicodeError) as error:
                     _add_issue(
                         issues,
@@ -556,6 +607,7 @@ class TransitionAuditService:
                         str(error),
                     )
                     continue
+                evidence_link_count += len(document.evidence_links)
                 try:
                     base = _base_repository_file(
                         repository,
@@ -577,8 +629,13 @@ class TransitionAuditService:
                         base_document = parse_semantic_document_bytes(
                             path,
                             base.content,
+                            max_evidence_links=MAX_EVIDENCE_LINKS_PER_FILE,
                         )
-                    except (ResearchFileError, TypeError, UnicodeError) as error:
+                    except (
+                        ResearchFileError,
+                        TypeError,
+                        UnicodeError,
+                    ) as error:
                         _add_issue(
                             issues,
                             "warning",
@@ -628,7 +685,12 @@ class TransitionAuditService:
                         path,
                         str(error),
                     )
-        return documents, changed_paths, direct_observation_refs
+        return (
+            documents,
+            changed_paths,
+            direct_observation_refs,
+            evidence_resource_limited,
+        )
 
     def _resolve_observations(
         self,
@@ -673,6 +735,7 @@ class TransitionAuditService:
         documents: Mapping[str, _SemanticState],
         changed_paths: set[str],
         records: Mapping[str, ObservationRecord],
+        evidence_resource_limited: bool,
         links: list[dict[str, object]],
         issues: list[dict[str, str]],
     ) -> list[ObservationRecord]:
@@ -742,6 +805,9 @@ class TransitionAuditService:
             if state is None or anchor not in state.document.sections:
                 continue
 
+        if evidence_resource_limited:
+            return assimilated_records
+
         matched: Counter[Assimilation] = Counter()
         for path, state in sorted(documents.items()):
             for occurrence in state.added_links:
@@ -806,7 +872,6 @@ class TransitionAuditService:
     def _observation_closure(
         self,
         reader: AnchoredWorkspaceReader,
-        repository: RepositoryBinding,
         proposal: TransitionProposal,
         record: ObservationRecord,
         base_entries: Mapping[str, _worktrees.RepositoryTreeEntry],
@@ -872,12 +937,21 @@ class TransitionAuditService:
                     )
                     continue
                 _reject_nested_repository(reader, canonical)
-                current = _read_anchored_file(reader, canonical)
-                base = _base_repository_file(
-                    repository,
+                current = _read_anchored_file(
+                    reader,
                     canonical,
-                    base_entries,
+                    max_bytes=MAX_VERSIONED_FILE_BYTES,
                 )
+                base = _base_regular_entry(canonical, base_entries)
+            except _ResourceLimitError as error:
+                _add_issue(
+                    issues,
+                    "error",
+                    "resource_limit_observation_file",
+                    canonical,
+                    str(error),
+                )
+                continue
             except TransitionError as error:
                 _add_issue(
                     issues,
@@ -909,7 +983,7 @@ class TransitionAuditService:
                             "ref_only"
                             if (
                                 base is not None
-                                and base.blob_oid == blob_oid
+                                and base.oid == blob_oid
                                 and base.mode == current.mode
                             )
                             else "derived"
@@ -1181,6 +1255,18 @@ def _base_repository_file(
     )
 
 
+def _base_regular_entry(
+    path: str,
+    entries: Mapping[str, _worktrees.RepositoryTreeEntry],
+) -> _worktrees.RepositoryTreeEntry | None:
+    entry = entries.get(path)
+    if entry is None:
+        return None
+    if entry.mode not in {"100644", "100755"} or entry.kind != "blob":
+        raise WorktreeError(f"repository path is not a regular SHA-1 blob: {path}")
+    return entry
+
+
 def _closure_path_is_versioned(path: object) -> bool:
     try:
         canonical = _canonical_path(path)
@@ -1287,7 +1373,7 @@ def _read_anchored_file(
                 "proposal file mode must be non-executable 100644"
             )
         if max_bytes is not None and anchored.identity[4] > max_bytes:
-            raise TransitionError(
+            raise _ResourceLimitError(
                 f"file exceeds {max_bytes} bytes: {relative}"
             )
         payload, _size, _digest = reader._stream_file(
@@ -1558,12 +1644,15 @@ __all__ = [
     "MAX_AFFECTED_PATHS",
     "MAX_ASSIMILATIONS",
     "MAX_EVIDENCE_SCOPE_BYTES",
+    "MAX_EVIDENCE_LINKS_AGGREGATE",
+    "MAX_EVIDENCE_LINKS_PER_FILE",
     "MAX_OBSERVATION_CLOSURE_PATHS",
     "MAX_PATH_BYTES",
     "MAX_PROPOSAL_BYTES",
     "MAX_RATIONALE_BYTES",
     "MAX_REFERENCE_BYTES",
     "MAX_WORKSPACE_PATHS",
+    "MAX_VERSIONED_FILE_BYTES",
     "TransitionAuditService",
     "TransitionError",
     "TransitionProposal",

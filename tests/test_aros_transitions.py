@@ -1904,9 +1904,13 @@ def test_audit_rejects_drift_and_runtime_observation_closure(
     real_parse = transitions_module.parse_semantic_document_bytes
     drifted = False
 
-    def parse_then_drift(path: str, raw: bytes):  # type: ignore[no-untyped-def]
+    def parse_then_drift(
+        path: str,
+        raw: bytes,
+        **kwargs: object,
+    ):  # type: ignore[no-untyped-def]
         nonlocal drifted
-        parsed = real_parse(path, raw)
+        parsed = real_parse(path, raw, **kwargs)  # type: ignore[arg-type]
         if not drifted:
             drifted = True
             (drift_root / path).write_text("# Replaced during audit\n", encoding="utf-8")
@@ -1985,6 +1989,9 @@ def test_transition_input_limits_are_explicit_and_enforced(tmp_path: Path) -> No
     assert transitions_module.MAX_RATIONALE_BYTES == 4_096
     assert transitions_module.MAX_EVIDENCE_SCOPE_BYTES == 4_096
     assert transitions_module.MAX_OBSERVATION_CLOSURE_PATHS == 1_024
+    assert transitions_module.MAX_VERSIONED_FILE_BYTES == 16_777_216
+    assert transitions_module.MAX_EVIDENCE_LINKS_PER_FILE == 1_024
+    assert transitions_module.MAX_EVIDENCE_LINKS_AGGREGATE == 4_096
 
     base = _init_workspace(tmp_path)
     oversized_ref = _write_proposal(
@@ -2165,6 +2172,104 @@ def test_evidence_scope_is_bounded_without_bounding_semantic_content(
     )
 
 
+def test_oversized_current_semantic_and_service_files_fail_before_parse(
+    tmp_path: Path,
+) -> None:
+    semantic_root = tmp_path / "semantic"
+    semantic_base = _init_workspace(semantic_root)
+    (semantic_root / "memory" / "NOW.md").write_bytes(
+        b"x" * (transitions_module.MAX_VERSIONED_FILE_BYTES + 1)
+    )
+    semantic_proposal = _write_proposal(
+        semantic_root,
+        "T-large-semantic",
+        base_commit=semantic_base,
+        workspace_paths=["memory/NOW.md"],
+    )
+
+    service_root = tmp_path / "service"
+    service_base = _init_workspace(service_root)
+    service_ref = "runs/RUN-oversized/final.json"
+    service_path = service_root / service_ref
+    service_path.parent.mkdir(parents=True)
+    service_path.write_bytes(
+        b"x" * (transitions_module.MAX_VERSIONED_FILE_BYTES + 1)
+    )
+    service_proposal = _write_proposal(
+        service_root,
+        "T-large-service",
+        base_commit=service_base,
+        workspace_paths=[service_ref],
+    )
+
+    for audit in (
+        _audit(semantic_root, semantic_proposal),
+        _audit(service_root, service_proposal),
+    ):
+        assert audit["mechanically_valid"] is False
+        assert any("resource_limit" in issue["code"] for issue in audit["issues"])
+        assert len(audit["issues"]) < 5
+
+
+def test_evidence_link_per_file_and_aggregate_counts_are_bounded(
+    tmp_path: Path,
+) -> None:
+    per_file_root = tmp_path / "per-file"
+    _init_workspace(per_file_root)
+    claim = per_file_root / "knowledge" / "claims" / "C-many-links.md"
+    claim.parent.mkdir(parents=True)
+    claim.write_text(_claim_document("C-many-links", []), encoding="utf-8")
+    _git(per_file_root, "add", "knowledge/claims/C-many-links.md")
+    _git(per_file_root, "commit", "-qm", "add bounded EvidenceLink file")
+    per_file_base = _git(per_file_root, "rev-parse", "HEAD")
+    link = {
+        "observation_ref": "tasks/TASK-20260805-many/collected.json",
+        "relation": "context",
+        "scope": "Repeated bounded link.",
+    }
+    claim.write_text(
+        _claim_document(
+            "C-many-links",
+            [link] * (transitions_module.MAX_EVIDENCE_LINKS_PER_FILE + 1),
+        ),
+        encoding="utf-8",
+    )
+    per_file_proposal = _write_proposal(
+        per_file_root,
+        "T-many-links-file",
+        base_commit=per_file_base,
+        workspace_paths=["knowledge/claims/C-many-links.md"],
+    )
+
+    aggregate_root = tmp_path / "aggregate"
+    aggregate_base = _init_workspace(aggregate_root)
+    aggregate_paths: list[str] = []
+    links_per_file = 900
+    for index in range(5):
+        relative = f"knowledge/claims/C-aggregate-{index}.md"
+        path = aggregate_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            _claim_document(f"C-aggregate-{index}", [link] * links_per_file),
+            encoding="utf-8",
+        )
+        aggregate_paths.append(relative)
+    aggregate_proposal = _write_proposal(
+        aggregate_root,
+        "T-many-links-aggregate",
+        base_commit=aggregate_base,
+        workspace_paths=aggregate_paths,
+    )
+
+    for audit in (
+        _audit(per_file_root, per_file_proposal),
+        _audit(aggregate_root, aggregate_proposal),
+    ):
+        assert audit["mechanically_valid"] is False
+        assert any("resource_limit" in issue["code"] for issue in audit["issues"])
+        assert len(audit["issues"]) < 20
+
+
 def test_observation_closure_path_count_is_bounded_before_reads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2250,6 +2355,83 @@ def test_audit_reuses_batched_base_tree_projection_for_many_paths(
     assert audit["mechanically_valid"] is True
     assert len(calls) <= 3
     assert any(len(call) >= len(paths) for call in calls)
+
+
+def test_large_ref_only_closure_uses_metadata_without_base_blob_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    versioned_paths: list[str] = []
+    for index in range(300):
+        relative = f"runs/RUN-ref-only-{index:03d}/manifest.json"
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True)
+        path.write_text("{}\n", encoding="utf-8")
+        versioned_paths.append(relative)
+    _git(tmp_path, "add", "runs")
+    _git(tmp_path, "commit", "-qm", "record large ref-only closure")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    (tmp_path / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nMetadata-only closure.\n",
+        encoding="utf-8",
+    )
+    observation_ref = "runs/RUN-ref-only/final.json"
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-ref-only-metadata",
+        base_commit=base,
+        workspace_paths=["memory/NOW.md"],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": ["memory/NOW.md"],
+                "rationale": "memory/NOW.md#Findings",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            observation_ref,
+            kind="run_final",
+            versioned_paths=tuple(versioned_paths),
+        ),
+    )
+    blob_calls: list[str] = []
+    tree_calls: list[tuple[str, ...]] = []
+    real_blob = worktrees_module.read_repository_blob
+    real_git_bytes = worktrees_module._git_bytes
+
+    def recording_blob(repository: object, oid: str) -> bytes:
+        blob_calls.append(oid)
+        if len(blob_calls) == 1:
+            return real_blob(repository, oid)  # type: ignore[arg-type]
+        return b""
+
+    def recording_git_bytes(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> bytes:
+        if "ls-tree" in args:
+            tree_calls.append(args)
+        return real_git_bytes(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "read_repository_blob", recording_blob)
+    monkeypatch.setattr(worktrees_module, "_git_bytes", recording_git_bytes)
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    assert len(blob_calls) == 1
+    assert len(tree_calls) <= 6
+    assert {
+        path["state"]
+        for record in audit["observation_closure"]
+        for path in record["paths"]
+    } == {"ref_only"}
 
 
 @pytest.mark.parametrize(

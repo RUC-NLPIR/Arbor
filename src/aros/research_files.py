@@ -58,6 +58,10 @@ class ResearchFileError(ValueError):
     """A semantic file is unsafe or mechanically ambiguous."""
 
 
+class ResearchFileLimitError(ResearchFileError):
+    """A semantic file exceeds a caller-supplied mechanical link bound."""
+
+
 @dataclass(frozen=True)
 class EvidenceLink:
     observation_ref: str
@@ -123,11 +127,20 @@ def read_semantic_document(root: Path, relative: str) -> SemanticDocument:
     return parse_semantic_document_bytes(normalized_relative, raw)
 
 
-def parse_semantic_document_bytes(relative_path: str, raw: bytes) -> SemanticDocument:
+def parse_semantic_document_bytes(
+    relative_path: str,
+    raw: bytes,
+    *,
+    max_evidence_links: int | None = None,
+) -> SemanticDocument:
     """Parse one exact semantic file payload without filesystem access."""
     normalized_relative = _normalized_relative(relative_path)
     if not isinstance(raw, bytes):
         raise ResearchFileError("semantic content must be bytes")
+    if max_evidence_links is not None and (
+        type(max_evidence_links) is not int or max_evidence_links < 0
+    ):
+        raise ResearchFileError("max_evidence_links must be nonnegative or null")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -138,7 +151,11 @@ def parse_semantic_document_bytes(relative_path: str, raw: bytes) -> SemanticDoc
     frontmatter, body = _split_frontmatter(text, normalized_relative)
     identifier = _validate_navigation_identity(normalized_relative, frontmatter)
     sections = _sections(body, normalized_relative)
-    evidence_links = _evidence_links(normalized_relative, sections)
+    evidence_links = _evidence_links(
+        normalized_relative,
+        sections,
+        max_evidence_links=max_evidence_links,
+    )
     warnings = tuple(
         f"missing recommended section: {heading}"
         for heading in _recommended_sections(normalized_relative)
@@ -320,6 +337,8 @@ def _closes_fence(line: str, marker: str, minimum: int) -> bool:
 def _evidence_links(
     relative: str,
     sections: Mapping[str, str],
+    *,
+    max_evidence_links: int | None,
 ) -> tuple[EvidenceLinkOccurrence, ...]:
     occurrences: list[EvidenceLinkOccurrence] = []
     for anchor, content in sections.items():
@@ -357,6 +376,13 @@ def _evidence_links(
                 "relation": relation,
                 "scope": payload["scope"],
             }
+            if (
+                max_evidence_links is not None
+                and len(occurrences) >= max_evidence_links
+            ):
+                raise ResearchFileLimitError(
+                    f"EvidenceLink count exceeds {max_evidence_links}: {relative}"
+                )
             occurrences.append(
                 EvidenceLinkOccurrence(
                     path=relative,
@@ -386,6 +412,7 @@ __all__ = [
     "EvidenceLink",
     "EvidenceLinkOccurrence",
     "ResearchFileError",
+    "ResearchFileLimitError",
     "SemanticDocument",
     "parse_semantic_document_bytes",
     "read_semantic_document",

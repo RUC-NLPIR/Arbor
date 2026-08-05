@@ -68,36 +68,40 @@ class ObservationCatalog:
     """Resolve and enumerate versioned terminal observations without writes."""
 
     def __init__(self, root: str | Path):
+        supplied = Path(root).expanduser()
+        candidate = supplied if supplied.is_absolute() else Path.cwd() / supplied
         try:
-            self._repository = bind_repository(root)
-            self.root = self._repository.root
-        except WorktreeError as error:
+            with AnchoredWorkspaceReader(candidate) as reader:
+                repository = bind_repository(reader.root)
+                reader.require_repository(
+                    repository.root,
+                    repository.git_dir,
+                    repository.common_dir,
+                )
+                self.root = reader.root
+        except (AnchoredReadError, OSError, WorktreeError) as error:
             raise ObservationError(f"invalid observation workspace: {root}") from error
 
     def resolve(self, observation_ref: str) -> ObservationRecord:
-        owner, record_id = _parse_observation_ref(observation_ref)
         try:
             with AnchoredWorkspaceReader(self.root) as reader:
-                reader.require_git_marker()
-                reader.require_file(observation_ref)
-                if owner == "task":
-                    record = self._resolve_task(observation_ref, record_id, reader)
-                elif owner == "run":
-                    record = self._resolve_run(observation_ref, record_id, reader)
-                else:
-                    record = self._resolve_eval(observation_ref, record_id, reader)
-                if bind_repository(self.root) != self._repository:
+                repository = bind_repository(reader.root)
+                reader.require_repository(
+                    repository.root,
+                    repository.git_dir,
+                    repository.common_dir,
+                )
+                record = self._resolve_record(observation_ref, reader)
+                if bind_repository(reader.root) != repository:
                     raise WorktreeError(
-                        f"repository binding changed: {self.root}"
+                        f"repository binding changed: {reader.root}"
                     )
-                reader.revalidate()
                 return record
         except ObservationError:
             raise
         except (
             AnchoredReadError,
             EvalError,
-            KeyError,
             OSError,
             RunError,
             TaskError,
@@ -108,19 +112,60 @@ class ObservationCatalog:
             ) from error
 
     def enumerate_terminal(self) -> tuple[ObservationRecord, ...]:
-        records = [self.resolve(ref) for ref in self._candidate_refs()]
-        linked_run_finals = {
-            f"runs/{record.payload['run_id']}/final.json"
-            for record in records
-            if record.kind in {"measurement", "eval_outcome"}
-        }
-        return tuple(
-            record
-            for record in records
-            if not (
-                record.kind == "run_final" and record.ref in linked_run_finals
-            )
-        )
+        try:
+            with AnchoredWorkspaceReader(self.root) as reader:
+                repository = bind_repository(reader.root)
+                reader.require_repository(
+                    repository.root,
+                    repository.git_dir,
+                    repository.common_dir,
+                )
+                records = [
+                    self._resolve_record(ref, reader)
+                    for ref in self._candidate_refs(reader)
+                ]
+                linked_run_finals = {
+                    f"runs/{record.payload['run_id']}/final.json"
+                    for record in records
+                    if record.kind in {"measurement", "eval_outcome"}
+                }
+                result = tuple(
+                    record
+                    for record in records
+                    if not (
+                        record.kind == "run_final"
+                        and record.ref in linked_run_finals
+                    )
+                )
+                if bind_repository(reader.root) != repository:
+                    raise WorktreeError(
+                        f"repository binding changed: {reader.root}"
+                    )
+                return result
+        except ObservationError:
+            raise
+        except (
+            AnchoredReadError,
+            EvalError,
+            OSError,
+            RunError,
+            TaskError,
+            WorktreeError,
+        ) as error:
+            raise ObservationError(f"invalid observation catalog: {error}") from error
+
+    def _resolve_record(
+        self,
+        observation_ref: str,
+        reader: AnchoredWorkspaceReader,
+    ) -> ObservationRecord:
+        owner, record_id = _parse_observation_ref(observation_ref)
+        reader.require_file(observation_ref)
+        if owner == "task":
+            return self._resolve_task(observation_ref, record_id, reader)
+        if owner == "run":
+            return self._resolve_run(observation_ref, record_id, reader)
+        return self._resolve_eval(observation_ref, record_id, reader)
 
     def _resolve_task(
         self,
@@ -212,10 +257,14 @@ class ObservationCatalog:
             payload=receipt,
         )
 
-    def _candidate_refs(self) -> tuple[str, ...]:
+    def _candidate_refs(
+        self,
+        reader: AnchoredWorkspaceReader,
+    ) -> tuple[str, ...]:
         candidates: list[str] = []
         candidates.extend(
             self._records_under(
+                reader,
                 Path("tasks"),
                 re.compile(
                     r"^TASK-[0-9]{8}-[A-Za-z0-9]"
@@ -227,6 +276,7 @@ class ObservationCatalog:
         )
         candidates.extend(
             self._records_under(
+                reader,
                 Path("runs"),
                 re.compile(r"^RUN-[A-Za-z0-9][A-Za-z0-9-]*$"),
                 "final.json",
@@ -234,6 +284,7 @@ class ObservationCatalog:
         )
         candidates.extend(
             self._records_under(
+                reader,
                 Path("eval/evaluations"),
                 re.compile(r"^EVAL-[0-9a-f]{64}$"),
                 "receipt.json",
@@ -243,15 +294,24 @@ class ObservationCatalog:
 
     def _records_under(
         self,
+        reader: AnchoredWorkspaceReader,
         relative_root: Path,
         identity: re.Pattern[str],
         filename: str,
         *,
         ignored_entries: frozenset[str] = frozenset(),
     ) -> list[str]:
-        directory = self.root / relative_root
+        parent = Path(".")
+        for part in relative_root.parts:
+            try:
+                parent_entries = reader.listdir(parent)
+            except FileNotFoundError:
+                return []
+            if part not in parent_entries:
+                return []
+            parent = parent / part
         try:
-            metadata = directory.lstat()
+            metadata = reader.lstat(relative_root)
         except FileNotFoundError:
             return []
         except OSError as error:
@@ -263,52 +323,52 @@ class ObservationCatalog:
                 f"observation directory has invalid identity: {relative_root.as_posix()}"
             )
         try:
-            entries = sorted(directory.iterdir(), key=lambda path: path.name)
+            entries = reader.listdir(relative_root)
         except OSError as error:
             raise ObservationError(
                 f"unable to enumerate observations: {relative_root.as_posix()}"
             ) from error
         refs: list[str] = []
-        for entry in entries:
+        for name in entries:
+            entry = relative_root / name
             try:
-                entry_metadata = entry.lstat()
+                entry_metadata = reader.lstat(entry)
             except OSError as error:
                 raise ObservationError(
                     f"unable to inspect observation identity: {entry}"
                 ) from error
-            if identity.fullmatch(entry.name) is None:
-                if entry.name in ignored_entries:
+            if identity.fullmatch(name) is None:
+                if name in ignored_entries:
                     continue
                 if stat.S_ISLNK(entry_metadata.st_mode):
                     raise ObservationError(
                         f"terminal observation has invalid identity: {entry}"
                     )
                 if stat.S_ISDIR(entry_metadata.st_mode):
-                    candidate = entry / filename
                     try:
-                        candidate.lstat()
-                    except FileNotFoundError:
-                        continue
+                        child_entries = reader.listdir(entry)
                     except OSError as error:
                         raise ObservationError(
-                            f"unable to inspect terminal observation: {candidate}"
+                            f"unable to inspect terminal observation: {entry}"
                         ) from error
-                    raise ObservationError(
-                        f"terminal observation has invalid identity: {candidate}"
-                    )
+                    if filename in child_entries:
+                        raise ObservationError(
+                            "terminal observation has invalid identity: "
+                            f"{entry / filename}"
+                        )
                 continue
             if stat.S_ISLNK(entry_metadata.st_mode) or not stat.S_ISDIR(
                 entry_metadata.st_mode
             ):
                 raise ObservationError(f"observation identity must be a directory: {entry}")
-            path = entry / filename
             try:
-                path.lstat()
-            except FileNotFoundError:
-                continue
+                child_entries = reader.listdir(entry)
             except OSError as error:
-                raise ObservationError(f"unable to inspect observation record: {path}") from error
-            refs.append(path.relative_to(self.root).as_posix())
+                raise ObservationError(
+                    f"unable to inspect observation record: {entry}"
+                ) from error
+            if filename in child_entries:
+                refs.append((entry / filename).as_posix())
         return refs
 
 def validate_task_measurement_lineage(

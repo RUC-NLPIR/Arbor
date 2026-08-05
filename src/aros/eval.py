@@ -68,18 +68,21 @@ def read_validated_eval_receipt(
 ) -> dict[str, object]:
     """Strictly read one receipt and its immutable Eval-to-Run lineage."""
     evaluation_id = _evaluation_id(eval_id)
-    service = EvalService(root)
     if reader is read_json_strict_no_repair:
         try:
-            with AnchoredWorkspaceReader(service.root) as anchored:
-                anchored.require_git_marker()
+            with AnchoredWorkspaceReader(root) as anchored:
+                service = EvalService(anchored.root)
+                anchored.require_repository(
+                    service.repository.root,
+                    service.repository.git_dir,
+                    service.repository.common_dir,
+                )
                 receipt = _read_validated_eval_receipt(
                     service,
                     evaluation_id,
                     anchored,
                 )
                 _worktrees._validate_repository_binding(service.repository)
-                anchored.revalidate()
                 return receipt
         except EvalError:
             raise
@@ -89,6 +92,7 @@ def read_validated_eval_receipt(
             _worktrees.WorktreeError,
         ) as error:
             raise EvalError(f"invalid evaluation workspace: {root}") from error
+    service = EvalService(root)
     return _read_validated_eval_receipt(service, evaluation_id, reader)
 
 

@@ -469,6 +469,71 @@ def test_anchored_workspace_reader_revalidates_lineage_and_closes_fds(
             os.fstat(descriptor)
 
 
+def test_anchored_workspace_reader_streams_without_oversized_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"x" * (2 * 1024 * 1024 + 17)
+    target = tmp_path / "large.log"
+    target.write_bytes(payload)
+    real_read = store_module.os.read
+    requested: list[int] = []
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        requested.append(size)
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(store_module.os, "read", bounded_read)
+
+    with store_module.AnchoredWorkspaceReader(tmp_path) as reader:
+        captured = reader.verify_stream(
+            "large.log",
+            expected_size=len(payload),
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+            capture_limit=1024,
+        )
+        assert captured is None
+        assert all(not hasattr(entry, "payload") for entry in reader._files.values())
+
+    assert requested
+    assert max(requested) <= 65_536
+
+
+def test_anchored_workspace_reader_exit_revalidates_automatically(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "record.json"
+    replacement = tmp_path / "replacement.json"
+    assert create_json(target, {"version": 1}) is True
+    assert create_json(replacement, {"version": 1}) is True
+
+    with pytest.raises(store_module.AnchoredReadError, match="changed|identity"):
+        with store_module.AnchoredWorkspaceReader(tmp_path) as reader:
+            assert reader.read_json("record.json") == {"version": 1}
+            os.replace(replacement, target)
+
+
+def test_anchored_workspace_reader_preserves_body_and_revalidation_errors(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "record.json"
+    replacement = tmp_path / "replacement.json"
+    assert create_json(target, {"version": 1}) is True
+    assert create_json(replacement, {"version": 1}) is True
+
+    class BodyError(RuntimeError):
+        pass
+
+    with pytest.raises(store_module.AnchoredReadError) as caught:
+        with store_module.AnchoredWorkspaceReader(tmp_path) as reader:
+            reader.read_json("record.json")
+            os.replace(replacement, target)
+            raise BodyError("body failed")
+
+    assert isinstance(caught.value.original_error, BodyError)
+    assert isinstance(caught.value.revalidation_error, store_module.AnchoredReadError)
+
+
 def test_task_execution_claim_read_recovers_crashed_store_alias(
     tmp_path: Path,
 ) -> None:

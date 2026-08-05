@@ -121,15 +121,18 @@ def read_validated_run_manifest(
     """Strictly read one immutable Run manifest without reconciliation."""
     if reader is read_json_strict_no_repair:
         try:
-            repository = bind_repository(root)
-            with AnchoredWorkspaceReader(repository.root) as anchored:
-                anchored.require_git_marker()
+            with AnchoredWorkspaceReader(root) as anchored:
+                repository = bind_repository(anchored.root)
+                anchored.require_repository(
+                    repository.root,
+                    repository.git_dir,
+                    repository.common_dir,
+                )
                 manifest = RunService(repository.root)._load_manifest(
                     run_id,
                     reader=anchored,
                 )
                 _validate_repository_binding(repository)
-                anchored.revalidate()
                 return manifest
         except RunError:
             raise
@@ -147,15 +150,18 @@ def read_validated_run_final(
     """Strictly read one immutable Run final without reconciliation."""
     if reader is read_json_strict_no_repair:
         try:
-            repository = bind_repository(root)
-            with AnchoredWorkspaceReader(repository.root) as anchored:
-                anchored.require_git_marker()
+            with AnchoredWorkspaceReader(root) as anchored:
+                repository = bind_repository(anchored.root)
+                anchored.require_repository(
+                    repository.root,
+                    repository.git_dir,
+                    repository.common_dir,
+                )
                 final = RunService(repository.root).read_validated_final(
                     run_id,
                     reader=anchored,
                 )
                 _validate_repository_binding(repository)
-                anchored.revalidate()
                 return final
         except RunError:
             raise
@@ -765,17 +771,17 @@ class RunService:
             raise RunError(f"invalid verified {stream} receipt: {run_id}")
         if isinstance(reader, AnchoredWorkspaceReader):
             try:
-                raw = reader.read_bytes(canonical)
+                raw = reader.verify_stream(
+                    canonical,
+                    expected_size=declared_size,
+                    expected_sha256=declared_sha256,
+                    capture_limit=max_bytes if capture else None,
+                )
             except (AnchoredReadError, OSError) as error:
                 raise RunError(f"unable to read verified {stream}: {run_id}") from error
-            if (
-                len(raw) != declared_size
-                or hashlib.sha256(raw).hexdigest() != declared_sha256
-            ):
-                raise RunError(
-                    f"verified {stream} bytes differ from receipt: {run_id}"
-                )
-            return raw if capture else None
+            if capture and not isinstance(raw, bytes):
+                raise RunError(f"verified {stream} exceeds capture limit: {run_id}")
+            return raw
         path = self.root / canonical
         try:
             metadata = path.lstat()

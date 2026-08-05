@@ -15,6 +15,8 @@ from types import MappingProxyType
 import pytest
 
 import arbor.aros.observations as observations_module
+import arbor.aros.runs as runs_module
+import arbor.aros.store as store_module
 import arbor.aros.tasks as tasks_module
 from arbor.aros.eval import EvalService, read_validated_eval_receipt
 from arbor.aros.eval_records import build_measurement_receipt
@@ -26,6 +28,7 @@ from arbor.aros.observations import (
 )
 from arbor.aros.receipts import record_sha256
 from arbor.aros.runs import (
+    RunError,
     RunService,
     read_validated_run_final,
     read_validated_run_manifest,
@@ -507,6 +510,80 @@ def test_observation_read_rejects_workspace_identity_races(
 
     with pytest.raises(ObservationError, match="binding|changed|identity"):
         catalog.resolve(ref)
+
+
+@pytest.mark.parametrize("owner", ("task", "run", "eval"))
+def test_enumeration_rejects_directory_replacement_during_listing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner: str,
+) -> None:
+    if owner == "task":
+        _collected_task(tmp_path)
+        directory = tmp_path / "tasks"
+    elif owner == "run":
+        _install_run_final(tmp_path)
+        directory = tmp_path / "runs"
+    else:
+        _install_eval_receipt(tmp_path)
+        directory = tmp_path / "eval" / "evaluations"
+    catalog = ObservationCatalog(tmp_path)
+    identity = (directory.stat().st_dev, directory.stat().st_ino)
+    real_iterdir = Path.iterdir
+    real_listdir = store_module.os.listdir
+    replaced = False
+
+    def replace_directory() -> None:
+        nonlocal replaced
+        if replaced:
+            return
+        replaced = True
+        backing = directory.with_name(f"{directory.name}-original")
+        directory.rename(backing)
+        directory.mkdir()
+
+    def swapping_iterdir(path: Path):  # type: ignore[no-untyped-def]
+        if path == directory:
+            replace_directory()
+        return real_iterdir(path)
+
+    def swapping_listdir(path: object = ".") -> list[str]:
+        if isinstance(path, int):
+            metadata = os.fstat(path)
+            if (metadata.st_dev, metadata.st_ino) == identity:
+                replace_directory()
+        return real_listdir(path)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "iterdir", swapping_iterdir)
+    monkeypatch.setattr(store_module.os, "listdir", swapping_listdir)
+
+    with pytest.raises(ObservationError, match="changed|identity|listing"):
+        catalog.enumerate_terminal()
+
+
+def test_standalone_reader_anchors_root_before_repository_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _service, manifest, _final = _install_run_final(tmp_path)
+    run_id = str(manifest["run_id"])
+    real_bind = runs_module.bind_repository
+    replaced = False
+
+    def bind_then_replace(root: str | Path):  # type: ignore[no-untyped-def]
+        nonlocal replaced
+        binding = real_bind(root)
+        if not replaced:
+            replaced = True
+            backing = tmp_path.with_name(f"{tmp_path.name}-original")
+            tmp_path.rename(backing)
+            shutil.copytree(backing, tmp_path)
+        return binding
+
+    monkeypatch.setattr(runs_module, "bind_repository", bind_then_replace)
+
+    with pytest.raises(RunError, match="changed|identity|workspace"):
+        read_validated_run_final(tmp_path, run_id)
 
 
 @pytest.mark.parametrize("missing", ("run_link", "final", "output"))

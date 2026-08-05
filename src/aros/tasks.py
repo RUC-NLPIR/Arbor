@@ -283,15 +283,18 @@ def read_validated_task_collection(
     """Read one versioned Task collection without touching runtime state."""
     if reader is read_json_strict_no_repair:
         try:
-            repository = worktrees_module.bind_repository(root)
-            with AnchoredWorkspaceReader(repository.root) as anchored:
-                anchored.require_git_marker()
+            with AnchoredWorkspaceReader(root) as anchored:
+                repository = worktrees_module.bind_repository(anchored.root)
+                anchored.require_repository(
+                    repository.root,
+                    repository.git_dir,
+                    repository.common_dir,
+                )
                 collected = _TaskCollectionReader(
                     repository.root,
                     reader=anchored,
                 ).read(task_id)
                 worktrees_module._validate_repository_binding(repository)
-                anchored.revalidate()
                 return collected
         except TaskError:
             raise

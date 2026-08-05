@@ -58,7 +58,16 @@ def _init_workspace(root: Path) -> None:
     _git(root, "add", "README.md")
     _git(root, "commit", "-qm", "initial state")
     init_workspace(root, "Test child task execution")
-    _git(root, "add", ".gitignore", "AGENTS.md", "AROS.md", "memory/NOW.md")
+    _git(
+        root,
+        "add",
+        ".gitignore",
+        "AGENTS.md",
+        "AROS.md",
+        "memory/NOW.md",
+        "model/CURRENT.md",
+        "questions/FRONTIER.md",
+    )
     _git(root, "commit", "-qm", "initialize AROS")
 
 

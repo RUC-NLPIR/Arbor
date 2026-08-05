@@ -2789,8 +2789,6 @@ class TaskService:
         )
         if _COMMIT.fullmatch(tip) is None:
             raise TaskError(f"owned task worktree has an invalid HEAD: {target}")
-        if registration.get("HEAD") != tip:
-            raise TaskError(f"owned task worktree registry HEAD mismatch: {target}")
         branch_tip = self._safe_git_text(
             "rev-parse",
             "--verify",

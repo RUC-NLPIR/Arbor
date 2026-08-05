@@ -1626,6 +1626,43 @@ def test_repeated_start_and_ready_readers_preserve_dirty_advanced_worktree(
     assert registry.count(str(worktree)) == 1
 
 
+def test_worktree_validation_tolerates_registry_head_lag_during_child_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _create(service, key="registry-head-lag")
+    task_id = str(brief["task_id"])
+    _commit_brief(tmp_path, brief)
+    service._ensure_worktree(task_id)
+    worktree = tmp_path / ".worktree" / "tasks" / task_id
+    real_registrations = service._worktree_registrations
+    advanced = False
+
+    def registrations_then_child_commit() -> list[dict[str, object]]:
+        nonlocal advanced
+        registrations = real_registrations()
+        if not advanced:
+            advanced = True
+            (worktree / "child-result.txt").write_text("result\n", encoding="utf-8")
+            _git(worktree, "add", "child-result.txt")
+            _git(worktree, "commit", "-qm", "advance during validation")
+        return registrations
+
+    monkeypatch.setattr(
+        service,
+        "_worktree_registrations",
+        registrations_then_child_commit,
+    )
+
+    status = service.status(task_id)
+
+    assert advanced is True
+    assert status["state"] == "worktree_ready"
+    assert _git(worktree, "rev-parse", "HEAD") != brief["base_commit"]
+
+
 @pytest.mark.parametrize("status_state", ("missing", "prepared"))
 def test_ready_status_recovers_from_valid_create_once_ownership(
     tmp_path: Path,

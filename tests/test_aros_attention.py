@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -343,6 +344,125 @@ def test_attention_bounds_multibyte_text_and_reports_omissions(
     for invalid in (511, 16_001, True):
         with pytest.raises(ValueError, match="max_chars"):
             service.build(max_chars=invalid)
+
+
+def test_attention_minimum_budget_preserves_shapes_and_accounts_omissions(
+    tmp_path: Path,
+) -> None:
+    _terminal_service, terminal_manifest, _final = (
+        observation_support._install_run_final(tmp_path)
+    )
+    init_workspace(tmp_path, "Inspect complete and pending work.")
+    _write_question_views(tmp_path)
+    now = tmp_path / "memory" / "NOW.md"
+    now.write_text(
+        now.read_text(encoding="utf-8")
+        + "\n## Current blockers\n\nAwait the calibration fixture.\n",
+        encoding="utf-8",
+    )
+    rivals = tmp_path / "model" / "rivals"
+    rivals.mkdir()
+    (rivals / "R-0001.md").write_text("# Rival\n", encoding="utf-8")
+    head = _commit_workspace(tmp_path, "populate minimum attention fixture")
+    runs = RunService(tmp_path)
+    pending_manifest = runs.prepare(
+        [sys.executable, "-c", "pass"],
+        idempotency_key="minimum-attention-pending",
+        actor="principal",
+        security_profile="trusted-local",
+    )
+    now.write_text("DIRTY_CANDIDATE_MEANING", encoding="utf-8")
+    context = AttentionAuthorityContext(
+        authority={
+            "state": "available",
+            "enforcement_class": "hard",
+            "capabilities": ["inspect"],
+        },
+        remaining_budget={
+            "state": "exhausted",
+            "enforcement_class": "hard",
+            "remaining_tokens": 0,
+        },
+        institutional_obligations=(
+            {"obligation_id": "ACK-1", "kind": "review"},
+        ),
+    )
+    service = ResearchAttentionService(tmp_path)
+    roomy = service.build(max_chars=16_000, context=context)
+
+    assert roomy["active_question"]
+    assert roomy["current_uncertainty"]
+    assert roomy["hypotheses"]["competing"]
+    assert [item["ref"] for item in roomy["pending_measurements"]] == [
+        f"runs/{pending_manifest['run_id']}/manifest.json"
+    ]
+    assert [item["ref"] for item in roomy["unassimilated_returns"]] == [
+        f"runs/{terminal_manifest['run_id']}/final.json"
+    ]
+    assert roomy["current_obligations"]["scientific"]
+    assert roomy["current_obligations"]["institutional"]
+    assert roomy["blocked_reasons"]
+
+    packet = service.build(max_chars=512, context=context)
+    encoded = _compact_json(packet)
+
+    assert set(packet) == TOP_LEVEL_KEYS
+    assert packet["authority"] == {"state": "available"}
+    assert packet["remaining_budget"] == {"state": "exhausted"}
+    assert set(packet["hypotheses"]) == {"leading", "competing"}
+    assert set(packet["current_obligations"]) == {
+        "scientific",
+        "institutional",
+    }
+    assert packet["snapshot"] == {"head": head}
+    assert "DIRTY_CANDIDATE_MEANING" not in encoded
+    assert {"index_incomplete", "truncated"} <= set(packet["warnings"])
+    assert packet["omitted"]["count"] > 10
+    assert "aros boot" in packet["omitted"]["pointers"]
+    assert len(encoded) <= 512
+    assert json.loads(service.render_text(packet)) == packet
+
+
+def test_attention_reads_sections_after_one_megabyte_without_rejecting_view(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    padding = "x" * (1_048_576 + 200)
+    question = tmp_path / "questions" / "Q-0001" / "question.md"
+    question.write_text(
+        "---\nid: Q-0001\nstatus: open\n---\n"
+        "# Question\n\n"
+        f"{padding}\n\n"
+        "## Current best answer\n\nLate exact answer.\n\n"
+        "## Current uncertainty\n\nLate exact question uncertainty.\n\n"
+        "## Resolution criterion\n\nLate resolution criterion.\n\n"
+        "## Stop / pivot criterion\n\nLate stop criterion.\n\n"
+        "## Expected information gain\n\nLate information gain.\n",
+        encoding="utf-8",
+    )
+    now = tmp_path / "memory" / "NOW.md"
+    now.write_text(
+        f"# Current State\n\n{padding}\n\n"
+        "## Current uncertainty\n\nLate exact NOW uncertainty.\n",
+        encoding="utf-8",
+    )
+    _commit_workspace(tmp_path, "store large canonical semantic views")
+
+    packet = ResearchAttentionService(tmp_path).build(max_chars=16_000)
+    sections = _section_map(packet)
+
+    assert sections["Current uncertainty"]["excerpt"] == (
+        "Late exact question uncertainty."
+    )
+    assert any(
+        item["path"] == "memory/NOW.md"
+        and item["excerpt"] == "Late exact NOW uncertainty."
+        for item in packet["current_uncertainty"]
+    )
+    assert packet["active_question"]["content_sha256"] == hashlib.sha256(
+        question.read_bytes()
+    ).hexdigest()
+    assert not any("semantic_view_too_large" in warning for warning in packet["warnings"])
 
 
 def test_attention_exposes_current_and_rival_hypothesis_refs(tmp_path: Path) -> None:

@@ -62,7 +62,6 @@ _RUN_TERMINAL_STATES = {
     "timed_out",
     "cancelled",
 }
-_MAX_SEMANTIC_BYTES = 1_048_576
 _MAX_EXCERPT_CHARS = 768
 _MAX_DIRTY_PATHS = 48
 _MAX_WORKTREES = 16
@@ -479,11 +478,6 @@ def _load_semantic_document(
         return None
     try:
         entry = _regular_git_entry(repository, head, path)
-        size_text = _worktrees._git_text(repository, "cat-file", "-s", entry.blob_oid)
-        size = int(size_text)
-        if size > _MAX_SEMANTIC_BYTES:
-            _warn(warnings, f"semantic_view_too_large:{path}")
-            return None
         raw = _worktrees._git_bytes(repository, "cat-file", "blob", entry.blob_oid)
         text = raw.decode("utf-8")
         frontmatter, body = _split_frontmatter(text, path)
@@ -1110,15 +1104,28 @@ def _fit_packet(packet: dict[str, object], max_chars: int) -> None:
     if len(_packet_json(packet)) <= max_chars:
         return
 
-    warnings[:] = [
+    retained_warnings = [
         warning
         for warning in warnings
         if warning in {"index_incomplete", "truncated"}
     ]
+    for warning in warnings:
+        if warning not in retained_warnings:
+            _record_omission(
+                omitted,
+                "warnings",
+                1,
+                {
+                    "warning_sha256": hashlib.sha256(
+                        warning.encode("utf-8")
+                    ).hexdigest()
+                },
+            )
+    warnings[:] = retained_warnings
     if len(_packet_json(packet)) <= max_chars:
         return
 
-    _install_minimal_packet(packet)
+    _install_minimal_packet(packet, max_chars)
     if len(_packet_json(packet)) > max_chars:
         raise ValueError("max_chars is too small for the attention packet shape")
 
@@ -1156,13 +1163,14 @@ def _nested(packet: dict[str, object], path: tuple[str, ...]) -> object:
     return value
 
 
-def _install_minimal_packet(packet: dict[str, object]) -> None:
+def _install_minimal_packet(packet: dict[str, object], max_chars: int) -> None:
     snapshot = packet["snapshot"]
     assert isinstance(snapshot, dict)
     canonical = snapshot.get("canonical")
     candidate = snapshot.get("candidate")
     assert isinstance(canonical, dict)
     assert isinstance(candidate, dict)
+    omitted_count = _minimal_omitted_count(packet, canonical, candidate)
     packet["snapshot"] = {
         "canonical": {"head": canonical.get("head")},
         "candidate": {},
@@ -1177,11 +1185,60 @@ def _install_minimal_packet(packet: dict[str, object]) -> None:
     budget = packet["remaining_budget"]
     assert isinstance(authority, dict)
     assert isinstance(budget, dict)
-    packet["authority"] = authority.get("state")
-    packet["remaining_budget"] = budget.get("state")
+    packet["authority"] = {"state": authority.get("state")}
+    packet["remaining_budget"] = {"state": budget.get("state")}
     packet["blocked_reasons"] = []
     packet["warnings"] = ["index_incomplete", "truncated"]
-    packet["omitted"] = {"count": 1, "pointers": []}
+    packet["omitted"] = {
+        "count": omitted_count,
+        "pointers": ["aros boot"],
+    }
+    if len(_packet_json(packet)) > max_chars:
+        packet["snapshot"] = {"head": canonical.get("head")}
+
+
+def _minimal_omitted_count(
+    packet: dict[str, object],
+    canonical: dict[str, object],
+    candidate: dict[str, object],
+) -> int:
+    omitted = packet["omitted"]
+    assert isinstance(omitted, dict)
+    recorded = sum(
+        int(entry.get("count", 0))
+        for entry in omitted.values()
+        if isinstance(entry, dict)
+    )
+    authority = packet["authority"]
+    budget = packet["remaining_budget"]
+    hypotheses = packet["hypotheses"]
+    obligations = packet["current_obligations"]
+    assert isinstance(authority, dict)
+    assert isinstance(budget, dict)
+    assert isinstance(hypotheses, dict)
+    assert isinstance(obligations, dict)
+    dropped = (
+        _fact_count({key: value for key, value in canonical.items() if key != "head"})
+        + _fact_count(candidate)
+        + _fact_count(packet["active_question"])
+        + _fact_count(packet["current_uncertainty"])
+        + _fact_count(hypotheses)
+        + _fact_count(packet["pending_measurements"])
+        + _fact_count(packet["unassimilated_returns"])
+        + _fact_count(obligations)
+        + _fact_count(packet["blocked_reasons"])
+        + _fact_count({key: value for key, value in authority.items() if key != "state"})
+        + _fact_count({key: value for key, value in budget.items() if key != "state"})
+    )
+    return recorded + dropped
+
+
+def _fact_count(value: object) -> int:
+    if isinstance(value, dict):
+        return sum(_fact_count(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_fact_count(item) for item in value)
+    return 0 if value is None else 1
 
 
 def _warn(warnings: list[str], warning: str) -> None:

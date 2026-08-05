@@ -219,12 +219,15 @@ class AnchoredWorkspaceReader:
                         "workspace path component is not a directory"
                     )
                 child = os.open(name, flags, dir_fd=parent)
-                identity = _anchored_directory_identity(os.fstat(child))
-                if identity != _anchored_directory_identity(before):
+                try:
+                    identity = _anchored_directory_identity(os.fstat(child))
+                    if identity != _anchored_directory_identity(before):
+                        raise AnchoredReadError(
+                            "workspace directory identity changed while opening"
+                        )
+                except BaseException:
                     os.close(child)
-                    raise AnchoredReadError(
-                        "workspace directory identity changed while opening"
-                    )
+                    raise
                 prior = current
                 current = (*current, name)
                 self._directories[current] = _AnchoredDirectory(
@@ -578,12 +581,15 @@ class AnchoredWorkspaceReader:
                         "workspace path component is not a directory"
                     )
                 child = os.open(name, _anchored_directory_flags(), dir_fd=descriptor)
-                identity = _anchored_directory_identity(os.fstat(child))
-                if identity != _anchored_directory_identity(before):
+                try:
+                    identity = _anchored_directory_identity(os.fstat(child))
+                    if identity != _anchored_directory_identity(before):
+                        raise AnchoredReadError(
+                            "workspace directory identity changed while opening"
+                        )
+                except BaseException:
                     os.close(child)
-                    raise AnchoredReadError(
-                        "workspace directory identity changed while opening"
-                    )
+                    raise
                 existing = self._directories.get(current)
                 if existing is None:
                     self._directories[current] = _AnchoredDirectory(

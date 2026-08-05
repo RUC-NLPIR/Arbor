@@ -564,6 +564,60 @@ def test_anchored_workspace_reader_bounds_peak_descriptors_across_files(
     assert not live
 
 
+@pytest.mark.parametrize(
+    ("site", "failed_open_index"),
+    (("constructor", 1), ("traversal", 0)),
+)
+def test_anchored_workspace_reader_closes_descriptor_when_fstat_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+    failed_open_index: int,
+) -> None:
+    reader = None
+    if site == "traversal":
+        (tmp_path / "first" / "second").mkdir(parents=True)
+        reader = store_module.AnchoredWorkspaceReader(tmp_path)
+    real_open = store_module.os.open
+    real_fstat = store_module.os.fstat
+    opened: list[int] = []
+    failed = False
+
+    def tracking_open(*args: object, **kwargs: object) -> int:
+        descriptor = real_open(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(descriptor)
+        return descriptor
+
+    def failing_fstat(descriptor: int):  # type: ignore[no-untyped-def]
+        nonlocal failed
+        if (
+            not failed
+            and len(opened) > failed_open_index
+            and descriptor == opened[failed_open_index]
+        ):
+            failed = True
+            raise OSError("injected fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(store_module.os, "open", tracking_open)
+    monkeypatch.setattr(store_module.os, "fstat", failing_fstat)
+
+    with pytest.raises(OSError, match="injected fstat"):
+        if site == "constructor":
+            store_module.AnchoredWorkspaceReader(tmp_path)
+        else:
+            assert reader is not None
+            reader.require_directory("first/second")
+    if reader is not None:
+        reader.close()
+
+    assert failed is True
+    assert opened
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
 def test_anchored_json_reader_preserves_large_strict_reader_compatibility(
     tmp_path: Path,
 ) -> None:

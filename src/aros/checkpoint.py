@@ -24,7 +24,6 @@ from .store import (
     canonical_json_bytes,
     create_json,
     json_sha256,
-    read_json_strict_no_repair,
     validate_json_shape,
 )
 from .transitions import (
@@ -40,10 +39,13 @@ from .worktrees import (
     RepositoryBinding,
     WorktreeError,
     bind_repository,
+    read_tree_into_index,
     read_repository_snapshot,
     read_repository_tree_entries,
     resolve_repository_commit,
     run_git,
+    update_index_cacheinfo,
+    write_index_tree,
 )
 
 
@@ -287,12 +289,15 @@ class CheckpointService:
             )
 
         audit_path = self.candidate_repository.root / audit_ref
-        _create_once_audit(audit_path, audit_bytes, audit)
+        audit_snapshot_before = _snapshot_file(audit_path)
+        if audit_snapshot_before.exists:
+            _require_exact_audit_file(audit_path, audit_bytes, audit)
         index_path = checkpoint_root / "index"
         index_ref = index_path.relative_to(self.candidate_repository.root).as_posix()
         captured: dict[str, bytes] = {}
         receipts: tuple[CandidatePathReceipt, ...]
         candidate_tree: str
+        prepared: PreparedCheckpoint
 
         with AnchoredWorkspaceReader(
             self.candidate_repository.root,
@@ -305,7 +310,19 @@ class CheckpointService:
             )
             built: list[CandidatePathReceipt] = []
             for item in expected.values():
-                raw, mode = _read_anchored_candidate(reader, item.path)
+                if item.path == audit_ref:
+                    raw, mode = audit_bytes, "100644"
+                    if audit_snapshot_before.exists:
+                        observed, observed_mode = _read_anchored_candidate(
+                            reader,
+                            item.path,
+                        )
+                        if observed != raw or observed_mode != mode:
+                            raise CheckpointError(
+                                "existing audit file changed before preparation"
+                            )
+                else:
+                    raw, mode = _read_anchored_candidate(reader, item.path)
                 digest = hashlib.sha256(raw).hexdigest()
                 blob_oid = _blob_oid(raw)
                 if (
@@ -370,77 +387,131 @@ class CheckpointService:
                 receipts,
                 transition_id,
             )
+            repeated_audit = self.audit_service.audit(proposal_ref)
+            if repeated_audit != audit:
+                raise CheckpointError("transition audit changed during preparation")
+            self._require_unchanged_authority(
+                candidate_before,
+                canonical_before,
+                base_commit,
+                user_index,
+            )
+            reader.revalidate()
+            index_snapshot = _snapshot_file(index_path)
+            if not index_snapshot.exists or index_snapshot.content is None:
+                raise CheckpointError("checkpoint index disappeared after tree creation")
+            index_sha256 = hashlib.sha256(index_snapshot.content).hexdigest()
+            reader.verify_stream(
+                index_ref,
+                expected_size=len(index_snapshot.content),
+                expected_sha256=index_sha256,
+                capture_limit=None,
+            )
+            prepared_ref = f".aros/checkpoints/{transition_id}/prepared.json"
+            record: dict[str, object] = {
+                "schema_version": 1,
+                "transition_id": transition_id,
+                "prepared_ref": prepared_ref,
+                "proposal_ref": proposal_ref,
+                "proposal_blob_sha256": audit["proposal_blob_sha256"],
+                "canonical_ref": self.canonical_ref,
+                "base_commit": base_commit,
+                "audit_payload_sha256": audit["audit_payload_sha256"],
+                "audit_file_sha256": hashlib.sha256(audit_bytes).hexdigest(),
+                "candidate_subject_sha256": audit["candidate_subject_sha256"],
+                "candidate_tree": candidate_tree,
+                "message_sha256": message_sha256,
+                "candidate_paths": [
+                    {
+                        "path": receipt.path,
+                        "mode": receipt.mode,
+                        "blob_oid": receipt.blob_oid,
+                        "content_sha256": receipt.content_sha256,
+                    }
+                    for receipt in receipts
+                ],
+                "index_ref": index_ref,
+                "index_sha256": index_sha256,
+            }
+            prepared_bytes = _stored_json_bytes(record)
+            _create_once_audit(audit_path, audit_bytes, audit)
+            observed_audit, audit_mode = _read_anchored_candidate(reader, audit_ref)
+            if observed_audit != audit_bytes or audit_mode != "100644":
+                raise CheckpointError("published audit file differs from testimony")
 
-        repeated_audit = self.audit_service.audit(proposal_ref)
-        if repeated_audit != audit:
-            raise CheckpointError("transition audit changed during preparation")
-        self._require_unchanged_authority(
-            candidate_before,
-            canonical_before,
-            base_commit,
-            user_index,
-        )
-        index_sha256 = hashlib.sha256(_read_plain_file(index_path)).hexdigest()
-        prepared_ref = f".aros/checkpoints/{transition_id}/prepared.json"
-        record: dict[str, object] = {
-            "schema_version": 1,
-            "transition_id": transition_id,
-            "prepared_ref": prepared_ref,
-            "proposal_ref": proposal_ref,
-            "proposal_blob_sha256": audit["proposal_blob_sha256"],
-            "canonical_ref": self.canonical_ref,
-            "base_commit": base_commit,
-            "audit_payload_sha256": audit["audit_payload_sha256"],
-            "audit_file_sha256": hashlib.sha256(audit_bytes).hexdigest(),
-            "candidate_subject_sha256": audit["candidate_subject_sha256"],
-            "candidate_tree": candidate_tree,
-            "message_sha256": message_sha256,
-            "candidate_paths": [
-                {
-                    "path": receipt.path,
-                    "mode": receipt.mode,
-                    "blob_oid": receipt.blob_oid,
-                    "content_sha256": receipt.content_sha256,
-                }
-                for receipt in receipts
-            ],
-            "index_ref": index_ref,
-            "index_sha256": index_sha256,
-        }
-        prepared_path = self.candidate_repository.root / prepared_ref
-        existing = _read_prepared_if_present(prepared_path)
-        if existing is not None and existing != record:
-            raise CheckpointError("prepared checkpoint retry conflicts with existing record")
-        if existing is None and not create_json(prepared_path, record):
+            prepared_path = self.candidate_repository.root / prepared_ref
             existing = _read_prepared_if_present(prepared_path)
-            if existing != record:
+            if existing is not None and existing != (record, prepared_bytes):
                 raise CheckpointError(
-                    "prepared checkpoint create-once publication conflict"
+                    "prepared checkpoint retry conflicts byte-for-byte"
                 )
-        if _read_prepared_if_present(prepared_path) != record:
-            raise CheckpointError("prepared checkpoint record changed after publication")
-        self._require_unchanged_authority(
-            candidate_before,
-            canonical_before,
-            base_commit,
-            user_index,
-        )
-        return PreparedCheckpoint(
-            transition_id=transition_id,
-            prepared_ref=prepared_ref,
-            candidate_subject_sha256=str(audit["candidate_subject_sha256"]),
-            audit_payload_sha256=str(audit["audit_payload_sha256"]),
-            audit_testimony=_freeze_mapping(audit),
-            base_commit=base_commit,
-            candidate_tree=candidate_tree,
-            candidate_paths=receipts,
-            proposal_ref=proposal_ref,
-            proposal_blob_sha256=str(audit["proposal_blob_sha256"]),
-            message_sha256=message_sha256,
-            canonical_ref=self.canonical_ref,
-            index_ref=index_ref,
-            index_sha256=index_sha256,
-        )
+            if existing is None and not create_json(prepared_path, record):
+                existing = _read_prepared_if_present(prepared_path)
+                if existing != (record, prepared_bytes):
+                    raise CheckpointError(
+                        "prepared checkpoint create-once publication conflict"
+                    )
+            if _read_prepared_if_present(prepared_path) != (record, prepared_bytes):
+                raise CheckpointError(
+                    "prepared checkpoint bytes changed after publication"
+                )
+            reader.verify_stream(
+                prepared_ref,
+                expected_size=len(prepared_bytes),
+                expected_sha256=hashlib.sha256(prepared_bytes).hexdigest(),
+                capture_limit=None,
+            )
+            reader.revalidate()
+            self._require_unchanged_authority(
+                candidate_before,
+                canonical_before,
+                base_commit,
+                user_index,
+            )
+            if _snapshot_file(index_path) != index_snapshot:
+                raise CheckpointError(
+                    "checkpoint temp index changed after prepared publication"
+                )
+            _require_exact_audit_file(audit_path, audit_bytes, audit)
+            _verify_candidate_tree(
+                self.canonical_repository,
+                base_commit,
+                candidate_tree,
+                receipts,
+                transition_id,
+            )
+            if _read_prepared_if_present(prepared_path) != (record, prepared_bytes):
+                raise CheckpointError(
+                    "prepared checkpoint bytes changed during final validation"
+                )
+            if _snapshot_file(index_path) != index_snapshot:
+                raise CheckpointError(
+                    "checkpoint temp index changed during final validation"
+                )
+            self._require_unchanged_authority(
+                candidate_before,
+                canonical_before,
+                base_commit,
+                user_index,
+            )
+            reader.revalidate()
+            prepared = PreparedCheckpoint(
+                transition_id=transition_id,
+                prepared_ref=prepared_ref,
+                candidate_subject_sha256=str(audit["candidate_subject_sha256"]),
+                audit_payload_sha256=str(audit["audit_payload_sha256"]),
+                audit_testimony=_freeze_mapping(audit),
+                base_commit=base_commit,
+                candidate_tree=candidate_tree,
+                candidate_paths=receipts,
+                proposal_ref=proposal_ref,
+                proposal_blob_sha256=str(audit["proposal_blob_sha256"]),
+                message_sha256=message_sha256,
+                canonical_ref=self.canonical_ref,
+                index_ref=index_ref,
+                index_sha256=index_sha256,
+            )
+        return prepared
 
     def _require_bindings(self) -> None:
         if bind_repository(self.candidate_repository.root) != self.candidate_repository:
@@ -761,7 +832,11 @@ def _initialize_index(
         index_path.unlink()
         _fsync_directory(index_path.parent)
     _git_success(
-        run_git(repository, "read-tree", base_commit, index_file=index_path),
+        read_tree_into_index(
+            repository,
+            base_commit,
+            index_file=index_path,
+        ),
         "initialize checkpoint index",
     )
     metadata = index_path.lstat()
@@ -785,7 +860,6 @@ def _stage_blob(
             "-w",
             "--stdin",
             input_bytes=content,
-            index_file=index_path,
         ),
         f"write checkpoint blob: {receipt.path}",
     )
@@ -796,13 +870,12 @@ def _stage_blob(
     if observed != receipt.blob_oid:
         raise CheckpointError(f"Git blob OID mismatch: {receipt.path}")
     _git_success(
-        run_git(
+        update_index_cacheinfo(
             repository,
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            f"{receipt.mode},{receipt.blob_oid},{receipt.path}",
             index_file=index_path,
+            mode=receipt.mode,
+            oid=receipt.blob_oid,
+            path=receipt.path,
         ),
         f"stage checkpoint blob: {receipt.path}",
     )
@@ -810,7 +883,7 @@ def _stage_blob(
 
 def _write_tree(repository: RepositoryBinding, index_path: Path) -> str:
     result = _git_success(
-        run_git(repository, "write-tree", index_file=index_path),
+        write_index_tree(repository, index_file=index_path),
         "write checkpoint tree",
     )
     try:
@@ -1031,7 +1104,9 @@ def _decode_paths(raw: bytes, description: str) -> set[str]:
     return result
 
 
-def _read_prepared_if_present(path: Path) -> dict[str, object] | None:
+def _read_prepared_if_present(
+    path: Path,
+) -> tuple[dict[str, object], bytes] | None:
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -1044,7 +1119,8 @@ def _read_prepared_if_present(path: Path) -> dict[str, object] | None:
     ):
         raise CheckpointError("prepared checkpoint must be a bounded create-once file")
     try:
-        value = read_json_strict_no_repair(path)
+        raw = _read_plain_file(path, max_bytes=MAX_PREPARED_BYTES)
+        value = _strict_json_loads(raw)
         validate_json_shape(
             value,
             max_depth=MAX_JSON_DEPTH,
@@ -1054,7 +1130,7 @@ def _read_prepared_if_present(path: Path) -> dict[str, object] | None:
         raise CheckpointError(f"prepared checkpoint record is invalid: {error}") from error
     if not isinstance(value, dict) or set(value) != _PREPARED_FIELDS:
         raise CheckpointError("prepared checkpoint record has an invalid shape")
-    return value
+    return value, raw
 
 
 def _create_once_audit(
@@ -1063,6 +1139,20 @@ def _create_once_audit(
     audit: dict[str, object],
 ) -> None:
     created = create_json(path, audit)
+    try:
+        _require_exact_audit_file(path, content, audit)
+    except CheckpointError as error:
+        conflict = "publication" if created else "existing"
+        raise CheckpointError(
+            f"{conflict} audit file conflicts byte-for-byte: {error}"
+        ) from error
+
+
+def _require_exact_audit_file(
+    path: Path,
+    content: bytes,
+    audit: dict[str, object],
+) -> None:
     existing = _read_plain_file(path, max_bytes=MAX_AUDIT_FILE_BYTES)
     try:
         decoded = _strict_json_loads(existing)
@@ -1074,8 +1164,7 @@ def _create_once_audit(
     except (JsonStructureError, TypeError, UnicodeError, ValueError) as error:
         raise CheckpointError("existing audit file is not strict JSON") from error
     if existing != content or decoded != audit:
-        conflict = "publication" if created else "existing"
-        raise CheckpointError(f"{conflict} audit file conflicts byte-for-byte")
+        raise CheckpointError("audit file conflicts byte-for-byte")
     if stat.S_IMODE(path.stat().st_mode) & 0o111:
         raise CheckpointError("existing audit file must be non-executable")
 

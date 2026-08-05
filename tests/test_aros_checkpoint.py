@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import stat
@@ -12,8 +13,10 @@ from pathlib import Path
 import pytest
 
 import arbor.aros.checkpoint as checkpoint_module
+import arbor.aros.worktrees as worktrees_module
 from arbor.aros.checkpoint import CheckpointError, CheckpointService
 from arbor.aros.worktrees import bind_repository
+from tests import test_aros_observations as observation_support
 from tests import test_aros_tasks as task_support
 
 
@@ -61,6 +64,7 @@ def _write_proposal(
     transition_id: str,
     base_commit: str,
     workspace_paths: list[str],
+    assimilations: list[dict[str, object]] | None = None,
 ) -> str:
     relative = f"transitions/{transition_id}/proposal.json"
     path = root / relative
@@ -71,7 +75,7 @@ def _write_proposal(
                 "schema_version": 1,
                 "base_commit": base_commit,
                 "workspace_paths": workspace_paths,
-                "assimilations": [],
+                "assimilations": assimilations or [],
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -145,18 +149,18 @@ def test_checkpoint_prepare_never_uses_or_changes_user_index(
     service, proposal_ref, _base = _valid_service(tmp_path)
     before = _index_bytes(tmp_path)
     calls: list[tuple[tuple[str, ...], Path | None]] = []
-    real_run_git = checkpoint_module.run_git
+    real_git_result = worktrees_module._git_result
 
-    def recording_run_git(
+    def recording_git_result(
         repository: object,
         *args: str,
         **kwargs: object,
     ) -> subprocess.CompletedProcess[bytes]:
         index_file = kwargs.get("index_file")
         calls.append((args, index_file if isinstance(index_file, Path) else None))
-        return real_run_git(repository, *args, **kwargs)  # type: ignore[arg-type]
+        return real_git_result(repository, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(checkpoint_module, "run_git", recording_run_git)
+    monkeypatch.setattr(worktrees_module, "_git_result", recording_git_result)
 
     prepared = service.prepare(proposal_ref, "exact message")
 
@@ -193,6 +197,75 @@ def test_checkpoint_prepare_tree_contains_exact_audited_paths(tmp_path: Path) ->
     audit = json.loads((tmp_path / "transitions/T-checkpoint/audit.json").read_bytes())
     assert audit["audit_payload_sha256"] == prepared.audit_payload_sha256
     assert audit["candidate_subject_sha256"] == prepared.candidate_subject_sha256
+
+
+def test_checkpoint_prepare_stages_derived_closure_but_not_base_ref_only_closure(
+    tmp_path: Path,
+) -> None:
+    _run_service, manifest, _final = observation_support._install_run_final(tmp_path)
+    run_id = str(manifest["run_id"])
+    manifest_ref = f"runs/{run_id}/manifest.json"
+    final_ref = f"runs/{run_id}/final.json"
+    memory = tmp_path / "memory" / "NOW.md"
+    memory.parent.mkdir()
+    memory.write_text(
+        "# Current State\n\n## Findings\n\nInitial process context.\n",
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", manifest_ref, "memory/NOW.md")
+    _git(tmp_path, "commit", "-qm", "record observation manifest baseline")
+    base = _git_text(tmp_path, "rev-parse", "HEAD")
+    memory.write_text(
+        "# Current State\n\n## Findings\n\nAssimilated process context.\n\n"
+        + json.dumps(
+            {
+                "observation_ref": final_ref,
+                "relation": "context",
+                "scope": "process context",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-derived-closure",
+        base,
+        ["memory/NOW.md"],
+        assimilations=[
+            {
+                "observation_ref": final_ref,
+                "affected_paths": ["memory/NOW.md"],
+                "rationale": "memory/NOW.md#Findings",
+            }
+        ],
+    )
+
+    prepared = CheckpointService(
+        tmp_path,
+        canonical_repository=bind_repository(tmp_path),
+        canonical_ref=_git_text(tmp_path, "symbolic-ref", "HEAD"),
+    ).prepare(proposal_ref, "derived closure")
+
+    closure_paths = {
+        path["path"]: path["state"]
+        for record in prepared.audit_testimony["observation_closure"]
+        for path in record["paths"]
+    }
+    assert closure_paths == {manifest_ref: "ref_only", final_ref: "derived"}
+    candidate_paths = {receipt.path for receipt in prepared.candidate_paths}
+    assert final_ref in candidate_paths
+    assert manifest_ref not in candidate_paths
+    base_tree = _tree(tmp_path, base)
+    candidate_tree = _tree(tmp_path, prepared.candidate_tree)
+    assert candidate_tree[manifest_ref] == base_tree[manifest_ref]
+    assert candidate_tree[final_ref][1] == hashlib.sha1(
+        b"blob "
+        + str((tmp_path / final_ref).stat().st_size).encode("ascii")
+        + b"\0"
+        + (tmp_path / final_ref).read_bytes()
+    ).hexdigest()
 
 
 def test_checkpoint_prepare_preserves_unrelated_staged_and_unstaged_work(
@@ -242,17 +315,17 @@ def test_checkpoint_prepare_rejects_overlapping_index_or_worktree_drift(
     if drift == "overlapping_index":
         _git(tmp_path, "add", "memory/NOW.md")
     else:
-        real_run_git = checkpoint_module.run_git
+        real_read_tree = checkpoint_module.read_tree_into_index
         changed = False
 
         def drift_after_read_tree(
             repository: object,
-            *args: str,
+            commit: str,
             **kwargs: object,
         ) -> subprocess.CompletedProcess[bytes]:
             nonlocal changed
-            result = real_run_git(repository, *args, **kwargs)  # type: ignore[arg-type]
-            if args and args[0] == "read-tree" and not changed:
+            result = real_read_tree(repository, commit, **kwargs)  # type: ignore[arg-type]
+            if not changed:
                 changed = True
                 (tmp_path / "memory/NOW.md").write_text(
                     "# Current State\n\n## Findings\n\nConcurrent drift.\n",
@@ -260,7 +333,11 @@ def test_checkpoint_prepare_rejects_overlapping_index_or_worktree_drift(
                 )
             return result
 
-        monkeypatch.setattr(checkpoint_module, "run_git", drift_after_read_tree)
+        monkeypatch.setattr(
+            checkpoint_module,
+            "read_tree_into_index",
+            drift_after_read_tree,
+        )
     index_before = _index_bytes(tmp_path)
 
     with pytest.raises(CheckpointError, match="index|overlap|drift|changed"):
@@ -315,6 +392,116 @@ def test_checkpoint_prepare_is_exactly_idempotent_and_conflicting_retry_fails(
     with pytest.raises(CheckpointError, match="conflict|message|retry"):
         service.prepare(proposal_ref, "different message")
     assert prepared_path.read_bytes() == prepared_bytes
+
+
+def test_checkpoint_prepare_rejects_semantic_prepared_retry_with_different_bytes(
+    tmp_path: Path,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    prepared = service.prepare(proposal_ref, "stable message")
+    prepared_path = tmp_path / prepared.prepared_ref
+    value = json.loads(prepared_path.read_bytes())
+    prepared_path.unlink()
+    prepared_path.write_text(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CheckpointError, match="byte|conflict|retry"):
+        service.prepare(proposal_ref, "stable message")
+
+
+@pytest.mark.parametrize("failure", ("selected_drift", "object_import", "tree"))
+def test_checkpoint_prepare_does_not_publish_audit_before_candidate_is_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    audit_path = tmp_path / "transitions/T-checkpoint/audit.json"
+    if failure == "object_import":
+        monkeypatch.setattr(
+            checkpoint_module,
+            "_import_commit_objects",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                CheckpointError("injected object import failure")
+            ),
+        )
+    elif failure == "tree":
+        monkeypatch.setattr(
+            checkpoint_module,
+            "_write_tree",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                CheckpointError("injected tree failure")
+            ),
+        )
+    else:
+        real_verify = checkpoint_module._verify_candidate_tree
+
+        def drift_after_tree(*args: object, **kwargs: object) -> None:
+            real_verify(*args, **kwargs)  # type: ignore[arg-type]
+            (tmp_path / "memory/NOW.md").write_text(
+                "# Current State\n\n## Findings\n\nLate drift.\n",
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(
+            checkpoint_module,
+            "_verify_candidate_tree",
+            drift_after_tree,
+        )
+
+    with pytest.raises(CheckpointError, match="import|tree|drift|changed"):
+        service.prepare(proposal_ref, "prepublication failure")
+
+    assert not audit_path.exists()
+    assert not (tmp_path / ".aros/checkpoints/T-checkpoint/prepared.json").exists()
+
+
+@pytest.mark.parametrize(
+    "target",
+    ("selected", "audit", "temp_index", "prepared"),
+)
+def test_checkpoint_prepare_revalidates_everything_after_prepared_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    real_create_json = checkpoint_module.create_json
+
+    def publish_then_drift(path: str | Path, value: object) -> bool:
+        created = real_create_json(path, value)
+        prepared_path = Path(path)
+        if prepared_path.name != "prepared.json":
+            return created
+        if target == "selected":
+            (tmp_path / "memory/NOW.md").write_text(
+                "# Current State\n\n## Findings\n\nPost-publication drift.\n",
+                encoding="utf-8",
+            )
+        elif target == "audit":
+            audit_path = tmp_path / "transitions/T-checkpoint/audit.json"
+            audit = json.loads(audit_path.read_bytes())
+            audit_path.unlink()
+            audit_path.write_text(json.dumps(audit), encoding="utf-8")
+        elif target == "temp_index":
+            index = tmp_path / ".aros/checkpoints/T-checkpoint/index"
+            replacement = index.with_name("replacement-index")
+            replacement.write_bytes(index.read_bytes())
+            os.replace(replacement, index)
+        else:
+            prepared = json.loads(prepared_path.read_bytes())
+            prepared_path.unlink()
+            prepared_path.write_text(json.dumps(prepared), encoding="utf-8")
+        return created
+
+    monkeypatch.setattr(checkpoint_module, "create_json", publish_then_drift)
+
+    with pytest.raises(CheckpointError, match="audit|candidate|changed|drift|index|prepared"):
+        service.prepare(proposal_ref, "postpublication validation")
+
+    assert (tmp_path / ".aros/checkpoints/T-checkpoint/prepared.json").exists()
 
 
 def test_checkpoint_prepare_final_tree_has_no_admission_receipt(tmp_path: Path) -> None:
@@ -461,3 +648,41 @@ def test_checkpoint_prepare_pins_modes_and_ignores_ambient_hooks(
     assert stat.S_IMODE((tmp_path / prepared.index_ref).stat().st_mode) & 0o077 == 0
     with pytest.raises(TypeError):
         prepared.audit_testimony["mechanically_valid"] = False  # type: ignore[index]
+
+
+def test_checkpoint_prepare_has_no_admission_finalize_or_user_index_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    real_git_result = worktrees_module._git_result
+
+    def record_git(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(args)
+        return real_git_result(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_result", record_git)
+
+    service.prepare(proposal_ref, "preparation only")
+
+    verbs = {args[0] for args in calls if args}
+    assert verbs.isdisjoint({"add", "commit", "commit-tree", "reset", "update-ref"})
+    source = inspect.getsource(CheckpointService)
+    for forbidden in (
+        "AdmissionGateway",
+        "FinalizeFence",
+        "commit-tree",
+        "update-ref",
+        "compare-and-swap",
+    ):
+        assert forbidden not in source
+    assert not any(
+        fragment in name.casefold()
+        for name, _value in inspect.getmembers(CheckpointService)
+        for fragment in ("admit", "finalize")
+    )

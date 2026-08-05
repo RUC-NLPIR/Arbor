@@ -253,6 +253,11 @@ def run_git(
         if index_file is None
         else _checkpoint_index_file(repository, index_file)
     )
+    index_identity = (
+        None
+        if safe_index is None
+        else _checkpoint_index_identity(safe_index)
+    )
     result = _git_result(
         repository,
         *args,
@@ -262,6 +267,75 @@ def run_git(
     _validate_repository_binding(repository)
     if safe_index is not None:
         _checkpoint_index_file(repository, safe_index)
+        observed_identity = _checkpoint_index_identity(safe_index)
+        if index_identity is not None and observed_identity != index_identity:
+            raise WorktreeError("checkpoint index identity changed during Git command")
+    return result
+
+
+def read_tree_into_index(
+    repository: RepositoryBinding,
+    commit: str,
+    *,
+    index_file: str | Path,
+) -> subprocess.CompletedProcess[bytes]:
+    """Initialize one contained checkpoint index from an exact commit."""
+    _repository_commit(commit)
+    return _run_mutating_index_git(
+        repository,
+        "read-tree",
+        commit,
+        index_file=index_file,
+    )
+
+
+def update_index_cacheinfo(
+    repository: RepositoryBinding,
+    *,
+    index_file: str | Path,
+    mode: str,
+    oid: str,
+    path: str,
+) -> subprocess.CompletedProcess[bytes]:
+    """Add one exact regular blob receipt to a contained checkpoint index."""
+    if mode not in {"100644", "100755"}:
+        raise WorktreeError("checkpoint index mode is invalid")
+    if _COMMIT.fullmatch(oid) is None:
+        raise WorktreeError("checkpoint index blob OID is invalid")
+    canonical = _repository_path(path).as_posix()
+    return _run_mutating_index_git(
+        repository,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"{mode},{oid},{canonical}",
+        index_file=index_file,
+    )
+
+
+def write_index_tree(
+    repository: RepositoryBinding,
+    *,
+    index_file: str | Path,
+) -> subprocess.CompletedProcess[bytes]:
+    """Write the tree represented by one contained checkpoint index."""
+    return _run_mutating_index_git(
+        repository,
+        "write-tree",
+        index_file=index_file,
+    )
+
+
+def _run_mutating_index_git(
+    repository: RepositoryBinding,
+    *args: str,
+    index_file: str | Path,
+) -> subprocess.CompletedProcess[bytes]:
+    _validate_repository_binding(repository)
+    safe_index = _checkpoint_index_file(repository, index_file)
+    result = _git_result(repository, *args, index_file=safe_index)
+    _validate_repository_binding(repository)
+    _checkpoint_index_file(repository, safe_index)
     return result
 
 
@@ -1260,19 +1334,52 @@ def _checkpoint_index_file(
     for component in candidate.relative_to(owner.root).parts[:-1]:
         current /= component
         _require_plain_directory(current, "checkpoint index parent")
+    _checkpoint_index_identity(candidate)
+    return candidate
+
+
+def _checkpoint_index_identity(
+    path: Path,
+) -> tuple[int, int, int, int] | None:
     try:
-        metadata = candidate.lstat()
+        before = path.lstat()
     except FileNotFoundError:
-        return candidate
+        return None
     except OSError as error:
         raise WorktreeError("unable to inspect checkpoint index") from error
     if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
     ):
         raise WorktreeError("checkpoint index must be a single-link plain file")
-    return candidate
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as error:
+        raise WorktreeError("unable to open checkpoint index exactly") from error
+    try:
+        opened = os.fstat(descriptor)
+        observed = path.lstat()
+    finally:
+        os.close(descriptor)
+    identity = (before.st_dev, before.st_ino, before.st_mode, before.st_nlink)
+    if (
+        (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink) != identity
+        or (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_mode,
+            observed.st_nlink,
+        )
+        != identity
+    ):
+        raise WorktreeError("checkpoint index identity changed while opening")
+    return identity
 
 
 def _require_plain_directory(path: Path, description: str) -> None:

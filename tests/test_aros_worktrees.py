@@ -353,16 +353,23 @@ def test_run_git_rejects_temp_index_drift_during_command(
     ) -> subprocess.CompletedProcess[bytes]:
         nonlocal replaced
         result = real_git_result(repo, *args, **kwargs)  # type: ignore[arg-type]
-        if args and args[0] == "write-tree" and not replaced:
+        if args and args[0] == "hash-object" and not replaced:
             replaced = True
-            index.unlink()
-            index.symlink_to(repo.git_dir / "index")
+            replacement = index.with_name("replacement-index")
+            replacement.write_bytes(index.read_bytes())
+            os.replace(replacement, index)
         return result
 
     monkeypatch.setattr(worktrees_module, "_git_result", replace_after_git)
 
     with pytest.raises(WorktreeError, match="index|exact|plain"):
-        worktrees_module.run_git(repository, "write-tree", index_file=index)
+        worktrees_module.run_git(
+            repository,
+            "hash-object",
+            "--stdin",
+            input_bytes=b"identity drift",
+            index_file=index,
+        )
 
 
 def test_detached_checkout_is_exact_clean_and_hermetic(

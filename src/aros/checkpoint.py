@@ -48,6 +48,7 @@ from .worktrees import (
     read_repository_snapshot,
     read_repository_tree_entries,
     resolve_repository_commit,
+    run_checkpoint_ref_transaction,
     run_git,
     update_index_cacheinfo,
     write_index_tree,
@@ -2204,13 +2205,11 @@ def _atomic_ref_transaction(
         "commit",
     ]
     transaction = ("\n".join(commands) + "\n").encode("ascii")
-    validate_current_fence()
     _git_success(
-        run_git(
+        run_checkpoint_ref_transaction(
             repository,
-            "update-ref",
-            "--stdin",
             input_bytes=transaction,
+            validate_fence=validate_current_fence,
         ),
         "atomic checkpoint CAS ref transaction",
     )

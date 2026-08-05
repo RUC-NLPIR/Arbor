@@ -1081,6 +1081,63 @@ def test_fence_expiry_during_observation_preflight_never_reaches_ref_transaction
     assert _git(canonical, "show-ref", "--verify", observation_ref, check=False).returncode != 0
 
 
+def test_fence_expiry_during_transaction_binding_validation_never_reaches_cas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        _candidate,
+        canonical,
+        base,
+        observation_ref,
+        _return_commit,
+    ) = _task_finalize_fixture(tmp_path)
+    now = 1_500
+    expired_during_binding = False
+    real_validate = worktrees_module._validate_repository_binding
+
+    def expire_after_transaction_binding(repository: object) -> None:
+        nonlocal now, expired_during_binding
+        real_validate(repository)  # type: ignore[arg-type]
+        caller = inspect.currentframe().f_back  # type: ignore[union-attr]
+        if caller is None:
+            return
+        caller_name = caller.f_code.co_name
+        run_git_args = caller.f_locals.get("args")
+        is_current_transaction = (
+            caller_name == "run_git"
+            and isinstance(run_git_args, tuple)
+            and run_git_args[:2] == ("update-ref", "--stdin")
+        )
+        is_specialized_transaction = (
+            caller_name == "run_checkpoint_ref_transaction"
+        )
+        if (
+            not expired_during_binding
+            and (is_current_transaction or is_specialized_transaction)
+        ):
+            now = 1_601
+            expired_during_binding = True
+
+    monkeypatch.setattr(
+        worktrees_module,
+        "_validate_repository_binding",
+        expire_after_transaction_binding,
+    )
+    service.clock = lambda: now
+
+    with pytest.raises(CheckpointError, match="fence|time|expired"):
+        service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert expired_during_binding is True
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == base
+    assert _git(canonical, "show-ref", "--verify", observation_ref, check=False).returncode != 0
+
+
 def test_finalize_creates_eval_ref_at_validated_candidate_commit(
     tmp_path: Path,
 ) -> None:

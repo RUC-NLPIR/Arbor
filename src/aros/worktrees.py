@@ -33,6 +33,8 @@ _BASE_CONFIGS = (
 )
 REPOSITORY_TREE_QUERY_BATCH_SIZE = 256
 MAX_REPOSITORY_TREE_QUERY_PATHS = 20_000
+MAX_CHECKPOINT_REF_TRANSACTION_BYTES = 1_048_576
+MAX_CHECKPOINT_REF_TRANSACTION_COMMANDS = 1_024
 
 
 class WorktreeError(ValueError):
@@ -272,6 +274,78 @@ def run_git(
         if index_identity is not None and observed_identity != index_identity:
             raise WorktreeError("checkpoint index identity changed during Git command")
     return result
+
+
+def run_checkpoint_ref_transaction(
+    repository: RepositoryBinding,
+    *,
+    input_bytes: bytes,
+    validate_fence: Callable[[], None],
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one fenced, bounded checkpoint update-ref transaction."""
+    if not isinstance(repository, RepositoryBinding):
+        raise WorktreeError("checkpoint ref transaction repository is invalid")
+    _validate_checkpoint_ref_transaction(input_bytes)
+    if not callable(validate_fence):
+        raise WorktreeError("checkpoint ref transaction fence must be callable")
+    _validate_repository_binding(repository)
+    validate_fence()
+    result = _git_result(
+        repository,
+        "update-ref",
+        "--stdin",
+        input_bytes=input_bytes,
+    )
+    _validate_repository_binding(repository)
+    return result
+
+
+def _validate_checkpoint_ref_transaction(input_bytes: object) -> None:
+    if (
+        not isinstance(input_bytes, bytes)
+        or not input_bytes
+        or len(input_bytes) > MAX_CHECKPOINT_REF_TRANSACTION_BYTES
+    ):
+        raise WorktreeError("checkpoint ref transaction input exceeds its bound")
+    try:
+        text = input_bytes.decode("ascii")
+    except UnicodeError as error:
+        raise WorktreeError(
+            "checkpoint ref transaction input must be ASCII"
+        ) from error
+    if "\x00" in text or "\r" in text or not text.endswith("\n"):
+        raise WorktreeError("checkpoint ref transaction input is not canonical")
+    commands = text.splitlines()
+    if (
+        len(commands) > MAX_CHECKPOINT_REF_TRANSACTION_COMMANDS
+        or len(commands) < 4
+        or commands[0] != "start"
+        or commands[-2:] != ["prepare", "commit"]
+    ):
+        raise WorktreeError("checkpoint ref transaction framing is invalid")
+    updates = 0
+    refs: set[str] = set()
+    for command in commands[1:-2]:
+        if len(command.encode("ascii")) > 4_096:
+            raise WorktreeError("checkpoint ref transaction command exceeds bound")
+        fields = command.split(" ")
+        verb = fields[0]
+        expected_fields = 4 if verb == "update" else 3
+        if (
+            verb not in {"update", "create", "verify"}
+            or len(fields) != expected_fields
+            or not fields[1].startswith("refs/")
+            or fields[1] in refs
+            or any(_COMMIT.fullmatch(oid) is None for oid in fields[2:])
+        ):
+            raise WorktreeError("checkpoint ref transaction command is invalid")
+        refs.add(fields[1])
+        if verb == "update":
+            updates += 1
+    if updates != 1:
+        raise WorktreeError(
+            "checkpoint ref transaction must contain exactly one ref update"
+        )
 
 
 def read_repository_refs_snapshot(

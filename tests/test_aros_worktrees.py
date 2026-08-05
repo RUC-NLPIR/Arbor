@@ -382,6 +382,89 @@ def test_run_git_rejects_temp_index_drift_during_command(
         )
 
 
+def test_checkpoint_ref_transaction_checks_binding_then_fence_then_pinned_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    commit, _tree = _init_repository(root)
+    repository = bind_repository(root)
+    observation_ref = "refs/aros/observations/test/record"
+    transaction = (
+        "start\n"
+        f"update refs/heads/master {commit} {commit}\n"
+        f"create {observation_ref} {commit}\n"
+        "prepare\n"
+        "commit\n"
+    ).encode("ascii")
+    events: list[str] = []
+    real_validate = worktrees_module._validate_repository_binding
+    real_git_result = worktrees_module._git_result
+
+    def record_binding(repo: RepositoryBinding) -> None:
+        events.append("binding")
+        real_validate(repo)
+
+    def record_fence() -> None:
+        events.append("fence")
+
+    def record_git(
+        repo: RepositoryBinding,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args == ("update-ref", "--stdin"):
+            events.append("update")
+            assert kwargs == {"input_bytes": transaction}
+        return real_git_result(repo, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_validate_repository_binding", record_binding)
+    monkeypatch.setattr(worktrees_module, "_git_result", record_git)
+
+    result = worktrees_module.run_checkpoint_ref_transaction(
+        repository,
+        input_bytes=transaction,
+        validate_fence=record_fence,
+    )
+
+    assert result.returncode == 0
+    assert events == ["binding", "fence", "update", "binding"]
+    assert _git(root, "rev-parse", observation_ref).stdout.strip() == commit
+
+
+@pytest.mark.parametrize(
+    ("transaction", "fence"),
+    (
+        (b"", lambda: None),
+        (b"x" * 1_048_577, lambda: None),
+        (b"start\r\nprepare\ncommit\n", lambda: None),
+        (
+            b"start\nupdate refs/heads/main "
+            + b"a" * 40
+            + b" "
+            + b"b" * 40
+            + b"\nprepare\ncommit\n",
+            None,
+        ),
+    ),
+    ids=("empty", "oversized", "crlf", "missing-fence"),
+)
+def test_checkpoint_ref_transaction_rejects_unbounded_or_invalid_inputs(
+    tmp_path: Path,
+    transaction: bytes,
+    fence: object,
+) -> None:
+    root = tmp_path / "repository"
+    _init_repository(root)
+
+    with pytest.raises(WorktreeError, match="transaction|fence|bound|input"):
+        worktrees_module.run_checkpoint_ref_transaction(
+            bind_repository(root),
+            input_bytes=transaction,
+            validate_fence=fence,  # type: ignore[arg-type]
+        )
+
+
 def test_read_repository_refs_snapshot_rejects_before_full_memory_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

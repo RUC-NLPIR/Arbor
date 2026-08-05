@@ -9,7 +9,7 @@ import shutil
 import stat
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .store import json_sha256
 
@@ -57,6 +57,15 @@ class RepositoryBinding:
     root: Path
     git_dir: Path
     common_dir: Path
+
+
+@dataclass(frozen=True)
+class RepositoryFile:
+    """One exact regular blob read from a pinned repository commit."""
+
+    path: str
+    blob_oid: str
+    content: bytes
 
 
 @dataclass(frozen=True)
@@ -191,6 +200,82 @@ def read_repository_snapshot(repository: RepositoryBinding) -> dict[str, object]
     }
     _validate_repository_binding(repository)
     return snapshot
+
+
+def resolve_repository_commit(
+    repository: RepositoryBinding,
+    ref: str,
+) -> str:
+    """Resolve one exact full Git ref to its current SHA-1 commit."""
+    _validate_repository_binding(repository)
+    if not isinstance(ref, str) or not ref.startswith("refs/"):
+        raise WorktreeError("canonical ref must be a full Git ref")
+    checked = _git_result(repository, "check-ref-format", ref)
+    if checked.returncode != 0:
+        raise WorktreeError(f"invalid canonical ref: {ref!r}")
+    commit = _git_text(repository, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if _COMMIT.fullmatch(commit) is None:
+        raise WorktreeError(f"canonical ref does not resolve to a SHA-1 commit: {ref}")
+    _validate_repository_binding(repository)
+    return commit
+
+
+def read_repository_file(
+    repository: RepositoryBinding,
+    commit: str,
+    path: str,
+) -> RepositoryFile | None:
+    """Read one exact regular Git file, or ``None`` when it is absent."""
+    _validate_repository_binding(repository)
+    candidate = PurePosixPath(path) if isinstance(path, str) else PurePosixPath()
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\x00" in path
+        or "\\" in path
+        or candidate.is_absolute()
+        or candidate.as_posix() != path
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    ):
+        raise WorktreeError(f"invalid repository file path: {path!r}")
+    if not isinstance(commit, str) or _COMMIT.fullmatch(commit) is None:
+        raise WorktreeError(f"invalid repository commit: {commit!r}")
+    raw = _git_bytes(
+        repository,
+        "--literal-pathspecs",
+        "ls-tree",
+        "-z",
+        "--full-tree",
+        commit,
+        "--",
+        path,
+    )
+    records = [record for record in raw.split(b"\0") if record]
+    if not records:
+        _validate_repository_binding(repository)
+        return None
+    if len(records) != 1:
+        raise WorktreeError(f"repository path is ambiguous: {path}")
+    header, separator, raw_path = records[0].partition(b"\t")
+    fields = header.split(b" ")
+    if (
+        separator != b"\t"
+        or raw_path != path.encode("utf-8")
+        or len(fields) != 3
+        or fields[0] not in {b"100644", b"100755"}
+        or fields[1] != b"blob"
+        or re.fullmatch(rb"[0-9a-f]{40}", fields[2]) is None
+    ):
+        raise WorktreeError(f"repository path is not a regular SHA-1 blob: {path}")
+    blob_oid = fields[2].decode("ascii")
+    content = _git_bytes(repository, "cat-file", "blob", blob_oid)
+    digest = hashlib.sha1(
+        b"blob " + str(len(content)).encode("ascii") + b"\0" + content
+    ).hexdigest()
+    if digest != blob_oid:
+        raise WorktreeError(f"repository blob bytes do not match object ID: {path}")
+    _validate_repository_binding(repository)
+    return RepositoryFile(path=path, blob_oid=blob_oid, content=content)
 
 
 def read_candidate_status(repository: RepositoryBinding) -> dict[str, object]:

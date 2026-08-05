@@ -82,7 +82,43 @@ class ObservationCatalog:
         except (AnchoredReadError, OSError, WorktreeError) as error:
             raise ObservationError(f"invalid observation workspace: {root}") from error
 
-    def resolve(self, observation_ref: str) -> ObservationRecord:
+    def resolve(
+        self,
+        observation_ref: str,
+        *,
+        reader: AnchoredWorkspaceReader | None = None,
+    ) -> ObservationRecord:
+        if reader is not None:
+            try:
+                repository = bind_repository(reader.root)
+                if repository.root != self.root:
+                    raise ObservationError(
+                        "observation reader root differs from catalog root"
+                    )
+                reader.require_repository(
+                    repository.root,
+                    repository.git_dir,
+                    repository.common_dir,
+                )
+                record = self._resolve_record(observation_ref, reader)
+                if bind_repository(reader.root) != repository:
+                    raise WorktreeError(
+                        f"repository binding changed: {reader.root}"
+                    )
+                return record
+            except ObservationError:
+                raise
+            except (
+                AnchoredReadError,
+                EvalError,
+                OSError,
+                RunError,
+                TaskError,
+                WorktreeError,
+            ) as error:
+                raise ObservationError(
+                    f"invalid observation lineage for {observation_ref}: {error}"
+                ) from error
         try:
             with AnchoredWorkspaceReader(self.root) as reader:
                 repository = bind_repository(reader.root)

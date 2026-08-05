@@ -1146,10 +1146,11 @@ def test_oversized_base_semantic_is_prebounded_without_blob_read(
 
     audit = _audit(tmp_path, proposal_ref)
 
-    assert audit["mechanically_valid"] is True
+    assert audit["mechanically_valid"] is False
+    assert audit["assimilation_links"] == []
     assert blob_reads == []
     assert any(
-        issue["severity"] == "warning"
+        issue["severity"] == "error"
         and issue["code"] == "resource_limit_base_semantic"
         for issue in audit["issues"]
     )
@@ -2382,6 +2383,131 @@ def test_current_and_base_semantic_reads_share_aggregate_budget(
     assert blob_reads == []
     assert any(
         issue["code"] == "resource_limit_base_semantic"
+        for issue in audit["issues"]
+    )
+
+
+def test_exact_base_semantic_is_unchanged_without_base_budget_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 4 * 1024 * 1024
+    monkeypatch.setattr(transitions_module, "MAX_AUDIT_CAPTURE_BYTES", limit)
+    _init_workspace(tmp_path)
+    relative = "knowledge/claims/C-exact-budget.md"
+    claim = tmp_path / relative
+    claim.parent.mkdir(parents=True)
+    prefix = (
+        _claim_document("C-exact-budget", []) + "\n## Assumptions\n\n"
+    ).encode("utf-8")
+    claim_size = 512 * 1024
+    claim.write_bytes(prefix + b"x" * (claim_size - len(prefix)))
+    _git(tmp_path, "add", relative)
+    _git(tmp_path, "commit", "-qm", "record exact budget Claim")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+
+    paths = [relative]
+    earlier_total = limit - claim_size - 256 * 1024
+    for index in range(4):
+        idea_ref = f"ideas/BUDGET-{index}.md"
+        idea = tmp_path / idea_ref
+        idea.parent.mkdir(parents=True, exist_ok=True)
+        header = f"# Idea {index}\n\n".encode()
+        size = earlier_total // 4
+        idea.write_bytes(header + b"i" * (size - len(header)))
+        paths.append(idea_ref)
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-exact-budget",
+        base_commit=base,
+        workspace_paths=sorted(paths),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert any(
+        issue["code"] == "semantic_path_unchanged" and issue["ref"] == relative
+        for issue in audit["issues"]
+    )
+    assert not any(
+        issue["code"] == "resource_limit_base_semantic"
+        for issue in audit["issues"]
+    )
+
+
+def test_changed_base_semantic_budget_exhaustion_fails_without_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 4 * 1024 * 1024
+    monkeypatch.setattr(transitions_module, "MAX_AUDIT_CAPTURE_BYTES", limit)
+    _init_workspace(tmp_path)
+    relative = "knowledge/claims/C-changed-budget.md"
+    claim = tmp_path / relative
+    claim.parent.mkdir(parents=True)
+    prefix = _claim_document("C-changed-budget", []).encode("utf-8")
+    base_size = 1024 * 1024
+    claim.write_bytes(prefix + b"x" * (base_size - len(prefix)))
+    _git(tmp_path, "add", relative)
+    _git(tmp_path, "commit", "-qm", "record changed budget Claim base")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    observation_ref = f"eval/evaluations/EVAL-{'c' * 64}/receipt.json"
+    claim.write_text(
+        _claim_document(
+            "C-changed-budget",
+            [
+                {
+                    "observation_ref": observation_ref,
+                    "relation": "supports",
+                    "scope": "Must not bind without base evidence budget.",
+                }
+            ],
+        ),
+        encoding="utf-8",
+    )
+
+    paths = [relative]
+    earlier_total = limit - base_size // 2
+    for index in range(4):
+        idea_ref = f"ideas/CHANGED-BUDGET-{index}.md"
+        idea = tmp_path / idea_ref
+        idea.parent.mkdir(parents=True, exist_ok=True)
+        header = f"# Idea {index}\n\n".encode()
+        size = earlier_total // 4
+        idea.write_bytes(header + b"i" * (size - len(header)))
+        paths.append(idea_ref)
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-changed-budget",
+        base_commit=base,
+        workspace_paths=sorted(paths),
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": [relative],
+                "rationale": f"{relative}#Evidence links",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            observation_ref,
+            kind="measurement",
+            candidate_commit="c" * 40,
+            measurement_state="valid",
+        ),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert audit["assimilation_links"] == []
+    assert any(
+        issue["severity"] == "error"
+        and issue["code"] == "resource_limit_base_semantic"
         for issue in audit["issues"]
     )
 

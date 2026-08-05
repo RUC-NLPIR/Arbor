@@ -633,24 +633,7 @@ class TransitionAuditService:
                     continue
                 evidence_link_count += len(document.evidence_links)
                 try:
-                    base = _base_repository_file(
-                        reader,
-                        repository,
-                        path,
-                        base_entries,
-                    )
-                except (
-                    _ResourceLimitError,
-                    _worktrees.WorktreeLimitError,
-                ) as error:
-                    base = None
-                    _add_issue(
-                        issues,
-                        "warning",
-                        "resource_limit_base_semantic",
-                        path,
-                        f"base semantic baseline ignored: {error}",
-                    )
+                    base_entry = _base_regular_entry(path, base_entries)
                 except WorktreeError as error:
                     _add_issue(
                         issues,
@@ -661,25 +644,70 @@ class TransitionAuditService:
                     )
                     continue
                 base_document: SemanticDocument | None = None
-                if base is not None:
+                base_is_exact = (
+                    base_entry is not None
+                    and base_entry.oid == blob_oid
+                    and base_entry.mode == current.mode
+                )
+                if base_is_exact:
+                    base_document = document
+                    _add_issue(
+                        issues,
+                        "error",
+                        "semantic_path_unchanged",
+                        path,
+                        "selected semantic path does not differ from base_commit",
+                    )
+                else:
+                    changed_paths.add(path)
                     try:
-                        base_document = parse_semantic_document_bytes(
+                        base = _base_repository_file(
+                            reader,
+                            repository,
                             path,
-                            base.content,
-                            max_evidence_links=MAX_EVIDENCE_LINKS_PER_FILE,
+                            base_entries,
                         )
                     except (
-                        ResearchFileError,
-                        TypeError,
-                        UnicodeError,
+                        _ResourceLimitError,
+                        _worktrees.WorktreeLimitError,
                     ) as error:
+                        evidence_resource_limited = True
                         _add_issue(
                             issues,
-                            "warning",
-                            "invalid_base_semantic",
+                            "error",
+                            "resource_limit_base_semantic",
                             path,
-                            f"base semantic baseline ignored: {error}",
+                            f"base semantic baseline unavailable: {error}",
                         )
+                        continue
+                    except WorktreeError as error:
+                        _add_issue(
+                            issues,
+                            "error",
+                            "invalid_base_path",
+                            path,
+                            str(error),
+                        )
+                        continue
+                    if base is not None:
+                        try:
+                            base_document = parse_semantic_document_bytes(
+                                path,
+                                base.content,
+                                max_evidence_links=MAX_EVIDENCE_LINKS_PER_FILE,
+                            )
+                        except (
+                            ResearchFileError,
+                            TypeError,
+                            UnicodeError,
+                        ) as error:
+                            _add_issue(
+                                issues,
+                                "warning",
+                                "invalid_base_semantic",
+                                path,
+                                f"base semantic baseline ignored: {error}",
+                            )
                 documents[path] = _SemanticState(
                     document=document,
                     added_links=_added_evidence_links(document, base_document),
@@ -693,20 +721,6 @@ class TransitionAuditService:
                         path,
                         warning,
                     )
-                if (
-                    base is not None
-                    and base.blob_oid == blob_oid
-                    and base.mode == current.mode
-                ):
-                    _add_issue(
-                        issues,
-                        "error",
-                        "semantic_path_unchanged",
-                        path,
-                        "selected semantic path does not differ from base_commit",
-                    )
-                else:
-                    changed_paths.add(path)
             else:
                 terminal_ref = _terminal_observation_ref(path)
                 if terminal_ref is not None:

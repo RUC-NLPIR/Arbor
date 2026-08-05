@@ -499,6 +499,71 @@ def test_anchored_workspace_reader_streams_without_oversized_capture(
     assert max(requested) <= 65_536
 
 
+def test_anchored_stream_rejects_actual_size_before_declared_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "large.log"
+    target.write_bytes(b"x" * (2 * 1024 * 1024))
+    real_read = store_module.os.read
+    read_calls = 0
+
+    def counting_read(descriptor: int, size: int) -> bytes:
+        nonlocal read_calls
+        read_calls += 1
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(store_module.os, "read", counting_read)
+
+    with store_module.AnchoredWorkspaceReader(tmp_path) as reader:
+        with pytest.raises(store_module.AnchoredReadError, match="size|receipt"):
+            reader.verify_stream(
+                "large.log",
+                expected_size=1,
+                expected_sha256="0" * 64,
+                capture_limit=1024,
+            )
+        assert read_calls == 0
+
+
+def test_anchored_workspace_reader_bounds_peak_descriptors_across_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = tmp_path / "records"
+    records.mkdir()
+    for index in range(128):
+        (records / f"{index:03d}.json").write_text(
+            '{"value":1}\n',
+            encoding="utf-8",
+        )
+    real_open = store_module.os.open
+    real_close = store_module.os.close
+    live: set[int] = set()
+    peak = 0
+
+    def tracking_open(*args: object, **kwargs: object) -> int:
+        nonlocal peak
+        descriptor = real_open(*args, **kwargs)  # type: ignore[arg-type]
+        live.add(descriptor)
+        peak = max(peak, len(live))
+        return descriptor
+
+    def tracking_close(descriptor: int) -> None:
+        live.discard(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(store_module.os, "open", tracking_open)
+    monkeypatch.setattr(store_module.os, "close", tracking_close)
+
+    with store_module.AnchoredWorkspaceReader(tmp_path) as reader:
+        for index in range(128):
+            reader.require_file(f"records/{index:03d}.json")
+        assert peak <= 16
+
+    assert not live
+
+
 def test_anchored_json_reader_preserves_large_strict_reader_compatibility(
     tmp_path: Path,
 ) -> None:

@@ -147,7 +147,6 @@ _FileIdentity = tuple[int, int, int, int, int, int, int]
 
 @dataclass(frozen=True)
 class _AnchoredDirectory:
-    descriptor: int
     parent: _DirectoryKey | None
     name: str
     identity: _DirectoryIdentity
@@ -155,7 +154,6 @@ class _AnchoredDirectory:
 
 @dataclass
 class _AnchoredFile:
-    descriptor: int
     parent: _DirectoryKey
     name: str
     identity: _FileIdentity
@@ -200,18 +198,44 @@ class AnchoredWorkspaceReader:
         self._json: dict[tuple[str, ...], Any] = {}
         self._listings: dict[_DirectoryKey, _AnchoredListing] = {}
         self._stats: dict[tuple[str, ...], tuple[os.stat_result, _FileIdentity]] = {}
+        self._slash_descriptor: int | None = None
+        self._root_descriptor: int | None = None
         self._closed = False
         flags = _anchored_directory_flags()
         try:
-            descriptor = os.open(os.sep, flags)
-            metadata = os.fstat(descriptor)
+            self._slash_descriptor = os.open(os.sep, flags)
+            metadata = os.fstat(self._slash_descriptor)
             self._directories[()] = _AnchoredDirectory(
-                descriptor,
                 None,
                 os.sep,
                 _anchored_directory_identity(metadata),
             )
-            self._directory_descriptor(self._workspace_key)
+            parent = self._slash_descriptor
+            current: _DirectoryKey = ()
+            for index, name in enumerate(self._workspace_key):
+                before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISDIR(before.st_mode):
+                    raise AnchoredReadError(
+                        "workspace path component is not a directory"
+                    )
+                child = os.open(name, flags, dir_fd=parent)
+                identity = _anchored_directory_identity(os.fstat(child))
+                if identity != _anchored_directory_identity(before):
+                    os.close(child)
+                    raise AnchoredReadError(
+                        "workspace directory identity changed while opening"
+                    )
+                prior = current
+                current = (*current, name)
+                self._directories[current] = _AnchoredDirectory(
+                    prior,
+                    name,
+                    identity,
+                )
+                if index and parent != self._slash_descriptor:
+                    os.close(parent)
+                parent = child
+                self._root_descriptor = parent
         except BaseException:
             self.close()
             raise
@@ -249,18 +273,33 @@ class AnchoredWorkspaceReader:
         key = self._workspace_file_key(path)
         if key in self._json:
             return self._json[key]
-        anchored = self._open_file(key)
-        payload, _size, _digest = self._stream_file(anchored, capture=True)
+        with self._open_file(key) as (descriptor, anchored):
+            payload, _size, _digest = self._stream_file(
+                descriptor,
+                anchored,
+                capture=True,
+                capture_limit=None,
+            )
         assert payload is not None
         value = _strict_json_loads(payload)
         self._json[key] = value
         return value
 
     def require_file(self, path: str | Path) -> None:
-        self._stream_file(self._open_file(self._workspace_file_key(path)), capture=False)
+        with self._open_file(self._workspace_file_key(path)) as (
+            descriptor,
+            anchored,
+        ):
+            self._stream_file(
+                descriptor,
+                anchored,
+                capture=False,
+                capture_limit=None,
+            )
 
     def require_directory(self, path: str | Path) -> None:
-        self._directory_descriptor(self._workspace_directory_key(path))
+        with self._open_directory(self._workspace_directory_key(path)):
+            pass
 
     def require_repository(
         self,
@@ -271,8 +310,10 @@ class AnchoredWorkspaceReader:
         if self._absolute_key(root) != self._workspace_key:
             raise AnchoredReadError("repository root differs from anchored workspace")
         self.require_git_marker()
-        self._directory_descriptor(self._absolute_key(git_dir))
-        self._directory_descriptor(self._absolute_key(common_dir))
+        with self._open_directory(self._absolute_key(git_dir)):
+            pass
+        with self._open_directory(self._absolute_key(common_dir)):
+            pass
 
     def require_git_marker(self) -> None:
         metadata = self.lstat(".git")
@@ -288,17 +329,17 @@ class AnchoredWorkspaceReader:
         existing = self._listings.get(key)
         if existing is not None:
             return existing.names
-        descriptor = self._directory_descriptor(key)
-        names = tuple(sorted(os.listdir(descriptor)))
-        entries = tuple(
-            (
-                name,
-                _anchored_file_identity(
-                    os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                ),
+        with self._open_directory(key) as descriptor:
+            names = tuple(sorted(os.listdir(descriptor)))
+            entries = tuple(
+                (
+                    name,
+                    _anchored_file_identity(
+                        os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    ),
+                )
+                for name in names
             )
-            for name in names
-        )
         self._listings[key] = _AnchoredListing(names, entries)
         return names
 
@@ -308,11 +349,12 @@ class AnchoredWorkspaceReader:
         if existing is not None:
             return existing[0]
         parent = key[:-1]
-        metadata = os.stat(
-            key[-1],
-            dir_fd=self._directory_descriptor(parent),
-            follow_symlinks=False,
-        )
+        with self._open_directory(parent) as descriptor:
+            metadata = os.stat(
+                key[-1],
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
         self._stats[key] = (metadata, _anchored_file_identity(metadata))
         return metadata
 
@@ -330,133 +372,175 @@ class AnchoredWorkspaceReader:
             type(capture_limit) is not int or capture_limit < 0
         ):
             raise AnchoredReadError("capture limit must be nonnegative or null")
-        anchored = self._open_file(self._workspace_file_key(path))
-        capture = capture_limit is not None and expected_size <= capture_limit
-        payload, size, digest = self._stream_file(anchored, capture=capture)
+        with self._open_file(self._workspace_file_key(path)) as (
+            descriptor,
+            anchored,
+        ):
+            actual_size = anchored.identity[4]
+            if actual_size != expected_size:
+                raise AnchoredReadError("workspace stream size differs from receipt")
+            capture = capture_limit is not None and actual_size <= capture_limit
+            payload, size, digest = self._stream_file(
+                descriptor,
+                anchored,
+                capture=capture,
+                capture_limit=capture_limit,
+            )
         if size != expected_size or digest != expected_sha256:
             raise AnchoredReadError("workspace stream differs from receipt")
         return payload
 
     def revalidate(self) -> None:
         self._require_open()
-        for key, directory in tuple(self._directories.items()):
-            current = _anchored_directory_identity(os.fstat(directory.descriptor))
-            if directory.parent is None:
-                observed = _anchored_directory_identity(os.stat(os.sep))
-            else:
-                observed = _anchored_directory_identity(
-                    os.stat(
-                        directory.name,
-                        dir_fd=self._directory_descriptor(directory.parent),
-                        follow_symlinks=False,
-                    )
-                )
-            if current != directory.identity or observed != directory.identity:
-                raise AnchoredReadError("workspace directory identity changed")
+        assert self._slash_descriptor is not None
+        assert self._root_descriptor is not None
+        if (
+            _anchored_directory_identity(os.fstat(self._slash_descriptor))
+            != self._directories[()].identity
+            or _anchored_directory_identity(os.fstat(self._root_descriptor))
+            != self._directories[self._workspace_key].identity
+        ):
+            raise AnchoredReadError("workspace retained directory identity changed")
+        for key in tuple(self._directories):
+            with self._open_directory(key, force_slash=True) as descriptor:
+                directory = self._directories[key]
+                if (
+                    _anchored_directory_identity(os.fstat(descriptor))
+                    != directory.identity
+                ):
+                    raise AnchoredReadError("workspace directory identity changed")
             listing = self._listings.get(key)
             if listing is not None:
-                names = tuple(sorted(os.listdir(directory.descriptor)))
-                entries = tuple(
-                    (
-                        name,
-                        _anchored_file_identity(
-                            os.stat(
-                                name,
-                                dir_fd=directory.descriptor,
-                                follow_symlinks=False,
-                            )
-                        ),
+                with self._open_directory(key, force_slash=True) as descriptor:
+                    names = tuple(sorted(os.listdir(descriptor)))
+                    entries = tuple(
+                        (
+                            name,
+                            _anchored_file_identity(
+                                os.stat(
+                                    name,
+                                    dir_fd=descriptor,
+                                    follow_symlinks=False,
+                                )
+                            ),
+                        )
+                        for name in names
                     )
-                    for name in names
-                )
                 if names != listing.names or entries != listing.entries:
                     raise AnchoredReadError("workspace directory listing changed")
-        for key, (metadata, identity) in self._stats.items():
-            observed = os.stat(
-                key[-1],
-                dir_fd=self._directory_descriptor(key[:-1]),
-                follow_symlinks=False,
-            )
-            if _anchored_file_identity(metadata) != identity or (
-                _anchored_file_identity(observed) != identity
-            ):
+        for key, (_metadata, identity) in self._stats.items():
+            with self._open_directory(key[:-1], force_slash=True) as descriptor:
+                observed = os.stat(
+                    key[-1],
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            if _anchored_file_identity(observed) != identity:
                 raise AnchoredReadError("workspace path identity changed")
-        for anchored in self._files.values():
-            self._validate_file_path(anchored)
-            self._stream_file(anchored, capture=False)
+        for key, snapshot in self._files.items():
+            with self._open_file(key, force_slash=True) as (descriptor, anchored):
+                if anchored.identity != snapshot.identity:
+                    raise AnchoredReadError("workspace file identity changed")
+                if snapshot.sha256 is not None:
+                    self._stream_file(
+                        descriptor,
+                        anchored,
+                        capture=False,
+                        capture_limit=None,
+                    )
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        descriptors = [item.descriptor for item in self._files.values()]
-        descriptors.extend(
-            item.descriptor
-            for _key, item in sorted(
-                self._directories.items(),
-                key=lambda item: len(item[0]),
-                reverse=True,
-            )
-        )
+        descriptors = (self._root_descriptor, self._slash_descriptor)
         for descriptor in descriptors:
+            if descriptor is None:
+                continue
             try:
                 os.close(descriptor)
             except OSError:
                 pass
 
-    def _open_file(self, key: tuple[str, ...]) -> _AnchoredFile:
+    @contextmanager
+    def _open_file(
+        self,
+        key: tuple[str, ...],
+        *,
+        force_slash: bool = False,
+    ) -> Iterator[tuple[int, _AnchoredFile]]:
         self._require_open()
-        existing = self._files.get(key)
-        if existing is not None:
-            return existing
         parent = key[:-1]
         name = key[-1]
-        parent_descriptor = self._directory_descriptor(parent)
-        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            raise AnchoredReadError(
-                "workspace authority path must be a single-link plain file"
+        with self._open_directory(parent, force_slash=force_slash) as parent_descriptor:
+            before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise AnchoredReadError(
+                    "workspace authority path must be a single-link plain file"
+                )
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_descriptor,
             )
-        descriptor = os.open(
-            name,
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=parent_descriptor,
-        )
-        try:
-            identity = _anchored_file_identity(os.fstat(descriptor))
-            if identity != _anchored_file_identity(before):
-                raise AnchoredReadError("workspace file identity changed while opening")
-        except BaseException:
-            os.close(descriptor)
-            raise
-        anchored = _AnchoredFile(descriptor, parent, name, identity)
-        self._files[key] = anchored
-        return anchored
+            try:
+                identity = _anchored_file_identity(os.fstat(descriptor))
+                if identity != _anchored_file_identity(before):
+                    raise AnchoredReadError(
+                        "workspace file identity changed while opening"
+                    )
+                anchored = self._files.get(key)
+                if anchored is None:
+                    anchored = _AnchoredFile(parent, name, identity)
+                    self._files[key] = anchored
+                elif anchored.identity != identity:
+                    raise AnchoredReadError("workspace file identity changed")
+                yield descriptor, anchored
+                observed = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    _anchored_file_identity(os.fstat(descriptor)) != identity
+                    or _anchored_file_identity(observed) != identity
+                ):
+                    raise AnchoredReadError("workspace file identity changed")
+            finally:
+                os.close(descriptor)
 
     def _stream_file(
         self,
+        descriptor: int,
         anchored: _AnchoredFile,
         *,
         capture: bool,
+        capture_limit: int | None,
     ) -> tuple[bytes | None, int, str]:
-        if _anchored_file_identity(os.fstat(anchored.descriptor)) != anchored.identity:
+        if _anchored_file_identity(os.fstat(descriptor)) != anchored.identity:
             raise AnchoredReadError("workspace file identity changed")
-        os.lseek(anchored.descriptor, 0, os.SEEK_SET)
+        os.lseek(descriptor, 0, os.SEEK_SET)
         digest = hashlib.sha256()
         payload = bytearray() if capture else None
         size = 0
         while True:
-            chunk = os.read(anchored.descriptor, 65_536)
+            chunk = os.read(descriptor, 65_536)
             if not chunk:
                 break
             digest.update(chunk)
             size += len(chunk)
             if payload is not None:
-                payload.extend(chunk)
-        os.lseek(anchored.descriptor, 0, os.SEEK_SET)
-        if _anchored_file_identity(os.fstat(anchored.descriptor)) != anchored.identity:
+                if capture_limit is not None and size > capture_limit:
+                    payload = None
+                else:
+                    payload.extend(chunk)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if (
+            _anchored_file_identity(os.fstat(descriptor)) != anchored.identity
+            or size != anchored.identity[4]
+        ):
             raise AnchoredReadError("workspace file identity changed while reading")
         observed = digest.hexdigest()
         if anchored.sha256 is None:
@@ -465,49 +549,57 @@ class AnchoredWorkspaceReader:
             raise AnchoredReadError("workspace file bytes changed")
         return bytes(payload) if payload is not None else None, size, observed
 
-    def _validate_file_path(self, anchored: _AnchoredFile) -> None:
-        observed = os.stat(
-            anchored.name,
-            dir_fd=self._directory_descriptor(anchored.parent),
-            follow_symlinks=False,
-        )
-        if _anchored_file_identity(observed) != anchored.identity:
-            raise AnchoredReadError("workspace file identity changed")
-
-    def _directory_descriptor(self, key: _DirectoryKey) -> int:
+    @contextmanager
+    def _open_directory(
+        self,
+        key: _DirectoryKey,
+        *,
+        force_slash: bool = False,
+    ) -> Iterator[int]:
         self._require_open()
-        if key in self._directories:
-            return self._directories[key].descriptor
-        current: _DirectoryKey = ()
-        descriptor = self._directories[()].descriptor
-        for name in key:
-            parent = current
-            current = (*current, name)
-            existing = self._directories.get(current)
-            if existing is not None:
-                descriptor = existing.descriptor
-                continue
-            before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-            if not stat.S_ISDIR(before.st_mode):
-                raise AnchoredReadError("workspace path component is not a directory")
-            child = os.open(name, _anchored_directory_flags(), dir_fd=descriptor)
-            try:
+        assert self._slash_descriptor is not None
+        assert self._root_descriptor is not None
+        if not force_slash and key[: len(self._workspace_key)] == self._workspace_key:
+            current = self._workspace_key
+            descriptor = self._root_descriptor
+            names = key[len(self._workspace_key) :]
+        else:
+            current = ()
+            descriptor = self._slash_descriptor
+            names = key
+        opened: list[int] = []
+        try:
+            for name in names:
+                parent = current
+                current = (*current, name)
+                before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if not stat.S_ISDIR(before.st_mode):
+                    raise AnchoredReadError(
+                        "workspace path component is not a directory"
+                    )
+                child = os.open(name, _anchored_directory_flags(), dir_fd=descriptor)
                 identity = _anchored_directory_identity(os.fstat(child))
                 if identity != _anchored_directory_identity(before):
+                    os.close(child)
                     raise AnchoredReadError(
                         "workspace directory identity changed while opening"
                     )
-            except BaseException:
-                os.close(child)
-                raise
-            self._directories[current] = _AnchoredDirectory(
-                child,
-                parent,
-                name,
-                identity,
-            )
-            descriptor = child
-        return descriptor
+                existing = self._directories.get(current)
+                if existing is None:
+                    self._directories[current] = _AnchoredDirectory(
+                        parent,
+                        name,
+                        identity,
+                    )
+                elif existing.identity != identity:
+                    os.close(child)
+                    raise AnchoredReadError("workspace directory identity changed")
+                opened.append(child)
+                descriptor = child
+            yield descriptor
+        finally:
+            for opened_descriptor in reversed(opened):
+                os.close(opened_descriptor)
 
     def _workspace_file_key(self, path: str | Path) -> tuple[str, ...]:
         candidate = Path(path)

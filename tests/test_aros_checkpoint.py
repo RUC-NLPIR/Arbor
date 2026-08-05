@@ -1702,6 +1702,26 @@ def test_checkpoint_prepare_persists_exact_unstaged_principal_message(
     assert "message" not in _tree(tmp_path, prepared.candidate_tree)
 
 
+def test_checkpoint_prepare_accepts_nonexecutable_permission_normalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    real_fchmod = checkpoint_module.os.fchmod
+
+    def normalize_permissions(descriptor: int, _mode: int) -> None:
+        real_fchmod(descriptor, 0o666)
+
+    monkeypatch.setattr(checkpoint_module.os, "fchmod", normalize_permissions)
+
+    prepared = service.prepare(proposal_ref, "permission-degraded message")
+
+    message_path = (tmp_path / prepared.prepared_ref).with_name("message")
+    mode = stat.S_IMODE(message_path.stat().st_mode)
+    assert mode & 0o111 == 0
+    assert message_path.read_bytes() == b"permission-degraded message"
+
+
 def test_checkpoint_prepare_rejects_drifted_runtime_message_artifact(
     tmp_path: Path,
 ) -> None:
@@ -2743,7 +2763,7 @@ def test_reconcile_rejects_admission_mode_before_projection_mutation(
     admission_ref = f"transitions/{prepared.transition_id}/admission.json"
     admission_path = candidate / admission_ref
     admission_path.write_bytes(receipt)
-    admission_path.chmod(0o600)
+    admission_path.chmod(0o755)
     index_before = _index_bytes(candidate)
 
     with pytest.raises(CheckpointError, match="admission|admitted|mode|0644"):
@@ -2754,11 +2774,76 @@ def test_reconcile_rejects_admission_mode_before_projection_mutation(
     assert _git(candidate, "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode != 0
     assert _index_bytes(candidate) == index_before
     assert admission_path.read_bytes() == receipt
-    assert stat.S_IMODE(admission_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(admission_path.stat().st_mode) == 0o755
     assert not _event_path(candidate, prepared.transition_id).exists()
 
     admission_path.chmod(0o644)
     assert service.reconcile(prepared.prepared_ref)["state"] == "admitted"
+
+
+def test_reconcile_accepts_nonexecutable_admission_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        _canonical,
+        _base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-admission-nonexec-mode")
+    _leave_projection_pending(monkeypatch, service, prepared, receipt, fence)
+    admission_path = (
+        candidate / f"transitions/{prepared.transition_id}/admission.json"
+    )
+    admission_path.write_bytes(receipt)
+    admission_path.chmod(0o600)
+
+    result = service.reconcile(prepared.prepared_ref)
+
+    assert result["state"] == "admitted"
+    assert stat.S_IMODE(admission_path.stat().st_mode) & 0o111 == 0
+
+
+def test_reconcile_accepts_nonexecutable_event_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        _canonical,
+        _base,
+        _message,
+    ) = _finalize_fixture(tmp_path, transition_id="T-event-nonexec-mode")
+    _leave_projection_pending(monkeypatch, service, prepared, receipt, fence)
+    admitted = checkpoint_module._load_reconcile_admitted(
+        service,
+        prepared.prepared_ref,
+        prepared.transition_id,
+    )
+    expected = checkpoint_module._expected_admitted_event(service, admitted)
+    expected.path.parent.mkdir(exist_ok=True)
+    expected.path.write_bytes(expected.content)
+    expected.path.chmod(0o644)
+
+    result = service.reconcile(prepared.prepared_ref)
+
+    assert result["state"] == "admitted"
+    assert expected.path.read_bytes() == expected.content
+    assert stat.S_IMODE(expected.path.stat().st_mode) & 0o111 == 0
+    projection = checkpoint_module.read_checkpoint_projection_state(
+        bind_repository(candidate),
+        canonical_commit=str(result["commit"]),
+        canonical_ref=prepared.canonical_ref,
+    )
+    assert projection.state == "current"
 
 
 def test_reconcile_rejects_conflicting_event_before_projection_mutation(

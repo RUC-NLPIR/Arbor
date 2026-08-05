@@ -502,7 +502,7 @@ def _projection_event_completes(
 ) -> bool:
     try:
         metadata = path.lstat()
-        if stat.S_IMODE(metadata.st_mode) != 0o600:
+        if not _same_executable_mode(metadata.st_mode, 0o600):
             return False
         raw = _read_plain_file(path, max_bytes=65_536)
         value = _strict_json_loads(raw)
@@ -1854,7 +1854,7 @@ def _validate_projection_overlap(
         if (
             not stat.S_ISREG(admission_metadata.st_mode)
             or stat.S_ISLNK(admission_metadata.st_mode)
-            or stat.S_IMODE(admission_metadata.st_mode) != 0o644
+            or not _same_executable_mode(admission_metadata.st_mode, 0o644)
             or _read_plain_file(
                 admission_path,
                 max_bytes=MAX_ADMISSION_RECEIPT_BYTES,
@@ -2096,7 +2096,7 @@ def _create_once_exact_file(path: Path, content: bytes, *, mode: int) -> None:
         existing = _read_plain_file(path, max_bytes=len(content))
         if (
             existing != content
-            or stat.S_IMODE(path.stat().st_mode) != mode
+            or not _same_executable_mode(path.stat().st_mode, mode)
         ):
             raise CheckpointError("existing admitted working file conflicts")
         return
@@ -2124,8 +2124,13 @@ def _create_once_exact_file(path: Path, content: bytes, *, mode: int) -> None:
         temporary_path.unlink(missing_ok=True)
         _fsync_directory(path.parent)
     existing = _read_plain_file(path, max_bytes=len(content))
-    if existing != content or stat.S_IMODE(path.stat().st_mode) != mode:
+    if existing != content or not _same_executable_mode(path.stat().st_mode, mode):
         raise CheckpointError("admitted working file publication conflicts")
+
+
+def _same_executable_mode(observed_mode: int, expected_mode: int) -> bool:
+    """Compare portable Git mode classes rather than filesystem rw bits."""
+    return bool(stat.S_IMODE(observed_mode) & 0o111) == bool(expected_mode & 0o111)
 
 
 def _expected_admitted_event(
@@ -2166,7 +2171,7 @@ def _require_event_absent_or_exact(expected: _ExpectedAdmittedEvent) -> None:
     if (
         not stat.S_ISREG(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != expected.mode
+        or not _same_executable_mode(metadata.st_mode, expected.mode)
         or _read_plain_file(expected.path, max_bytes=len(expected.content))
         != expected.content
     ):
@@ -3803,10 +3808,10 @@ def _read_message_if_present(path: Path) -> bytes | None:
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_size > MAX_MESSAGE_BYTES
-        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or stat.S_IMODE(metadata.st_mode) & 0o111
     ):
         raise CheckpointError(
-            "checkpoint message must be a bounded create-once 0600 plain file"
+            "checkpoint message must be a bounded create-once non-executable plain file"
         )
     identity = (metadata.st_dev, metadata.st_ino)
     if metadata.st_nlink > 1:
@@ -3847,7 +3852,7 @@ def _create_once_message(path: Path, content: bytes) -> None:
         if (
             not stat.S_ISREG(temporary_metadata.st_mode)
             or temporary_metadata.st_nlink != 1
-            or stat.S_IMODE(temporary_metadata.st_mode) != 0o600
+            or stat.S_IMODE(temporary_metadata.st_mode) & 0o111
             or temporary_metadata.st_size > MAX_MESSAGE_BYTES
             or _read_plain_file(
                 temporary_path,

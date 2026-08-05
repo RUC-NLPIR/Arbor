@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -18,6 +19,7 @@ from .observations import (
     validate_task_measurement_lineage,
 )
 from .research_files import (
+    EvidenceLinkOccurrence,
     ResearchFileError,
     SemanticDocument,
     parse_semantic_document_bytes,
@@ -83,6 +85,12 @@ class TransitionProposal:
     assimilations: tuple[Assimilation, ...]
 
 
+@dataclass(frozen=True)
+class _SemanticState:
+    document: SemanticDocument
+    added_links: tuple[EvidenceLinkOccurrence, ...]
+
+
 def load_transition_proposal(
     root: str | Path,
     proposal_ref: str,
@@ -91,6 +99,25 @@ def load_transition_proposal(
     _proposal_identity(proposal_ref)
     try:
         with AnchoredWorkspaceReader(root) as reader:
+            repository = _worktrees.bind_repository(reader.root)
+            reader.require_repository(
+                repository.root,
+                repository.git_dir,
+                repository.common_dir,
+            )
+            _reject_nested_repository(reader, proposal_ref)
+            snapshot = _worktrees.read_repository_snapshot(repository)
+            head = snapshot.get("head")
+            if isinstance(head, str):
+                gitlink = _worktrees.find_repository_gitlink_ancestor(
+                    repository,
+                    head,
+                    proposal_ref,
+                )
+                if gitlink is not None:
+                    raise TransitionError(
+                        f"proposal descends from base gitlink: {gitlink}"
+                    )
             raw = _read_anchored_bytes(reader, proposal_ref)
             return _parse_proposal(raw)
     except TransitionError:
@@ -217,26 +244,47 @@ class TransitionAuditService:
                 )
             else:
                 try:
-                    proposal_raw = _read_anchored_bytes(reader, proposal_ref)
-                    proposal_blob_sha256 = hashlib.sha256(proposal_raw).hexdigest()
-                    proposal = _parse_proposal(proposal_raw)
-                    base_commit = proposal.base_commit
-                except (AnchoredReadError, OSError) as error:
+                    _reject_nested_repository(reader, proposal_ref)
+                    if canonical_commit is not None:
+                        gitlink = _worktrees.find_repository_gitlink_ancestor(
+                            repository,
+                            canonical_commit,
+                            proposal_ref,
+                        )
+                        if gitlink is not None:
+                            raise TransitionError(
+                                f"proposal descends from base gitlink: {gitlink}"
+                            )
+                except (TransitionError, WorktreeError) as error:
                     _add_issue(
                         issues,
                         "error",
-                        "unsafe_proposal",
-                        proposal_ref,
-                        f"proposal is not an anchored ordinary file: {type(error).__name__}",
-                    )
-                except TransitionError as error:
-                    _add_issue(
-                        issues,
-                        "error",
-                        "invalid_proposal_schema",
+                        "submodule_proposal_path",
                         proposal_ref,
                         str(error),
                     )
+                else:
+                    try:
+                        proposal_raw = _read_anchored_bytes(reader, proposal_ref)
+                        proposal_blob_sha256 = hashlib.sha256(proposal_raw).hexdigest()
+                        proposal = _parse_proposal(proposal_raw)
+                        base_commit = proposal.base_commit
+                    except (AnchoredReadError, OSError) as error:
+                        _add_issue(
+                            issues,
+                            "error",
+                            "unsafe_proposal",
+                            proposal_ref,
+                            f"proposal is not an anchored ordinary file: {type(error).__name__}",
+                        )
+                    except TransitionError as error:
+                        _add_issue(
+                            issues,
+                            "error",
+                            "invalid_proposal_schema",
+                            proposal_ref,
+                            str(error),
+                        )
 
             if proposal is not None:
                 if canonical_commit is None or proposal.base_commit != canonical_commit:
@@ -247,25 +295,44 @@ class TransitionAuditService:
                         proposal_ref,
                         "proposal base_commit is not the current canonical ref commit",
                     )
-                documents, changed_paths = self._audit_workspace_paths(
+                documents, changed_paths, direct_observation_refs = (
+                    self._audit_workspace_paths(
+                        reader,
+                        repository,
+                        proposal,
+                        path_receipts,
+                        issues,
+                    )
+                )
+                observation_refs = {
+                    *direct_observation_refs,
+                    *(item.observation_ref for item in proposal.assimilations),
+                }
+                records = self._resolve_observations(
                     reader,
-                    repository,
-                    proposal,
-                    path_receipts,
+                    observation_refs,
                     issues,
                 )
-                records = self._audit_assimilations(
-                    reader,
-                    repository,
+                assimilated_records = self._audit_assimilations(
                     transition_id,
                     proposal,
                     documents,
                     changed_paths,
-                    observation_closure,
+                    records,
                     assimilation_links,
                     issues,
                 )
-                _audit_joint_lineage(records, issues)
+                observation_closure.extend(
+                    self._observation_closure(
+                        reader,
+                        repository,
+                        proposal,
+                        record,
+                        issues,
+                    )
+                    for record in records.values()
+                )
+                _audit_joint_lineage(assimilated_records, issues)
 
             after = _worktrees.read_repository_snapshot(repository)
             try:
@@ -306,9 +373,10 @@ class TransitionAuditService:
         proposal: TransitionProposal,
         receipts: list[dict[str, object]],
         issues: list[dict[str, str]],
-    ) -> tuple[dict[str, SemanticDocument], set[str]]:
-        documents: dict[str, SemanticDocument] = {}
+    ) -> tuple[dict[str, _SemanticState], set[str], set[str]]:
+        documents: dict[str, _SemanticState] = {}
         changed_paths: set[str] = set()
+        direct_observation_refs: set[str] = set()
         for path in proposal.workspace_paths:
             owner = _path_owner(path)
             if owner is None:
@@ -381,6 +449,11 @@ class TransitionAuditService:
                         proposal.base_commit,
                         path,
                     )
+                    base_document = (
+                        parse_semantic_document_bytes(path, base.content)
+                        if base is not None
+                        else None
+                    )
                 except (ResearchFileError, TypeError, UnicodeError) as error:
                     _add_issue(
                         issues,
@@ -399,7 +472,10 @@ class TransitionAuditService:
                         str(error),
                     )
                     continue
-                documents[path] = document
+                documents[path] = _SemanticState(
+                    document=document,
+                    added_links=_added_evidence_links(document, base_document),
+                )
                 for warning in document.warnings:
                     _add_issue(
                         issues,
@@ -419,6 +495,10 @@ class TransitionAuditService:
                 else:
                     changed_paths.add(path)
             else:
+                terminal_ref = _terminal_observation_ref(path)
+                if terminal_ref is not None:
+                    direct_observation_refs.add(terminal_ref)
+                    continue
                 try:
                     _validate_service_record(reader, self.root, path, owner)
                 except (EvalError, RunError, TaskError, TypeError, ValueError) as error:
@@ -429,22 +509,16 @@ class TransitionAuditService:
                         path,
                         str(error),
                     )
-        return documents, changed_paths
+        return documents, changed_paths, direct_observation_refs
 
-    def _audit_assimilations(
+    def _resolve_observations(
         self,
         reader: AnchoredWorkspaceReader,
-        repository: RepositoryBinding,
-        transition_id: str,
-        proposal: TransitionProposal,
-        documents: Mapping[str, SemanticDocument],
-        changed_paths: set[str],
-        closure: list[dict[str, object]],
-        links: list[dict[str, object]],
+        observation_refs: set[str],
         issues: list[dict[str, str]],
-    ) -> list[ObservationRecord]:
-        if not proposal.assimilations:
-            return []
+    ) -> dict[str, ObservationRecord]:
+        if not observation_refs:
+            return {}
         try:
             catalog = ObservationCatalog(reader.root)
         except ObservationError as error:
@@ -455,9 +529,41 @@ class TransitionAuditService:
                 "observations",
                 str(error),
             )
-            return []
+            return {}
+        records: dict[str, ObservationRecord] = {}
+        for observation_ref in sorted(observation_refs):
+            try:
+                records[observation_ref] = catalog.resolve(
+                    observation_ref,
+                    reader=reader,
+                )
+            except ObservationError as error:
+                _add_issue(
+                    issues,
+                    "error",
+                    "invalid_observation",
+                    observation_ref,
+                    str(error),
+                )
+        return records
 
-        records: list[ObservationRecord] = []
+    def _audit_assimilations(
+        self,
+        transition_id: str,
+        proposal: TransitionProposal,
+        documents: Mapping[str, _SemanticState],
+        changed_paths: set[str],
+        records: Mapping[str, ObservationRecord],
+        links: list[dict[str, object]],
+        issues: list[dict[str, str]],
+    ) -> list[ObservationRecord]:
+        if not proposal.assimilations:
+            return []
+        groups: dict[
+            tuple[str, str],
+            list[tuple[Assimilation, ObservationRecord | None]],
+        ] = defaultdict(list)
+        assimilated_records: list[ObservationRecord] = []
         for assimilation in proposal.assimilations:
             target_path, anchor = _rationale_parts(assimilation.rationale)
             for affected in assimilation.affected_paths:
@@ -493,8 +599,8 @@ class TransitionAuditService:
                     assimilation.rationale,
                     "rationale path must be one of the assimilation affected_paths",
                 )
-            document = documents.get(target_path)
-            if document is None or anchor not in document.sections:
+            state = documents.get(target_path)
+            if state is None or anchor not in state.document.sections:
                 _add_issue(
                     issues,
                     "error",
@@ -502,32 +608,15 @@ class TransitionAuditService:
                     assimilation.rationale,
                     "rationale heading does not exist in its semantic file",
                 )
-
-            try:
-                record = catalog.resolve(assimilation.observation_ref, reader=reader)
-            except ObservationError as error:
-                _add_issue(
-                    issues,
-                    "error",
-                    "invalid_observation",
-                    assimilation.observation_ref,
-                    str(error),
-                )
-                continue
-            records.append(record)
-            closure.append(
-                self._observation_closure(
-                    reader,
-                    repository,
-                    proposal,
-                    record,
-                    issues,
-                )
-            )
-            if record.kind == "measurement" and record.measurement_state not in {
+            record = records.get(assimilation.observation_ref)
+            if record is not None:
+                assimilated_records.append(record)
+            if record is not None and record.kind == "measurement" and (
+                record.measurement_state not in {
                 "valid",
                 "underpowered",
-            }:
+                }
+            ):
                 _add_issue(
                     issues,
                     "error",
@@ -535,56 +624,70 @@ class TransitionAuditService:
                     record.ref,
                     "measurement observations must be valid or underpowered",
                 )
-
-            if document is None or anchor not in document.sections:
+            if state is None or anchor not in state.document.sections:
                 continue
+            groups[(target_path, anchor)].append((assimilation, record))
+
+        for (target_path, anchor), group in sorted(groups.items()):
+            state = documents[target_path]
             occurrences = [
                 occurrence
-                for occurrence in document.evidence_links
+                for occurrence in state.added_links
                 if occurrence.anchor == anchor
             ]
-            matching = []
+            expected_refs = {
+                assimilation.observation_ref for assimilation, _record in group
+            }
             for occurrence in occurrences:
-                if occurrence.link.observation_ref != assimilation.observation_ref:
+                if occurrence.link.observation_ref not in expected_refs:
                     _add_issue(
                         issues,
                         "error",
                         "evidence_link_mismatch",
-                        assimilation.rationale,
-                        "EvidenceLink observation_ref differs from assimilation",
+                        f"{target_path}#{anchor}",
+                        "new EvidenceLink observation_ref has no matching assimilation",
                     )
-                    continue
-                matching.append(occurrence)
-                if record.kind in {"run_final", "eval_outcome"} and (
-                    occurrence.link.relation != "context"
+            for assimilation, record in group:
+                matching = [
+                    occurrence
+                    for occurrence in occurrences
+                    if occurrence.link.observation_ref
+                    == assimilation.observation_ref
+                ]
+                if record is not None:
+                    for occurrence in matching:
+                        if (
+                            record.kind != "measurement"
+                            and occurrence.link.relation != "context"
+                        ):
+                            _add_issue(
+                                issues,
+                                "error",
+                                "nonmeasurement_evidence",
+                                assimilation.rationale,
+                                "nonmeasurement observations may only be context",
+                            )
+                        links.append(
+                            _link_receipt(
+                                transition_id,
+                                assimilation.observation_ref,
+                                occurrence,
+                            )
+                        )
+                if (
+                    record is not None
+                    and record.kind == "measurement"
+                    and target_path.startswith("knowledge/claims/")
+                    and not matching
                 ):
                     _add_issue(
                         issues,
                         "error",
-                        "nonmeasurement_evidence",
+                        "measurement_evidence_link_missing",
                         assimilation.rationale,
-                        "process or nonmeasurement outcomes may only be context",
+                        "measurement Claim assimilation requires a new matching EvidenceLink",
                     )
-                links.append(
-                    _link_receipt(
-                        transition_id,
-                        assimilation.observation_ref,
-                        occurrence,
-                    )
-                )
-            if (
-                record.kind == "measurement"
-                and target_path.startswith("knowledge/claims/")
-                and not matching
-            ):
-                _add_issue(
-                    issues,
-                    "error",
-                    "measurement_evidence_link_missing",
-                    assimilation.rationale,
-                    "measurement Claim assimilation requires a matching EvidenceLink",
-                )
-        return records
+        return assimilated_records
 
     def _observation_closure(
         self,
@@ -682,9 +785,13 @@ class TransitionAuditService:
                 {
                     "path": canonical,
                     "state": (
-                        "ref_only"
-                        if base is not None and base.blob_oid == blob_oid
-                        else "derived"
+                        "workspace"
+                        if canonical in proposal.workspace_paths
+                        else (
+                            "ref_only"
+                            if base is not None and base.blob_oid == blob_oid
+                            else "derived"
+                        )
                     ),
                     "blob_oid": blob_oid,
                 }
@@ -845,6 +952,47 @@ def _path_owner(path: str) -> str | None:
     return None
 
 
+def _terminal_observation_ref(path: str) -> str | None:
+    task = _TASK_PATH.fullmatch(path)
+    if task is not None and task.group(2) == "collected":
+        return path
+    run = _RUN_PATH.fullmatch(path)
+    if run is not None and run.group(2) == "final":
+        return path
+    if _EVAL_PATH.fullmatch(path) is not None:
+        return path
+    return None
+
+
+def _added_evidence_links(
+    current: SemanticDocument,
+    base: SemanticDocument | None,
+) -> tuple[EvidenceLinkOccurrence, ...]:
+    remaining = Counter(
+        _evidence_identity(occurrence)
+        for occurrence in (() if base is None else base.evidence_links)
+    )
+    added: list[EvidenceLinkOccurrence] = []
+    for occurrence in current.evidence_links:
+        identity = _evidence_identity(occurrence)
+        if remaining[identity]:
+            remaining[identity] -= 1
+        else:
+            added.append(occurrence)
+    return tuple(added)
+
+
+def _evidence_identity(
+    occurrence: EvidenceLinkOccurrence,
+) -> tuple[str, str, str, str]:
+    return (
+        occurrence.anchor,
+        occurrence.link.observation_ref,
+        occurrence.link.relation,
+        occurrence.link.scope,
+    )
+
+
 def _read_anchored_bytes(
     reader: AnchoredWorkspaceReader,
     relative: str,
@@ -947,18 +1095,65 @@ def _audit_joint_lineage(
 ) -> None:
     tasks = [record for record in records if record.kind == "task_return"]
     measurements = [record for record in records if record.kind == "measurement"]
-    for task in tasks:
-        for measurement in measurements:
-            try:
-                validate_task_measurement_lineage(task, measurement)
-            except ObservationError as error:
-                _add_issue(
-                    issues,
-                    "error",
-                    "task_measurement_candidate_mismatch",
-                    f"{task.ref}|{measurement.ref}",
-                    str(error),
-                )
+    if not tasks or not measurements:
+        return
+    task_groups: dict[str, list[ObservationRecord]] = defaultdict(list)
+    measurement_groups: dict[str, list[ObservationRecord]] = defaultdict(list)
+    for record in tasks:
+        candidate = record.candidate_commit
+        if not isinstance(candidate, str) or _COMMIT.fullmatch(candidate) is None:
+            _add_issue(
+                issues,
+                "error",
+                "task_measurement_candidate_mismatch",
+                record.ref,
+                "joint observation has no valid candidate commit",
+            )
+            continue
+        task_groups[candidate].append(record)
+    for record in measurements:
+        candidate = record.candidate_commit
+        if not isinstance(candidate, str) or _COMMIT.fullmatch(candidate) is None:
+            _add_issue(
+                issues,
+                "error",
+                "task_measurement_candidate_mismatch",
+                record.ref,
+                "joint observation has no valid candidate commit",
+            )
+            continue
+        measurement_groups[candidate].append(record)
+    for candidate in sorted(set(task_groups) | set(measurement_groups)):
+        candidate_tasks = task_groups.get(candidate, [])
+        candidate_measurements = measurement_groups.get(candidate, [])
+        if not candidate_tasks or not candidate_measurements:
+            unmatched = sorted(
+                record.ref for record in [*candidate_tasks, *candidate_measurements]
+            )
+            _add_issue(
+                issues,
+                "error",
+                "task_measurement_candidate_mismatch",
+                "|".join(unmatched),
+                f"candidate {candidate} lacks a matching Task or measurement observation",
+            )
+            continue
+        try:
+            validate_task_measurement_lineage(
+                candidate_tasks[0],
+                candidate_measurements[0],
+            )
+        except ObservationError as error:
+            refs = sorted(
+                record.ref for record in [*candidate_tasks, *candidate_measurements]
+            )
+            _add_issue(
+                issues,
+                "error",
+                "task_measurement_candidate_mismatch",
+                "|".join(refs),
+                str(error),
+            )
 
 
 def _add_issue(

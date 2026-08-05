@@ -12,8 +12,9 @@ from pathlib import Path
 import pytest
 
 import arbor.aros.transitions as transitions_module
+from arbor.aros.eval import EvalService
 from arbor.aros.observations import ObservationRecord
-from arbor.aros.store import canonical_json_bytes, json_sha256
+from arbor.aros.store import atomic_write_json, canonical_json_bytes, json_sha256
 from arbor.aros.transitions import (
     Assimilation,
     TransitionAuditService,
@@ -23,6 +24,7 @@ from arbor.aros.transitions import (
     load_transition_proposal,
 )
 from tests import test_aros_observations as observation_support
+from tests import test_aros_eval as eval_support
 
 
 AUDIT_FIELDS = {
@@ -124,6 +126,20 @@ def _fake_observation(
     )
 
 
+def _claim_document(
+    identifier: str,
+    links: list[dict[str, str]],
+    *,
+    statement: str = "",
+) -> str:
+    encoded_links = "\n".join(json.dumps(link, sort_keys=True) for link in links)
+    return (
+        f"---\nid: {identifier}\n---\n# Claim\n\n"
+        f"## Statement and scope\n\n{statement}\n\n"
+        f"## Evidence links\n\n{encoded_links}\n"
+    )
+
+
 def _snapshot_tree(root: Path) -> dict[str, tuple[int, bytes | None]]:
     snapshot: dict[str, tuple[int, bytes | None]] = {}
     for path in [root, *sorted(root.rglob("*"), key=lambda item: item.as_posix())]:
@@ -150,6 +166,49 @@ def _changed_semantic_proposal(root: Path, transition_id: str = "T-basic") -> st
         base_commit=base,
         workspace_paths=["memory/NOW.md"],
     )
+
+
+def _install_eval_for_candidate(
+    root: Path,
+    candidate_commit: str,
+) -> str:
+    scorer = root / "evaluation" / "score.py"
+    scorer.parent.mkdir(exist_ok=True)
+    scorer.write_bytes(
+        b"print('{\"schema_version\":1,\"metric\":0.5,\"sample_count\":1}')\n"
+    )
+    _git(root, "add", "evaluation/score.py")
+    _git(root, "commit", "-qm", "add joint evaluator apparatus")
+    apparatus_commit = _git(root, "rev-parse", "HEAD")
+    manifest = eval_support._visible_manifest(
+        apparatus_commit,
+        hashlib.sha256(scorer.read_bytes()).hexdigest(),
+    )
+    manifest_path = root / "eval" / "suites" / "quality" / "1" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", "eval/suites/quality/1/manifest.json")
+    _git(root, "commit", "-qm", "add joint evaluator manifest")
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        "joint-task-measurement",
+    )
+    assert isinstance(lease, eval_support.eval_module.ExecutionLease)
+    receipt = eval_support._terminal_receipt(root, lease.request, lease.execution)
+    receipt_ref = (
+        f"eval/evaluations/{lease.request['eval_id']}/receipt.json"
+    )
+    atomic_write_json(root / receipt_ref, receipt)
+    lease.close()
+    return receipt_ref
 
 
 def test_proposal_requires_exact_four_fields_and_directory_identity(
@@ -298,6 +357,48 @@ def test_audit_reports_non_utf8_scalar_semantic_links(tmp_path: Path) -> None:
 
     assert audit["mechanically_valid"] is False
     assert any("semantic" in str(issue["code"]) for issue in audit["issues"])
+
+
+@pytest.mark.parametrize("boundary", ("current_nested", "base_gitlink"))
+def test_audit_rejects_proposal_under_nested_repository_or_base_gitlink(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    base = _init_workspace(tmp_path)
+    transition_id = f"T-proposal-{boundary.replace('_', '-')}"
+    proposal_directory = tmp_path / "transitions" / transition_id
+    proposal_directory.mkdir(parents=True)
+    _git(proposal_directory, "init", "-q", "-b", "main")
+    _git(proposal_directory, "config", "user.email", "nested@example.invalid")
+    _git(proposal_directory, "config", "user.name", "Nested Test")
+    (proposal_directory / "nested.txt").write_text("nested\n", encoding="utf-8")
+    _git(proposal_directory, "add", "nested.txt")
+    _git(proposal_directory, "commit", "-qm", "nested proposal repository")
+    if boundary == "base_gitlink":
+        _git(tmp_path, "add", f"transitions/{transition_id}")
+        _git(tmp_path, "commit", "-qm", "record proposal gitlink")
+        base = _git(tmp_path, "rev-parse", "HEAD")
+        backup = tmp_path / ".worktree" / f"removed-{transition_id}"
+        backup.parent.mkdir()
+        proposal_directory.rename(backup)
+        proposal_directory.mkdir()
+    proposal_ref = _write_proposal(
+        tmp_path,
+        transition_id,
+        base_commit=base,
+        workspace_paths=[],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert set(audit) == AUDIT_FIELDS
+    assert audit["mechanically_valid"] is False
+    assert audit["proposal_blob_sha256"] is None
+    assert any(
+        "proposal" in str(issue["code"])
+        and ("submodule" in str(issue["code"]) or "nested" in str(issue["detail"]))
+        for issue in audit["issues"]
+    )
 
 
 def test_audit_rejects_stale_base_symlink_runtime_and_undeclared_paths(
@@ -680,6 +781,302 @@ def test_eval_outcome_can_only_link_as_process_context(
     assert any("nonmeasurement" in str(issue["code"]) for issue in audit["issues"])
 
 
+def test_audit_binds_only_new_evidence_link_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    claim = tmp_path / "knowledge" / "claims" / "C-delta.md"
+    claim.parent.mkdir(parents=True)
+    existing_ref = "runs/RUN-existing/final.json"
+    new_ref = f"eval/evaluations/EVAL-{'3' * 64}/receipt.json"
+    existing = {
+        "observation_ref": existing_ref,
+        "relation": "context",
+        "scope": "Existing apparatus context.",
+    }
+    added = {
+        "observation_ref": new_ref,
+        "relation": "supports",
+        "scope": "New bounded measurement.",
+    }
+    claim.write_text(_claim_document("C-delta", [existing]), encoding="utf-8")
+    _git(tmp_path, "add", "knowledge/claims/C-delta.md")
+    _git(tmp_path, "commit", "-qm", "add existing EvidenceLink")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    claim.write_text(
+        _claim_document("C-delta", [existing, added], statement="Updated."),
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-evidence-delta",
+        base_commit=base,
+        workspace_paths=["knowledge/claims/C-delta.md"],
+        assimilations=[
+            {
+                "observation_ref": new_ref,
+                "affected_paths": ["knowledge/claims/C-delta.md"],
+                "rationale": "knowledge/claims/C-delta.md#Evidence links",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            new_ref,
+            kind="measurement",
+            candidate_commit="3" * 40,
+            measurement_state="valid",
+        ),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    assert [link["observation_ref"] for link in audit["assimilation_links"]] == [
+        new_ref
+    ]
+
+
+def test_two_assimilations_share_evidence_section_without_cross_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    claim = tmp_path / "knowledge" / "claims" / "C-shared.md"
+    claim.parent.mkdir(parents=True)
+    claim.write_text(_claim_document("C-shared", []), encoding="utf-8")
+    _git(tmp_path, "add", "knowledge/claims/C-shared.md")
+    _git(tmp_path, "commit", "-qm", "add shared EvidenceLink section")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    candidate = "4" * 40
+    eval_ref = f"eval/evaluations/EVAL-{'4' * 64}/receipt.json"
+    task_ref = "tasks/TASK-20260805-shared/collected.json"
+    claim.write_text(
+        _claim_document(
+            "C-shared",
+            [
+                {
+                    "observation_ref": eval_ref,
+                    "relation": "supports",
+                    "scope": "Measurement delta.",
+                },
+                {
+                    "observation_ref": task_ref,
+                    "relation": "context",
+                    "scope": "Task process context.",
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+    records = {
+        eval_ref: _fake_observation(
+            eval_ref,
+            kind="measurement",
+            candidate_commit=candidate,
+            measurement_state="valid",
+        ),
+        task_ref: _fake_observation(
+            task_ref,
+            candidate_commit=candidate,
+            base_commit=base,
+        ),
+    }
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-shared-links",
+        base_commit=base,
+        workspace_paths=["knowledge/claims/C-shared.md"],
+        assimilations=[
+            {
+                "observation_ref": eval_ref,
+                "affected_paths": ["knowledge/claims/C-shared.md"],
+                "rationale": "knowledge/claims/C-shared.md#Evidence links",
+            },
+            {
+                "observation_ref": task_ref,
+                "affected_paths": ["knowledge/claims/C-shared.md"],
+                "rationale": "knowledge/claims/C-shared.md#Evidence links",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, ref, **_kwargs: records[ref],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    assert {link["observation_ref"] for link in audit["assimilation_links"]} == {
+        eval_ref,
+        task_ref,
+    }
+    assert not any("mismatch" in str(issue["code"]) for issue in audit["issues"])
+
+
+def test_existing_measurement_link_alone_cannot_support_new_assimilation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    claim = tmp_path / "knowledge" / "claims" / "C-old-link.md"
+    claim.parent.mkdir(parents=True)
+    observation_ref = f"eval/evaluations/EVAL-{'5' * 64}/receipt.json"
+    link = {
+        "observation_ref": observation_ref,
+        "relation": "supports",
+        "scope": "Previously assimilated measurement.",
+    }
+    claim.write_text(_claim_document("C-old-link", [link]), encoding="utf-8")
+    _git(tmp_path, "add", "knowledge/claims/C-old-link.md")
+    _git(tmp_path, "commit", "-qm", "record old measurement link")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    claim.write_text(
+        _claim_document("C-old-link", [link], statement="Changed prose only."),
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-old-link",
+        base_commit=base,
+        workspace_paths=["knowledge/claims/C-old-link.md"],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": ["knowledge/claims/C-old-link.md"],
+                "rationale": "knowledge/claims/C-old-link.md#Evidence links",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            observation_ref,
+            kind="measurement",
+            candidate_commit="5" * 40,
+            measurement_state="valid",
+        ),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert audit["assimilation_links"] == []
+    assert any("link_missing" in str(issue["code"]) for issue in audit["issues"])
+
+
+def test_changed_evidence_link_scope_is_a_new_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    claim = tmp_path / "knowledge" / "claims" / "C-changed-link.md"
+    claim.parent.mkdir(parents=True)
+    observation_ref = f"eval/evaluations/EVAL-{'6' * 64}/receipt.json"
+    old = {
+        "observation_ref": observation_ref,
+        "relation": "supports",
+        "scope": "Old scope.",
+    }
+    new = {**old, "scope": "New narrower scope."}
+    claim.write_text(_claim_document("C-changed-link", [old]), encoding="utf-8")
+    _git(tmp_path, "add", "knowledge/claims/C-changed-link.md")
+    _git(tmp_path, "commit", "-qm", "record old link scope")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    claim.write_text(_claim_document("C-changed-link", [new]), encoding="utf-8")
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-changed-link",
+        base_commit=base,
+        workspace_paths=["knowledge/claims/C-changed-link.md"],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": ["knowledge/claims/C-changed-link.md"],
+                "rationale": "knowledge/claims/C-changed-link.md#Evidence links",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            observation_ref,
+            kind="measurement",
+            candidate_commit="6" * 40,
+            measurement_state="valid",
+        ),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    assert [link["scope"] for link in audit["assimilation_links"]] == [
+        "New narrower scope."
+    ]
+
+
+@pytest.mark.parametrize("relation", ("supports", "challenges", "bounds"))
+def test_task_evidence_links_must_be_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relation: str,
+) -> None:
+    _init_workspace(tmp_path)
+    claim = tmp_path / "knowledge" / "claims" / "C-task-relation.md"
+    claim.parent.mkdir(parents=True)
+    claim.write_text(_claim_document("C-task-relation", []), encoding="utf-8")
+    _git(tmp_path, "add", "knowledge/claims/C-task-relation.md")
+    _git(tmp_path, "commit", "-qm", "add Task relation claim")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    observation_ref = "tasks/TASK-20260805-relation/collected.json"
+    claim.write_text(
+        _claim_document(
+            "C-task-relation",
+            [
+                {
+                    "observation_ref": observation_ref,
+                    "relation": relation,
+                    "scope": "Task output is process context only.",
+                }
+            ],
+        ),
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        f"T-task-{relation}",
+        base_commit=base,
+        workspace_paths=["knowledge/claims/C-task-relation.md"],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": ["knowledge/claims/C-task-relation.md"],
+                "rationale": "knowledge/claims/C-task-relation.md#Evidence links",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            observation_ref,
+            base_commit=base,
+        ),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert any("nonmeasurement" in str(issue["code"]) for issue in audit["issues"])
+
+
 def test_audit_derives_exact_new_observation_closure(tmp_path: Path) -> None:
     _service, manifest, _final = observation_support._install_run_final(tmp_path)
     base = _git(tmp_path, "rev-parse", "HEAD")
@@ -784,6 +1181,109 @@ def test_audit_validates_explicit_service_records(tmp_path: Path) -> None:
     assert {receipt["owner"] for receipt in audit["path_receipts"]} == {"run"}
 
 
+def test_direct_terminal_service_records_derive_complete_owner_closure(
+    tmp_path: Path,
+) -> None:
+    task_root = tmp_path / "task"
+    _service, task_id, _collected = observation_support._collected_task(task_root)
+    task_ref = f"tasks/{task_id}/collected.json"
+    task_proposal = _write_proposal(
+        task_root,
+        "T-direct-task",
+        base_commit=_git(task_root, "rev-parse", "HEAD"),
+        workspace_paths=[task_ref],
+    )
+
+    run_root = tmp_path / "run"
+    _run_service, manifest, _final = observation_support._install_run_final(run_root)
+    run_id = str(manifest["run_id"])
+    run_ref = f"runs/{run_id}/final.json"
+    run_proposal = _write_proposal(
+        run_root,
+        "T-direct-run",
+        base_commit=_git(run_root, "rev-parse", "HEAD"),
+        workspace_paths=[run_ref],
+    )
+
+    eval_root = tmp_path / "eval"
+    installed = observation_support._install_eval_receipt(eval_root)
+    eval_ref = str(installed["receipt_ref"])
+    eval_proposal = _write_proposal(
+        eval_root,
+        "T-direct-eval",
+        base_commit=_git(eval_root, "rev-parse", "HEAD"),
+        workspace_paths=[eval_ref],
+    )
+
+    cases = (
+        (
+            _audit(task_root, task_proposal),
+            task_ref,
+            {f"tasks/{task_id}/brief.json", task_ref},
+        ),
+        (
+            _audit(run_root, run_proposal),
+            run_ref,
+            {f"runs/{run_id}/manifest.json", run_ref},
+        ),
+        (
+            _audit(eval_root, eval_proposal),
+            eval_ref,
+            {
+                eval_ref,
+                f"runs/{installed['run_id']}/manifest.json",
+                f"runs/{installed['run_id']}/final.json",
+            },
+        ),
+    )
+    for audit, selected_ref, expected_paths in cases:
+        assert audit["mechanically_valid"] is True
+        assert len(audit["observation_closure"]) == 1
+        closure = audit["observation_closure"][0]
+        assert closure["observation_ref"] == selected_ref
+        paths = {item["path"]: item for item in closure["paths"]}
+        assert set(paths) == expected_paths
+        assert paths[selected_ref]["state"] == "workspace"
+        assert len(paths) == len(set(paths))
+
+
+def test_preterminal_task_brief_and_run_manifest_need_no_terminal_closure(
+    tmp_path: Path,
+) -> None:
+    task_root = tmp_path / "task"
+    _service, brief, _ownership, _final = (
+        observation_support.task_test_support._create_terminal_task(task_root)
+    )
+    task_ref = f"tasks/{brief['task_id']}/brief.json"
+    task_proposal = _write_proposal(
+        task_root,
+        "T-preterminal-task",
+        base_commit=_git(task_root, "rev-parse", "HEAD"),
+        workspace_paths=[task_ref],
+    )
+
+    run_root = tmp_path / "run"
+    _run_service, manifest, _run_final = observation_support._install_run_final(
+        run_root
+    )
+    run_id = str(manifest["run_id"])
+    run_ref = f"runs/{run_id}/manifest.json"
+    (run_root / "runs" / run_id / "final.json").unlink()
+    run_proposal = _write_proposal(
+        run_root,
+        "T-preterminal-run",
+        base_commit=_git(run_root, "rev-parse", "HEAD"),
+        workspace_paths=[run_ref],
+    )
+
+    for audit in (
+        _audit(task_root, task_proposal),
+        _audit(run_root, run_proposal),
+    ):
+        assert audit["mechanically_valid"] is True
+        assert audit["observation_closure"] == []
+
+
 def test_audit_task_measurement_pair_requires_equal_candidate_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -841,6 +1341,140 @@ def test_audit_task_measurement_pair_requires_equal_candidate_commit(
 
     assert audit["mechanically_valid"] is False
     assert any("candidate" in str(issue["detail"]).casefold() for issue in audit["issues"])
+
+
+def test_two_task_measurement_candidate_groups_do_not_cross_compare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _init_workspace(tmp_path)
+    paths = {
+        "memory/PAIR-A.md": "Findings",
+        "memory/PAIR-B.md": "Findings",
+        "model/PAIR-A.md": "Measurement",
+        "model/PAIR-B.md": "Measurement",
+    }
+    for path, heading in paths.items():
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"# Record\n\n## {heading}\n\nChanged.\n", encoding="utf-8")
+    eval_a = f"eval/evaluations/EVAL-{'7' * 64}/receipt.json"
+    eval_b = f"eval/evaluations/EVAL-{'8' * 64}/receipt.json"
+    task_a = "tasks/TASK-20260805-pair-a/collected.json"
+    task_b = "tasks/TASK-20260805-pair-b/collected.json"
+    candidate_a = "7" * 40
+    candidate_b = "8" * 40
+    records = {
+        eval_a: _fake_observation(
+            eval_a,
+            kind="measurement",
+            candidate_commit=candidate_a,
+            measurement_state="valid",
+        ),
+        eval_b: _fake_observation(
+            eval_b,
+            kind="measurement",
+            candidate_commit=candidate_b,
+            measurement_state="underpowered",
+        ),
+        task_a: _fake_observation(
+            task_a,
+            candidate_commit=candidate_a,
+            base_commit=base,
+        ),
+        task_b: _fake_observation(
+            task_b,
+            candidate_commit=candidate_b,
+            base_commit=base,
+        ),
+    }
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-two-pairs",
+        base_commit=base,
+        workspace_paths=sorted(paths),
+        assimilations=[
+            {
+                "observation_ref": eval_a,
+                "affected_paths": ["model/PAIR-A.md"],
+                "rationale": "model/PAIR-A.md#Measurement",
+            },
+            {
+                "observation_ref": eval_b,
+                "affected_paths": ["model/PAIR-B.md"],
+                "rationale": "model/PAIR-B.md#Measurement",
+            },
+            {
+                "observation_ref": task_a,
+                "affected_paths": ["memory/PAIR-A.md"],
+                "rationale": "memory/PAIR-A.md#Findings",
+            },
+            {
+                "observation_ref": task_b,
+                "affected_paths": ["memory/PAIR-B.md"],
+                "rationale": "memory/PAIR-B.md#Findings",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, ref, **_kwargs: records[ref],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    assert not any("candidate_mismatch" in str(issue["code"]) for issue in audit["issues"])
+
+
+@eval_support.requires_linux_claims
+def test_real_task_collection_and_eval_receipt_form_joint_lineage(
+    tmp_path: Path,
+) -> None:
+    _service, task_id, collected = observation_support._collected_task(tmp_path)
+    task_ref = f"tasks/{task_id}/collected.json"
+    _git(tmp_path, "add", task_ref)
+    _git(tmp_path, "commit", "-qm", "record real Task collection")
+    eval_ref = _install_eval_for_candidate(
+        tmp_path,
+        str(collected["child_commit"]),
+    )
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    (tmp_path / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nReal Task return.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model" / "CURRENT.md").write_text(
+        "# Current Model\n\n## Measurement\n\nReal measurement.\n",
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-real-joint",
+        base_commit=base,
+        workspace_paths=["memory/NOW.md", "model/CURRENT.md"],
+        assimilations=[
+            {
+                "observation_ref": eval_ref,
+                "affected_paths": ["model/CURRENT.md"],
+                "rationale": "model/CURRENT.md#Measurement",
+            },
+            {
+                "observation_ref": task_ref,
+                "affected_paths": ["memory/NOW.md"],
+                "rationale": "memory/NOW.md#Findings",
+            },
+        ],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    closure = {item["observation_ref"]: item for item in audit["observation_closure"]}
+    assert set(closure) == {task_ref, eval_ref}
+    assert closure[task_ref]["candidate_commit"] == collected["child_commit"]
+    assert closure[eval_ref]["candidate_commit"] == collected["child_commit"]
 
 
 def test_stale_task_base_is_bound_as_fact_without_denial(

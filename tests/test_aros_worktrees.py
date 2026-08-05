@@ -19,6 +19,7 @@ from arbor.aros.worktrees import (
     bind_repository,
     create_detached_checkout,
     create_execution_bundle,
+    find_repository_gitlink_ancestor,
     remove_clean_checkout,
     remove_clean_execution_bundle,
     validate_detached_checkout,
@@ -134,6 +135,34 @@ def test_read_repository_and_candidate_status_are_strict_projections(
         "branch": "master",
     }
     assert status == {"state": "available", "dirty": False, "dirty_paths": []}
+
+
+def test_repository_gitlink_ancestor_is_pinned_and_allows_new_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _init_repository(root)
+    nested = root / "model" / "component"
+    nested.mkdir(parents=True)
+    _init_repository(nested)
+    _git(root, "add", "model/component")
+    _git(root, "commit", "-qm", "record gitlink")
+    commit = _git(root, "rev-parse", "HEAD").stdout.strip()
+    repository = bind_repository(root)
+
+    assert find_repository_gitlink_ancestor(
+        repository,
+        commit,
+        "model/component/CURRENT.md",
+    ) == "model/component"
+    assert (
+        find_repository_gitlink_ancestor(
+            repository,
+            commit,
+            "model/new/CURRENT.md",
+        )
+        is None
+    )
 
 
 def test_detached_checkout_is_exact_clean_and_hermetic(

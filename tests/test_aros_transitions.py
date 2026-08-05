@@ -409,6 +409,44 @@ def test_audit_rejects_selected_file_inside_submodule(tmp_path: Path) -> None:
     assert any("submodule" in str(issue["code"]) for issue in audit["issues"])
 
 
+def test_audit_rejects_base_gitlink_descendant_after_marker_removed(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    nested = tmp_path / "model" / "component"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q", "-b", "main")
+    _git(nested, "config", "user.email", "nested@example.invalid")
+    _git(nested, "config", "user.name", "Nested Test")
+    (nested / "CURRENT.md").write_text("# Nested Model\n", encoding="utf-8")
+    _git(nested, "add", "CURRENT.md")
+    _git(nested, "commit", "-qm", "nested state")
+    _git(tmp_path, "add", "model/component")
+    _git(tmp_path, "commit", "-qm", "record base gitlink")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+
+    backup = tmp_path / ".worktree" / "removed-component"
+    backup.parent.mkdir()
+    nested.rename(backup)
+    nested.mkdir()
+    (nested / "CURRENT.md").write_text(
+        "# Ordinary Replacement Model\n",
+        encoding="utf-8",
+    )
+    assert not (nested / ".git").exists()
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-base-gitlink",
+        base_commit=base,
+        workspace_paths=["model/component/CURRENT.md"],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert any("submodule" in str(issue["code"]) for issue in audit["issues"])
+
+
 @pytest.mark.parametrize("case", ("unchanged", "rationale"))
 def test_audit_requires_changed_semantic_rationale_path(
     tmp_path: Path,

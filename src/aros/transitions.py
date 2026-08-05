@@ -321,6 +321,20 @@ class TransitionAuditService:
                 )
                 continue
             try:
+                gitlink = _worktrees.find_repository_gitlink_ancestor(
+                    repository,
+                    proposal.base_commit,
+                    path,
+                )
+                if gitlink is not None:
+                    _add_issue(
+                        issues,
+                        "error",
+                        "submodule_workspace_path",
+                        path,
+                        f"path descends from base gitlink: {gitlink}",
+                    )
+                    continue
                 _reject_nested_repository(reader, path)
                 raw = _read_anchored_bytes(reader, path)
             except TransitionError as error:
@@ -328,6 +342,15 @@ class TransitionAuditService:
                     issues,
                     "error",
                     "submodule_workspace_path",
+                    path,
+                    str(error),
+                )
+                continue
+            except WorktreeError as error:
+                _add_issue(
+                    issues,
+                    "error",
+                    "invalid_base_path",
                     path,
                     str(error),
                 )
@@ -615,6 +638,20 @@ class TransitionAuditService:
                 )
                 continue
             try:
+                gitlink = _worktrees.find_repository_gitlink_ancestor(
+                    repository,
+                    proposal.base_commit,
+                    canonical,
+                )
+                if gitlink is not None:
+                    _add_issue(
+                        issues,
+                        "error",
+                        "submodule_observation_closure",
+                        record.ref,
+                        f"observation path descends from base gitlink: {gitlink}",
+                    )
+                    continue
                 _reject_nested_repository(reader, canonical)
                 raw = _read_anchored_bytes(reader, canonical)
                 base = _worktrees.read_repository_file(

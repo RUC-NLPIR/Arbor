@@ -69,6 +69,13 @@ class RepositoryFile:
 
 
 @dataclass(frozen=True)
+class _RepositoryTreeEntry:
+    mode: str
+    kind: str
+    oid: str
+
+
+@dataclass(frozen=True)
 class CheckoutBinding:
     path: Path
     git_dir: Path
@@ -227,6 +234,57 @@ def read_repository_file(
 ) -> RepositoryFile | None:
     """Read one exact regular Git file, or ``None`` when it is absent."""
     _validate_repository_binding(repository)
+    canonical = _repository_path(path).as_posix()
+    _repository_commit(commit)
+    entry = _read_repository_tree_entry(repository, commit, canonical)
+    if entry is None:
+        _validate_repository_binding(repository)
+        return None
+    if (
+        entry.mode not in {"100644", "100755"}
+        or entry.kind != "blob"
+    ):
+        raise WorktreeError(f"repository path is not a regular SHA-1 blob: {path}")
+    blob_oid = entry.oid
+    content = _git_bytes(repository, "cat-file", "blob", blob_oid)
+    digest = hashlib.sha1(
+        b"blob " + str(len(content)).encode("ascii") + b"\0" + content
+    ).hexdigest()
+    if digest != blob_oid:
+        raise WorktreeError(f"repository blob bytes do not match object ID: {path}")
+    _validate_repository_binding(repository)
+    return RepositoryFile(path=path, blob_oid=blob_oid, content=content)
+
+
+def find_repository_gitlink_ancestor(
+    repository: RepositoryBinding,
+    commit: str,
+    path: str,
+) -> str | None:
+    """Return the first base-tree gitlink at or above one candidate path."""
+    _validate_repository_binding(repository)
+    candidate = _repository_path(path)
+    _repository_commit(commit)
+    gitlink: str | None = None
+    for length in range(1, len(candidate.parts) + 1):
+        ancestor = PurePosixPath(*candidate.parts[:length]).as_posix()
+        entry = _read_repository_tree_entry(repository, commit, ancestor)
+        if entry is None:
+            break
+        if entry.mode == "160000" and entry.kind == "commit":
+            gitlink = ancestor
+            break
+        if length < len(candidate.parts) and not (
+            entry.mode == "040000" and entry.kind == "tree"
+        ):
+            raise WorktreeError(
+                f"repository path descends through a non-tree entry: {ancestor}"
+            )
+    _validate_repository_binding(repository)
+    return gitlink
+
+
+def _repository_path(path: object) -> PurePosixPath:
     candidate = PurePosixPath(path) if isinstance(path, str) else PurePosixPath()
     if (
         not isinstance(path, str)
@@ -238,8 +296,24 @@ def read_repository_file(
         or any(part in {"", ".", ".."} for part in candidate.parts)
     ):
         raise WorktreeError(f"invalid repository file path: {path!r}")
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise WorktreeError("repository file path must be valid UTF-8") from error
+    return candidate
+
+
+def _repository_commit(commit: object) -> str:
     if not isinstance(commit, str) or _COMMIT.fullmatch(commit) is None:
         raise WorktreeError(f"invalid repository commit: {commit!r}")
+    return commit
+
+
+def _read_repository_tree_entry(
+    repository: RepositoryBinding,
+    commit: str,
+    path: str,
+) -> _RepositoryTreeEntry | None:
     raw = _git_bytes(
         repository,
         "--literal-pathspecs",
@@ -252,7 +326,6 @@ def read_repository_file(
     )
     records = [record for record in raw.split(b"\0") if record]
     if not records:
-        _validate_repository_binding(repository)
         return None
     if len(records) != 1:
         raise WorktreeError(f"repository path is ambiguous: {path}")
@@ -262,20 +335,16 @@ def read_repository_file(
         separator != b"\t"
         or raw_path != path.encode("utf-8")
         or len(fields) != 3
-        or fields[0] not in {b"100644", b"100755"}
-        or fields[1] != b"blob"
+        or fields[0] not in {b"040000", b"100644", b"100755", b"120000", b"160000"}
+        or fields[1] not in {b"blob", b"commit", b"tree"}
         or re.fullmatch(rb"[0-9a-f]{40}", fields[2]) is None
     ):
-        raise WorktreeError(f"repository path is not a regular SHA-1 blob: {path}")
-    blob_oid = fields[2].decode("ascii")
-    content = _git_bytes(repository, "cat-file", "blob", blob_oid)
-    digest = hashlib.sha1(
-        b"blob " + str(len(content)).encode("ascii") + b"\0" + content
-    ).hexdigest()
-    if digest != blob_oid:
-        raise WorktreeError(f"repository blob bytes do not match object ID: {path}")
-    _validate_repository_binding(repository)
-    return RepositoryFile(path=path, blob_oid=blob_oid, content=content)
+        raise WorktreeError(f"repository path has an invalid tree entry: {path}")
+    return _RepositoryTreeEntry(
+        mode=fields[0].decode("ascii"),
+        kind=fields[1].decode("ascii"),
+        oid=fields[2].decode("ascii"),
+    )
 
 
 def read_candidate_status(repository: RepositoryBinding) -> dict[str, object]:

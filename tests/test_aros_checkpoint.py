@@ -116,6 +116,28 @@ def _index_bytes(root: Path) -> bytes:
     return (Path(_git_text(root, "rev-parse", "--absolute-git-dir")) / "index").read_bytes()
 
 
+def _write_sparse_file(path: Path, size: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as stream:
+        stream.truncate(size)
+
+
+def _reject_opening_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    target: Path,
+    *,
+    larger_than: int,
+) -> None:
+    real_open = checkpoint_module.os.open
+
+    def guarded_open(path: object, *args: object, **kwargs: object) -> int:
+        if Path(path) == target and target.stat().st_size > larger_than:
+            raise AssertionError(f"oversized snapshot was opened: {target}")
+        return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(checkpoint_module.os, "open", guarded_open)
+
+
 def _authority(root: Path) -> tuple[bytes, bytes, bytes | None]:
     git_dir = Path(_git_text(root, "rev-parse", "--absolute-git-dir"))
     fetch_head = git_dir / "FETCH_HEAD"
@@ -203,6 +225,51 @@ def test_checkpoint_prepare_tree_contains_exact_audited_paths(tmp_path: Path) ->
     audit = json.loads((tmp_path / "transitions/T-checkpoint/audit.json").read_bytes())
     assert audit["audit_payload_sha256"] == prepared.audit_payload_sha256
     assert audit["candidate_subject_sha256"] == prepared.candidate_subject_sha256
+
+
+def test_checkpoint_prepare_allows_unchanged_declared_service_records(
+    tmp_path: Path,
+) -> None:
+    _run_service, manifest, _final = observation_support._install_run_final(tmp_path)
+    run_id = str(manifest["run_id"])
+    service_paths = tuple(
+        sorted(
+            (
+                f"runs/{run_id}/manifest.json",
+                f"runs/{run_id}/final.json",
+            )
+        )
+    )
+    _git(tmp_path, "add", "--", *service_paths)
+    _git(tmp_path, "commit", "-qm", "version service records")
+    base = _git_text(tmp_path, "rev-parse", "HEAD")
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-unchanged-service",
+        base,
+        list(service_paths),
+    )
+    service = CheckpointService(
+        tmp_path,
+        canonical_repository=bind_repository(tmp_path),
+        canonical_ref=_git_text(tmp_path, "symbolic-ref", "HEAD"),
+    )
+
+    audit = service.audit_service.audit(proposal_ref)
+    assert audit["mechanically_valid"] is True, audit["issues"]
+    prepared = service.prepare(proposal_ref, "unchanged service records")
+
+    receipts = {receipt.path for receipt in prepared.candidate_paths}
+    audit_ref = "transitions/T-unchanged-service/audit.json"
+    assert receipts == {*service_paths, proposal_ref, audit_ref}
+    base_tree = _tree(tmp_path, base)
+    candidate_tree = _tree(tmp_path, prepared.candidate_tree)
+    assert all(candidate_tree[path] == base_tree[path] for path in service_paths)
+    assert {
+        path
+        for path, entry in candidate_tree.items()
+        if base_tree.get(path) != entry
+    } == {proposal_ref, audit_ref}
 
 
 def test_checkpoint_prepare_stages_derived_closure_but_not_base_ref_only_closure(
@@ -381,6 +448,86 @@ def test_checkpoint_prepare_rejects_ineligible_audit_without_tree_or_index_chang
     assert not (tmp_path / ".aros/checkpoints/T-ineligible/prepared.json").exists()
 
 
+def test_checkpoint_file_snapshots_require_an_explicit_bound() -> None:
+    parameter = inspect.signature(checkpoint_module._snapshot_file).parameters.get(
+        "max_bytes"
+    )
+
+    assert parameter is not None
+    assert parameter.default is inspect.Parameter.empty
+
+
+def test_checkpoint_prepare_rejects_oversized_existing_audit_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    audit_path = tmp_path / "transitions/T-checkpoint/audit.json"
+    _write_sparse_file(audit_path, checkpoint_module.MAX_AUDIT_FILE_BYTES + 1)
+    _reject_opening_snapshot(
+        monkeypatch,
+        audit_path,
+        larger_than=checkpoint_module.MAX_AUDIT_FILE_BYTES,
+    )
+
+    with pytest.raises(CheckpointError, match="bound"):
+        service.prepare(proposal_ref, "bounded audit snapshot")
+
+
+def test_checkpoint_prepare_rejects_oversized_user_index_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    index_path = bind_repository(tmp_path).git_dir / "index"
+    real_resolve = checkpoint_module.resolve_repository_commit
+    resolved = 0
+
+    def enlarge_after_authority_resolution(
+        repository: object,
+        ref: str,
+    ) -> str:
+        nonlocal resolved
+        commit = real_resolve(repository, ref)  # type: ignore[arg-type]
+        resolved += 1
+        if resolved == 2:
+            _write_sparse_file(index_path, 4_194_305)
+        return commit
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        "resolve_repository_commit",
+        enlarge_after_authority_resolution,
+    )
+    _reject_opening_snapshot(monkeypatch, index_path, larger_than=4_194_304)
+
+    with pytest.raises(CheckpointError, match="bound"):
+        service.prepare(proposal_ref, "bounded user index snapshot")
+
+
+def test_checkpoint_prepare_rejects_oversized_temp_index_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    index_path = tmp_path / ".aros/checkpoints/T-checkpoint/index"
+    real_verify = checkpoint_module._verify_candidate_tree
+
+    def enlarge_after_tree_verification(*args: object, **kwargs: object) -> None:
+        real_verify(*args, **kwargs)  # type: ignore[arg-type]
+        _write_sparse_file(index_path, 4_194_305)
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_verify_candidate_tree",
+        enlarge_after_tree_verification,
+    )
+    _reject_opening_snapshot(monkeypatch, index_path, larger_than=4_194_304)
+
+    with pytest.raises(CheckpointError, match="bound"):
+        service.prepare(proposal_ref, "bounded temp index snapshot")
+
+
 def test_checkpoint_prepare_is_exactly_idempotent_and_conflicting_retry_fails(
     tmp_path: Path,
 ) -> None:
@@ -520,14 +667,14 @@ def test_checkpoint_prepare_rejects_index_replaced_between_tree_and_snapshot(
     real_snapshot = checkpoint_module._snapshot_file
     replaced = False
 
-    def replace_before_snapshot(path: Path) -> object:
+    def replace_before_snapshot(path: Path, *, max_bytes: int) -> object:
         nonlocal replaced
         if path == index_path and path.exists() and not replaced:
             replaced = True
             replacement = path.with_name("replacement-index")
             replacement.write_bytes(base_index_bytes)
             os.replace(replacement, path)
-        return real_snapshot(path)
+        return real_snapshot(path, max_bytes=max_bytes)
 
     monkeypatch.setattr(checkpoint_module, "_snapshot_file", replace_before_snapshot)
 
@@ -551,7 +698,7 @@ def test_checkpoint_prepare_rejects_verification_index_swap_before_write_tree(
     snapshot_replaced = False
     verification_replaced = False
 
-    def replace_before_snapshot(path: Path) -> object:
+    def replace_before_snapshot(path: Path, *, max_bytes: int) -> object:
         nonlocal good_candidate_bytes, snapshot_replaced
         if path == index_path and path.exists() and not snapshot_replaced:
             good_candidate_bytes = path.read_bytes()
@@ -559,7 +706,7 @@ def test_checkpoint_prepare_rejects_verification_index_swap_before_write_tree(
             replacement = path.with_name("replacement-index")
             replacement.write_bytes(base_index_bytes)
             os.replace(replacement, path)
-        return real_snapshot(path)
+        return real_snapshot(path, max_bytes=max_bytes)
 
     def replace_before_verification_write_tree(
         repository: object,
@@ -651,6 +798,69 @@ def test_checkpoint_prepare_final_tree_has_no_admission_receipt(tmp_path: Path) 
     paths = set(_tree(tmp_path, prepared.candidate_tree))
     assert "transitions/T-checkpoint/admission.json" not in paths
     assert not any(path.endswith("/admission.json") for path in paths)
+
+
+def test_checkpoint_object_import_rejects_oversized_fetch_head_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate"
+    canonical = tmp_path / "canonical"
+    commit, _canonical_ref = _init_repository(candidate)
+    _git(tmp_path, "clone", "-q", str(candidate), str(canonical))
+    canonical_repository = bind_repository(canonical)
+    fetch_head = canonical_repository.git_dir / "FETCH_HEAD"
+    _write_sparse_file(fetch_head, 1_048_577)
+    _reject_opening_snapshot(monkeypatch, fetch_head, larger_than=1_048_576)
+
+    with pytest.raises(CheckpointError, match="bound"):
+        checkpoint_module._import_commit_objects(
+            canonical_repository,
+            bind_repository(candidate),
+            (commit,),
+        )
+
+
+@pytest.mark.parametrize("excess", ("bytes", "count"))
+def test_checkpoint_object_import_bounds_canonical_ref_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    excess: str,
+) -> None:
+    candidate = tmp_path / "candidate"
+    canonical = tmp_path / "canonical"
+    commit, _canonical_ref = _init_repository(candidate)
+    _git(tmp_path, "clone", "-q", str(candidate), str(canonical))
+    if excess == "bytes":
+        ref_snapshot = b"x" * 4_194_305
+    else:
+        ref_snapshot = b"".join(
+            f"refs/heads/r{index:05d}\0{commit}\n".encode("ascii")
+            for index in range(20_001)
+        )
+    real_run_git = checkpoint_module.run_git
+    ref_commands: list[tuple[str, ...]] = []
+
+    def oversized_ref_snapshot(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args and args[0] == "for-each-ref":
+            ref_commands.append(args)
+            return subprocess.CompletedProcess(args, 0, ref_snapshot, b"")
+        return real_run_git(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(checkpoint_module, "run_git", oversized_ref_snapshot)
+
+    with pytest.raises(CheckpointError, match="ref.*bound|bound.*ref"):
+        checkpoint_module._import_commit_objects(
+            bind_repository(canonical),
+            bind_repository(candidate),
+            (commit,),
+        )
+    assert ref_commands
+    assert all("--count=20001" in command for command in ref_commands)
 
 
 def test_checkpoint_prepare_distinct_candidate_imports_exact_objects_without_ref_update(

@@ -92,6 +92,10 @@ _SERVICE_COMMIT_FIELDS = {
 MAX_MESSAGE_BYTES = 1_048_576
 MAX_AUDIT_FILE_BYTES = MAX_VERSIONED_FILE_BYTES
 MAX_PREPARED_BYTES = 4_194_304
+MAX_CHECKPOINT_INDEX_BYTES = 4_194_304
+MAX_FETCH_HEAD_BYTES = 1_048_576
+MAX_CANONICAL_REFS = 20_000
+MAX_CANONICAL_REF_SNAPSHOT_BYTES = 4_194_304
 
 
 class CheckpointError(ValueError):
@@ -229,7 +233,10 @@ class CheckpointService:
             self.canonical_repository,
             self.canonical_ref,
         )
-        user_index = _snapshot_file(self.candidate_repository.git_dir / "index")
+        user_index = _snapshot_file(
+            self.candidate_repository.git_dir / "index",
+            max_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+        )
 
         audit = self.audit_service.audit(proposal_ref)
         _validate_audit_testimony(audit, transition_id)
@@ -314,7 +321,10 @@ class CheckpointService:
             )
 
         audit_path = self.candidate_repository.root / audit_ref
-        audit_snapshot_before = _snapshot_file(audit_path)
+        audit_snapshot_before = _snapshot_file(
+            audit_path,
+            max_bytes=MAX_AUDIT_FILE_BYTES,
+        )
         if audit_snapshot_before.exists:
             _require_exact_audit_file(audit_path, audit_bytes, audit)
         index_path = checkpoint_root / "index"
@@ -421,7 +431,10 @@ class CheckpointService:
                 user_index,
             )
             reader.revalidate()
-            index_snapshot = _snapshot_file(index_path)
+            index_snapshot = _snapshot_file(
+                index_path,
+                max_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+            )
             if not index_snapshot.exists or index_snapshot.content is None:
                 raise CheckpointError("checkpoint index disappeared after tree creation")
             _verify_index_snapshot_tree(
@@ -496,7 +509,13 @@ class CheckpointService:
                 base_commit,
                 user_index,
             )
-            if _snapshot_file(index_path) != index_snapshot:
+            if (
+                _snapshot_file(
+                    index_path,
+                    max_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+                )
+                != index_snapshot
+            ):
                 raise CheckpointError(
                     "checkpoint temp index changed after prepared publication"
                 )
@@ -512,7 +531,13 @@ class CheckpointService:
                 raise CheckpointError(
                     "prepared checkpoint bytes changed during final validation"
                 )
-            if _snapshot_file(index_path) != index_snapshot:
+            if (
+                _snapshot_file(
+                    index_path,
+                    max_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+                )
+                != index_snapshot
+            ):
                 raise CheckpointError(
                     "checkpoint temp index changed during final validation"
                 )
@@ -570,7 +595,13 @@ class CheckpointService:
             != base_commit
         ):
             raise CheckpointError("repository root, HEAD, or canonical ref drifted")
-        if _snapshot_file(self.candidate_repository.git_dir / "index") != user_index:
+        if (
+            _snapshot_file(
+                self.candidate_repository.git_dir / "index",
+                max_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+            )
+            != user_index
+        ):
             raise CheckpointError("ordinary user index drifted during checkpoint preparation")
 
 
@@ -992,7 +1023,25 @@ def _verify_candidate_tree(
     )
     changed = _decode_paths(result.stdout, "checkpoint tree delta")
     expected = {receipt.path for receipt in receipts}
-    if changed != expected:
+    base_entries = {
+        entry.path: entry
+        for entry in read_repository_tree_entries(
+            repository,
+            base_commit,
+            expected,
+        )
+    }
+    expected_changed = {
+        receipt.path
+        for receipt in receipts
+        if (
+            (base_entry := base_entries.get(receipt.path)) is None
+            or base_entry.kind != "blob"
+            or base_entry.mode != receipt.mode
+            or base_entry.oid != receipt.blob_oid
+        )
+    }
+    if changed != expected_changed:
         raise CheckpointError("checkpoint tree differs outside exact audited paths")
     entries = {
         entry.path: entry
@@ -1076,12 +1125,12 @@ def _import_commit_objects(
         for oid in commits:
             _require_exact_commit(canonical, oid)
         return
-    refs_before = _git_success(
-        run_git(canonical, "for-each-ref", "--format=%(refname)%00%(objectname)"),
-        "snapshot canonical refs",
-    ).stdout
+    refs_before = _snapshot_canonical_refs(canonical, "snapshot canonical refs")
     fetch_paths = {canonical.git_dir / "FETCH_HEAD", canonical.common_dir / "FETCH_HEAD"}
-    fetch_before = {path: _snapshot_file(path) for path in fetch_paths}
+    fetch_before = {
+        path: _snapshot_file(path, max_bytes=MAX_FETCH_HEAD_BYTES)
+        for path in fetch_paths
+    }
     for oid in commits:
         present = run_git(canonical, "cat-file", "-e", f"{oid}^{{commit}}")
         if present.returncode == 0:
@@ -1099,15 +1148,36 @@ def _import_commit_objects(
             f"import audited commit object: {oid}",
         )
         _require_exact_commit(canonical, oid)
-    refs_after = _git_success(
-        run_git(canonical, "for-each-ref", "--format=%(refname)%00%(objectname)"),
-        "verify canonical refs",
-    ).stdout
+    refs_after = _snapshot_canonical_refs(canonical, "verify canonical refs")
     if refs_after != refs_before or any(
-        _snapshot_file(path) != snapshot
+        _snapshot_file(path, max_bytes=MAX_FETCH_HEAD_BYTES) != snapshot
         for path, snapshot in fetch_before.items()
     ):
         raise CheckpointError("audited object import changed a ref or FETCH_HEAD")
+
+
+def _snapshot_canonical_refs(
+    repository: RepositoryBinding,
+    description: str,
+) -> bytes:
+    snapshot = _git_success(
+        run_git(
+            repository,
+            "for-each-ref",
+            f"--count={MAX_CANONICAL_REFS + 1}",
+            "--format=%(refname)%00%(objectname)",
+        ),
+        description,
+    ).stdout
+    count = snapshot.count(b"\n")
+    if snapshot and not snapshot.endswith(b"\n"):
+        count += 1
+    if (
+        len(snapshot) > MAX_CANONICAL_REF_SNAPSHOT_BYTES
+        or count > MAX_CANONICAL_REFS
+    ):
+        raise CheckpointError("canonical ref snapshot exceeds checkpoint bound")
+    return snapshot
 
 
 def _require_exact_commit(repository: RepositoryBinding, oid: str) -> None:
@@ -1284,7 +1354,7 @@ def _ensure_runtime_directory(root: Path, parts: tuple[str, ...]) -> Path:
     return current
 
 
-def _snapshot_file(path: Path) -> _FileSnapshot:
+def _snapshot_file(path: Path, *, max_bytes: int) -> _FileSnapshot:
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -1295,7 +1365,7 @@ def _snapshot_file(path: Path) -> _FileSnapshot:
         or metadata.st_nlink != 1
     ):
         raise CheckpointError(f"authority file must be a single-link plain file: {path}")
-    content = _read_plain_file(path)
+    content = _read_plain_file(path, max_bytes=max_bytes)
     observed = path.lstat()
     identity = (
         observed.st_dev,

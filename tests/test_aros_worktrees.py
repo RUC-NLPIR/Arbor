@@ -117,6 +117,25 @@ def test_read_worktree_inventory_is_strict_read_only_projection(
     assert all("--expire=now" not in call for call in calls)
 
 
+def test_read_repository_and_candidate_status_are_strict_projections(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    commit, _tree = _init_repository(root)
+    repository = bind_repository(root)
+
+    snapshot = worktrees_module.read_repository_snapshot(repository)
+    status = worktrees_module.read_candidate_status(repository)
+
+    assert snapshot == {
+        "repository": str(root.resolve()),
+        "head": commit,
+        "ref": "refs/heads/master",
+        "branch": "master",
+    }
+    assert status == {"state": "available", "dirty": False, "dirty_paths": []}
+
+
 def test_detached_checkout_is_exact_clean_and_hermetic(
     tmp_path: Path,
     monkeypatch,

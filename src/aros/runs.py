@@ -235,7 +235,10 @@ def read_run_inventory(root: str | Path) -> tuple[dict[str, object], ...]:
                     repository.root / status_ref,
                     reader=reader,
                 )
-                inventory.append(_validate_inventory_status(run_id, manifest, status))
+                projection = _validate_inventory_status(run_id, manifest, status)
+                projection["manifest_ref"] = manifest_ref
+                projection["candidate_commit"] = manifest.get("candidate_commit")
+                inventory.append(projection)
             _validate_repository_binding(repository)
             return tuple(inventory)
     except RunError:

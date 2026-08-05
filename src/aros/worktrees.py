@@ -160,6 +160,97 @@ def read_worktree_inventory(
     return tuple(sorted(projected, key=lambda item: str(item["path"])))
 
 
+def read_repository_snapshot(repository: RepositoryBinding) -> dict[str, object]:
+    """Read one exact repository HEAD/ref/branch projection without writes."""
+    _validate_repository_binding(repository)
+    head = _optional_git_projection(
+        repository,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        missing_returncodes=frozenset({1, 128}),
+    )
+    if head is not None and _COMMIT.fullmatch(head) is None:
+        raise WorktreeError("repository HEAD projection is invalid")
+    ref = _optional_git_projection(
+        repository,
+        "symbolic-ref",
+        "--quiet",
+        "HEAD",
+        missing_returncodes=frozenset({1}),
+    )
+    if ref is not None and (
+        not ref.startswith("refs/heads/") or ref == "refs/heads/"
+    ):
+        raise WorktreeError("repository ref projection is invalid")
+    snapshot = {
+        "repository": str(repository.root),
+        "head": head,
+        "ref": ref,
+        "branch": ref.removeprefix("refs/heads/") if ref is not None else None,
+    }
+    _validate_repository_binding(repository)
+    return snapshot
+
+
+def read_candidate_status(repository: RepositoryBinding) -> dict[str, object]:
+    """Read one strict candidate dirty-path projection without index refresh."""
+    _validate_repository_binding(repository)
+    result = _git_result(
+        repository,
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--no-renames",
+    )
+    if result.returncode != 0:
+        raise WorktreeError(f"candidate status projection failed: {_git_error(result)}")
+    changes: list[dict[str, object]] = []
+    for raw in (entry for entry in result.stdout.split(b"\0") if entry):
+        if len(raw) < 4 or raw[2:3] != b" ":
+            raise WorktreeError("candidate status projection is malformed")
+        try:
+            status = raw[:2].decode("ascii")
+            path = raw[3:].decode("utf-8")
+        except UnicodeError as error:
+            raise WorktreeError("candidate status projection is not UTF-8") from error
+        if not path:
+            raise WorktreeError("candidate status projection has an empty path")
+        changes.append(
+            {
+                "path": path,
+                "status": status,
+                "state_sha256": hashlib.sha256(
+                    f"{status}\0{path}".encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+    _validate_repository_binding(repository)
+    ordered = sorted(
+        changes,
+        key=lambda item: (str(item["path"]), str(item["status"])),
+    )
+    return {"state": "available", "dirty": bool(ordered), "dirty_paths": ordered}
+
+
+def _optional_git_projection(
+    repository: RepositoryBinding,
+    *args: str,
+    missing_returncodes: frozenset[int],
+) -> str | None:
+    result = _git_result(repository, *args)
+    if result.returncode in missing_returncodes:
+        return None
+    if result.returncode != 0:
+        raise WorktreeError(f"Git projection failed: {' '.join(args)}: {_git_error(result)}")
+    try:
+        return result.stdout.decode("utf-8").strip()
+    except UnicodeError as error:
+        raise WorktreeError("Git projection returned invalid UTF-8") from error
+
+
 def create_detached_checkout(
     repo: RepositoryBinding,
     path: str | Path,

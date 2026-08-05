@@ -203,5 +203,5 @@ def test_top_level_aros_init_status_and_boot_use_real_workspace(
     assert boot.exit_code == 0, boot.output
     packet = json.loads(boot.output)
     assert packet["schema_version"] == 1
-    assert packet["snapshot"]["canonical"]["head"] is None
+    assert packet["snapshot"]["canonical"] is None
     assert "canonical_head_unavailable" in packet["warnings"]

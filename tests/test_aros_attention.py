@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+import arbor.aros.attention as attention_module
+import arbor.aros.store as store_module
 from arbor.aros.attention import (
     AttentionAuthorityContext,
     ResearchAttentionService,
@@ -197,9 +200,11 @@ def test_attention_separates_head_from_dirty_pending_edits(tmp_path: Path) -> No
     packet = ResearchAttentionService(tmp_path).build()
 
     snapshot = packet["snapshot"]
-    assert snapshot["canonical"]["head"] == head
+    assert snapshot["canonical"] == head
     assert snapshot["candidate"]["head"] == head
-    assert "memory/NOW.md" in _paths(snapshot["candidate"]["dirty_paths"])
+    assert "memory/NOW.md" in _paths(
+        snapshot["candidate"]["git_status"]["dirty_paths"]
+    )
     assert "DIRTY_PENDING_MEANING" not in _compact_json(packet)
     assert "NOW preserves canonical uncertainty verbatim." in _compact_json(packet)
 
@@ -334,13 +339,13 @@ def test_attention_bounds_multibyte_text_and_reports_omissions(
     assert encoded.encode("utf-8").decode("utf-8") == encoded
     assert "truncated" in packet["warnings"]
     assert packet["omitted"]
-    assert any(value["count"] > 0 for value in packet["omitted"].values())
+    assert any(count > 0 for count in packet["omitted"].values())
 
     minimum = service.build(max_chars=512)
     assert len(_compact_json(minimum)) <= 512
     assert len(service.render_text(minimum)) <= 512
-    assert minimum["omitted"]["count"] > 0
-    assert isinstance(minimum["omitted"]["pointers"], list)
+    assert sum(minimum["omitted"].values()) > 0
+    assert "aros boot" in minimum["omitted"]
     for invalid in (511, 16_001, True):
         with pytest.raises(ValueError, match="max_chars"):
             service.build(max_chars=invalid)
@@ -414,11 +419,11 @@ def test_attention_minimum_budget_preserves_shapes_and_accounts_omissions(
         "scientific",
         "institutional",
     }
-    assert packet["snapshot"] == {"head": head}
+    assert packet["snapshot"] == {"canonical": head, "candidate": {}}
     assert "DIRTY_CANDIDATE_MEANING" not in encoded
     assert {"index_incomplete", "truncated"} <= set(packet["warnings"])
-    assert packet["omitted"]["count"] > 10
-    assert "aros boot" in packet["omitted"]["pointers"]
+    assert sum(packet["omitted"].values()) > 10
+    assert "aros boot" in packet["omitted"]
     assert len(encoded) <= 512
     assert json.loads(service.render_text(packet)) == packet
 
@@ -607,14 +612,228 @@ def test_attention_combines_canonical_head_with_candidate_pending_state(
         canonical_repository=bind_repository(canonical),
     ).build()
 
-    assert packet["snapshot"]["canonical"]["head"] == canonical_head
-    assert packet["snapshot"]["canonical"]["repository"] == str(canonical.resolve())
+    assert packet["snapshot"]["canonical"] == canonical_head
+    assert packet["snapshot"]["canonical_repository"] == str(canonical.resolve())
     assert packet["snapshot"]["candidate"]["repository"] == str(candidate.resolve())
     assert "questions/Q-0001/question.md" in _paths(
-        packet["snapshot"]["candidate"]["dirty_paths"]
+        packet["snapshot"]["candidate"]["git_status"]["dirty_paths"]
     )
     assert "dirty candidate" not in _compact_json(packet)
     assert "Exact canonical answer." in _compact_json(packet)
     assert [item["ref"] for item in packet["pending_measurements"]] == [
         f"runs/{manifest['run_id']}/manifest.json"
     ]
+
+
+def test_attention_run_inventory_failure_is_unavailable_and_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path, with_question=False)
+    runs = RunService(tmp_path)
+    manifest = runs.prepare(
+        [sys.executable, "-c", "pass"],
+        idempotency_key="attention-run-alias",
+        actor="principal",
+        security_profile="trusted-local",
+    )
+    run_id = str(manifest["run_id"])
+    status = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    digest = hashlib.sha256(os.fsencode(status.name)).hexdigest()
+    alias = status.parent / f".aros-json-{digest}.attention-crash.tmp"
+    os.link(status, alias, follow_symlinks=False)
+    before = {
+        path: (path.lstat().st_ino, path.lstat().st_nlink, path.read_bytes())
+        for path in (status, alias)
+    }
+    synced: list[Path] = []
+    monkeypatch.setattr(store_module, "_fsync_directory", synced.append)
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    run_availability = packet["snapshot"]["candidate"]["availability"]["runs"]
+    assert run_availability["state"] == "unavailable"
+    assert run_availability["error"]
+    assert "operational_read_failed:runs" in packet["warnings"]
+    assert any(
+        blocker["layer"] == "operational"
+        and blocker["ref"] == "run_inventory"
+        for blocker in packet["blocked_reasons"]
+    )
+    assert packet["pending_measurements"] == []
+    assert synced == []
+    assert {
+        path: (path.lstat().st_ino, path.lstat().st_nlink, path.read_bytes())
+        for path in (status, alias)
+    } == before
+
+
+def test_attention_terminal_inventory_failure_disables_pending_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _service, manifest, _final = observation_support._install_run_final(tmp_path)
+    _finish_observation_workspace(tmp_path)
+
+    def unavailable(_catalog: object) -> object:
+        raise attention_module.ObservationError("terminal catalog unavailable")
+
+    monkeypatch.setattr(
+        attention_module.ObservationCatalog,
+        "enumerate_terminal",
+        unavailable,
+    )
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    terminal = packet["snapshot"]["candidate"]["availability"][
+        "terminal_observations"
+    ]
+    assert terminal["state"] == "unavailable"
+    assert packet["pending_measurements"] == []
+    assert packet["unassimilated_returns"] == []
+    assert not any(
+        item.get("measurement_state") == "terminal_observation_missing"
+        for item in packet["pending_measurements"]
+    )
+    assert str(manifest["run_id"]) not in _compact_json(packet)
+
+
+def test_attention_git_status_failure_is_not_reported_as_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    real_git_result = attention_module._worktrees._git_result
+
+    def failing_status(repository, *args, **kwargs):
+        if "status" in args:
+            return subprocess.CompletedProcess(args, 1, b"", b"status failed")
+        return real_git_result(repository, *args, **kwargs)
+
+    monkeypatch.setattr(attention_module._worktrees, "_git_result", failing_status)
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    status = packet["snapshot"]["candidate"]["git_status"]
+    assert status["state"] == "unavailable"
+    assert "dirty" not in status
+    assert any(
+        blocker["layer"] == "operational"
+        and blocker["ref"] == "candidate_git_status"
+        for blocker in packet["blocked_reasons"]
+    )
+
+
+def test_attention_uses_semantic_owner_for_canonical_git_blobs(tmp_path: Path) -> None:
+    _init_workspace(tmp_path)
+    question = tmp_path / "questions" / "Q-0001" / "question.md"
+    question.write_text(
+        question.read_text(encoding="utf-8")
+        + "\n## Evidence links\n\nnot-json\n",
+        encoding="utf-8",
+    )
+    _commit_workspace(tmp_path, "add invalid owned semantic document")
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    assert packet["active_question"] is not None
+    assert "malformed_semantic_view:questions/Q-0001/question.md" in packet[
+        "warnings"
+    ]
+    assert not packet["active_question"].get("sections")
+
+
+def test_attention_context_is_deeply_immutable_and_bounded(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path, with_question=False)
+    source = {
+        "state": "available",
+        "nested": {"capabilities": ["inspect"]},
+    }
+    obligations = tuple(
+        {"obligation_id": f"OB-{index:04d}", "kind": "review"}
+        for index in range(1_000)
+    )
+    context = AttentionAuthorityContext(
+        authority=source,
+        remaining_budget={"state": "available", "note": "界" * 50_000},
+        institutional_obligations=obligations,
+    )
+    source["nested"]["capabilities"].append("mutated")  # type: ignore[index]
+
+    roomy = ResearchAttentionService(tmp_path).build(
+        max_chars=16_000,
+        context=context,
+    )
+    minimum = ResearchAttentionService(tmp_path).build(
+        max_chars=512,
+        context=context,
+    )
+
+    assert roomy["authority"]["nested"]["capabilities"] == ["inspect"]
+    assert "note" not in roomy["remaining_budget"]
+    assert roomy["omitted"]["institutional obligations"] == 968
+    assert any(
+        pointer.startswith("remaining_budget.note#sha256=") and count == 1
+        for pointer, count in roomy["omitted"].items()
+    )
+    with pytest.raises((AttributeError, TypeError)):
+        context.authority["nested"]["capabilities"].append("blocked")  # type: ignore[index,union-attr]
+    assert len(roomy["current_obligations"]["institutional"]) <= 32
+    assert minimum["authority"] == {"state": "available"}
+    assert minimum["remaining_budget"] == {"state": "available"}
+    assert all(isinstance(count, int) and count > 0 for count in minimum["omitted"].values())
+    assert "aros boot" in minimum["omitted"]
+    assert len(_compact_json(minimum)) <= 512
+    with pytest.raises(TypeError, match="finite JSON-compatible"):
+        AttentionAuthorityContext(
+            authority={"state": "available", "nested": [float("nan")]},
+            remaining_budget={"state": "available"},
+            institutional_obligations=(),
+        )
+
+
+def test_attention_snapshot_and_omitted_schema_are_stable_across_budgets(
+    tmp_path: Path,
+) -> None:
+    head = _init_workspace(tmp_path)
+    service = ResearchAttentionService(tmp_path)
+
+    roomy = service.build(max_chars=8_000)
+    minimum = service.build(max_chars=512)
+
+    for packet in (roomy, minimum):
+        assert packet["snapshot"]["canonical"] == head
+        assert isinstance(packet["snapshot"]["candidate"], dict)
+        assert isinstance(packet["authority"], dict)
+        assert isinstance(packet["remaining_budget"], dict)
+        assert isinstance(packet["hypotheses"], dict)
+        assert isinstance(packet["current_obligations"], dict)
+        assert all(
+            isinstance(pointer, str) and isinstance(count, int) and count > 0
+            for pointer, count in packet["omitted"].items()
+        )
+
+
+def test_attention_fails_when_repository_snapshot_drifts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    real_facts = attention_module._repository_facts
+    calls = 0
+
+    def drifting_facts(repository):
+        nonlocal calls
+        calls += 1
+        facts = real_facts(repository)
+        if calls >= 3:
+            facts["head"] = "0" * 40
+        return facts
+
+    monkeypatch.setattr(attention_module, "_repository_facts", drifting_facts)
+
+    with pytest.raises(ValueError, match="snapshot|changed|drift"):
+        ResearchAttentionService(tmp_path).build()

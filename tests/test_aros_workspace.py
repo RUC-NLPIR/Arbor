@@ -343,8 +343,8 @@ def test_boot_workspace_uses_only_durable_allowlisted_views_and_git(tmp_path: Pa
 
     packet = json.loads(boot)
     assert packet["schema_version"] == 1
-    assert packet["snapshot"]["candidate"]["dirty"] is True
-    assert packet["snapshot"]["canonical"]["head"] is None
+    assert packet["snapshot"]["candidate"]["git_status"]["dirty"] is True
+    assert packet["snapshot"]["canonical"] is None
     assert "FORBIDDEN_ACTIVE_MD_SENTINEL" not in boot
     assert "FORBIDDEN_TRANSCRIPT_SENTINEL" not in boot
     assert "FORBIDDEN_PROVIDER_SENTINEL" not in boot

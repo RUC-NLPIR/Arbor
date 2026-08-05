@@ -138,6 +138,28 @@ _INVENTORY_BASE_FIELDS = {
     "manifest_sha256",
     "updated_at",
 }
+_INVENTORY_LAUNCH_FIELDS = {
+    "actor",
+    "carrier",
+    "tmux_session",
+    "host",
+    "launch_receipt_sha256",
+    "launched_at",
+}
+_INVENTORY_PROCESS_FIELDS = {
+    "runner_pid",
+    "process_pid",
+    "process_pgid",
+    "process_start_token",
+    "started_at",
+    "heartbeat_at",
+}
+_INVENTORY_TERMINAL_FIELDS = {
+    "exit_code",
+    "finished_at",
+    "final_ref",
+}
+_START_TOKEN = re.compile(r"^linux-proc-start:[0-9]+$")
 class RunError(ValueError):
     """Raised when a durable run request is invalid or unsafe."""
 
@@ -271,6 +293,8 @@ def _inventory_run_ids(
         entry = f"{relative_root}/{name}"
         metadata = reader.lstat(entry)
         if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            if _RUN_ID.fullmatch(name) is not None:
+                raise RunError(f"Run inventory identity is not a directory: {entry}")
             continue
         children = reader.listdir(entry)
         if record_name not in children:
@@ -299,6 +323,26 @@ def _validate_inventory_status(
         or not _valid_utc_timestamp(status.get("updated_at"))
     ):
         raise RunError(f"invalid Run inventory status: {run_id}")
+    fields = set(status)
+    launched = _INVENTORY_BASE_FIELDS | _INVENTORY_LAUNCH_FIELDS
+    running = launched | _INVENTORY_PROCESS_FIELDS
+    reconciled_terminal = launched | {
+        "started_at",
+        "heartbeat_at",
+    } | _INVENTORY_TERMINAL_FIELDS
+    running_terminal = running | _INVENTORY_TERMINAL_FIELDS
+    allowed_fields = {
+        "prepared": (_INVENTORY_BASE_FIELDS,),
+        "launched": (launched,),
+        "running": (running,),
+        "lost": (launched | {"reason"}, running | {"reason"}),
+        "completed": (reconciled_terminal, running_terminal),
+        "failed_process": (reconciled_terminal, running_terminal),
+        "timed_out": (reconciled_terminal, running_terminal),
+        "cancelled": (reconciled_terminal, running_terminal),
+    }
+    if fields not in allowed_fields[str(state)]:
+        raise RunError(f"invalid {state} Run inventory status fields: {run_id}")
     for field in (
         "launched_at",
         "started_at",
@@ -312,6 +356,18 @@ def _validate_inventory_status(
             type(status[field]) is not int or int(status[field]) <= 0
         ):
             raise RunError(f"invalid Run inventory status {field}: {run_id}")
+    for field in ("actor", "carrier", "tmux_session", "host", "reason"):
+        if field in status and (
+            not isinstance(status[field], str) or not status[field]
+        ):
+            raise RunError(f"invalid Run inventory status {field}: {run_id}")
+    if "carrier" in status and status["carrier"] != "tmux":
+        raise RunError(f"invalid Run inventory status carrier: {run_id}")
+    if "process_start_token" in status and (
+        not isinstance(status["process_start_token"], str)
+        or _START_TOKEN.fullmatch(str(status["process_start_token"])) is None
+    ):
+        raise RunError(f"invalid Run inventory status process_start_token: {run_id}")
     if "exit_code" in status and status["exit_code"] is not None and type(
         status["exit_code"]
     ) is not int:
@@ -322,8 +378,6 @@ def _validate_inventory_status(
             or re.fullmatch(r"[0-9a-f]{64}", status[field]) is None
         ):
             raise RunError(f"invalid Run inventory status {field}: {run_id}")
-    if state == "prepared" and set(status) != _INVENTORY_BASE_FIELDS:
-        raise RunError(f"invalid prepared Run inventory status: {run_id}")
     if state == "lost" and (
         not isinstance(status.get("reason"), str) or not status["reason"]
     ):

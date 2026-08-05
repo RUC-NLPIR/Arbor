@@ -78,6 +78,14 @@ _MAX_WORKTREES = 16
 _MAX_RIVALS = 16
 _MAX_PENDING = 32
 _MAX_RETURNS = 32
+_OPERATIONAL_SNAPSHOT_ATTEMPTS = 3
+_CONTEXT_STATES = {
+    "available",
+    "unavailable",
+    "not_configured",
+    "exhausted",
+    "blocked",
+}
 
 
 @dataclass(frozen=True)
@@ -95,6 +103,8 @@ class AttentionAuthorityContext:
             raise TypeError("authority must be a mapping")
         if not isinstance(budget, Mapping):
             raise TypeError("remaining_budget must be a mapping")
+        _validate_context_state(authority, "authority")
+        _validate_context_state(budget, "remaining_budget")
         if not isinstance(self.institutional_obligations, tuple) or any(
             not isinstance(item, Mapping) for item in self.institutional_obligations
         ):
@@ -110,6 +120,14 @@ class AttentionAuthorityContext:
             "institutional_obligations",
             institutional,
         )
+
+
+def _validate_context_state(value: Mapping[str, object], field: str) -> None:
+    state = value.get("state")
+    if not isinstance(state, str):
+        raise TypeError(f"{field}.state must be a string")
+    if state not in _CONTEXT_STATES:
+        raise ValueError(f"{field}.state is unknown or unbounded: {state!r}")
 
 
 @dataclass(frozen=True)
@@ -239,23 +257,12 @@ class ResearchAttentionService:
             warnings,
             omitted,
         )
-        terminal, terminal_availability = _terminal_observations(
+        terminal, run_inventory, eval_inventory, availability = (
+            _operational_snapshot(
             self.candidate_repository.root,
             warnings,
+            )
         )
-        run_inventory, run_availability = _run_inventory(
-            self.candidate_repository.root,
-            warnings,
-        )
-        eval_inventory, eval_availability = _eval_inventory(
-            self.candidate_repository.root,
-            warnings,
-        )
-        availability = {
-            "runs": run_availability,
-            "evals": eval_availability,
-            "terminal_observations": terminal_availability,
-        }
         candidate_snapshot = snapshot["candidate"]
         assert isinstance(candidate_snapshot, dict)
         candidate_snapshot["availability"] = availability
@@ -686,6 +693,53 @@ def _terminal_observations(
         return None, {"state": "unavailable", "error": "read_failed"}
 
 
+def _operational_snapshot(
+    root: Path,
+    warnings: list[str],
+) -> tuple[
+    tuple[ObservationRecord, ...] | None,
+    tuple[dict[str, object], ...] | None,
+    tuple[dict[str, object], ...] | None,
+    dict[str, dict[str, str]],
+]:
+    for _attempt in range(_OPERATIONAL_SNAPSHOT_ATTEMPTS):
+        before, before_availability = _terminal_observations(root, warnings)
+        runs, run_availability = _run_inventory(root, warnings)
+        evals, eval_availability = _eval_inventory(root, warnings)
+        after, after_availability = _terminal_observations(root, warnings)
+        terminal_availability = (
+            after_availability
+            if before is not None
+            else before_availability
+        )
+        availability = {
+            "runs": run_availability,
+            "evals": eval_availability,
+            "terminal_observations": terminal_availability,
+        }
+        if before is None or after is None:
+            return None, runs, evals, availability
+        if _terminal_identity(before) == _terminal_identity(after):
+            return after, runs, evals, availability
+    _warn(warnings, "operational_snapshot_unstable")
+    unavailable = {
+        name: {"state": "unavailable", "error": "snapshot_unstable"}
+        for name in ("runs", "evals", "terminal_observations")
+    }
+    return None, None, None, unavailable
+
+
+def _terminal_identity(
+    records: tuple[ObservationRecord, ...],
+) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        sorted(
+            (record.kind, record.ref, record.record_sha256)
+            for record in records
+        )
+    )
+
+
 def _run_inventory(
     root: Path,
     warnings: list[str],
@@ -747,19 +801,28 @@ def _pending_measurements(
         if isinstance(run_id, str):
             linked_runs.add(run_id)
         receipt_ref = f"eval/evaluations/{status['eval_id']}/receipt.json"
-        if receipt_ref in terminal_paths or status.get("evaluation_state") == "completed":
+        if receipt_ref in terminal_paths:
             continue
         eval_id = str(status["eval_id"])
+        terminal_missing = status.get("evaluation_state") == "completed"
         pending_evals.append(
             {
                 "kind": "eval",
                 "ref": f".aros/evaluations/{eval_id}/request.json",
                 "record_sha256": None,
                 "candidate_commit": status.get("candidate_commit"),
-                "measurement_state": status.get("measurement_state"),
+                "measurement_state": (
+                    "terminal_observation_missing"
+                    if terminal_missing
+                    else status.get("measurement_state")
+                ),
                 "process_state": status.get("referenced_process_state"),
                 "evaluation_state": status.get("evaluation_state"),
-                "reason": status.get("reason"),
+                "reason": (
+                    "terminal_observation_missing"
+                    if terminal_missing
+                    else status.get("reason")
+                ),
                 "versioned_paths": [],
                 "retrieval_pointers": [
                     {"path": f".aros/evaluations/{eval_id}/request.json"},

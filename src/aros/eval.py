@@ -237,6 +237,26 @@ def _read_eval_inventory_item(
             }
         )
     execution = service._load_execution(request, reader=reader)
+    live, liveness_reason = _execution_claim_liveness(
+        service,
+        request,
+        execution,
+    )
+    if not live:
+        return _validate_eval_inventory_status(
+            {
+                "eval_id": eval_id,
+                "evaluation_state": "lost",
+                "referenced_process_state": "lost",
+                "measurement_state": "not_available",
+                "run_id": None,
+                "receipt_ref": None,
+                "reason": liveness_reason,
+                "updated_at": execution["claimed_at"],
+                "candidate_commit": request["candidate_commit"],
+                "evaluator_ref": evaluator_ref,
+            }
+        )
     run_link = service._load_run_link(request, execution, reader=reader)
     if run_link is None:
         process_state = "prepared"
@@ -1137,52 +1157,16 @@ class EvalService:
                 reader=reader,
             )
             return ExistingEvaluation(receipt)
-        if execution["host"] != socket.gethostname():
-            return self._receipt_or_lost(
-                request,
-                execution,
-                "execution claim host is not local",
-                reconcile_run=reconcile_run,
-                reader=reader,
-            )
-        lock_state, lock_fd, lock_identity = _observe_execution_lock(
-            self._execution_lock_path(str(request["eval_id"]))
+        live, liveness_reason = _execution_claim_liveness(
+            self,
+            request,
+            execution,
         )
-        if lock_state == "acquired":
-            assert lock_fd is not None
-            try:
-                return self._receipt_or_lost(
-                    request,
-                    execution,
-                    "execution claim lock was released",
-                    reconcile_run=reconcile_run,
-                    reader=reader,
-                )
-            finally:
-                _release_execution_lock(lock_fd)
-        if lock_state == "missing":
+        if not live:
             return self._receipt_or_lost(
                 request,
                 execution,
-                "execution claim lock was released",
-                reconcile_run=reconcile_run,
-                reader=reader,
-            )
-        assert lock_identity is not None
-        broker_pid = int(execution["broker_pid"])
-        if _linux_process_start_token(broker_pid) != execution["broker_start_token"]:
-            return self._receipt_or_lost(
-                request,
-                execution,
-                "execution claim broker is not live",
-                reconcile_run=reconcile_run,
-                reader=reader,
-            )
-        if not _linux_broker_owns_lock(execution, lock_identity):
-            return self._receipt_or_lost(
-                request,
-                execution,
-                "execution claim broker does not own the lock",
+                liveness_reason,
                 reconcile_run=reconcile_run,
                 reader=reader,
             )
@@ -1887,6 +1871,31 @@ def _acquire_existing_idempotency_lock(path: Path) -> int:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _execution_claim_liveness(
+    service: EvalService,
+    request: dict[str, object],
+    execution: dict[str, object],
+) -> tuple[bool, str]:
+    if execution["host"] != socket.gethostname():
+        return False, "execution claim host is not local"
+    lock_state, lock_fd, lock_identity = _observe_execution_lock(
+        service._execution_lock_path(str(request["eval_id"]))
+    )
+    if lock_state == "acquired":
+        assert lock_fd is not None
+        _release_execution_lock(lock_fd)
+        return False, "execution claim lock was released"
+    if lock_state == "missing":
+        return False, "execution claim lock was released"
+    assert lock_identity is not None
+    broker_pid = int(execution["broker_pid"])
+    if _linux_process_start_token(broker_pid) != execution["broker_start_token"]:
+        return False, "execution claim broker is not live"
+    if not _linux_broker_owns_lock(execution, lock_identity):
+        return False, "execution claim broker does not own the lock"
+    return True, "execution claim is live"
 
 
 def _observe_execution_lock(

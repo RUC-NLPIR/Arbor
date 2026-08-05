@@ -145,6 +145,12 @@ def _mark_run_lost(root: Path, service: RunService, run_id: str) -> None:
     status.update(
         {
             "state": "lost",
+            "actor": "principal",
+            "carrier": "tmux",
+            "tmux_session": f"aros-{run_id.lower()}",
+            "host": "attention-test-host",
+            "launch_receipt_sha256": "a" * 64,
+            "launched_at": status["updated_at"],
             "reason": "process_absent_without_final_receipt",
         }
     )
@@ -699,6 +705,101 @@ def test_attention_terminal_inventory_failure_disables_pending_inference(
     assert str(manifest["run_id"]) not in _compact_json(packet)
 
 
+def test_attention_retries_when_terminal_observations_change_mid_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = observation_support._install_eval_receipt(tmp_path)
+    _finish_observation_workspace(tmp_path)
+    real_enumerate = attention_module.ObservationCatalog.enumerate_terminal
+    calls = 0
+
+    def publish_between_reads(catalog):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ()
+        return real_enumerate(catalog)
+
+    monkeypatch.setattr(
+        attention_module.ObservationCatalog,
+        "enumerate_terminal",
+        publish_between_reads,
+    )
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    assert calls >= 4
+    assert [item["ref"] for item in packet["unassimilated_returns"]] == [
+        installed["receipt_ref"]
+    ]
+    assert packet["pending_measurements"] == []
+
+
+def test_attention_completed_eval_missing_terminal_record_stays_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = observation_support._install_eval_receipt(tmp_path)
+    _finish_observation_workspace(tmp_path)
+    monkeypatch.setattr(
+        attention_module.ObservationCatalog,
+        "enumerate_terminal",
+        lambda _catalog: (),
+    )
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    assert packet["unassimilated_returns"] == []
+    assert [item["kind"] for item in packet["pending_measurements"]] == ["eval"]
+    assert packet["pending_measurements"][0]["measurement_state"] == (
+        "terminal_observation_missing"
+    )
+    eval_id = Path(str(installed["receipt_ref"])).parent.name
+    assert packet["pending_measurements"][0]["ref"].endswith(
+        f"{eval_id}/request.json"
+    )
+    assert any(
+        blocker["layer"] == "operational"
+        and blocker["reason"] == "terminal_observation_missing"
+        for blocker in packet["blocked_reasons"]
+    )
+
+
+def test_attention_unstable_operational_snapshot_becomes_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observation_support._install_eval_receipt(tmp_path)
+    _finish_observation_workspace(tmp_path)
+    real_enumerate = attention_module.ObservationCatalog.enumerate_terminal
+    calls = 0
+
+    def always_changes(catalog):
+        nonlocal calls
+        calls += 1
+        return () if calls % 2 else real_enumerate(catalog)
+
+    monkeypatch.setattr(
+        attention_module.ObservationCatalog,
+        "enumerate_terminal",
+        always_changes,
+    )
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    availability = packet["snapshot"]["candidate"]["availability"]
+    assert all(item["state"] == "unavailable" for item in availability.values())
+    assert packet["pending_measurements"] == []
+    assert packet["unassimilated_returns"] == []
+    assert "operational_snapshot_unstable" in packet["warnings"]
+    assert any(
+        blocker["layer"] == "operational"
+        and blocker["reason"] == "snapshot_unstable"
+        for blocker in packet["blocked_reasons"]
+    )
+
+
 def test_attention_git_status_failure_is_not_reported_as_clean(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -828,6 +929,33 @@ def test_attention_preserves_supplied_context_until_packet_requires_fitting(
     assert minimum["remaining_budget"] == {"state": "available"}
     assert minimum["omitted"]["aros boot"] >= 2
     assert len(_compact_json(minimum)) <= 512
+
+
+@pytest.mark.parametrize(
+    ("target", "state"),
+    [
+        ("authority", 7),
+        ("authority", "x" * 200),
+        ("authority", "invented"),
+        ("remaining_budget", None),
+        ("remaining_budget", "x" * 200),
+        ("remaining_budget", "invented"),
+    ],
+)
+def test_attention_context_rejects_unbounded_or_unknown_states(
+    target: str,
+    state: object,
+) -> None:
+    authority: dict[str, object] = {"state": "available"}
+    budget: dict[str, object] = {"state": "available"}
+    (authority if target == "authority" else budget)["state"] = state
+
+    with pytest.raises((TypeError, ValueError), match="state"):
+        AttentionAuthorityContext(
+            authority=authority,
+            remaining_budget=budget,
+            institutional_obligations=(),
+        )
 
 
 def test_attention_snapshot_and_omitted_schema_are_stable_across_budgets(

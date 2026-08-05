@@ -818,6 +818,33 @@ def test_read_eval_inventory_keeps_lost_request_without_receipt_pending(
     )
 
 
+@requires_linux_claims
+def test_read_eval_inventory_uses_execution_claim_liveness(tmp_path: Path) -> None:
+    root = tmp_path / "repository"
+    _manifest, _tree, candidate_commit = _init_evaluator_repository(root)
+    service = EvalService(root)
+    service.register("eval/suites/quality/1/manifest.json", actor="registrar")
+    lease = service._begin_execution(
+        "quality",
+        "1",
+        candidate_commit,
+        "principal",
+        "inventory-execution-liveness",
+    )
+    assert isinstance(lease, eval_module.ExecutionLease)
+
+    live = eval_module.read_eval_inventory(root)[0]
+    assert live["evaluation_state"] == "running"
+    assert live["updated_at"] == lease.execution["claimed_at"]
+
+    lease.close()
+    lost = eval_module.read_eval_inventory(root)[0]
+    assert lost["evaluation_state"] == "lost"
+    assert lost["referenced_process_state"] == "lost"
+    assert lost["reason"] == "execution claim lock was released"
+    assert lost["updated_at"] == lease.execution["claimed_at"]
+
+
 @pytest.mark.parametrize("tamper", ["invalid_id", "malformed", "nan"])
 def test_read_eval_inventory_rejects_invalid_identity_and_json(
     tmp_path: Path,

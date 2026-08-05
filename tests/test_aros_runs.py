@@ -901,6 +901,45 @@ def test_read_run_inventory_rejects_invalid_identity_and_nonfinite_json(
         runs_module.read_run_inventory(tmp_path)
 
 
+@pytest.mark.parametrize("shape", ["symlink", "file"])
+def test_read_run_inventory_rejects_valid_looking_non_directory_identity(
+    tmp_path: Path,
+    shape: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    invalid = runs_root / f"RUN-{shape}"
+    if shape == "symlink":
+        backing = tmp_path / "run-backing"
+        backing.mkdir()
+        invalid.symlink_to(backing, target_is_directory=True)
+    else:
+        invalid.write_text("not a Run directory\n", encoding="utf-8")
+
+    with pytest.raises(RunError, match="identity|directory|inventory"):
+        runs_module.read_run_inventory(tmp_path)
+
+
+@pytest.mark.parametrize("tamper", ["base_only_running", "wrong_optional_type"])
+def test_read_run_inventory_rejects_incomplete_or_mistyped_running_status(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key=f"inventory-{tamper}")
+    run_id = str(manifest["run_id"])
+    status_path = tmp_path / ".aros" / "runs" / run_id / "status.json"
+    status = service.status(run_id, reconcile=False)
+    status["state"] = "running"
+    if tamper == "wrong_optional_type":
+        status["process_pid"] = "123"
+    atomic_write_json(status_path, status)
+
+    with pytest.raises(RunError, match="running|status|process_pid"):
+        runs_module.read_run_inventory(tmp_path)
+
+
 @pytest.mark.parametrize(
     "tamper",
     (

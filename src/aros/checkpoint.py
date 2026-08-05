@@ -265,6 +265,23 @@ class CheckpointService:
         if len(audit_bytes) > MAX_AUDIT_FILE_BYTES:
             raise CheckpointError("audit testimony exceeds the checkpoint bound")
         audit_ref = f"transitions/{transition_id}/audit.json"
+        prepared_ref = f".aros/checkpoints/{transition_id}/prepared.json"
+        index_ref = f".aros/checkpoints/{transition_id}/index"
+        audit_file_sha256 = hashlib.sha256(audit_bytes).hexdigest()
+        known_binding = {
+            "schema_version": 1,
+            "transition_id": transition_id,
+            "prepared_ref": prepared_ref,
+            "proposal_ref": proposal_ref,
+            "proposal_blob_sha256": audit["proposal_blob_sha256"],
+            "canonical_ref": self.canonical_ref,
+            "base_commit": base_commit,
+            "audit_payload_sha256": audit["audit_payload_sha256"],
+            "audit_file_sha256": audit_file_sha256,
+            "candidate_subject_sha256": audit["candidate_subject_sha256"],
+            "message_sha256": message_sha256,
+            "index_ref": index_ref,
+        }
         expected = _expected_candidate_paths(
             audit,
             proposal_ref,
@@ -276,6 +293,14 @@ class CheckpointService:
             self.candidate_repository.root,
             (".aros", "checkpoints", transition_id),
         )
+        prepared_path = checkpoint_root / "prepared.json"
+        existing = _read_prepared_if_present(prepared_path)
+        if existing is not None and any(
+            existing[0][key] != value for key, value in known_binding.items()
+        ):
+            raise CheckpointError(
+                "prepared checkpoint retry conflicts with durable binding"
+            )
         staged = _staged_paths(
             self.candidate_repository,
             base_commit,
@@ -293,7 +318,6 @@ class CheckpointService:
         if audit_snapshot_before.exists:
             _require_exact_audit_file(audit_path, audit_bytes, audit)
         index_path = checkpoint_root / "index"
-        index_ref = index_path.relative_to(self.candidate_repository.root).as_posix()
         captured: dict[str, bytes] = {}
         receipts: tuple[CandidatePathReceipt, ...]
         candidate_tree: str
@@ -413,7 +437,6 @@ class CheckpointService:
                 expected_sha256=index_sha256,
                 capture_limit=None,
             )
-            prepared_ref = f".aros/checkpoints/{transition_id}/prepared.json"
             record: dict[str, object] = {
                 "schema_version": 1,
                 "transition_id": transition_id,
@@ -423,7 +446,7 @@ class CheckpointService:
                 "canonical_ref": self.canonical_ref,
                 "base_commit": base_commit,
                 "audit_payload_sha256": audit["audit_payload_sha256"],
-                "audit_file_sha256": hashlib.sha256(audit_bytes).hexdigest(),
+                "audit_file_sha256": audit_file_sha256,
                 "candidate_subject_sha256": audit["candidate_subject_sha256"],
                 "candidate_tree": candidate_tree,
                 "message_sha256": message_sha256,
@@ -440,17 +463,16 @@ class CheckpointService:
                 "index_sha256": index_sha256,
             }
             prepared_bytes = _stored_json_bytes(record)
-            _create_once_audit(audit_path, audit_bytes, audit)
-            observed_audit, audit_mode = _read_anchored_candidate(reader, audit_ref)
-            if observed_audit != audit_bytes or audit_mode != "100644":
-                raise CheckpointError("published audit file differs from testimony")
-
-            prepared_path = self.candidate_repository.root / prepared_ref
             existing = _read_prepared_if_present(prepared_path)
             if existing is not None and existing != (record, prepared_bytes):
                 raise CheckpointError(
                     "prepared checkpoint retry conflicts byte-for-byte"
                 )
+            _create_once_audit(audit_path, audit_bytes, audit)
+            observed_audit, audit_mode = _read_anchored_candidate(reader, audit_ref)
+            if observed_audit != audit_bytes or audit_mode != "100644":
+                raise CheckpointError("published audit file differs from testimony")
+
             if existing is None and not create_json(prepared_path, record):
                 existing = _read_prepared_if_present(prepared_path)
                 if existing != (record, prepared_bytes):

@@ -389,14 +389,60 @@ def test_checkpoint_prepare_is_exactly_idempotent_and_conflicting_retry_fails(
     first = service.prepare(proposal_ref, "stable message")
     prepared_path = tmp_path / first.prepared_ref
     prepared_bytes = prepared_path.read_bytes()
-    audit_bytes = (tmp_path / "transitions/T-checkpoint/audit.json").read_bytes()
+    audit_path = tmp_path / "transitions/T-checkpoint/audit.json"
+    audit_bytes = audit_path.read_bytes()
+    audit_path.unlink()
     second = service.prepare(proposal_ref, "stable message")
 
     assert second == first
     assert prepared_path.read_bytes() == prepared_bytes
-    assert (tmp_path / "transitions/T-checkpoint/audit.json").read_bytes() == audit_bytes
+    assert audit_path.read_bytes() == audit_bytes
     with pytest.raises(CheckpointError, match="conflict|message|retry"):
         service.prepare(proposal_ref, "different message")
+    assert prepared_path.read_bytes() == prepared_bytes
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ("message", "candidate", "proposal", "prepared_bytes"),
+)
+def test_checkpoint_prepare_incompatible_retry_does_not_restore_missing_audit(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    prepared = service.prepare(proposal_ref, "stable message")
+    prepared_path = tmp_path / prepared.prepared_ref
+    prepared_bytes = prepared_path.read_bytes()
+    audit_path = tmp_path / "transitions/T-checkpoint/audit.json"
+    audit_path.unlink()
+    message = "stable message"
+    if drift == "message":
+        message = "different message"
+    elif drift == "candidate":
+        (tmp_path / "memory/NOW.md").write_text(
+            "# Current State\n\n## Findings\n\nDifferent finding.\n",
+            encoding="utf-8",
+        )
+    elif drift == "proposal":
+        proposal_path = tmp_path / proposal_ref
+        proposal = json.loads(proposal_path.read_bytes())
+        proposal_path.write_text(
+            json.dumps(proposal, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        record = json.loads(prepared_bytes)
+        prepared_path.write_text(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        prepared_bytes = prepared_path.read_bytes()
+
+    with pytest.raises(CheckpointError, match="conflict|retry"):
+        service.prepare(proposal_ref, message)
+
+    assert not audit_path.exists()
     assert prepared_path.read_bytes() == prepared_bytes
 
 

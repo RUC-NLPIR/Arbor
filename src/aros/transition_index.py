@@ -18,6 +18,7 @@ from . import worktrees as _worktrees
 from .checkpoint import (
     MAX_ADMISSION_RECEIPT_BYTES,
     MAX_AUDIT_FILE_BYTES,
+    _admission_receipt_bindings,
     _decode_admission_receipt,
     _expected_candidate_paths,
     _stored_json_bytes,
@@ -632,10 +633,14 @@ def _validate_admitted_transition(
     ):
         raise _IndexIncomplete("transition audit binding is invalid")
     receipt = _decode_admission_receipt(admission_bytes)
+    receipt_subject, receipt_audit, receipt_ref, _receipt_sha256 = (
+        _admission_receipt_bindings(receipt)
+    )
     if (
-        receipt["candidateSubjectSHA256"] != audit["candidate_subject_sha256"]
-        or receipt["auditPayloadSHA256"] != audit["audit_payload_sha256"]
-        or receipt["canonicalRef"] != canonical_ref
+        receipt_subject != audit["candidate_subject_sha256"]
+        or receipt_audit != audit["audit_payload_sha256"]
+        or receipt_ref is not None
+        and receipt_ref != canonical_ref
     ):
         raise _IndexIncomplete("transition admission binding is invalid")
     expected = _expected_candidate_paths(

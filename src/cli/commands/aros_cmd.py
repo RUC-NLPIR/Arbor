@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 import typer
 from typer.core import TyperCommand
 
+from ...aros.checkpoint import (
+    CheckpointService,
+    _decode_human_direct_admission_receipt,
+    bind_repository,
+    read_repository_snapshot,
+)
 from ...aros.eval import EvalService, ExistingEvaluation
 from ...aros.principal import build_principal_agent, run_principal
 from ...aros.runs import RunService
+from ...aros.store import canonical_json_bytes
 from ...aros.tasks import TaskService
 from ...aros.workspace import (
     DEFAULT_BOOT_MAX_CHARS,
@@ -77,6 +87,49 @@ def _print_json(value: Any) -> None:
 def _fail(exc: Exception) -> None:
     typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
     raise typer.Exit(code=2) from exc
+
+
+class HumanDirectGateway:
+    """Issue only explicit cooperative human-direct checkpoint receipts."""
+
+    def __init__(self, *, clock: Callable[[], int] | None = None):
+        selected_clock = clock or (lambda: time.time_ns() // 1_000_000)
+        if not callable(selected_clock):
+            raise TypeError("human-direct clock must be callable")
+        self._clock = selected_clock
+
+    def admit_transition(
+        self,
+        *,
+        candidate_subject_sha256: str,
+        audit_payload_sha256: str,
+        audit_testimony: Mapping[str, object],
+    ) -> bytes:
+        del audit_testimony
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "receipt_kind": "human_direct",
+            "decision": "allow",
+            "candidate_subject_sha256": candidate_subject_sha256,
+            "audit_payload_sha256": audit_payload_sha256,
+            "enforcement_class": "cooperative",
+            "issuer": "human-direct",
+            "issued_at": self._clock(),
+        }
+        receipt = canonical_json_bytes(
+            {
+                **payload,
+                "receipt_sha256": hashlib.sha256(
+                    canonical_json_bytes(payload)
+                ).hexdigest(),
+            }
+        )
+        _decode_human_direct_admission_receipt(receipt)
+        return receipt
+
+    def revalidate_transition(self, receipt: bytes) -> bytes:
+        _decode_human_direct_admission_receipt(receipt)
+        return receipt
 
 
 class _RequireCommandSeparator(TyperCommand):
@@ -149,6 +202,59 @@ def status_command(
     missing = status.get("missing")
     if missing:
         typer.echo("missing: " + ", ".join(str(item) for item in missing))
+
+
+@aros_app.command("checkpoint")
+def checkpoint_command(
+    proposal_ref: str = typer.Option(
+        ...,
+        "--proposal",
+        help="Tracked transitions/T-*/proposal.json to checkpoint.",
+    ),
+    message: str = typer.Option(
+        ...,
+        "--message",
+        help="Exact Git commit message.",
+    ),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+    cooperative_human_direct: bool = typer.Option(
+        False,
+        "--cooperative-human-direct",
+        help=(
+            "Explicitly use cooperative human-direct admission for same-UID "
+            "writable Git."
+        ),
+    ),
+) -> None:
+    """Create one explicitly cooperative human-direct checkpoint."""
+    if not cooperative_human_direct:
+        _fail(
+            ValueError(
+                "checkpoint requires explicit --cooperative-human-direct; "
+                "same-UID writable Git is cooperative"
+            )
+        )
+    try:
+        root = _root(cwd)
+        repository = bind_repository(root)
+        canonical_ref = read_repository_snapshot(repository).get("ref")
+        if not isinstance(canonical_ref, str):
+            raise ValueError("checkpoint requires an attached canonical Git branch")
+        result = CheckpointService(
+            root,
+            canonical_repository=repository,
+            canonical_ref=canonical_ref,
+            gateway=HumanDirectGateway(),
+        ).checkpoint(proposal_ref, message)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(
+        {
+            **result,
+            "checkpoint_authority": "human-direct",
+            "enforcement_class": "cooperative",
+        }
+    )
 
 
 @run_app.command("start", cls=_RequireCommandSeparator)

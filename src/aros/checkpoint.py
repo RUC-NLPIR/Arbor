@@ -138,6 +138,17 @@ _ADMISSION_RECEIPT_FIELDS = {
     "issuedAt",
     "receiptSHA256",
 }
+_HUMAN_DIRECT_RECEIPT_FIELDS = {
+    "schema_version",
+    "receipt_kind",
+    "decision",
+    "candidate_subject_sha256",
+    "audit_payload_sha256",
+    "enforcement_class",
+    "issuer",
+    "issued_at",
+    "receipt_sha256",
+}
 _FINALIZE_FENCE_FIELDS = {
     "schemaVersion",
     "receiptSHA256",
@@ -755,19 +766,21 @@ class CheckpointService:
                 raise CheckpointError(
                     "finalize retry receipt differs from canonical admission"
                 )
-            if (
-                not isinstance(finalize_fence, bytes)
-                or len(finalize_fence) > MAX_FINALIZE_FENCE_BYTES
-            ):
-                raise CheckpointError("finalize retry fence bytes are invalid")
+            _require_finalize_authorization(
+                admission_receipt,
+                admitted.admission,
+                finalize_fence,
+                clock=None,
+            )
             return _project_admitted_checkpoint(self, admitted)
         state = _load_finalization_state(self, prepared_ref, transition_id)
         receipt = _decode_admission_receipt(admission_receipt)
         _require_receipt_binding(receipt, state.record, self.canonical_ref)
-        _decode_finalize_fence(
+        _require_finalize_authorization(
+            admission_receipt,
+            receipt,
             finalize_fence,
-            receipt=receipt,
-            now_ms=self.clock(),
+            clock=self.clock,
         )
         self.barrier.reach("after_allow")
 
@@ -832,10 +845,11 @@ class CheckpointService:
         )
         receipt = _decode_admission_receipt(admission_receipt)
         _require_receipt_binding(receipt, repeated.record, self.canonical_ref)
-        _decode_finalize_fence(
+        _require_finalize_authorization(
+            admission_receipt,
+            receipt,
             finalize_fence,
-            receipt=receipt,
-            now_ms=self.clock(),
+            clock=self.clock,
         )
         if (
             _snapshot_file(
@@ -855,10 +869,11 @@ class CheckpointService:
         self.barrier.reach("after_commit_object")
 
         def require_current_fence() -> None:
-            _decode_finalize_fence(
+            _require_finalize_authorization(
+                admission_receipt,
+                receipt,
                 finalize_fence,
-                receipt=receipt,
-                now_ms=self.clock(),
+                clock=self.clock,
             )
 
         _atomic_ref_transaction(
@@ -2127,7 +2142,7 @@ def _expected_admitted_event(
         "base_commit": admitted.record["base_commit"],
         "commit": admitted.commit,
         "canonical_ref": service.canonical_ref,
-        "receipt_sha256": admitted.admission["receiptSHA256"],
+        "receipt_sha256": _admission_receipt_bindings(admitted.admission)[3],
     }
     event = {**payload, "event_sha256": json_sha256(payload)}
     return _ExpectedAdmittedEvent(
@@ -2181,7 +2196,7 @@ def _write_projection_intent(
         "base_commit": record["base_commit"],
         "commit": commit,
         "canonical_ref": service.canonical_ref,
-        "receipt_sha256": receipt["receiptSHA256"],
+        "receipt_sha256": _admission_receipt_bindings(receipt)[3],
     }
     intent = {**payload, "projection_sha256": json_sha256(payload)}
     path = (
@@ -2563,6 +2578,31 @@ def _epoch_milliseconds() -> int:
 
 
 def _decode_admission_receipt(raw: bytes) -> dict[str, object]:
+    if not isinstance(raw, bytes) or not raw or len(raw) > MAX_ADMISSION_RECEIPT_BYTES:
+        raise CheckpointError("admission receipt bytes exceed the bound")
+    try:
+        value = _strict_json_loads(raw)
+        validate_json_shape(value, max_depth=8, max_nodes=2_048)
+    except (
+        JsonStructureError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ) as error:
+        raise CheckpointError(
+            f"admission receipt is not strict UTF-8 JSON: {error}"
+        ) from error
+    if not isinstance(value, dict):
+        raise CheckpointError("admission receipt has invalid fields")
+    fields = set(value)
+    if fields == _ADMISSION_RECEIPT_FIELDS:
+        return _decode_procontract_admission_receipt(raw)
+    if fields == _HUMAN_DIRECT_RECEIPT_FIELDS:
+        return _decode_human_direct_admission_receipt(raw)
+    raise CheckpointError("admission receipt has invalid fields")
+
+
+def _decode_procontract_admission_receipt(raw: bytes) -> dict[str, object]:
     receipt = _decode_canonical_record(
         raw,
         fields=_ADMISSION_RECEIPT_FIELDS,
@@ -2647,6 +2687,45 @@ def _decode_admission_receipt(raw: bytes) -> dict[str, object]:
     return receipt
 
 
+def _decode_human_direct_admission_receipt(raw: bytes) -> dict[str, object]:
+    receipt = _decode_canonical_record(
+        raw,
+        fields=_HUMAN_DIRECT_RECEIPT_FIELDS,
+        hash_field="receipt_sha256",
+        max_bytes=MAX_ADMISSION_RECEIPT_BYTES,
+        description="human-direct admission receipt",
+    )
+    if type(receipt["schema_version"]) is not int or receipt["schema_version"] != 1:
+        raise CheckpointError(
+            "human-direct admission receipt schema_version must be integer 1"
+        )
+    if receipt["receipt_kind"] != "human_direct":
+        raise CheckpointError(
+            "human-direct admission receipt receipt_kind must be human_direct"
+        )
+    if receipt["decision"] != "allow":
+        raise CheckpointError("human-direct admission receipt decision must be allow")
+    if receipt["enforcement_class"] != "cooperative":
+        raise CheckpointError(
+            "human-direct admission receipt enforcement_class must be cooperative"
+        )
+    if receipt["issuer"] != "human-direct":
+        raise CheckpointError(
+            "human-direct admission receipt issuer must be human-direct"
+        )
+    for field in (
+        "candidate_subject_sha256",
+        "audit_payload_sha256",
+        "receipt_sha256",
+    ):
+        _required_sha256(receipt[field], f"human-direct admission receipt {field}")
+    _nonnegative_integer(
+        receipt["issued_at"],
+        "human-direct admission receipt issued_at timestamp",
+    )
+    return receipt
+
+
 def _decode_finalize_fence(
     raw: bytes,
     *,
@@ -2704,16 +2783,70 @@ def _decode_finalize_fence(
     return fence
 
 
+def _require_finalize_authorization(
+    receipt_raw: bytes,
+    receipt: Mapping[str, object],
+    token_raw: bytes,
+    *,
+    clock: Callable[[], int] | None,
+) -> None:
+    if not isinstance(token_raw, bytes) or len(token_raw) > MAX_FINALIZE_FENCE_BYTES:
+        raise CheckpointError("finalize fence bytes are invalid")
+    fields = set(receipt)
+    if fields == _HUMAN_DIRECT_RECEIPT_FIELDS:
+        if token_raw != receipt_raw:
+            raise CheckpointError(
+                "human-direct cooperative token must equal admission receipt bytes"
+            )
+        return
+    if fields != _ADMISSION_RECEIPT_FIELDS:
+        raise CheckpointError("finalize fence receipt binding is invalid")
+    if clock is None:
+        return
+    _decode_finalize_fence(
+        token_raw,
+        receipt=receipt,
+        now_ms=clock(),
+    )
+
+
+def _admission_receipt_bindings(
+    receipt: Mapping[str, object],
+) -> tuple[str, str, str | None, str]:
+    fields = set(receipt)
+    if fields == _ADMISSION_RECEIPT_FIELDS:
+        subject = receipt["candidateSubjectSHA256"]
+        audit = receipt["auditPayloadSHA256"]
+        canonical_ref: object = receipt["canonicalRef"]
+        receipt_sha256 = receipt["receiptSHA256"]
+    elif fields == _HUMAN_DIRECT_RECEIPT_FIELDS:
+        subject = receipt["candidate_subject_sha256"]
+        audit = receipt["audit_payload_sha256"]
+        canonical_ref = None
+        receipt_sha256 = receipt["receipt_sha256"]
+    else:
+        raise CheckpointError("admission receipt binding has invalid fields")
+    _required_sha256(subject, "admission receipt candidate subject")
+    _required_sha256(audit, "admission receipt audit payload")
+    _required_sha256(receipt_sha256, "admission receipt self-hash")
+    if canonical_ref is not None and not isinstance(canonical_ref, str):
+        raise CheckpointError("admission receipt canonical ref is invalid")
+    return str(subject), str(audit), canonical_ref, str(receipt_sha256)
+
+
 def _require_receipt_binding(
     receipt: Mapping[str, object],
     prepared: Mapping[str, object],
     canonical_ref: str,
 ) -> None:
-    if receipt["candidateSubjectSHA256"] != prepared["candidate_subject_sha256"]:
+    subject, audit, receipt_ref, _receipt_sha256 = _admission_receipt_bindings(
+        receipt
+    )
+    if subject != prepared["candidate_subject_sha256"]:
         raise CheckpointError("admission receipt candidate subject does not match")
-    if receipt["auditPayloadSHA256"] != prepared["audit_payload_sha256"]:
+    if audit != prepared["audit_payload_sha256"]:
         raise CheckpointError("admission receipt audit payload does not match")
-    if receipt["canonicalRef"] != canonical_ref:
+    if receipt_ref is not None and receipt_ref != canonical_ref:
         raise CheckpointError("admission receipt canonical ref does not match service")
 
 

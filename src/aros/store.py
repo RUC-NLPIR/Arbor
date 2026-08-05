@@ -395,7 +395,13 @@ class AnchoredWorkspaceReader:
             pass
 
     def require_git_marker(self) -> None:
-        metadata = self.lstat(".git")
+        key = self._workspace_file_key(".git")
+        with self._open_directory(key[:-1]) as descriptor:
+            metadata = os.stat(
+                key[-1],
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
         if stat.S_ISDIR(metadata.st_mode):
             self.require_directory(".git")
         elif stat.S_ISREG(metadata.st_mode):

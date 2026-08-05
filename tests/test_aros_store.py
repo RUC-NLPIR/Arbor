@@ -7,6 +7,7 @@ import json
 import math
 import os
 import stat
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -735,6 +736,22 @@ def test_anchored_workspace_reader_exit_revalidates_automatically(
         with store_module.AnchoredWorkspaceReader(tmp_path) as reader:
             assert reader.read_json("record.json") == {"version": 1}
             os.replace(replacement, target)
+
+
+def test_anchored_repository_allows_git_directory_metadata_change(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    git_dir = tmp_path / ".git"
+
+    with store_module.AnchoredWorkspaceReader(tmp_path) as reader:
+        reader.require_repository(tmp_path, git_dir, git_dir)
+        metadata = git_dir.stat()
+        os.utime(
+            git_dir,
+            ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+        )
+        reader.revalidate()
 
 
 def test_anchored_workspace_reader_preserves_body_and_revalidation_errors(

@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -252,6 +253,133 @@ def test_attention_deduplicates_eval_linked_run(tmp_path: Path) -> None:
     assert [item["ref"] for item in returns] == [installed["receipt_ref"]]
     assert returns[0]["kind"] == "measurement"
     assert all(item["kind"] != "run_final" for item in returns)
+
+
+def test_attention_reads_transition_index_once_and_hides_proven_assimilation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = observation_support._install_eval_receipt(tmp_path)
+    _finish_observation_workspace(tmp_path)
+    observation_ref = str(installed["receipt_ref"])
+    record = SimpleNamespace(
+        observation_ref=observation_ref,
+        transition_id="T-attention-assimilation",
+        commit="a" * 40,
+        affected_paths=("memory/NOW.md",),
+        rationale="memory/NOW.md#Findings",
+        record_sha256="b" * 64,
+    )
+    latest = SimpleNamespace(
+        transition_id="T-attention-assimilation",
+        commit="a" * 40,
+        assimilations=(record,),
+        evidence_links=({"link_id": "EL-attention"},),
+    )
+    calls = 0
+
+    class _Index:
+        def __init__(self, *_args: object, **_kwargs: object):
+            pass
+
+        def read(self) -> object:
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(
+                state="complete",
+                assimilations={observation_ref: (record,)},
+                latest_evidence_transition=latest,
+            )
+
+    monkeypatch.setattr(attention_module, "TransitionIndex", _Index)
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    assert calls == 1
+    assert packet["unassimilated_returns"] == []
+    assert packet["pending_measurements"] == []
+    assert packet["recent_evidence_delta"] == [
+        {
+            "transition_id": "T-attention-assimilation",
+            "commit": "a" * 40,
+            "assimilations": [
+                {
+                    "observation_ref": observation_ref,
+                    "affected_paths": ["memory/NOW.md"],
+                    "rationale": "memory/NOW.md#Findings",
+                    "record_sha256": "b" * 64,
+                }
+            ],
+                "evidence_links": [{"link_id": "EL-attention"}],
+        }
+    ]
+    assert "index_incomplete" not in packet["warnings"]
+
+    minimum = ResearchAttentionService(tmp_path).build(max_chars=512)
+
+    assert calls == 2
+    assert len(_compact_json(minimum)) <= 512
+    pointer = [
+        {
+            "transition_id": "T-attention-assimilation",
+            "commit": "a" * 40,
+        }
+    ]
+    assert minimum["recent_evidence_delta"] == pointer
+    assert minimum["omitted"]
+
+    rivals = tmp_path / "model" / "rivals"
+    rivals.mkdir(exist_ok=True)
+    for number in range(20):
+        (rivals / f"R-{number:02d}.md").write_text(
+            f"# Rival {number}\n\n" + "unrelated oversized content " * 100,
+            encoding="utf-8",
+        )
+    _commit_workspace(tmp_path, "add unrelated oversized rivals")
+
+    oversized = ResearchAttentionService(tmp_path).build()
+
+    assert calls == 3
+    assert oversized["recent_evidence_delta"]
+    assert oversized["recent_evidence_delta"][0]["transition_id"] == (
+        "T-attention-assimilation"
+    )
+    assert oversized["recent_evidence_delta"][0]["commit"] == "a" * 40
+    assert len(_compact_json(oversized)) <= 8_000
+
+
+def test_attention_incomplete_index_retains_terminal_observation_and_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = observation_support._install_eval_receipt(tmp_path)
+    _finish_observation_workspace(tmp_path)
+    observation_ref = str(installed["receipt_ref"])
+    calls = 0
+
+    class _IncompleteIndex:
+        def __init__(self, *_args: object, **_kwargs: object):
+            pass
+
+        def read(self) -> object:
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(
+                state="index_incomplete",
+                assimilations={observation_ref: (object(),)},
+                latest_evidence_transition=object(),
+            )
+
+    monkeypatch.setattr(attention_module, "TransitionIndex", _IncompleteIndex)
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    assert calls == 1
+    assert [item["ref"] for item in packet["unassimilated_returns"]] == [
+        observation_ref
+    ]
+    assert packet["recent_evidence_delta"] == []
+    assert "index_incomplete" in packet["warnings"]
 
 
 def test_attention_terminal_record_appears_only_in_unassimilated(tmp_path: Path) -> None:

@@ -27,6 +27,7 @@ from .research_files import (
 )
 from .runs import RunError, read_run_inventory
 from .store import AnchoredReadError, AnchoredWorkspaceReader
+from .transition_index import TransitionIndex
 from .worktrees import (
     RepositoryBinding,
     WorktreeError,
@@ -297,10 +298,26 @@ class ResearchAttentionService:
         candidate_snapshot = snapshot["candidate"]
         assert isinstance(candidate_snapshot, dict)
         candidate_snapshot["availability"] = availability
+        transition_index = TransitionIndex(
+            self.candidate_repository,
+            self.canonical_repository,
+        ).read()
+        if transition_index.state == "complete":
+            assimilated = set(transition_index.assimilations)
+            recent_evidence_delta = _recent_evidence_delta(
+                transition_index.latest_evidence_transition
+            )
+        else:
+            assimilated = set()
+            recent_evidence_delta = []
+            _warn(warnings, "index_incomplete")
         visible_terminal = (
             _visible_terminal_observations(terminal, eval_inventory)
             if terminal is not None
             else ()
+        )
+        visible_terminal = tuple(
+            record for record in visible_terminal if record.ref not in assimilated
         )
         unassimilated = (
             bound_items(
@@ -335,14 +352,12 @@ class ResearchAttentionService:
             availability,
             candidate_state,
         )
-        _warn(warnings, "index_incomplete")
-
         packet: dict[str, object] = {
             "schema_version": 1,
             "snapshot": snapshot,
             "active_question": active_question,
             "current_uncertainty": current_uncertainty,
-            "recent_evidence_delta": [],
+            "recent_evidence_delta": recent_evidence_delta,
             "hypotheses": hypotheses,
             "pending_measurements": pending,
             "unassimilated_returns": unassimilated,
@@ -356,9 +371,26 @@ class ResearchAttentionService:
             "warnings": warnings,
             "omitted": omitted,
         }
+        if recent_evidence_delta and len(packet_json(packet)) > max_chars:
+            latest = recent_evidence_delta[0]
+            transition_id = latest["transition_id"]
+            detail_count = len(latest["assimilations"]) + len(
+                latest["evidence_links"]
+            )
+            add_omission(
+                omitted,
+                f"transition:{transition_id}:detail",
+                max(1, detail_count),
+            )
+            packet["recent_evidence_delta"] = [
+                {
+                    "transition_id": transition_id,
+                    "commit": latest["commit"],
+                }
+            ]
         if omitted:
             _warn(warnings, "truncated")
-        fit_packet(packet, max_chars)
+        _fit_with_recent_evidence_priority(packet, max_chars)
         if (
             _repository_facts(self.canonical_repository) != canonical_facts
             or _repository_facts(self.candidate_repository) != candidate_facts
@@ -855,6 +887,74 @@ def _visible_terminal_observations(
             and record.payload["run_id"] in linked_runs
         )
     )
+
+
+def _recent_evidence_delta(value: object) -> list[dict[str, object]]:
+    if value is None:
+        return []
+    assimilations = getattr(value, "assimilations")
+    evidence_links = getattr(value, "evidence_links")
+    return [
+        {
+            "transition_id": getattr(value, "transition_id"),
+            "commit": getattr(value, "commit"),
+            "assimilations": [
+                {
+                    "observation_ref": getattr(item, "observation_ref"),
+                    "affected_paths": list(getattr(item, "affected_paths")),
+                    "rationale": getattr(item, "rationale"),
+                    "record_sha256": getattr(item, "record_sha256"),
+                }
+                for item in assimilations
+            ],
+            "evidence_links": [_plain_json(item) for item in evidence_links],
+        }
+    ]
+
+
+def _fit_with_recent_evidence_priority(
+    packet: dict[str, object],
+    max_chars: int,
+) -> None:
+    try:
+        fit_packet(packet, max_chars)
+        return
+    except ValueError:
+        recent = packet["recent_evidence_delta"]
+        if not isinstance(recent, list) or not recent:
+            raise
+    omitted = packet["omitted"]
+    assert isinstance(omitted, dict)
+    omitted_count = max(1, sum(int(count) for count in omitted.values()))
+    packet.update(
+        {
+            "snapshot": {},
+            "active_question": None,
+            "current_uncertainty": [],
+            "hypotheses": {"leading": [], "competing": []},
+            "pending_measurements": [],
+            "unassimilated_returns": [],
+            "current_obligations": {"scientific": [], "institutional": []},
+            "remaining_budget": {},
+            "blocked_reasons": [],
+            "authority": {},
+            "warnings": ["truncated"],
+            "omitted": {"aros boot": omitted_count},
+        }
+    )
+    if len(packet_json(packet)) <= max_chars:
+        return
+    packet["recent_evidence_delta"] = []
+    if len(packet_json(packet)) > max_chars:
+        raise ValueError("max_chars is too small for the attention packet shape")
+
+
+def _plain_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _plain_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_plain_json(item) for item in value]
+    return value
 
 
 def _observation_item(record: ObservationRecord) -> dict[str, object]:

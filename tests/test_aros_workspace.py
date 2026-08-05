@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -201,7 +202,7 @@ def test_status_workspace_reports_explicit_views_without_reading_their_meaning(
     }
 
 
-def test_status_and_boot_discover_bounded_operational_run_facts(
+def test_status_workspace_discovers_bounded_operational_run_facts(
     tmp_path: Path, monkeypatch,
 ) -> None:
     from arbor.aros import runs as runs_module
@@ -258,14 +259,6 @@ def test_status_and_boot_discover_bounded_operational_run_facts(
     }
     assert all("unbounded_detail" not in item for item in summary["items"])
 
-    boot = boot_workspace(tmp_path)
-    assert "## Operational runs" in boot
-    assert "RUN-running-important" in boot
-    assert "RUN-lost-important" in boot
-    assert "completed=24" in boot
-    assert "additional runs omitted" in boot
-
-
 def test_run_discovery_reports_operational_error_without_inventing_lost_state(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -291,12 +284,6 @@ def test_run_discovery_reports_operational_error_without_inventing_lost_state(
         "truncated": False,
         "operational_error": "receipt store is unreadable",
     }
-
-    boot = boot_workspace(tmp_path)
-    assert "## Operational runs" in boot
-    assert "Operational error: receipt store is unreadable" in boot
-    assert "state: lost" not in boot
-
 
 def test_status_workspace_reports_git_dirty_state_and_worktrees(tmp_path: Path) -> None:
     _init_git(tmp_path)
@@ -354,11 +341,10 @@ def test_boot_workspace_uses_only_durable_allowlisted_views_and_git(tmp_path: Pa
 
     boot = boot_workspace(tmp_path)
 
-    assert "Find the causal mechanism." in boot
-    assert "The strongest counterevidence is C." in boot
-    assert "Is mediator M load-bearing?" in boot
-    assert "## Git and workspace status" in boot
-    assert "Branch:" in boot
+    packet = json.loads(boot)
+    assert packet["schema_version"] == 1
+    assert packet["snapshot"]["candidate"]["dirty"] is True
+    assert packet["snapshot"]["canonical"]["head"] is None
     assert "FORBIDDEN_ACTIVE_MD_SENTINEL" not in boot
     assert "FORBIDDEN_TRANSCRIPT_SENTINEL" not in boot
     assert "FORBIDDEN_PROVIDER_SENTINEL" not in boot
@@ -376,13 +362,28 @@ def test_boot_workspace_has_a_strict_size_limit_without_losing_git_reality(
     )
 
     boot = boot_workspace(tmp_path, max_chars=1_000)
+    packet = json.loads(boot)
 
     assert len(boot) <= 1_000
-    assert "## Mission and constraints" in boot
-    assert "## Working memory" in boot
-    assert "## Live questions" in boot
-    assert "## Git and workspace status" in boot
-    assert "truncated" in boot
+    assert set(packet) == {
+        "schema_version",
+        "snapshot",
+        "active_question",
+        "current_uncertainty",
+        "recent_evidence_delta",
+        "hypotheses",
+        "pending_measurements",
+        "unassimilated_returns",
+        "current_obligations",
+        "remaining_budget",
+        "blocked_reasons",
+        "authority",
+        "warnings",
+        "omitted",
+    }
+    assert "truncated" in packet["warnings"]
+    assert "canonical" in packet["snapshot"]
+    assert "candidate" in packet["snapshot"]
 
 
 def test_boot_workspace_rejects_a_useless_size_limit(tmp_path: Path) -> None:

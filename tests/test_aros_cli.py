@@ -201,4 +201,7 @@ def test_top_level_aros_init_status_and_boot_use_real_workspace(
 
     boot = runner.invoke(app, ["aros", "boot", "--cwd", str(tmp_path)])
     assert boot.exit_code == 0, boot.output
-    assert "Real CLI smoke" in boot.output
+    packet = json.loads(boot.output)
+    assert packet["schema_version"] == 1
+    assert packet["snapshot"]["canonical"]["head"] is None
+    assert "canonical_head_unavailable" in packet["warnings"]

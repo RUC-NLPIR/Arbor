@@ -12,9 +12,14 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .attention import (
+    DEFAULT_ATTENTION_MAX_CHARS,
+    AttentionAuthorityContext,
+    ResearchAttentionService,
+)
 
-DEFAULT_BOOT_MAX_CHARS = 12_000
-_MIN_BOOT_MAX_CHARS = 512
+
+DEFAULT_BOOT_MAX_CHARS = DEFAULT_ATTENTION_MAX_CHARS
 _MAX_CHANGES = 100
 _MAX_WORKTREES = 50
 _MAX_RUNS = 20
@@ -143,45 +148,25 @@ def status_workspace(root: str | Path) -> dict[str, object]:
     }
 
 
+def boot_packet(
+    root: str | Path,
+    max_chars: int = DEFAULT_BOOT_MAX_CHARS,
+    context: AttentionAuthorityContext | None = None,
+) -> dict[str, object]:
+    """Return the bounded packet used by every boot renderer."""
+    return ResearchAttentionService(root).build(max_chars=max_chars, context=context)
+
+
 def boot_workspace(
     root: str | Path,
     *,
     max_chars: int = DEFAULT_BOOT_MAX_CHARS,
+    context: AttentionAuthorityContext | None = None,
 ) -> str:
-    """Build a compact restart context from durable, explicitly allowed views."""
-    if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < _MIN_BOOT_MAX_CHARS:
-        raise ValueError(f"max_chars must be an integer >= {_MIN_BOOT_MAX_CHARS}")
-
-    workspace = Path(root).expanduser().resolve()
-    status = status_workspace(workspace)
-    if not status["initialized"]:
-        raise ValueError(
-            f"workspace is not initialized; run `aros init` at the Git root: {workspace}"
-        )
-    sections: list[tuple[str, str]] = [
-        (
-            "Mission and constraints — AROS.md",
-            _read_workspace_view(workspace, _VIEWS["mission"], max_chars),
-        ),
-        (
-            "Working memory — memory/NOW.md",
-            _read_workspace_view(workspace, _VIEWS["now"], max_chars),
-        ),
-    ]
-    if status["views"]["frontier"]["exists"]:  # type: ignore[index]
-        sections.append(
-            (
-                "Live questions — questions/FRONTIER.md",
-                _read_workspace_view(workspace, _VIEWS["frontier"], max_chars),
-            )
-        )
-    runs = status["runs"]
-    assert isinstance(runs, dict)
-    if runs["items"] or runs["operational_error"]:
-        sections.append(("Operational runs", _format_runs(runs)))
-    sections.append(("Git and workspace status", _format_status(status)))
-
-    return _render_bounded_sections(sections, max_chars)
+    """Render the exact ResearchAttentionPacket built for this boot."""
+    service = ResearchAttentionService(root)
+    packet = service.build(max_chars=max_chars, context=context)
+    return service.render_text(packet)
 
 
 def _write_new(path: Path, content: str) -> bool:
@@ -347,6 +332,15 @@ def _compact_run(run: dict[str, object]) -> dict[str, object]:
     return summary
 
 
+def _clip(content: str, limit: int) -> str:
+    if len(content) <= limit:
+        return content
+    marker = "\n\n[truncated]"
+    if limit <= len(marker):
+        return marker[:limit]
+    return content[: limit - len(marker)].rstrip() + marker
+
+
 def _parse_worktrees(raw: str) -> list[dict[str, object]]:
     worktrees: list[dict[str, object]] = []
     current: dict[str, object] | None = None
@@ -381,104 +375,3 @@ def _is_workspace_file(root: Path, relative: str) -> bool:
     except (OSError, ValueError):
         return False
     return path.is_file()
-
-
-def _read_workspace_view(root: Path, relative: str, limit: int) -> str:
-    if not _is_workspace_file(root, relative):
-        return "(missing)"
-    path = root / relative
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            content = handle.read(limit + 1)
-    except OSError as error:
-        return f"(unavailable: {error})"
-    if not content:
-        return "(empty)"
-    if len(content) > limit:
-        return _clip(content, limit)
-    return content.rstrip()
-
-
-def _format_status(status: dict[str, object]) -> str:
-    git = status["git"]
-    assert isinstance(git, dict)
-    lines = [
-        f"Initialized: {'yes' if status['initialized'] else 'no'}",
-        f"Repository: {'yes' if git['is_repository'] else 'no'}",
-        f"Branch: {git['branch'] or '(detached or unavailable)'}",
-        f"HEAD: {git['head'] or '(unborn or unavailable)'}",
-        f"Dirty: {'yes' if git['dirty'] else 'no'}",
-    ]
-    changes = git["changes"]
-    assert isinstance(changes, list)
-    if changes:
-        lines.append("Changes:")
-        lines.extend(f"- {change}" for change in changes)
-        if git["changes_truncated"]:
-            lines.append("- [additional changes truncated]")
-    worktrees = git["worktrees"]
-    assert isinstance(worktrees, list)
-    if worktrees:
-        lines.append("Worktrees:")
-        for worktree in worktrees:
-            assert isinstance(worktree, dict)
-            lines.append(
-                f"- {worktree['path']} "
-                f"[{worktree['branch'] or 'detached'} @ {worktree['head'] or 'unborn'}]"
-            )
-        if git["worktrees_truncated"]:
-            lines.append("- [additional worktrees truncated]")
-    return "\n".join(lines)
-
-
-def _format_runs(runs: dict[str, object]) -> str:
-    error = runs["operational_error"]
-    if error:
-        return f"Operational error: {error}"
-
-    counts = runs["counts"]
-    items = runs["items"]
-    assert isinstance(counts, dict)
-    assert isinstance(items, list)
-    count_text = ", ".join(f"{state}={count}" for state, count in counts.items())
-    lines = [f"Total: {runs['total']}", f"States: {count_text or '(none)'}"]
-    for item in items:
-        assert isinstance(item, dict)
-        line = f"- {item['run_id']}: {item['state']}"
-        if item.get("updated_at"):
-            line += f"; updated={item['updated_at']}"
-        if item.get("exit_code") is not None:
-            line += f"; exit_code={item['exit_code']}"
-        if item.get("reason"):
-            line += f"; reason={item['reason']}"
-        if item.get("final_ref"):
-            line += f"; final={item['final_ref']}"
-        lines.append(line)
-    if runs["truncated"]:
-        lines.append("- [additional runs omitted]")
-    return "\n".join(lines)
-
-
-def _render_bounded_sections(sections: list[tuple[str, str]], limit: int) -> str:
-    def render(contents: list[str]) -> str:
-        parts = ["# AROS Boot"]
-        for (title, _), content in zip(sections, contents):
-            parts.extend((f"## {title}", content))
-        return "\n\n".join(parts) + "\n"
-
-    empty = render([""] * len(sections))
-    available = limit - len(empty)
-    if available < len(sections):
-        raise ValueError("max_chars is too small for the boot section headers")
-    per_section = available // len(sections)
-    contents = [_clip(content, per_section) for _, content in sections]
-    return render(contents)
-
-
-def _clip(content: str, limit: int) -> str:
-    if len(content) <= limit:
-        return content
-    marker = "\n\n[truncated]"
-    if limit <= len(marker):
-        return marker[:limit]
-    return content[: limit - len(marker)].rstrip() + marker

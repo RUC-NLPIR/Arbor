@@ -800,3 +800,26 @@ def test_cache_has_exact_minimal_nested_record_schema(tmp_path: Path) -> None:
         "evidence_links",
     }
     assert hashlib.sha256(_cache_path(fixture).read_bytes()).hexdigest()
+
+
+def test_transition_index_state_json_is_explicit_and_json_safe(tmp_path: Path) -> None:
+    from arbor.aros.transition_index import transition_index_state_json
+
+    fixture = _admitted_assimilation(tmp_path)
+    index = _index(fixture)
+    incomplete = transition_index_state_json(index.read())
+    complete = transition_index_state_json(index.rebuild())
+
+    assert incomplete == {
+        "state": "index_incomplete",
+        "head": fixture.assimilation_commit,
+        "validated_through": None,
+        "assimilations": {},
+        "latest_evidence_transition": None,
+    }
+    cache = _read_cache(fixture)
+    assert complete == {
+        "state": "complete",
+        **{key: value for key, value in cache.items() if key != "schema_version"},
+    }
+    assert json.loads(json.dumps(complete, sort_keys=True)) == complete

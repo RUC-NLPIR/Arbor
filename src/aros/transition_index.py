@@ -400,6 +400,24 @@ def _encode_state(state: TransitionIndexState) -> dict[str, object]:
     }
 
 
+def transition_index_state_json(state: TransitionIndexState) -> dict[str, object]:
+    """Return the explicit JSON-safe projection of one index operation."""
+    if not isinstance(state, TransitionIndexState):
+        raise TypeError("state must be a TransitionIndexState")
+    return {
+        "state": state.state,
+        "head": state.head,
+        "validated_through": state.validated_through,
+        "assimilations": {
+            observation_ref: [_encode_assimilation_record(item) for item in records]
+            for observation_ref, records in sorted(state.assimilations.items())
+        },
+        "latest_evidence_transition": _encode_evidence_transition(
+            state.latest_evidence_transition
+        ),
+    }
+
+
 def _encode_assimilation_record(value: AssimilationRecord) -> dict[str, object]:
     return {
         "observation_ref": value.observation_ref,
@@ -1124,4 +1142,5 @@ __all__ = [
     "TransitionIndex",
     "TransitionIndexError",
     "TransitionIndexState",
+    "transition_index_state_json",
 ]

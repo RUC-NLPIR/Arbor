@@ -164,9 +164,12 @@ def boot_workspace(
     context: AttentionAuthorityContext | None = None,
 ) -> str:
     """Render the exact ResearchAttentionPacket built for this boot."""
-    service = ResearchAttentionService(root)
-    packet = service.build(max_chars=max_chars, context=context)
-    return service.render_text(packet)
+    return render_boot_packet(boot_packet(root, max_chars=max_chars, context=context))
+
+
+def render_boot_packet(packet: dict[str, object]) -> str:
+    """Render one already-built packet without deriving another observation."""
+    return ResearchAttentionService.render_text(packet)
 
 
 def _write_new(path: Path, content: str) -> bool:

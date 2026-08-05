@@ -16,18 +16,25 @@ from typer.core import TyperCommand
 from ...aros.checkpoint import (
     CheckpointService,
     _decode_human_direct_admission_receipt,
-    bind_repository,
-    read_repository_snapshot,
 )
 from ...aros.eval import EvalService, ExistingEvaluation
 from ...aros.principal import build_principal_agent, run_principal
 from ...aros.runs import RunService
 from ...aros.store import canonical_json_bytes
 from ...aros.tasks import TaskService
+from ...aros.transition_index import TransitionIndex, transition_index_state_json
+from ...aros.transitions import TransitionAuditService
+from ...aros.worktrees import (
+    RepositoryBinding,
+    bind_repository,
+    read_repository_snapshot,
+)
 from ...aros.workspace import (
     DEFAULT_BOOT_MAX_CHARS,
+    boot_packet,
     boot_workspace,
     init_workspace,
+    render_boot_packet,
     status_workspace,
 )
 from ...core import AgentConfig, create_provider
@@ -65,9 +72,15 @@ eval_app = typer.Typer(
     help=_EVAL_MEASUREMENT_BOUNDARY,
     no_args_is_help=True,
 )
+transition_app = typer.Typer(
+    name="transition",
+    help="Audit explicit research transition proposals.",
+    no_args_is_help=True,
+)
 aros_app.add_typer(run_app, name="run")
 aros_app.add_typer(task_app, name="task")
 aros_app.add_typer(eval_app, name="eval")
+aros_app.add_typer(transition_app, name="transition")
 
 
 def llm_defaults() -> dict[str, Any]:
@@ -78,6 +91,18 @@ def llm_defaults() -> dict[str, Any]:
 
 def _root(cwd: Path) -> Path:
     return cwd.expanduser().resolve()
+
+
+def _attached_repository(root: Path) -> tuple[RepositoryBinding, str]:
+    repository = bind_repository(root)
+    snapshot = read_repository_snapshot(repository)
+    canonical_ref = snapshot.get("ref")
+    if not isinstance(snapshot.get("head"), str) or not isinstance(
+        canonical_ref,
+        str,
+    ):
+        raise ValueError("operation requires an attached canonical Git branch")
+    return repository, canonical_ref
 
 
 def _print_json(value: Any) -> None:
@@ -167,13 +192,17 @@ def boot_command(
         min=1,
         help="Maximum characters in the derived boot context.",
     ),
+    as_json: bool = typer.Option(False, "--json", help="Emit the exact packet as JSON."),
 ) -> None:
     """Render the compact, provider-independent Principal boot context."""
     try:
-        context = boot_workspace(_root(cwd), max_chars=max_chars)
+        packet = boot_packet(_root(cwd), max_chars=max_chars)
     except (OSError, RuntimeError, ValueError) as exc:
         _fail(exc)
-    typer.echo(context)
+    if as_json:
+        typer.echo(render_boot_packet(packet))
+        return
+    typer.echo(render_boot_packet(packet))
 
 
 @aros_app.command("status")
@@ -255,6 +284,48 @@ def checkpoint_command(
             "enforcement_class": "cooperative",
         }
     )
+
+
+@transition_app.command("audit")
+def transition_audit_command(
+    proposal_ref: str = typer.Argument(
+        ...,
+        metavar="PROPOSAL",
+        help="Tracked transitions/T-*/proposal.json to audit.",
+    ),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Emit deterministic read-only testimony for one transition proposal."""
+    try:
+        root = _root(cwd)
+        _repository, canonical_ref = _attached_repository(root)
+        result = TransitionAuditService(
+            root,
+            canonical_ref=canonical_ref,
+        ).audit(proposal_ref)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(result)
+
+
+@aros_app.command("audit")
+def audit_command(
+    rebuild_index: bool = typer.Option(
+        False,
+        "--rebuild-index",
+        help="Explicitly rebuild the full disposable transition index.",
+    ),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+) -> None:
+    """Run an explicitly selected repository audit operation."""
+    if not rebuild_index:
+        _fail(ValueError("audit requires explicit --rebuild-index"))
+    try:
+        repository, _canonical_ref = _attached_repository(_root(cwd))
+        state = TransitionIndex(repository, repository).rebuild()
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    _print_json(transition_index_state_json(state))
 
 
 @run_app.command("start", cls=_RequireCommandSeparator)

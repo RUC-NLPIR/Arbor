@@ -96,7 +96,15 @@ def test_clean_configured_wheel_contents_include_oauth_modules(tmp_path: Path) -
 def test_direct_aros_help_is_the_root_app() -> None:
     result = runner.invoke(aros_app, ["--help"])
     assert result.exit_code == 0, result.output
-    for command in ("init", "boot", "status", "start", "run"):
+    for command in (
+        "init",
+        "boot",
+        "status",
+        "start",
+        "run",
+        "transition",
+        "audit",
+    ):
         assert command in result.output
     assert "\naros " not in result.output
 

@@ -398,7 +398,8 @@ class ResearchAttentionService:
             raise ValueError("repository snapshot changed while building attention")
         return packet
 
-    def render_text(self, packet: dict[str, object]) -> str:
+    @staticmethod
+    def render_text(packet: dict[str, object]) -> str:
         """Render the supplied packet itself, with no independent summary path."""
         if not isinstance(packet, dict) or set(packet) != _TOP_LEVEL_KEYS:
             raise ValueError("packet must have the exact ResearchAttentionPacket shape")

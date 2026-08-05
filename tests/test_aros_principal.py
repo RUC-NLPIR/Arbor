@@ -5,14 +5,19 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
-import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from arbor.aros.attention import AttentionAuthorityContext
 from arbor.aros.principal import (
     build_principal_agent,
     run_principal,
 )
+from arbor.aros.research_tool import ResearchTool
+from arbor.aros.worktrees import bind_repository
 from arbor.core.agent import Agent
 from arbor.core.llm.base import LLMResponse, TextBlock, ToolUseBlock, Usage
 from arbor.core.tools.file_edit import FileEditTool
@@ -35,6 +40,32 @@ class _ScriptedProvider:
 
     def count_tokens(self, text: str) -> int:
         return max(1, len(text) // 4)
+
+
+def _workspace(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "config", "user.email", "principal@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "config", "user.name", "Principal Test"],
+        check=True,
+    )
+    (root / ".gitignore").write_text("/.aros/\n/.worktree/\n", encoding="utf-8")
+    (root / "AROS.md").write_text("# AROS\n", encoding="utf-8")
+    (root / "memory").mkdir()
+    (root / "memory" / "NOW.md").write_text("# Current State\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(root), "add", ".gitignore", "AROS.md", "memory/NOW.md"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "-qm", "initial principal workspace"],
+        check=True,
+    )
+    return root
 
 
 def _tool_response(name: str, tool_input: dict[str, Any]) -> LLMResponse:
@@ -61,9 +92,10 @@ def _text_response(text: str) -> LLMResponse:
 
 
 def test_build_principal_uses_native_agent_and_exact_default_tools(tmp_path: Path):
+    root = _workspace(tmp_path)
     agent = build_principal_agent(
         _ScriptedProvider(),
-        tmp_path,
+        root,
         "mission: understand the system",
     )
 
@@ -74,7 +106,7 @@ def test_build_principal_uses_native_agent_and_exact_default_tools(tmp_path: Pat
         "Glob",
         "Edit",
         "Write",
-        "Inspect",
+        "Research",
         "Eval",
         "Run",
         "Task",
@@ -82,15 +114,16 @@ def test_build_principal_uses_native_agent_and_exact_default_tools(tmp_path: Pat
     assert agent.tools["Eval"].persist_results is False
     assert agent.tools["Task"].persist_results is False
     assert agent.config.auto_git is False
-    assert agent.config.runtime_dir == str(tmp_path / ".aros" / "agent")
-    assert (tmp_path / ".aros" / "agent").is_dir()
-    assert not (tmp_path / ".arbor").exists()
-    assert str(tmp_path) in agent.system_prompt
+    assert agent.config.runtime_dir == str(root / ".aros" / "agent")
+    assert (root / ".aros" / "agent").is_dir()
+    assert not (root / ".arbor").exists()
+    assert str(root) in agent.system_prompt
     assert "mission: understand the system" in agent.system_prompt
 
 
 def test_principal_prompt_states_the_trusted_local_task_boundary(tmp_path: Path):
-    agent = build_principal_agent(_ScriptedProvider(), tmp_path, "boot")
+    root = _workspace(tmp_path)
+    agent = build_principal_agent(_ScriptedProvider(), root, "boot")
     prompt = " ".join(agent.system_prompt.lower().split())
 
     assert "trusted-local and application-scoped, not a security sandbox" in prompt
@@ -105,9 +138,10 @@ def test_principal_prompt_states_the_trusted_local_task_boundary(tmp_path: Path)
 
 
 def test_principal_shell_is_opt_in_bounded_and_foreground_only(tmp_path: Path):
+    root = _workspace(tmp_path)
     agent = build_principal_agent(
         _ScriptedProvider(),
-        tmp_path,
+        root,
         "boot",
         allow_shell=True,
     )
@@ -118,7 +152,7 @@ def test_principal_shell_is_opt_in_bounded_and_foreground_only(tmp_path: Path):
         "Glob",
         "Edit",
         "Write",
-        "Inspect",
+        "Research",
         "Eval",
         "Run",
         "Task",
@@ -136,7 +170,8 @@ def test_principal_shell_is_opt_in_bounded_and_foreground_only(tmp_path: Path):
 def test_principal_eval_tool_states_measurement_interpretation_and_no_retry(
     tmp_path: Path,
 ) -> None:
-    agent = build_principal_agent(_ScriptedProvider(), tmp_path, "boot")
+    root = _workspace(tmp_path)
+    agent = build_principal_agent(_ScriptedProvider(), root, "boot")
     description = " ".join(agent.tools["Eval"].description.lower().split())
 
     assert "apparatus produces factual measurements" in description
@@ -146,23 +181,58 @@ def test_principal_eval_tool_states_measurement_interpretation_and_no_retry(
         assert unavailable not in description
 
 
-def test_inspect_returns_workspace_status_as_json(tmp_path: Path, monkeypatch):
-    from arbor.aros import principal
+def test_principal_research_defaults_to_attached_workspace_without_authority(
+    tmp_path: Path,
+) -> None:
+    root = _workspace(tmp_path)
+    binding = bind_repository(root)
 
-    expected = {
-        "initialized": True,
-        "git": {"head": "abc123", "dirty": ["memory/NOW.md"]},
-    }
-    monkeypatch.setattr(principal, "status_workspace", lambda root: expected)
-    agent = build_principal_agent(_ScriptedProvider(), tmp_path, "boot")
+    agent = build_principal_agent(_ScriptedProvider(), root, "boot")
 
-    result = asyncio.run(agent.tools["Inspect"].execute())
+    research = agent.tools["Research"]
+    assert isinstance(research, ResearchTool)
+    assert research.candidate_root == root
+    assert research.canonical_repository == binding
+    assert research.canonical_ref == "refs/heads/main"
+    assert research.attention_context is None
+    assert research.checkpoint_service.gateway is None
 
-    assert json.loads(result) == expected
+
+def test_principal_injects_explicit_research_host_context_without_schema_change(
+    tmp_path: Path,
+) -> None:
+    root = _workspace(tmp_path)
+    binding = bind_repository(root)
+    gateway = object()
+    context = AttentionAuthorityContext(
+        authority={"state": "available"},
+        remaining_budget={"state": "available"},
+        institutional_obligations=(),
+    )
+    expected_schema = copy.deepcopy(ResearchTool.input_schema)
+
+    agent = build_principal_agent(
+        _ScriptedProvider(),
+        root,
+        "boot",
+        canonical_repository=binding,
+        canonical_ref="refs/heads/main",
+        admission_gateway=gateway,
+        attention_context=context,
+    )
+
+    research = agent.tools["Research"]
+    assert isinstance(research, ResearchTool)
+    assert research.canonical_repository is binding
+    assert research.canonical_ref == "refs/heads/main"
+    assert research.attention_context is context
+    assert research.checkpoint_service.gateway is gateway
+    assert research.input_schema == expected_schema
 
 
 def test_principal_directly_writes_workspace_without_legacy_runtime(tmp_path: Path):
-    target = tmp_path / "artifact.txt"
+    root = _workspace(tmp_path)
+    target = root / "artifact.txt"
     provider = _ScriptedProvider([
         _tool_response(
             "Write",
@@ -173,7 +243,7 @@ def test_principal_directly_writes_workspace_without_legacy_runtime(tmp_path: Pa
 
     agent = build_principal_agent(
         provider,
-        tmp_path,
+        root,
         "mission: preserve evidence",
         max_turns=3,
     )
@@ -181,7 +251,7 @@ def test_principal_directly_writes_workspace_without_legacy_runtime(tmp_path: Pa
 
     assert result == "Artifact written."
     assert target.read_text(encoding="utf-8") == "measured observation\n"
-    assert not (tmp_path / ".arbor").exists()
+    assert not (root / ".arbor").exists()
 
 
 def test_principal_file_tools_block_outside_workspace_and_symlink_escape(tmp_path: Path):
@@ -189,6 +259,7 @@ def test_principal_file_tools_block_outside_workspace_and_symlink_escape(tmp_pat
     outside = tmp_path / "outside"
     root.mkdir()
     outside.mkdir()
+    _workspace(root)
     outside_file = outside / "outside.txt"
     outside_file.write_text("unchanged", encoding="utf-8")
     inside = root / "inside.txt"
@@ -263,5 +334,23 @@ def test_principal_module_has_no_legacy_control_plane_imports():
         if isinstance(node, ast.ImportFrom)
     )
 
-    forbidden = ("coordinator", "idea_tree", "executor", "mcp")
+    forbidden = (
+        "coordinator",
+        "idea_tree",
+        "executor",
+        "mcp",
+        "semantic_pipeline",
+        "auto_git",
+    )
     assert not any(part in module for module in imported for part in forbidden)
+
+
+def test_principal_rejects_detached_default_research_context(tmp_path: Path) -> None:
+    root = _workspace(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(root), "checkout", "-q", "--detach"],
+        check=True,
+    )
+
+    with pytest.raises(ValueError, match="attached canonical Git branch"):
+        build_principal_agent(_ScriptedProvider(), root, "boot")

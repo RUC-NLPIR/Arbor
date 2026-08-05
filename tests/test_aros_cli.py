@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
 from typer.testing import CliRunner
 
 from arbor.cli.app import app
@@ -58,25 +59,70 @@ def test_init_requires_mission_before_calling_workspace(
     assert called is False
 
 
-def test_boot_prints_derived_context_without_mutating_it(
+@pytest.mark.parametrize("as_json", [False, True])
+def test_boot_text_and_json_render_the_same_single_built_packet(
     tmp_path: Path, monkeypatch,
+    as_json: bool,
 ) -> None:
     calls: list[tuple[Path, int]] = []
+    rendered: list[dict[str, object]] = []
+    packet = {"schema_version": 1, "snapshot": {"head": "abc"}}
+    packet_wire = json.dumps(packet, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
-    def fake_boot(root: Path, max_chars: int = 80_000) -> str:
+    def fake_boot_packet(root: Path, max_chars: int = 80_000) -> dict[str, object]:
         calls.append((root, max_chars))
-        return "# AROS Boot\n\nmission: durable research"
+        return packet
 
-    monkeypatch.setattr(aros_cmd, "boot_workspace", fake_boot)
+    def fake_render(value: dict[str, object]) -> str:
+        rendered.append(value)
+        return packet_wire
+
+    monkeypatch.setattr(aros_cmd, "boot_packet", fake_boot_packet)
+    monkeypatch.setattr(aros_cmd, "render_boot_packet", fake_render)
+
+    argv = ["boot", "--cwd", str(tmp_path), "--max-chars", "1234"]
+    if as_json:
+        argv.append("--json")
+
+    result = runner.invoke(aros_cmd.aros_app, argv)
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(tmp_path.resolve(), 1234)]
+    assert result.output == packet_wire + "\n"
+    assert json.loads(result.output) == packet
+    assert rendered == [packet]
+
+
+def test_boot_json_wire_is_the_once_built_bounded_packet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(tmp_path)],
+        check=True,
+    )
+    aros_cmd.init_workspace(tmp_path, "Bound the exact boot packet.")
+    built: list[dict[str, object]] = []
+    real_boot_packet = aros_cmd.boot_packet
+
+    def recording_boot_packet(root: Path, max_chars: int) -> dict[str, object]:
+        packet = real_boot_packet(root, max_chars=max_chars)
+        built.append(packet)
+        return packet
+
+    monkeypatch.setattr(aros_cmd, "boot_packet", recording_boot_packet)
 
     result = runner.invoke(
         aros_cmd.aros_app,
-        ["boot", "--cwd", str(tmp_path), "--max-chars", "1234"],
+        ["boot", "--json", "--max-chars", "512", "--cwd", str(tmp_path)],
     )
 
     assert result.exit_code == 0, result.output
-    assert result.output == "# AROS Boot\n\nmission: durable research\n"
-    assert calls == [(tmp_path.resolve(), 1234)]
+    assert len(built) == 1
+    assert json.loads(result.output) == built[0]
+    wire = result.output.rstrip("\n")
+    assert len(wire) <= 512
+    assert wire == aros_cmd.render_boot_packet(built[0])
 
 
 def test_status_json_forwards_workspace_snapshot(

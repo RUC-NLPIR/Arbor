@@ -7,7 +7,6 @@ its hypothesis-tree execution machinery.
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -22,10 +21,13 @@ from ..core.tools.file_read import FileReadTool
 from ..core.tools.file_write import FileWriteTool
 from ..core.tools.glob_tool import GlobTool
 from ..core.tools.grep import GrepTool
+from .attention import AttentionAuthorityContext
+from .checkpoint import AdmissionGateway
 from .eval_tool import EvalTool
+from .research_tool import ResearchTool
 from .run_tool import RunTool
 from .task_tool import TaskTool
-from .workspace import status_workspace
+from .worktrees import RepositoryBinding, bind_repository, read_repository_snapshot
 
 
 PRINCIPAL_SYSTEM_PROMPT = """\
@@ -83,27 +85,6 @@ def _workspace_authorizer(root: Path) -> PathAuthorizer:
     return authorize
 
 
-class InspectTool(Tool):
-    """Return deterministic workspace and Git reality to the Principal."""
-
-    name = "Inspect"
-    description = (
-        "Inspect the current AROS workspace and Git reality, including "
-        "initialization, semantic views, HEAD, branch, dirty paths, and worktrees."
-    )
-    input_schema: dict[str, Any] = {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    }
-    is_read_only = True
-    persist_threshold = float("inf")
-
-    async def execute(self, **kwargs: Any) -> str:
-        del kwargs
-        return json.dumps(status_workspace(self.cwd), ensure_ascii=False, indent=2)
-
-
 class ForegroundBashTool(BashTool):
     """Trusted-local shell with a bounded timeout and no background API."""
 
@@ -137,6 +118,10 @@ def build_principal_agent(
     *,
     max_turns: int = 100,
     allow_shell: bool = False,
+    canonical_repository: RepositoryBinding | None = None,
+    canonical_ref: str | None = None,
+    admission_gateway: AdmissionGateway | None = None,
+    attention_context: AttentionAuthorityContext | None = None,
 ) -> Agent:
     """Build the native single-Principal Agent for *root*.
 
@@ -145,6 +130,15 @@ def build_principal_agent(
     here so the legacy ``.arbor`` runtime can never be created accidentally.
     """
     workspace_root = Path(root).expanduser().resolve()
+    research_repository = canonical_repository or bind_repository(workspace_root)
+    research_ref = canonical_ref
+    if research_ref is None:
+        observed_ref = read_repository_snapshot(research_repository).get("ref")
+        if not isinstance(observed_ref, str):
+            raise ValueError(
+                "Principal Research requires an attached canonical Git branch"
+            )
+        research_ref = observed_ref
     runtime_dir = workspace_root / ".aros" / "agent"
     authorizer = _workspace_authorizer(workspace_root)
     tool_kwargs = {
@@ -159,7 +153,14 @@ def build_principal_agent(
         GlobTool(**tool_kwargs),
         FileEditTool(**tool_kwargs),
         FileWriteTool(**tool_kwargs),
-        InspectTool(cwd=str(workspace_root), persist_results=False),
+        ResearchTool(
+            cwd=str(workspace_root),
+            canonical_repository=research_repository,
+            canonical_ref=research_ref,
+            admission_gateway=admission_gateway,
+            attention_context=attention_context,
+            persist_results=False,
+        ),
         EvalTool(cwd=str(workspace_root), persist_results=False),
         RunTool(cwd=str(workspace_root), persist_results=False),
         TaskTool(cwd=str(workspace_root), persist_results=False),

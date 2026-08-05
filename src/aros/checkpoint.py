@@ -400,6 +400,12 @@ class CheckpointService:
             index_snapshot = _snapshot_file(index_path)
             if not index_snapshot.exists or index_snapshot.content is None:
                 raise CheckpointError("checkpoint index disappeared after tree creation")
+            _verify_index_snapshot_tree(
+                self.canonical_repository,
+                checkpoint_root,
+                index_snapshot.content,
+                candidate_tree,
+            )
             index_sha256 = hashlib.sha256(index_snapshot.content).hexdigest()
             reader.verify_stream(
                 index_ref,
@@ -902,6 +908,37 @@ def _write_tree(repository: RepositoryBinding, index_path: Path) -> str:
     _fsync_file(index_path)
     _fsync_directory(index_path.parent)
     return tree
+
+
+def _verify_index_snapshot_tree(
+    repository: RepositoryBinding,
+    runtime: Path,
+    index_bytes: bytes,
+    candidate_tree: str,
+) -> None:
+    verification_index = runtime / "index-verification"
+    _replace_runtime_file(verification_index, index_bytes)
+    try:
+        result = _git_success(
+            write_index_tree(repository, index_file=verification_index),
+            "verify snapshotted checkpoint index",
+        )
+        try:
+            observed_tree = result.stdout.decode("ascii").strip()
+        except UnicodeError as error:
+            raise CheckpointError(
+                "snapshotted checkpoint index returned non-ASCII tree output"
+            ) from error
+        if observed_tree != candidate_tree:
+            raise CheckpointError(
+                "snapshotted checkpoint index does not reproduce candidate tree"
+            )
+    finally:
+        try:
+            verification_index.unlink()
+        except FileNotFoundError:
+            pass
+        _fsync_directory(runtime)
 
 
 def _verify_candidate_tree(

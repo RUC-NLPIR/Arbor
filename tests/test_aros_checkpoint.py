@@ -167,9 +167,15 @@ def test_checkpoint_prepare_never_uses_or_changes_user_index(
     assert _index_bytes(tmp_path) == before
     ordinary_index = bind_repository(tmp_path).git_dir / "index"
     assert all(index_file != ordinary_index for _args, index_file in calls)
+    prepared_index = tmp_path / prepared.index_ref
     for args, index_file in calls:
-        if args and args[0] in {"read-tree", "update-index", "write-tree"}:
-            assert index_file == tmp_path / prepared.index_ref
+        if args and args[0] in {"read-tree", "update-index"}:
+            assert index_file == prepared_index
+        elif args and args[0] == "write-tree":
+            assert index_file in {
+                prepared_index,
+                prepared_index.with_name("index-verification"),
+            }
 
 
 def test_checkpoint_prepare_tree_contains_exact_audited_paths(tmp_path: Path) -> None:
@@ -456,6 +462,34 @@ def test_checkpoint_prepare_does_not_publish_audit_before_candidate_is_ready(
 
     assert not audit_path.exists()
     assert not (tmp_path / ".aros/checkpoints/T-checkpoint/prepared.json").exists()
+
+
+def test_checkpoint_prepare_rejects_index_replaced_between_tree_and_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    index_path = tmp_path / ".aros/checkpoints/T-checkpoint/index"
+    base_index_bytes = _index_bytes(tmp_path)
+    real_snapshot = checkpoint_module._snapshot_file
+    replaced = False
+
+    def replace_before_snapshot(path: Path) -> object:
+        nonlocal replaced
+        if path == index_path and path.exists() and not replaced:
+            replaced = True
+            replacement = path.with_name("replacement-index")
+            replacement.write_bytes(base_index_bytes)
+            os.replace(replacement, path)
+        return real_snapshot(path)
+
+    monkeypatch.setattr(checkpoint_module, "_snapshot_file", replace_before_snapshot)
+
+    with pytest.raises(CheckpointError, match="index|tree|candidate"):
+        service.prepare(proposal_ref, "reject index snapshot race")
+
+    assert replaced is True
+    assert not (tmp_path / "transitions/T-checkpoint/audit.json").exists()
 
 
 @pytest.mark.parametrize(

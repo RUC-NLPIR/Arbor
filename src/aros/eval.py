@@ -58,6 +58,44 @@ class EvalError(ValueError):
     """Raised when an evaluation registration or request is unsafe."""
 
 
+def read_validated_eval_receipt(
+    root: str | Path,
+    eval_id: str,
+    *,
+    reader: _JsonReader = read_json_strict_no_repair,
+) -> dict[str, object]:
+    """Strictly read one receipt and its immutable Eval-to-Run lineage."""
+    evaluation_id = _evaluation_id(eval_id)
+    service = EvalService(root)
+    request = service._load_request(evaluation_id, reader=reader)
+    execution = service._load_execution(request, reader=reader)
+    receipt = service._load_bound_receipt(
+        request,
+        execution,
+        reader=reader,
+    )
+    if receipt is None:
+        raise EvalError(f"evaluation receipt does not exist: {evaluation_id}")
+    run_link = service._load_run_link(request, execution, reader=reader)
+    if run_link is None:
+        raise EvalError("existing receipt Run link lineage is missing")
+    service._validate_receipt_immutable_run_lineage(
+        request,
+        execution,
+        receipt,
+        run_link,
+        reader=reader,
+    )
+    runs = RunService(service.root)
+    run_id = str(receipt["run_id"])
+    for stream in ("stdout", "stderr"):
+        try:
+            runs.verify_output(run_id, stream, reader=reader)
+        except ValueError as error:
+            raise EvalError("existing receipt Run output lineage is invalid") from error
+    return receipt
+
+
 @dataclass(frozen=True)
 class ExistingEvaluation:
     status: dict[str, object]
@@ -999,6 +1037,28 @@ class EvalService:
         reconcile_run: bool = True,
         reader: _JsonReader | None = None,
     ) -> dict[str, object] | None:
+        receipt = self._load_bound_receipt(
+            request,
+            execution,
+            reader=reader,
+        )
+        if receipt is not None and execution is not None:
+            self._validate_receipt_run_lineage(
+                request,
+                execution,
+                receipt,
+                reconcile_run=reconcile_run,
+                reader=reader,
+            )
+        return receipt
+
+    def _load_bound_receipt(
+        self,
+        request: dict[str, object],
+        execution: dict[str, object] | None,
+        *,
+        reader: _JsonReader | None = None,
+    ) -> dict[str, object] | None:
         receipt_path = self._receipt_path(str(request["eval_id"]))
         try:
             receipt_value = _read_json_authority(receipt_path, reader)
@@ -1028,14 +1088,6 @@ class EvalService:
             and receipt["execution_sha256"] != execution["execution_sha256"]
         ):
             raise EvalError("existing receipt execution lineage mismatch")
-        if execution is not None:
-            self._validate_receipt_run_lineage(
-                request,
-                execution,
-                receipt,
-                reconcile_run=reconcile_run,
-                reader=reader,
-            )
         return receipt
 
     def _receipt_or_lost(
@@ -1117,14 +1169,39 @@ class EvalService:
             reconcile=reconcile_run,
             reader=reader,
         )
+        self._validate_receipt_immutable_run_lineage(
+            request,
+            execution,
+            receipt,
+            run_link,
+            reader=reader,
+        )
+
+    def _validate_receipt_immutable_run_lineage(
+        self,
+        request: dict[str, object],
+        execution: dict[str, object],
+        receipt: dict[str, object],
+        run_link: dict[str, object],
+        *,
+        reader: _JsonReader | None = None,
+    ) -> None:
         run_id = str(run_link["run_id"])
         try:
-            final_value = RunService(self.root).read_validated_final(
+            runs = RunService(self.root)
+            manifest_value = _read_json_authority(
+                self.root / "runs" / run_id / "manifest.json",
+                reader,
+            )
+            final_value = runs.read_validated_final(
                 run_id,
                 reader=reader,
             )
-        except ValueError as error:
+        except (OSError, ValueError) as error:
             raise EvalError("existing receipt Run final lineage is invalid") from error
+        if not isinstance(manifest_value, dict):
+            raise EvalError("linked Run manifest is invalid")
+        self._validate_linked_run_manifest(request, run_link, manifest_value)
         measurement = {
             "measurement_state": receipt["measurement_state"],
             "metric": receipt["metric"],
@@ -1171,6 +1248,42 @@ class EvalService:
             raise EvalError("linked Run lineage is invalid") from error
         if not isinstance(manifest_value, dict):
             raise EvalError("linked Run manifest is invalid")
+        self._validate_linked_run_manifest(request, run_link, manifest_value)
+        if (
+            status.get("run_id") != run_id
+            or status.get("manifest_sha256") != run_link["run_manifest_sha256"]
+        ):
+            raise EvalError("linked Run lineage is invalid")
+        state = status.get("state")
+        allowed_states = {
+            "prepared",
+            "launched",
+            "running",
+            "completed",
+            "failed_process",
+            "timed_out",
+            "cancelled",
+            "lost",
+        }
+        if state not in allowed_states:
+            raise EvalError("linked Run state is invalid")
+        if state in {"completed", "failed_process", "timed_out", "cancelled"}:
+            if status.get("final_ref") != f"runs/{run_id}/final.json":
+                raise EvalError("linked terminal Run final reference is invalid")
+            try:
+                final = runs.read_validated_final(run_id, reader=reader)
+            except ValueError as error:
+                raise EvalError("linked terminal Run final is invalid") from error
+            if final.get("state") != state:
+                raise EvalError("linked Run status and final state differ")
+        return status
+
+    def _validate_linked_run_manifest(
+        self,
+        request: dict[str, object],
+        run_link: dict[str, object],
+        manifest_value: dict[str, object],
+    ) -> None:
         bundle = manifest_value.get("execution_bundle")
         if not isinstance(bundle, dict):
             raise EvalError("linked Run bundle lineage is invalid")
@@ -1182,9 +1295,7 @@ class EvalService:
         candidate = bundle.get("candidate")
         apparatus = bundle.get("apparatus")
         if (
-            status.get("run_id") != run_id
-            or status.get("manifest_sha256") != run_link["run_manifest_sha256"]
-            or manifest_value.get("manifest_sha256")
+            manifest_value.get("manifest_sha256")
             != run_link["run_manifest_sha256"]
             or manifest_value.get("repository_ref")
             != f".worktree/eval/{request['eval_id']}"
@@ -1211,29 +1322,6 @@ class EvalService:
             or json_sha256(portable) != run_link["bundle_sha256"]
         ):
             raise EvalError("linked Run lineage is invalid")
-        state = status.get("state")
-        allowed_states = {
-            "prepared",
-            "launched",
-            "running",
-            "completed",
-            "failed_process",
-            "timed_out",
-            "cancelled",
-            "lost",
-        }
-        if state not in allowed_states:
-            raise EvalError("linked Run state is invalid")
-        if state in {"completed", "failed_process", "timed_out", "cancelled"}:
-            if status.get("final_ref") != f"runs/{run_id}/final.json":
-                raise EvalError("linked terminal Run final reference is invalid")
-            try:
-                final = runs.read_validated_final(run_id, reader=reader)
-            except ValueError as error:
-                raise EvalError("linked terminal Run final is invalid") from error
-            if final.get("state") != state:
-                raise EvalError("linked Run status and final state differ")
-        return status
 
     def _lost_evaluation(
         self,

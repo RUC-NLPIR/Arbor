@@ -37,6 +37,7 @@ from .store import (
     manifest_sha256 as _manifest_sha256,
     read_json,
     read_json_strict,
+    read_json_strict_no_repair,
     utc_now as _utc_now,
 )
 from .worktrees import (
@@ -106,6 +107,34 @@ _ALLOWED_SIGNALS = {
 }
 class RunError(ValueError):
     """Raised when a durable run request is invalid or unsafe."""
+
+
+def read_validated_run_manifest(
+    root: str | Path,
+    run_id: str,
+    *,
+    reader: _JsonReader = read_json_strict_no_repair,
+) -> dict[str, object]:
+    """Strictly read one immutable Run manifest without reconciliation."""
+    return _pure_run_service(root)._load_manifest(run_id, reader=reader)
+
+
+def read_validated_run_final(
+    root: str | Path,
+    run_id: str,
+    *,
+    reader: _JsonReader = read_json_strict_no_repair,
+) -> dict[str, object]:
+    """Strictly read one immutable Run final without reconciliation."""
+    return _pure_run_service(root).read_validated_final(run_id, reader=reader)
+
+
+def _pure_run_service(root: str | Path) -> RunService:
+    try:
+        repository = bind_repository(root)
+    except WorktreeError as error:
+        raise RunError(f"invalid Run workspace: {root}") from error
+    return RunService(repository.root)
 
 
 class RunService:

@@ -18,7 +18,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +31,7 @@ from .store import (
     file_lock,
     json_sha256,
     read_json,
+    read_json_strict_no_repair,
     utc_now,
 )
 
@@ -263,10 +264,21 @@ _UNSUPPORTED_FILE_MODE_ERRNOS = {
     getattr(errno, "ENOTSUP", errno.ENOSYS),
     getattr(errno, "EOPNOTSUPP", errno.ENOSYS),
 }
+_JsonReader = Callable[[str | Path], object]
 
 
 class TaskError(ValueError):
     """Raised when a child-task record is invalid or unsafe."""
+
+
+def read_validated_task_collection(
+    root: str | Path,
+    task_id: str,
+    *,
+    reader: _JsonReader = read_json_strict_no_repair,
+) -> dict[str, object]:
+    """Read one versioned Task collection without touching runtime state."""
+    return _TaskCollectionReader(root, reader=reader).read(task_id)
 
 
 class TaskService:
@@ -1632,11 +1644,17 @@ class TaskService:
         self,
         brief: dict[str, object],
         snapshot: dict[str, object],
+        *,
+        reader: _JsonReader | None = None,
     ) -> dict[str, object]:
         task_id = str(brief["task_id"])
         path = self._collected_path(task_id)
         _require_single_link_plain_file(path, "task collection")
-        collected = _read_object(path, "task collection")
+        collected = (
+            _read_object(path, "task collection")
+            if reader is None
+            else _read_object(path, "task collection", reader=reader)
+        )
         if (
             set(collected) != _COLLECTED_FIELDS
             or type(collected.get("schema_version")) is not int
@@ -1774,12 +1792,22 @@ class TaskService:
                 statuses.append(self._status_unlocked(task_id))
         return statuses
 
-    def _load_brief(self, task_id: str) -> dict[str, object]:
+    def _load_brief(
+        self,
+        task_id: str,
+        *,
+        reader: _JsonReader | None = None,
+    ) -> dict[str, object]:
         self._validate_task_id(task_id)
         _require_plain_directory(self.root / "tasks", "versioned tasks directory")
         directory = self.root / "tasks" / task_id
         _require_plain_directory(directory, "task brief directory")
-        brief = _read_object(directory / "brief.json", "task brief")
+        brief_path = directory / "brief.json"
+        brief = (
+            _read_object(brief_path, "task brief")
+            if reader is None
+            else _read_object(brief_path, "task brief", reader=reader)
+        )
         if set(brief) != _BRIEF_FIELDS or type(brief.get("schema_version")) is not int:
             raise TaskError(f"invalid task brief schema: {task_id}")
         if brief["schema_version"] != 1:
@@ -3399,6 +3427,62 @@ class TaskService:
         return self.root / ".aros" / "tasks" / "idempotency" / f"{digest}.json"
 
 
+class _TaskCollectionReader(TaskService):
+    """Reuse Task validation without TaskService's runtime initialization."""
+
+    def __init__(self, root: str | Path, *, reader: _JsonReader):
+        try:
+            repository = worktrees_module.bind_repository(root)
+        except worktrees_module.WorktreeError as error:
+            raise TaskError(f"invalid task collection workspace: {root}") from error
+        self.root = repository.root
+        self._git_dir = repository.git_dir
+        self._git_common_dir = repository.common_dir
+        self._reader = reader
+
+    def read(self, task_id: str) -> dict[str, object]:
+        brief = self._load_brief(task_id, reader=self._reader)
+        path = self._collected_path(task_id)
+        collected = _read_object(path, "task collection", reader=self._reader)
+        if (
+            set(collected) != _COLLECTED_FIELDS
+            or type(collected.get("schema_version")) is not int
+        ):
+            raise TaskError(f"invalid task collection schema: {task_id}")
+        return_commit = collected["return_commit"]
+        if (
+            not isinstance(return_commit, str)
+            or _COMMIT.fullmatch(return_commit) is None
+        ):
+            raise TaskError(f"invalid task collection return commit: {task_id}")
+        if collected["branch_ref"] != f"refs/heads/aros/task/{task_id}":
+            raise TaskError(f"task collection branch binding conflict: {task_id}")
+        if collected["final_state"] not in _TERMINAL_STATES:
+            raise TaskError(f"invalid task collection final state: {task_id}")
+        reviewed = self._load_reviewed_return(
+            brief,
+            {},
+            return_commit=return_commit,
+        )
+        snapshot = {
+            "ownership_sha256": collected["ownership_sha256"],
+            "branch_ref": collected["branch_ref"],
+            "child_commit": reviewed["child_commit"],
+            "return_commit": reviewed["return_commit"],
+            "final_state": collected["final_state"],
+            "final_sha256": collected["final_sha256"],
+            "return": reviewed["return"],
+        }
+        recorded = self._load_collected(
+            brief,
+            snapshot,
+            reader=self._reader,
+        )
+        if recorded != collected:
+            raise TaskError(f"task collection changed while reading: {task_id}")
+        return recorded
+
+
 def _record_sha256(record: dict[str, object], hash_field: str) -> str:
     try:
         return record_sha256(record, hash_field)
@@ -4125,10 +4209,15 @@ def _create_plain_directory(path: Path, description: str) -> None:
     _fsync_directory(path.parent)
 
 
-def _read_object(path: Path, description: str) -> dict[str, object]:
+def _read_object(
+    path: Path,
+    description: str,
+    *,
+    reader: _JsonReader | None = None,
+) -> dict[str, object]:
     _require_plain_file(path, description)
     try:
-        value = read_json(path)
+        value = read_json(path) if reader is None else reader(path)
     except (OSError, ValueError) as error:
         raise TaskError(f"unable to read {description}: {path}: {error}") from error
     if not isinstance(value, dict):

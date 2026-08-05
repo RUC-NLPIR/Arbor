@@ -958,6 +958,62 @@ def test_attention_context_rejects_unbounded_or_unknown_states(
         )
 
 
+@pytest.mark.parametrize(
+    ("target", "state", "layer"),
+    [
+        ("authority", "denied", "authority"),
+        ("authority", "expired", "authority"),
+        ("remaining_budget", "denied", "budget"),
+    ],
+)
+def test_attention_context_domain_states_preserve_owned_blockers(
+    tmp_path: Path,
+    target: str,
+    state: str,
+    layer: str,
+) -> None:
+    _init_workspace(tmp_path, with_question=False)
+    authority: dict[str, object] = {"state": "available"}
+    budget: dict[str, object] = {"state": "available"}
+    (authority if target == "authority" else budget)["state"] = state
+    context = AttentionAuthorityContext(
+        authority=authority,
+        remaining_budget=budget,
+        institutional_obligations=(),
+    )
+
+    packet = ResearchAttentionService(tmp_path).build(context=context)
+
+    assert any(
+        blocker["layer"] == layer and blocker["reason"] == state
+        for blocker in packet["blocked_reasons"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "state"),
+    [
+        ("authority", "exhausted"),
+        ("authority", "not_configured"),
+        ("remaining_budget", "expired"),
+    ],
+)
+def test_attention_context_rejects_cross_domain_states(
+    target: str,
+    state: str,
+) -> None:
+    authority: dict[str, object] = {"state": "available"}
+    budget: dict[str, object] = {"state": "available"}
+    (authority if target == "authority" else budget)["state"] = state
+
+    with pytest.raises(ValueError, match="state"):
+        AttentionAuthorityContext(
+            authority=authority,
+            remaining_budget=budget,
+            institutional_obligations=(),
+        )
+
+
 def test_attention_snapshot_and_omitted_schema_are_stable_across_budgets(
     tmp_path: Path,
 ) -> None:

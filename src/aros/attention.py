@@ -79,12 +79,20 @@ _MAX_RIVALS = 16
 _MAX_PENDING = 32
 _MAX_RETURNS = 32
 _OPERATIONAL_SNAPSHOT_ATTEMPTS = 3
-_CONTEXT_STATES = {
+_AUTHORITY_CONTEXT_STATES = {
+    "available",
+    "unavailable",
+    "blocked",
+    "denied",
+    "expired",
+}
+_BUDGET_CONTEXT_STATES = {
     "available",
     "unavailable",
     "not_configured",
     "exhausted",
     "blocked",
+    "denied",
 }
 
 
@@ -103,8 +111,16 @@ class AttentionAuthorityContext:
             raise TypeError("authority must be a mapping")
         if not isinstance(budget, Mapping):
             raise TypeError("remaining_budget must be a mapping")
-        _validate_context_state(authority, "authority")
-        _validate_context_state(budget, "remaining_budget")
+        _validate_context_state(
+            authority,
+            "authority",
+            _AUTHORITY_CONTEXT_STATES,
+        )
+        _validate_context_state(
+            budget,
+            "remaining_budget",
+            _BUDGET_CONTEXT_STATES,
+        )
         if not isinstance(self.institutional_obligations, tuple) or any(
             not isinstance(item, Mapping) for item in self.institutional_obligations
         ):
@@ -122,11 +138,15 @@ class AttentionAuthorityContext:
         )
 
 
-def _validate_context_state(value: Mapping[str, object], field: str) -> None:
+def _validate_context_state(
+    value: Mapping[str, object],
+    field: str,
+    allowed: set[str],
+) -> None:
     state = value.get("state")
     if not isinstance(state, str):
         raise TypeError(f"{field}.state must be a string")
-    if state not in _CONTEXT_STATES:
+    if state not in allowed:
         raise ValueError(f"{field}.state is unknown or unbounded: {state!r}")
 
 

@@ -227,6 +227,144 @@ def test_repository_blob_limit_checks_size_before_blob_read(
     assert read_repository_blob(repository, blob_oid) == b"exact repository bytes\n"
 
 
+def test_run_git_preserves_pinned_config_and_allows_only_safe_temp_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    commit, _tree = _init_repository(root)
+    repository = bind_repository(root)
+    runtime = root / ".aros" / "checkpoints" / "T-safe"
+    runtime.mkdir(parents=True)
+    index = runtime / "index"
+    monkeypatch.setenv("GIT_INDEX_FILE", str(root / ".git" / "index"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(tmp_path / "hooks"))
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    real_run = subprocess.run
+
+    def recording_run(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append((command, dict(kwargs)))
+        return real_run(command, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module.subprocess, "run", recording_run)
+
+    result = worktrees_module.run_git(
+        repository,
+        "read-tree",
+        commit,
+        index_file=index,
+    )
+    blob = worktrees_module.run_git(
+        repository,
+        "hash-object",
+        "--stdin",
+        input_bytes=b"binary\x00payload",
+        index_file=index,
+    )
+
+    assert result.returncode == 0
+    assert index.is_file()
+    assert blob.returncode == 0
+    assert isinstance(blob.stdout, bytes)
+    command, kwargs = next(
+        (recorded, options)
+        for recorded, options in calls
+        if "read-tree" in recorded
+    )
+    assert command[:4] == [
+        "git",
+        "--no-replace-objects",
+        f"--git-dir={repository.git_dir}",
+        f"--work-tree={repository.root}",
+    ]
+    configured = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "-c"
+    ]
+    assert configured == list(worktrees_module._BASE_CONFIGS)
+    assert kwargs["capture_output"] is True
+    assert kwargs["text"] is False
+    assert kwargs["timeout"] == 10
+    assert kwargs["check"] is False
+    environment = kwargs["env"]
+    assert isinstance(environment, dict)
+    assert environment["GIT_INDEX_FILE"] == str(index)
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert "GIT_CONFIG_COUNT" not in environment
+    assert "GIT_CONFIG_KEY_0" not in environment
+    assert "GIT_CONFIG_VALUE_0" not in environment
+
+    unsafe_parent = root / ".aros" / "checkpoints" / "not-a-directory"
+    unsafe_parent.write_text("plain file\n", encoding="utf-8")
+    symlink_parent = root / ".aros" / "checkpoints" / "linked"
+    symlink_parent.symlink_to(tmp_path, target_is_directory=True)
+    outside = tmp_path / "outside-index"
+    for unsafe in (
+        Path("relative-index"),
+        root / ".git" / "index",
+        root / ".aros" / "checkpoints" / "T-safe" / ".." / "escaped-index",
+        unsafe_parent / "index",
+        symlink_parent / "index",
+        outside,
+    ):
+        with pytest.raises(WorktreeError, match="index|checkpoint|path|parent"):
+            worktrees_module.run_git(
+                repository,
+                "write-tree",
+                index_file=unsafe,
+            )
+
+    index.unlink()
+    index.symlink_to(root / ".git" / "index")
+    with pytest.raises(WorktreeError, match="index|symlink|plain"):
+        worktrees_module.run_git(repository, "write-tree", index_file=index)
+
+
+def test_run_git_rejects_temp_index_drift_during_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    commit, _tree = _init_repository(root)
+    repository = bind_repository(root)
+    runtime = root / ".aros" / "checkpoints" / "T-drift"
+    runtime.mkdir(parents=True)
+    index = runtime / "index"
+    assert worktrees_module.run_git(
+        repository,
+        "read-tree",
+        commit,
+        index_file=index,
+    ).returncode == 0
+    real_git_result = worktrees_module._git_result
+    replaced = False
+
+    def replace_after_git(
+        repo: RepositoryBinding,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        nonlocal replaced
+        result = real_git_result(repo, *args, **kwargs)  # type: ignore[arg-type]
+        if args and args[0] == "write-tree" and not replaced:
+            replaced = True
+            index.unlink()
+            index.symlink_to(repo.git_dir / "index")
+        return result
+
+    monkeypatch.setattr(worktrees_module, "_git_result", replace_after_git)
+
+    with pytest.raises(WorktreeError, match="index|exact|plain"):
+        worktrees_module.run_git(repository, "write-tree", index_file=index)
+
+
 def test_detached_checkout_is_exact_clean_and_hermetic(
     tmp_path: Path,
     monkeypatch,

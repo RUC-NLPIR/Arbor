@@ -236,6 +236,35 @@ def resolve_repository_commit(
     return commit
 
 
+def run_git(
+    repository: RepositoryBinding,
+    *args: str,
+    input_bytes: bytes | None = None,
+    index_file: str | Path | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run pinned Git, optionally against one contained checkpoint index."""
+    _validate_repository_binding(repository)
+    if any(not isinstance(arg, str) or "\x00" in arg for arg in args):
+        raise WorktreeError("Git arguments must be NUL-free strings")
+    if input_bytes is not None and not isinstance(input_bytes, bytes):
+        raise WorktreeError("Git input must be bytes or null")
+    safe_index = (
+        None
+        if index_file is None
+        else _checkpoint_index_file(repository, index_file)
+    )
+    result = _git_result(
+        repository,
+        *args,
+        input_bytes=input_bytes,
+        index_file=safe_index,
+    )
+    _validate_repository_binding(repository)
+    if safe_index is not None:
+        _checkpoint_index_file(repository, safe_index)
+    return result
+
+
 def read_repository_file(
     repository: RepositoryBinding,
     commit: str,
@@ -1142,6 +1171,8 @@ def _git_result(
     *args: str,
     git_dir: Path | None = None,
     work_tree: Path | None = None,
+    input_bytes: bytes | None = None,
+    index_file: Path | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     command = [
         "git",
@@ -1152,15 +1183,20 @@ def _git_result(
     for config in _BASE_CONFIGS:
         command.extend(("-c", config))
     command.extend(args)
+    environment = _git_environment()
+    if index_file is not None:
+        environment["GIT_INDEX_FILE"] = str(index_file)
+    options: dict[str, object] = {
+        "capture_output": True,
+        "text": False,
+        "timeout": 10,
+        "check": False,
+        "env": environment,
+    }
+    if input_bytes is not None:
+        options["input"] = input_bytes
     try:
-        return subprocess.run(
-            command,
-            capture_output=True,
-            text=False,
-            timeout=10,
-            check=False,
-            env=_git_environment(),
-        )
+        return subprocess.run(command, **options)  # type: ignore[arg-type]
     except (OSError, subprocess.TimeoutExpired) as error:
         raise WorktreeError(f"Git command failed: {' '.join(args)}") from error
 
@@ -1184,6 +1220,59 @@ def _same_path(raw: str, target: Path) -> bool:
     return os.path.normcase(str(raw_absolute.resolve(strict=False))) == os.path.normcase(
         str(target_absolute.resolve(strict=False))
     )
+
+
+def _checkpoint_index_file(
+    repository: RepositoryBinding,
+    value: str | Path,
+) -> Path:
+    try:
+        candidate = Path(value)
+    except TypeError as error:
+        raise WorktreeError("checkpoint index path is invalid") from error
+    if (
+        not candidate.is_absolute()
+        or any(part in {"", ".", ".."} for part in candidate.parts[1:])
+        or candidate.absolute() != candidate
+        or candidate.resolve(strict=False) != candidate
+    ):
+        raise WorktreeError("checkpoint index must be an exact absolute path")
+    markers = [
+        index
+        for index in range(len(candidate.parts) - 1)
+        if candidate.parts[index : index + 2] == (".aros", "checkpoints")
+    ]
+    if len(markers) != 1:
+        raise WorktreeError("checkpoint index must be under .aros/checkpoints")
+    marker = markers[0]
+    if len(candidate.parts) - marker < 4:
+        raise WorktreeError("checkpoint index must include a runtime directory")
+    owner_root = Path(*candidate.parts[:marker])
+    try:
+        owner = bind_repository(owner_root)
+    except WorktreeError as error:
+        raise WorktreeError(
+            "checkpoint index owner must be a bound Git repository"
+        ) from error
+    if owner != repository and owner.root == repository.root:
+        raise WorktreeError("checkpoint index repository binding changed")
+    current = owner.root
+    for component in candidate.relative_to(owner.root).parts[:-1]:
+        current /= component
+        _require_plain_directory(current, "checkpoint index parent")
+    try:
+        metadata = candidate.lstat()
+    except FileNotFoundError:
+        return candidate
+    except OSError as error:
+        raise WorktreeError("unable to inspect checkpoint index") from error
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+    ):
+        raise WorktreeError("checkpoint index must be a single-link plain file")
+    return candidate
 
 
 def _require_plain_directory(path: Path, description: str) -> None:

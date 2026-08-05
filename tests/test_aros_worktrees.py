@@ -20,6 +20,7 @@ from arbor.aros.worktrees import (
     create_detached_checkout,
     create_execution_bundle,
     find_repository_gitlink_ancestor,
+    read_repository_tree_entries,
     remove_clean_checkout,
     remove_clean_execution_bundle,
     validate_detached_checkout,
@@ -163,6 +164,36 @@ def test_repository_gitlink_ancestor_is_pinned_and_allows_new_directories(
         )
         is None
     )
+
+
+def test_repository_tree_queries_batch_many_literal_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    commit, _tree = _init_repository(root)
+    repository = bind_repository(root)
+    requested = [f"memory/new-{index:04d}.md" for index in range(600)]
+    calls: list[tuple[str, ...]] = []
+    real_git_bytes = worktrees_module._git_bytes
+
+    def recording_git_bytes(
+        repo: RepositoryBinding,
+        *args: str,
+        **kwargs: object,
+    ) -> bytes:
+        if "ls-tree" in args:
+            calls.append(args)
+        return real_git_bytes(repo, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_bytes", recording_git_bytes)
+
+    entries = read_repository_tree_entries(repository, commit, requested)
+
+    assert entries == ()
+    assert worktrees_module.REPOSITORY_TREE_QUERY_BATCH_SIZE == 256
+    assert len(calls) == 3
+    assert all("--literal-pathspecs" in call for call in calls)
 
 
 def test_detached_checkout_is_exact_clean_and_hermetic(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -64,10 +65,24 @@ _SEMANTIC_PREFIXES = (
     "ideas/",
     "model/",
 )
+MAX_PROPOSAL_BYTES = 1_048_576
+MAX_WORKSPACE_PATHS = 256
+MAX_ASSIMILATIONS = 256
+MAX_AFFECTED_PATHS = 256
+MAX_PATH_BYTES = 1_024
+MAX_REFERENCE_BYTES = 1_024
+MAX_RATIONALE_BYTES = 4_096
+MAX_EVIDENCE_SCOPE_BYTES = 4_096
+MAX_OBSERVATION_CLOSURE_PATHS = 1_024
+MAX_PATH_COMPONENTS = 16
 
 
 class TransitionError(ValueError):
     """A transition proposal or audit input is unsafe or ambiguous."""
+
+
+class _ExecutableFileError(TransitionError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -89,6 +104,12 @@ class TransitionProposal:
 class _SemanticState:
     document: SemanticDocument
     added_links: tuple[EvidenceLinkOccurrence, ...]
+
+
+@dataclass(frozen=True)
+class _CurrentFile:
+    content: bytes
+    mode: str
 
 
 def load_transition_proposal(
@@ -118,8 +139,13 @@ def load_transition_proposal(
                     raise TransitionError(
                         f"proposal descends from base gitlink: {gitlink}"
                     )
-            raw = _read_anchored_bytes(reader, proposal_ref)
-            return _parse_proposal(raw)
+            current = _read_anchored_file(
+                reader,
+                proposal_ref,
+                max_bytes=MAX_PROPOSAL_BYTES,
+                require_non_executable=True,
+            )
+            return _parse_proposal(current.content)
     except TransitionError:
         raise
     except (AnchoredReadError, OSError, TypeError, UnicodeError, ValueError) as error:
@@ -139,7 +165,14 @@ def build_operational_proposal(
     if isinstance(workspace_paths, (str, bytes)):
         raise TransitionError("operational workspace_paths must be an iterable of paths")
     try:
-        paths = sorted({_canonical_path(path) for path in workspace_paths})
+        normalized: set[str] = set()
+        for count, path in enumerate(workspace_paths, start=1):
+            if count > MAX_WORKSPACE_PATHS:
+                raise TransitionError(
+                    "operational workspace_paths exceeds 256 entries"
+                )
+            normalized.add(_canonical_path(path))
+        paths = sorted(normalized)
     except TypeError as error:
         raise TransitionError("operational workspace_paths are invalid") from error
     for path in paths:
@@ -161,12 +194,13 @@ class TransitionAuditService:
     """Build deterministic mechanical receipts without changing workspace state."""
 
     def __init__(self, root: str | Path, *, canonical_ref: str):
+        _bounded_utf8(canonical_ref, MAX_REFERENCE_BYTES, "canonical_ref")
+        if not canonical_ref.startswith("refs/"):
+            raise TransitionError("canonical_ref must be a full Git ref")
         try:
             self.repository = _worktrees.bind_repository(root)
         except WorktreeError as error:
             raise TransitionError(f"invalid transition workspace: {root}") from error
-        if not isinstance(canonical_ref, str) or not canonical_ref.startswith("refs/"):
-            raise TransitionError("canonical_ref must be a full Git ref")
         self.root = self.repository.root
         self.canonical_ref = canonical_ref
 
@@ -265,9 +299,16 @@ class TransitionAuditService:
                     )
                 else:
                     try:
-                        proposal_raw = _read_anchored_bytes(reader, proposal_ref)
-                        proposal_blob_sha256 = hashlib.sha256(proposal_raw).hexdigest()
-                        proposal = _parse_proposal(proposal_raw)
+                        proposal_file = _read_anchored_file(
+                            reader,
+                            proposal_ref,
+                            max_bytes=MAX_PROPOSAL_BYTES,
+                            require_non_executable=True,
+                        )
+                        proposal_blob_sha256 = hashlib.sha256(
+                            proposal_file.content
+                        ).hexdigest()
+                        proposal = _parse_proposal(proposal_file.content)
                         base_commit = proposal.base_commit
                     except (AnchoredReadError, OSError) as error:
                         _add_issue(
@@ -276,6 +317,14 @@ class TransitionAuditService:
                             "unsafe_proposal",
                             proposal_ref,
                             f"proposal is not an anchored ordinary file: {type(error).__name__}",
+                        )
+                    except _ExecutableFileError as error:
+                        _add_issue(
+                            issues,
+                            "error",
+                            "executable_proposal",
+                            proposal_ref,
+                            str(error),
                         )
                     except TransitionError as error:
                         _add_issue(
@@ -322,16 +371,49 @@ class TransitionAuditService:
                     assimilation_links,
                     issues,
                 )
-                observation_closure.extend(
-                    self._observation_closure(
-                        reader,
-                        repository,
-                        proposal,
-                        record,
+                closure_paths = _bounded_closure_paths(records.values())
+                if closure_paths is None:
+                    _add_issue(
                         issues,
+                        "error",
+                        "observation_closure_limit",
+                        "observations",
+                        "observation closure exceeds 1024 unique paths",
                     )
-                    for record in records.values()
-                )
+                else:
+                    query_paths = {
+                        path
+                        for path in closure_paths
+                        if _closure_path_is_versioned(path)
+                    }
+                    try:
+                        closure_base_entries = _read_base_tree_entries(
+                            repository,
+                            proposal.base_commit,
+                            query_paths,
+                        )
+                    except WorktreeError as error:
+                        _add_issue(
+                            issues,
+                            "error",
+                            "invalid_observation_base_tree",
+                            proposal.base_commit,
+                            str(error),
+                        )
+                        closure_base_entries = {}
+                    emitted_closure_paths: set[str] = set()
+                    observation_closure.extend(
+                        self._observation_closure(
+                            reader,
+                            repository,
+                            proposal,
+                            record,
+                            closure_base_entries,
+                            emitted_closure_paths,
+                            issues,
+                        )
+                        for record in records.values()
+                    )
                 _audit_joint_lineage(assimilated_records, issues)
 
             after = _worktrees.read_repository_snapshot(repository)
@@ -377,6 +459,21 @@ class TransitionAuditService:
         documents: dict[str, _SemanticState] = {}
         changed_paths: set[str] = set()
         direct_observation_refs: set[str] = set()
+        try:
+            base_entries = _read_base_tree_entries(
+                repository,
+                proposal.base_commit,
+                proposal.workspace_paths,
+            )
+        except WorktreeError as error:
+            _add_issue(
+                issues,
+                "error",
+                "invalid_base_tree",
+                proposal.base_commit,
+                str(error),
+            )
+            base_entries = {}
         for path in proposal.workspace_paths:
             owner = _path_owner(path)
             if owner is None:
@@ -389,11 +486,7 @@ class TransitionAuditService:
                 )
                 continue
             try:
-                gitlink = _worktrees.find_repository_gitlink_ancestor(
-                    repository,
-                    proposal.base_commit,
-                    path,
-                )
+                gitlink = _base_gitlink_ancestor(base_entries, path)
                 if gitlink is not None:
                     _add_issue(
                         issues,
@@ -404,7 +497,7 @@ class TransitionAuditService:
                     )
                     continue
                 _reject_nested_repository(reader, path)
-                raw = _read_anchored_bytes(reader, path)
+                current = _read_anchored_file(reader, path)
             except TransitionError as error:
                 _add_issue(
                     issues,
@@ -432,22 +525,32 @@ class TransitionAuditService:
                     f"path is not an anchored ordinary file: {type(error).__name__}",
                 )
                 continue
+            raw = current.content
             blob_oid = _blob_oid(raw)
             receipts.append(
                 {
                     "path": path,
                     "owner": owner,
+                    "mode": current.mode,
                     "blob_oid": blob_oid,
                     "content_sha256": hashlib.sha256(raw).hexdigest(),
                 }
             )
+            if current.mode != "100644":
+                _add_issue(
+                    issues,
+                    "error",
+                    "executable_workspace_path",
+                    path,
+                    "workspace file mode must be non-executable 100644",
+                )
             if owner == "semantic":
                 try:
                     document = parse_semantic_document_bytes(path, raw)
-                    base = _worktrees.read_repository_file(
+                    base = _base_repository_file(
                         repository,
-                        proposal.base_commit,
                         path,
+                        base_entries,
                     )
                     base_document = (
                         parse_semantic_document_bytes(path, base.content)
@@ -476,6 +579,7 @@ class TransitionAuditService:
                     document=document,
                     added_links=_added_evidence_links(document, base_document),
                 )
+                _audit_evidence_bounds(document, issues)
                 for warning in document.warnings:
                     _add_issue(
                         issues,
@@ -484,7 +588,11 @@ class TransitionAuditService:
                         path,
                         warning,
                     )
-                if base is not None and base.blob_oid == blob_oid:
+                if (
+                    base is not None
+                    and base.blob_oid == blob_oid
+                    and base.mode == current.mode
+                ):
                     _add_issue(
                         issues,
                         "error",
@@ -695,9 +803,12 @@ class TransitionAuditService:
         repository: RepositoryBinding,
         proposal: TransitionProposal,
         record: ObservationRecord,
+        base_entries: Mapping[str, _worktrees.RepositoryTreeEntry],
+        emitted_paths: set[str],
         issues: list[dict[str, str]],
     ) -> dict[str, object]:
         paths: list[dict[str, object]] = []
+        versioned_paths: list[str] = []
         seen: set[str] = set()
         for path in sorted(record.versioned_paths):
             if path in seen:
@@ -740,12 +851,11 @@ class TransitionAuditService:
                     f"observation path is not service-owned: {canonical}",
                 )
                 continue
+            versioned_paths.append(canonical)
+            if canonical in emitted_paths:
+                continue
             try:
-                gitlink = _worktrees.find_repository_gitlink_ancestor(
-                    repository,
-                    proposal.base_commit,
-                    canonical,
-                )
+                gitlink = _base_gitlink_ancestor(base_entries, canonical)
                 if gitlink is not None:
                     _add_issue(
                         issues,
@@ -756,11 +866,11 @@ class TransitionAuditService:
                     )
                     continue
                 _reject_nested_repository(reader, canonical)
-                raw = _read_anchored_bytes(reader, canonical)
-                base = _worktrees.read_repository_file(
+                current = _read_anchored_file(reader, canonical)
+                base = _base_repository_file(
                     repository,
-                    proposal.base_commit,
                     canonical,
+                    base_entries,
                 )
             except TransitionError as error:
                 _add_issue(
@@ -780,22 +890,37 @@ class TransitionAuditService:
                     f"versioned observation path is unavailable: {canonical}: {type(error).__name__}",
                 )
                 continue
+            raw = current.content
             blob_oid = _blob_oid(raw)
             paths.append(
                 {
                     "path": canonical,
+                    "mode": current.mode,
                     "state": (
                         "workspace"
                         if canonical in proposal.workspace_paths
                         else (
                             "ref_only"
-                            if base is not None and base.blob_oid == blob_oid
+                            if (
+                                base is not None
+                                and base.blob_oid == blob_oid
+                                and base.mode == current.mode
+                            )
                             else "derived"
                         )
                     ),
                     "blob_oid": blob_oid,
                 }
             )
+            emitted_paths.add(canonical)
+            if current.mode != "100644":
+                _add_issue(
+                    issues,
+                    "error",
+                    "executable_observation_closure",
+                    canonical,
+                    "observation file mode must be non-executable 100644",
+                )
         task_base_status: str | None = None
         if record.kind == "task_return":
             task_base_status = (
@@ -807,7 +932,7 @@ class TransitionAuditService:
             "observation_ref": record.ref,
             "kind": record.kind,
             "record_sha256": record.record_sha256,
-            "versioned_paths": [item["path"] for item in paths],
+            "versioned_paths": versioned_paths,
             "candidate_commit": record.candidate_commit,
             "measurement_state": record.measurement_state,
             "task_base_status": task_base_status,
@@ -830,6 +955,8 @@ def _parse_proposal(raw: bytes) -> TransitionProposal:
     raw_paths = value["workspace_paths"]
     if not isinstance(raw_paths, list) or any(not isinstance(path, str) for path in raw_paths):
         raise TransitionError("proposal workspace_paths must be a list of strings")
+    if len(raw_paths) > MAX_WORKSPACE_PATHS:
+        raise TransitionError("proposal workspace_paths exceeds 256 entries")
     workspace_paths = tuple(_canonical_path(path) for path in raw_paths)
     if len(set(workspace_paths)) != len(workspace_paths) or tuple(
         sorted(workspace_paths)
@@ -839,6 +966,8 @@ def _parse_proposal(raw: bytes) -> TransitionProposal:
     raw_assimilations = value["assimilations"]
     if not isinstance(raw_assimilations, list):
         raise TransitionError("proposal assimilations must be a list")
+    if len(raw_assimilations) > MAX_ASSIMILATIONS:
+        raise TransitionError("proposal assimilations exceeds 256 entries")
     assimilations: list[Assimilation] = []
     for raw_assimilation in raw_assimilations:
         if not isinstance(raw_assimilation, dict) or set(raw_assimilation) != _ASSIMILATION_FIELDS:
@@ -848,11 +977,18 @@ def _parse_proposal(raw: bytes) -> TransitionProposal:
         raw_affected = raw_assimilation["affected_paths"]
         if not isinstance(observation_ref, str) or not observation_ref:
             raise TransitionError("assimilation observation_ref must be a non-empty string")
+        _bounded_utf8(
+            observation_ref,
+            MAX_REFERENCE_BYTES,
+            "assimilation observation_ref",
+        )
         _canonical_path(observation_ref)
         if not isinstance(raw_affected, list) or not raw_affected or any(
             not isinstance(path, str) for path in raw_affected
         ):
             raise TransitionError("assimilation affected_paths must be a non-empty list")
+        if len(raw_affected) > MAX_AFFECTED_PATHS:
+            raise TransitionError("assimilation affected_paths exceeds 256 entries")
         affected_paths = tuple(_canonical_path(path) for path in raw_affected)
         if len(set(affected_paths)) != len(affected_paths) or tuple(
             sorted(affected_paths)
@@ -860,6 +996,7 @@ def _parse_proposal(raw: bytes) -> TransitionProposal:
             raise TransitionError("assimilation affected_paths must be unique and sorted")
         if not isinstance(rationale, str):
             raise TransitionError("assimilation rationale must be a string")
+        _bounded_utf8(rationale, MAX_RATIONALE_BYTES, "assimilation rationale")
         _rationale_parts(rationale)
         assimilations.append(
             Assimilation(
@@ -907,31 +1044,44 @@ def _safe_transition_id(proposal_ref: object) -> str:
 
 
 def _safe_ref(value: object) -> str:
-    return value if isinstance(value, str) else ""
+    if not isinstance(value, str):
+        return ""
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return ""
+    return value if len(encoded) <= MAX_REFERENCE_BYTES else ""
+
+
+def _bounded_utf8(value: object, maximum: int, field: str) -> str:
+    if not isinstance(value, str):
+        raise TransitionError(f"{field} must be a string")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise TransitionError(f"{field} must contain valid UTF-8") from error
+    if len(encoded) > maximum:
+        raise TransitionError(f"{field} exceeds {maximum} UTF-8 bytes")
+    return value
 
 
 def _canonical_path(value: object) -> str:
     if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
         raise TransitionError(f"path must be a canonical relative path: {value!r}")
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError as error:
-        raise TransitionError("path must contain valid UTF-8 scalar values") from error
+    _bounded_utf8(value, MAX_PATH_BYTES, "path")
     path = PurePosixPath(value)
     if (
         path.is_absolute()
         or path.as_posix() != value
         or any(part in {"", ".", ".."} for part in path.parts)
+        or len(path.parts) > MAX_PATH_COMPONENTS
     ):
         raise TransitionError(f"path must be a canonical relative path: {value!r}")
     return value
 
 
 def _rationale_parts(rationale: str) -> tuple[str, str]:
-    try:
-        rationale.encode("utf-8")
-    except UnicodeEncodeError as error:
-        raise TransitionError("assimilation rationale must be valid UTF-8") from error
+    _bounded_utf8(rationale, MAX_RATIONALE_BYTES, "assimilation rationale")
     if rationale != rationale.strip() or "#" not in rationale:
         raise TransitionError("assimilation rationale must be exact path#Heading")
     path, separator, heading = rationale.partition("#")
@@ -964,6 +1114,125 @@ def _terminal_observation_ref(path: str) -> str | None:
     return None
 
 
+def _read_base_tree_entries(
+    repository: RepositoryBinding,
+    commit: str,
+    paths: Iterable[str],
+) -> dict[str, _worktrees.RepositoryTreeEntry]:
+    query_paths: set[str] = set()
+    for path in paths:
+        candidate = PurePosixPath(_canonical_path(path))
+        query_paths.update(
+            PurePosixPath(*candidate.parts[:length]).as_posix()
+            for length in range(1, len(candidate.parts) + 1)
+        )
+    return {
+        entry.path: entry
+        for entry in _worktrees.read_repository_tree_entries(
+            repository,
+            commit,
+            query_paths,
+        )
+    }
+
+
+def _base_gitlink_ancestor(
+    entries: Mapping[str, _worktrees.RepositoryTreeEntry],
+    path: str,
+) -> str | None:
+    candidate = PurePosixPath(path)
+    for length in range(1, len(candidate.parts) + 1):
+        ancestor = PurePosixPath(*candidate.parts[:length]).as_posix()
+        entry = entries.get(ancestor)
+        if entry is None:
+            continue
+        if entry.mode == "160000" and entry.kind == "commit":
+            return ancestor
+        if length < len(candidate.parts) and not (
+            entry.mode == "040000" and entry.kind == "tree"
+        ):
+            raise WorktreeError(
+                f"repository path descends through a non-tree entry: {ancestor}"
+            )
+    return None
+
+
+def _base_repository_file(
+    repository: RepositoryBinding,
+    path: str,
+    entries: Mapping[str, _worktrees.RepositoryTreeEntry],
+) -> _worktrees.RepositoryFile | None:
+    entry = entries.get(path)
+    if entry is None:
+        return None
+    if entry.mode not in {"100644", "100755"} or entry.kind != "blob":
+        raise WorktreeError(f"repository path is not a regular SHA-1 blob: {path}")
+    return _worktrees.RepositoryFile(
+        path=path,
+        mode=entry.mode,
+        blob_oid=entry.oid,
+        content=_worktrees.read_repository_blob(repository, entry.oid),
+    )
+
+
+def _closure_path_is_versioned(path: object) -> bool:
+    try:
+        canonical = _canonical_path(path)
+    except TransitionError:
+        return False
+    return (
+        not canonical.startswith((".aros/", ".git/"))
+        and _path_owner(canonical) in {"task", "run", "eval"}
+    )
+
+
+def _bounded_closure_paths(
+    records: Iterable[ObservationRecord],
+) -> set[str] | None:
+    paths: set[str] = set()
+    for record in records:
+        for path in record.versioned_paths:
+            paths.add(path)
+            if len(paths) > MAX_OBSERVATION_CLOSURE_PATHS:
+                return None
+    return paths
+
+
+def _audit_evidence_bounds(
+    document: SemanticDocument,
+    issues: list[dict[str, str]],
+) -> None:
+    for occurrence in document.evidence_links:
+        try:
+            _bounded_utf8(
+                occurrence.link.observation_ref,
+                MAX_REFERENCE_BYTES,
+                "EvidenceLink observation_ref",
+            )
+        except TransitionError as error:
+            _add_issue(
+                issues,
+                "error",
+                "evidence_reference_too_long",
+                f"{document.path}#{occurrence.anchor}",
+                str(error),
+            )
+        try:
+            _bounded_utf8(
+                occurrence.link.scope,
+                MAX_EVIDENCE_SCOPE_BYTES,
+                "EvidenceLink scope",
+            )
+        except TransitionError as error:
+            _add_issue(
+                issues,
+                "error",
+                "evidence_scope_too_long",
+                f"{document.path}#{occurrence.anchor}",
+                str(error),
+            )
+
+
 def _added_evidence_links(
     current: SemanticDocument,
     base: SemanticDocument | None,
@@ -993,12 +1262,28 @@ def _evidence_identity(
     )
 
 
-def _read_anchored_bytes(
+def _read_anchored_file(
     reader: AnchoredWorkspaceReader,
     relative: str,
-) -> bytes:
+    *,
+    max_bytes: int | None = None,
+    require_non_executable: bool = False,
+) -> _CurrentFile:
     key = reader._workspace_file_key(relative)
     with reader._open_file(key) as (descriptor, anchored):
+        mode = (
+            "100755"
+            if stat.S_IMODE(anchored.identity[2]) & 0o111
+            else "100644"
+        )
+        if require_non_executable and mode != "100644":
+            raise _ExecutableFileError(
+                "proposal file mode must be non-executable 100644"
+            )
+        if max_bytes is not None and anchored.identity[4] > max_bytes:
+            raise TransitionError(
+                f"file exceeds {max_bytes} bytes: {relative}"
+            )
         payload, _size, _digest = reader._stream_file(
             descriptor,
             anchored,
@@ -1006,7 +1291,7 @@ def _read_anchored_bytes(
             capture_limit=None,
         )
     assert payload is not None
-    return payload
+    return _CurrentFile(content=payload, mode=mode)
 
 
 def _reject_nested_repository(
@@ -1264,6 +1549,15 @@ def _finalize_audit(
 
 __all__ = [
     "Assimilation",
+    "MAX_AFFECTED_PATHS",
+    "MAX_ASSIMILATIONS",
+    "MAX_EVIDENCE_SCOPE_BYTES",
+    "MAX_OBSERVATION_CLOSURE_PATHS",
+    "MAX_PATH_BYTES",
+    "MAX_PROPOSAL_BYTES",
+    "MAX_RATIONALE_BYTES",
+    "MAX_REFERENCE_BYTES",
+    "MAX_WORKSPACE_PATHS",
     "TransitionAuditService",
     "TransitionError",
     "TransitionProposal",

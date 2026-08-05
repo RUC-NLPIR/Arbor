@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -29,6 +30,8 @@ _BASE_CONFIGS = (
     "core.symlinks=true",
     "core.attributesFile=/dev/null",
 )
+REPOSITORY_TREE_QUERY_BATCH_SIZE = 256
+MAX_REPOSITORY_TREE_QUERY_PATHS = 20_000
 
 
 class WorktreeError(ValueError):
@@ -64,12 +67,14 @@ class RepositoryFile:
     """One exact regular blob read from a pinned repository commit."""
 
     path: str
+    mode: str
     blob_oid: str
     content: bytes
 
 
 @dataclass(frozen=True)
-class _RepositoryTreeEntry:
+class RepositoryTreeEntry:
+    path: str
     mode: str
     kind: str
     oid: str
@@ -236,7 +241,8 @@ def read_repository_file(
     _validate_repository_binding(repository)
     canonical = _repository_path(path).as_posix()
     _repository_commit(commit)
-    entry = _read_repository_tree_entry(repository, commit, canonical)
+    entries = read_repository_tree_entries(repository, commit, (canonical,))
+    entry = entries[0] if entries else None
     if entry is None:
         _validate_repository_binding(repository)
         return None
@@ -245,15 +251,76 @@ def read_repository_file(
         or entry.kind != "blob"
     ):
         raise WorktreeError(f"repository path is not a regular SHA-1 blob: {path}")
-    blob_oid = entry.oid
+    content = read_repository_blob(repository, entry.oid)
+    _validate_repository_binding(repository)
+    return RepositoryFile(
+        path=path,
+        mode=entry.mode,
+        blob_oid=entry.oid,
+        content=content,
+    )
+
+
+def read_repository_blob(
+    repository: RepositoryBinding,
+    blob_oid: str,
+) -> bytes:
+    """Read and verify one exact SHA-1 blob without changing object storage."""
+    _validate_repository_binding(repository)
+    if not isinstance(blob_oid, str) or _COMMIT.fullmatch(blob_oid) is None:
+        raise WorktreeError(f"invalid repository blob object ID: {blob_oid!r}")
     content = _git_bytes(repository, "cat-file", "blob", blob_oid)
     digest = hashlib.sha1(
         b"blob " + str(len(content)).encode("ascii") + b"\0" + content
     ).hexdigest()
     if digest != blob_oid:
-        raise WorktreeError(f"repository blob bytes do not match object ID: {path}")
+        raise WorktreeError("repository blob bytes do not match object ID")
     _validate_repository_binding(repository)
-    return RepositoryFile(path=path, blob_oid=blob_oid, content=content)
+    return content
+
+
+def read_repository_tree_entries(
+    repository: RepositoryBinding,
+    commit: str,
+    paths: Iterable[str],
+) -> tuple[RepositoryTreeEntry, ...]:
+    """Read exact literal tree entries in bounded Git query batches."""
+    _validate_repository_binding(repository)
+    _repository_commit(commit)
+    if isinstance(paths, (str, bytes)):
+        raise WorktreeError("repository tree paths must be an iterable of paths")
+    requested: set[str] = set()
+    for count, path in enumerate(paths, start=1):
+        if count > MAX_REPOSITORY_TREE_QUERY_PATHS:
+            raise WorktreeError("too many repository tree paths")
+        requested.add(_repository_path(path).as_posix())
+    ordered = sorted(requested)
+    entries: dict[str, RepositoryTreeEntry] = {}
+    for offset in range(0, len(ordered), REPOSITORY_TREE_QUERY_BATCH_SIZE):
+        batch = ordered[offset : offset + REPOSITORY_TREE_QUERY_BATCH_SIZE]
+        raw = _git_bytes(
+            repository,
+            "--literal-pathspecs",
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            commit,
+            "--",
+            *batch,
+        )
+        if raw and not raw.endswith(b"\0"):
+            raise WorktreeError("repository tree query is not NUL terminated")
+        for record in (item for item in raw.split(b"\0") if item):
+            entry = _parse_repository_tree_entry(record)
+            if entry.path not in requested:
+                continue
+            if entry.path in entries:
+                raise WorktreeError(
+                    f"repository tree query returned an ambiguous path: {entry.path}"
+                )
+            entries[entry.path] = entry
+    _validate_repository_binding(repository)
+    return tuple(entries[path] for path in sorted(entries))
 
 
 def find_repository_gitlink_ancestor(
@@ -265,12 +332,19 @@ def find_repository_gitlink_ancestor(
     _validate_repository_binding(repository)
     candidate = _repository_path(path)
     _repository_commit(commit)
+    ancestors = [
+        PurePosixPath(*candidate.parts[:length]).as_posix()
+        for length in range(1, len(candidate.parts) + 1)
+    ]
+    entries = {
+        entry.path: entry
+        for entry in read_repository_tree_entries(repository, commit, ancestors)
+    }
     gitlink: str | None = None
-    for length in range(1, len(candidate.parts) + 1):
-        ancestor = PurePosixPath(*candidate.parts[:length]).as_posix()
-        entry = _read_repository_tree_entry(repository, commit, ancestor)
+    for length, ancestor in enumerate(ancestors, start=1):
+        entry = entries.get(ancestor)
         if entry is None:
-            break
+            continue
         if entry.mode == "160000" and entry.kind == "commit":
             gitlink = ancestor
             break
@@ -309,38 +383,31 @@ def _repository_commit(commit: object) -> str:
     return commit
 
 
-def _read_repository_tree_entry(
-    repository: RepositoryBinding,
-    commit: str,
-    path: str,
-) -> _RepositoryTreeEntry | None:
-    raw = _git_bytes(
-        repository,
-        "--literal-pathspecs",
-        "ls-tree",
-        "-z",
-        "--full-tree",
-        commit,
-        "--",
-        path,
-    )
-    records = [record for record in raw.split(b"\0") if record]
-    if not records:
-        return None
-    if len(records) != 1:
-        raise WorktreeError(f"repository path is ambiguous: {path}")
-    header, separator, raw_path = records[0].partition(b"\t")
+def _parse_repository_tree_entry(record: bytes) -> RepositoryTreeEntry:
+    header, separator, raw_path = record.partition(b"\t")
     fields = header.split(b" ")
+    allowed = {
+        (b"040000", b"tree"),
+        (b"100644", b"blob"),
+        (b"100755", b"blob"),
+        (b"120000", b"blob"),
+        (b"160000", b"commit"),
+    }
     if (
         separator != b"\t"
-        or raw_path != path.encode("utf-8")
+        or not raw_path
         or len(fields) != 3
-        or fields[0] not in {b"040000", b"100644", b"100755", b"120000", b"160000"}
-        or fields[1] not in {b"blob", b"commit", b"tree"}
+        or (fields[0], fields[1]) not in allowed
         or re.fullmatch(rb"[0-9a-f]{40}", fields[2]) is None
     ):
-        raise WorktreeError(f"repository path has an invalid tree entry: {path}")
-    return _RepositoryTreeEntry(
+        raise WorktreeError("repository tree query returned an invalid entry")
+    try:
+        path = raw_path.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise WorktreeError("repository tree path is not UTF-8") from error
+    _repository_path(path)
+    return RepositoryTreeEntry(
+        path=path,
         mode=fields[0].decode("ascii"),
         kind=fields[1].decode("ascii"),
         oid=fields[2].decode("ascii"),

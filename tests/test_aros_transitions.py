@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import arbor.aros.transitions as transitions_module
+import arbor.aros.worktrees as worktrees_module
 from arbor.aros.eval import EvalService
 from arbor.aros.observations import ObservationRecord
 from arbor.aros.store import atomic_write_json, canonical_json_bytes, json_sha256
@@ -330,6 +331,26 @@ def test_proposal_rejects_non_utf8_scalar_paths(tmp_path: Path) -> None:
     assert audit["mechanically_valid"] is False
 
 
+def test_constructor_and_audit_reject_non_utf8_public_refs_safely(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path)
+    with pytest.raises(TransitionError, match="UTF-8|canonical_ref"):
+        TransitionAuditService(
+            tmp_path,
+            canonical_ref="refs/heads/\ud800",
+        )
+
+    audit = TransitionAuditService(
+        tmp_path,
+        canonical_ref=_git(tmp_path, "symbolic-ref", "HEAD"),
+    ).audit("transitions/T-\ud800/proposal.json")
+
+    assert set(audit) == AUDIT_FIELDS
+    assert audit["mechanically_valid"] is False
+    assert canonical_json_bytes(audit)
+
+
 def test_audit_reports_non_utf8_scalar_semantic_links(tmp_path: Path) -> None:
     _init_workspace(tmp_path)
     claim = tmp_path / "knowledge" / "claims" / "C-scalar.md"
@@ -546,6 +567,73 @@ def test_audit_rejects_base_gitlink_descendant_after_marker_removed(
 
     assert audit["mechanically_valid"] is False
     assert any("submodule" in str(issue["code"]) for issue in audit["issues"])
+
+
+def test_executable_proposal_is_rejected_before_trusting_bytes(tmp_path: Path) -> None:
+    proposal_ref = _changed_semantic_proposal(tmp_path, "T-executable-proposal")
+    (tmp_path / proposal_ref).chmod(0o755)
+
+    with pytest.raises(TransitionError, match="executable|mode"):
+        load_transition_proposal(tmp_path, proposal_ref)
+
+    audit = _audit(tmp_path, proposal_ref)
+    assert audit["mechanically_valid"] is False
+    assert audit["proposal_blob_sha256"] is None
+    assert any("executable" in str(issue["code"]) for issue in audit["issues"])
+
+
+def test_chmod_only_semantic_change_binds_mode_and_is_rejected(
+    tmp_path: Path,
+) -> None:
+    base = _init_workspace(tmp_path)
+    path = tmp_path / "memory" / "NOW.md"
+    path.chmod(0o755)
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-chmod-only",
+        base_commit=base,
+        workspace_paths=["memory/NOW.md"],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert audit["path_receipts"][0]["mode"] == "100755"
+    assert any("executable" in str(issue["code"]) for issue in audit["issues"])
+    assert not any(
+        issue["code"] == "semantic_path_unchanged" for issue in audit["issues"]
+    )
+
+
+def test_executable_service_and_closure_files_bind_mode_and_fail(
+    tmp_path: Path,
+) -> None:
+    _service, manifest, _final = observation_support._install_run_final(tmp_path)
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    run_id = str(manifest["run_id"])
+    manifest_ref = f"runs/{run_id}/manifest.json"
+    final_ref = f"runs/{run_id}/final.json"
+    (tmp_path / final_ref).chmod(0o755)
+    (tmp_path / manifest_ref).chmod(0o755)
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-executable-service",
+        base_commit=base,
+        workspace_paths=[final_ref],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert audit["path_receipts"][0]["mode"] == "100755"
+    closure_paths = {
+        path["path"]: path
+        for record in audit["observation_closure"]
+        for path in record["paths"]
+    }
+    assert closure_paths[manifest_ref]["mode"] == "100755"
+    assert closure_paths[final_ref]["mode"] == "100755"
+    assert any("executable" in str(issue["code"]) for issue in audit["issues"])
 
 
 @pytest.mark.parametrize("case", ("unchanged", "rationale"))
@@ -1247,6 +1335,41 @@ def test_direct_terminal_service_records_derive_complete_owner_closure(
         assert len(paths) == len(set(paths))
 
 
+def test_overlapping_direct_observations_emit_each_closure_receipt_once(
+    tmp_path: Path,
+) -> None:
+    installed = observation_support._install_eval_receipt(tmp_path)
+    eval_ref = str(installed["receipt_ref"])
+    run_ref = f"runs/{installed['run_id']}/final.json"
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-overlapping-closure",
+        base_commit=_git(tmp_path, "rev-parse", "HEAD"),
+        workspace_paths=sorted([eval_ref, run_ref]),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    closure = {item["observation_ref"]: item for item in audit["observation_closure"]}
+    assert set(closure) == {eval_ref, run_ref}
+    assert set(closure[eval_ref]["versioned_paths"]) == {
+        eval_ref,
+        f"runs/{installed['run_id']}/manifest.json",
+        run_ref,
+    }
+    assert set(closure[run_ref]["versioned_paths"]) == {
+        f"runs/{installed['run_id']}/manifest.json",
+        run_ref,
+    }
+    receipts = [
+        path["path"]
+        for record in audit["observation_closure"]
+        for path in record["paths"]
+    ]
+    assert len(receipts) == len(set(receipts))
+
+
 def test_preterminal_task_brief_and_run_manifest_need_no_terminal_closure(
     tmp_path: Path,
 ) -> None:
@@ -1697,6 +1820,283 @@ def test_unrelated_dirty_paths_do_not_invalidate_audit(tmp_path: Path) -> None:
 
     assert audit["mechanically_valid"] is True
     assert (tmp_path / "unrelated.tmp").read_text(encoding="utf-8") == "preserve me\n"
+
+
+def test_transition_input_limits_are_explicit_and_enforced(tmp_path: Path) -> None:
+    assert transitions_module.MAX_PROPOSAL_BYTES == 1_048_576
+    assert transitions_module.MAX_WORKSPACE_PATHS == 256
+    assert transitions_module.MAX_ASSIMILATIONS == 256
+    assert transitions_module.MAX_AFFECTED_PATHS == 256
+    assert transitions_module.MAX_PATH_BYTES == 1_024
+    assert transitions_module.MAX_REFERENCE_BYTES == 1_024
+    assert transitions_module.MAX_RATIONALE_BYTES == 4_096
+    assert transitions_module.MAX_EVIDENCE_SCOPE_BYTES == 4_096
+    assert transitions_module.MAX_OBSERVATION_CLOSURE_PATHS == 1_024
+
+    base = _init_workspace(tmp_path)
+    oversized_ref = _write_proposal(
+        tmp_path,
+        "T-oversized",
+        base_commit=base,
+        workspace_paths=[],
+    )
+    (tmp_path / oversized_ref).write_bytes(
+        b" " * (transitions_module.MAX_PROPOSAL_BYTES + 1)
+    )
+    with pytest.raises(TransitionError, match="size|bytes|large"):
+        load_transition_proposal(tmp_path, oversized_ref)
+    oversized_audit = _audit(tmp_path, oversized_ref)
+    assert oversized_audit["mechanically_valid"] is False
+    assert oversized_audit["proposal_blob_sha256"] is None
+
+    workspace_ref = _write_proposal(
+        tmp_path,
+        "T-too-many-paths",
+        base_commit=base,
+        workspace_paths=[
+            f"memory/P-{index:03d}.md"
+            for index in range(transitions_module.MAX_WORKSPACE_PATHS + 1)
+        ],
+    )
+    with pytest.raises(TransitionError, match="workspace_paths|256"):
+        load_transition_proposal(tmp_path, workspace_ref)
+
+    assimilation_ref = _write_proposal(
+        tmp_path,
+        "T-too-many-assimilations",
+        base_commit=base,
+        workspace_paths=["memory/NOW.md"],
+        assimilations=[
+            {
+                "observation_ref": (
+                    f"tasks/TASK-20260805-b{index:03d}/collected.json"
+                ),
+                "affected_paths": ["memory/NOW.md"],
+                "rationale": "memory/NOW.md#Findings",
+            }
+            for index in range(transitions_module.MAX_ASSIMILATIONS + 1)
+        ],
+    )
+    with pytest.raises(TransitionError, match="assimilations|256"):
+        load_transition_proposal(tmp_path, assimilation_ref)
+
+    affected_ref = _write_proposal(
+        tmp_path,
+        "T-too-many-affected",
+        base_commit=base,
+        workspace_paths=["memory/NOW.md"],
+        assimilations=[
+            {
+                "observation_ref": "tasks/TASK-20260805-bounded/collected.json",
+                "affected_paths": [
+                    f"memory/A-{index:03d}.md"
+                    for index in range(transitions_module.MAX_AFFECTED_PATHS + 1)
+                ],
+                "rationale": "memory/A-000.md#Findings",
+            }
+        ],
+    )
+    with pytest.raises(TransitionError, match="affected_paths|256"):
+        load_transition_proposal(tmp_path, affected_ref)
+
+
+@pytest.mark.parametrize("field", ("path", "reference", "rationale"))
+def test_transition_string_limits_use_utf8_bytes(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    base = _init_workspace(tmp_path)
+    workspace_paths = ["memory/NOW.md"]
+    observation_ref = "tasks/TASK-20260805-string/collected.json"
+    rationale = "memory/NOW.md#Findings"
+    if field == "path":
+        workspace_paths = [
+            "memory/" + "x" * transitions_module.MAX_PATH_BYTES + ".md"
+        ]
+    elif field == "reference":
+        observation_ref = (
+            "tasks/TASK-20260805-"
+            + "r" * transitions_module.MAX_REFERENCE_BYTES
+            + "/collected.json"
+        )
+    else:
+        rationale = (
+            "memory/NOW.md#"
+            + "H" * transitions_module.MAX_RATIONALE_BYTES
+        )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        f"T-long-{field}",
+        base_commit=base,
+        workspace_paths=workspace_paths,
+        assimilations=(
+            []
+            if field == "path"
+            else [
+                {
+                    "observation_ref": observation_ref,
+                    "affected_paths": ["memory/NOW.md"],
+                    "rationale": rationale,
+                }
+            ]
+        ),
+    )
+
+    with pytest.raises(TransitionError, match="long|bytes|1024|4096"):
+        load_transition_proposal(tmp_path, proposal_ref)
+
+
+def test_evidence_scope_is_bounded_without_bounding_semantic_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    claim = tmp_path / "knowledge" / "claims" / "C-scope-bound.md"
+    claim.parent.mkdir(parents=True)
+    claim.write_text(_claim_document("C-scope-bound", []), encoding="utf-8")
+    large = tmp_path / "memory" / "LARGE.md"
+    large.write_text("# Large\n\nInitial.\n", encoding="utf-8")
+    _git(tmp_path, "add", "knowledge/claims/C-scope-bound.md", "memory/LARGE.md")
+    _git(tmp_path, "commit", "-qm", "add bounded link and large semantic files")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    observation_ref = "tasks/TASK-20260805-scope/collected.json"
+    claim.write_text(
+        _claim_document(
+            "C-scope-bound",
+            [
+                {
+                    "observation_ref": observation_ref,
+                    "relation": "context",
+                    "scope": "s"
+                    * (transitions_module.MAX_EVIDENCE_SCOPE_BYTES + 1),
+                }
+            ],
+        ),
+        encoding="utf-8",
+    )
+    large.write_text(
+        "# Large\n\n" + "content\n" * 150_000,
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-scope-bound",
+        base_commit=base,
+        workspace_paths=[
+            "knowledge/claims/C-scope-bound.md",
+            "memory/LARGE.md",
+        ],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": ["knowledge/claims/C-scope-bound.md"],
+                "rationale": "knowledge/claims/C-scope-bound.md#Evidence links",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            observation_ref,
+            base_commit=base,
+        ),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert any("scope" in str(issue["code"]) for issue in audit["issues"])
+    assert any(
+        receipt["path"] == "memory/LARGE.md" for receipt in audit["path_receipts"]
+    )
+
+
+def test_observation_closure_path_count_is_bounded_before_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _init_workspace(tmp_path)
+    (tmp_path / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nBounded closure.\n",
+        encoding="utf-8",
+    )
+    observation_ref = "runs/RUN-bounded/final.json"
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-closure-bound",
+        base_commit=base,
+        workspace_paths=["memory/NOW.md"],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": ["memory/NOW.md"],
+                "rationale": "memory/NOW.md#Findings",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            observation_ref,
+            kind="run_final",
+            versioned_paths=tuple(
+                f".aros/runs/RUN-{index}/status.json"
+                for index in range(
+                    transitions_module.MAX_OBSERVATION_CLOSURE_PATHS + 1
+                )
+            ),
+        ),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert any("closure_limit" in str(issue["code"]) for issue in audit["issues"])
+    assert len(audit["issues"]) < 10
+
+
+def test_audit_reuses_batched_base_tree_projection_for_many_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _init_workspace(tmp_path)
+    paths: list[str] = []
+    for index in range(200):
+        relative = f"memory/batch/P-{index:03d}.md"
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# Batch {index}\n", encoding="utf-8")
+        paths.append(relative)
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-batched-tree",
+        base_commit=base,
+        workspace_paths=paths,
+    )
+    calls: list[tuple[str, ...]] = []
+    real_read = worktrees_module.read_repository_tree_entries
+
+    def recording_read(
+        repository: object,
+        commit: str,
+        requested: list[str] | tuple[str, ...] | set[str],
+    ):  # type: ignore[no-untyped-def]
+        calls.append(tuple(requested))
+        return real_read(repository, commit, requested)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        worktrees_module,
+        "read_repository_tree_entries",
+        recording_read,
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    assert len(calls) <= 3
+    assert any(len(call) >= len(paths) for call in calls)
 
 
 @pytest.mark.parametrize(

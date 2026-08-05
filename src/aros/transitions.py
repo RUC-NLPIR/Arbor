@@ -765,7 +765,7 @@ class TransitionAuditService:
                 if record is not None:
                     for occurrence in matching:
                         if (
-                            record.kind != "measurement"
+                            record.kind in {"run_final", "eval_outcome"}
                             and occurrence.link.relation != "context"
                         ):
                             _add_issue(
@@ -773,7 +773,7 @@ class TransitionAuditService:
                                 "error",
                                 "nonmeasurement_evidence",
                                 assimilation.rationale,
-                                "nonmeasurement observations may only be context",
+                                "process or evaluation outcomes may only be context",
                             )
                         links.append(
                             _link_receipt(

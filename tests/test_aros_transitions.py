@@ -810,9 +810,11 @@ def test_measurement_claim_requires_owner_parsed_link(
     assert receipt["canonical_sha256"] == canonical_sha256
 
 
-def test_eval_outcome_can_only_link_as_process_context(
+@pytest.mark.parametrize("kind", ("run_final", "eval_outcome"))
+def test_process_and_eval_outcomes_can_only_link_as_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    kind: str,
 ) -> None:
     base = _init_workspace(tmp_path)
     claim = tmp_path / "knowledge" / "claims" / "C-apparatus.md"
@@ -824,14 +826,18 @@ def test_eval_outcome_can_only_link_as_process_context(
     _git(tmp_path, "add", "knowledge/claims/C-apparatus.md")
     _git(tmp_path, "commit", "-qm", "add apparatus claim")
     base = _git(tmp_path, "rev-parse", "HEAD")
-    observation_ref = f"eval/evaluations/EVAL-{'a' * 64}/receipt.json"
+    observation_ref = (
+        "runs/RUN-process-context/final.json"
+        if kind == "run_final"
+        else f"eval/evaluations/EVAL-{'a' * 64}/receipt.json"
+    )
     claim.write_text(
         "---\nid: C-apparatus\n---\n# Claim\n\n## Evidence links\n\n"
         + json.dumps(
             {
                 "observation_ref": observation_ref,
                 "relation": "supports",
-                "scope": "Invalid evaluation cannot support the claim.",
+                "scope": "Process or invalid evaluation cannot support the claim.",
             },
             sort_keys=True,
         )
@@ -840,7 +846,7 @@ def test_eval_outcome_can_only_link_as_process_context(
     )
     proposal_ref = _write_proposal(
         tmp_path,
-        "T-eval-context",
+        f"T-{kind.replace('_', '-')}-context",
         base_commit=base,
         workspace_paths=["knowledge/claims/C-apparatus.md"],
         assimilations=[
@@ -856,16 +862,16 @@ def test_eval_outcome_can_only_link_as_process_context(
         "resolve",
         lambda _self, _ref, **_kwargs: _fake_observation(
             observation_ref,
-            kind="eval_outcome",
+            kind=kind,
             candidate_commit="c" * 40,
-            measurement_state="invalid_eval",
+            measurement_state=("invalid_eval" if kind == "eval_outcome" else None),
         ),
     )
 
     audit = _audit(tmp_path, proposal_ref)
 
     assert audit["mechanically_valid"] is False
-    assert audit["observation_closure"][0]["kind"] == "eval_outcome"
+    assert audit["observation_closure"][0]["kind"] == kind
     assert any("nonmeasurement" in str(issue["code"]) for issue in audit["issues"])
 
 
@@ -1110,8 +1116,11 @@ def test_changed_evidence_link_scope_is_a_new_delta(
     ]
 
 
-@pytest.mark.parametrize("relation", ("supports", "challenges", "bounds"))
-def test_task_evidence_links_must_be_context(
+@pytest.mark.parametrize(
+    "relation",
+    ("supports", "challenges", "bounds", "context"),
+)
+def test_task_evidence_links_preserve_owner_valid_relation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     relation: str,
@@ -1131,7 +1140,7 @@ def test_task_evidence_links_must_be_context(
                 {
                     "observation_ref": observation_ref,
                     "relation": relation,
-                    "scope": "Task output is process context only.",
+                    "scope": "Explicitly assimilated Task return.",
                 }
             ],
         ),
@@ -1161,8 +1170,9 @@ def test_task_evidence_links_must_be_context(
 
     audit = _audit(tmp_path, proposal_ref)
 
-    assert audit["mechanically_valid"] is False
-    assert any("nonmeasurement" in str(issue["code"]) for issue in audit["issues"])
+    assert audit["mechanically_valid"] is True
+    assert [link["relation"] for link in audit["assimilation_links"]] == [relation]
+    assert not any("nonmeasurement" in str(issue["code"]) for issue in audit["issues"])
 
 
 def test_audit_derives_exact_new_observation_closure(tmp_path: Path) -> None:

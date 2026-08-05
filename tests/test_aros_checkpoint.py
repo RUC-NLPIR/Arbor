@@ -821,6 +821,39 @@ def test_checkpoint_object_import_rejects_oversized_fetch_head_before_open(
         )
 
 
+def test_checkpoint_ref_snapshot_avoids_unbounded_run_git_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    commit, _canonical_ref = _init_repository(root)
+    repository = bind_repository(root)
+    (repository.git_dir / "packed-refs").write_bytes(
+        b"# pack-refs with: peeled fully-peeled sorted\n"
+        + commit.encode("ascii")
+        + b" refs/heads/"
+        + b"x" * 5_000_000
+        + b"\n"
+    )
+    real_run = subprocess.run
+
+    def reject_full_ref_capture(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if "for-each-ref" in command and kwargs.get("capture_output") is True:
+            raise AssertionError("checkpoint refs used unbounded subprocess capture")
+        return real_run(command, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module.subprocess, "run", reject_full_ref_capture)
+
+    with pytest.raises(CheckpointError, match="ref.*bound|bound.*ref"):
+        checkpoint_module._snapshot_canonical_refs(
+            repository,
+            "snapshot canonical refs",
+        )
+
+
 @pytest.mark.parametrize("excess", ("bytes", "count"))
 def test_checkpoint_object_import_bounds_canonical_ref_snapshot(
     tmp_path: Path,
@@ -838,20 +871,23 @@ def test_checkpoint_object_import_bounds_canonical_ref_snapshot(
             f"refs/heads/r{index:05d}\0{commit}\n".encode("ascii")
             for index in range(20_001)
         )
-    real_run_git = checkpoint_module.run_git
-    ref_commands: list[tuple[str, ...]] = []
+    limits: list[tuple[int, int]] = []
 
     def oversized_ref_snapshot(
         repository: object,
-        *args: str,
-        **kwargs: object,
-    ) -> subprocess.CompletedProcess[bytes]:
-        if args and args[0] == "for-each-ref":
-            ref_commands.append(args)
-            return subprocess.CompletedProcess(args, 0, ref_snapshot, b"")
-        return real_run_git(repository, *args, **kwargs)  # type: ignore[arg-type]
+        *,
+        max_refs: int,
+        max_bytes: int,
+    ) -> bytes:
+        del repository
+        limits.append((max_refs, max_bytes))
+        return ref_snapshot
 
-    monkeypatch.setattr(checkpoint_module, "run_git", oversized_ref_snapshot)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "read_repository_refs_snapshot",
+        oversized_ref_snapshot,
+    )
 
     with pytest.raises(CheckpointError, match="ref.*bound|bound.*ref"):
         checkpoint_module._import_commit_objects(
@@ -859,8 +895,7 @@ def test_checkpoint_object_import_bounds_canonical_ref_snapshot(
             bind_repository(candidate),
             (commit,),
         )
-    assert ref_commands
-    assert all("--count=20001" in command for command in ref_commands)
+    assert limits == [(20_000, 4_194_304)]
 
 
 def test_checkpoint_prepare_distinct_candidate_imports_exact_objects_without_ref_update(

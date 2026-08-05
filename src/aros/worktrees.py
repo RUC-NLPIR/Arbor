@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -39,7 +40,7 @@ class WorktreeError(ValueError):
 
 
 class WorktreeLimitError(WorktreeError):
-    """Raised before capture when a pinned Git object exceeds a bound."""
+    """Raised before an oversized pinned Git result is loaded into memory."""
 
 
 class BundleRemovalError(WorktreeError):
@@ -271,6 +272,74 @@ def run_git(
         if index_identity is not None and observed_identity != index_identity:
             raise WorktreeError("checkpoint index identity changed during Git command")
     return result
+
+
+def read_repository_refs_snapshot(
+    repository: RepositoryBinding,
+    *,
+    max_refs: int,
+    max_bytes: int,
+) -> bytes:
+    """Read the exact ref inventory through bounded pinned-Git capture."""
+    _validate_repository_binding(repository)
+    if type(max_refs) is not int or max_refs < 0:
+        raise WorktreeError("max_refs must be a nonnegative integer")
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise WorktreeError("max_bytes must be a nonnegative integer")
+    command = _git_command(
+        repository,
+        "for-each-ref",
+        f"--count={max_refs + 1}",
+        "--format=%(refname)%00%(objectname)",
+    )
+    environment = _git_environment()
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=False,
+                env=environment,
+            )
+            try:
+                returncode = process.wait(timeout=10)
+            except subprocess.TimeoutExpired as error:
+                process.kill()
+                process.wait()
+                raise WorktreeError("Git command timed out: for-each-ref") from error
+        except OSError as error:
+            raise WorktreeError("Git command failed: for-each-ref") from error
+        _validate_repository_binding(repository)
+        stdout_file.seek(0, os.SEEK_END)
+        stdout_size = stdout_file.tell()
+        if stdout_size > max_bytes:
+            raise WorktreeLimitError(
+                f"repository ref snapshot exceeds {max_bytes} bytes"
+            )
+        if returncode != 0:
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            result = subprocess.CompletedProcess(
+                command,
+                returncode,
+                stdout_file.read(4_096),
+                stderr_file.read(4_096),
+            )
+            raise WorktreeError(
+                f"Git command failed: for-each-ref: {_git_error(result)}"
+            )
+        stdout_file.seek(0)
+        snapshot = stdout_file.read()
+    count = snapshot.count(b"\n")
+    if snapshot and not snapshot.endswith(b"\n"):
+        count += 1
+    if count > max_refs:
+        raise WorktreeLimitError(
+            f"repository ref snapshot exceeds {max_refs} refs"
+        )
+    return snapshot
 
 
 def read_tree_into_index(
@@ -1248,15 +1317,12 @@ def _git_result(
     input_bytes: bytes | None = None,
     index_file: Path | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    command = [
-        "git",
-        "--no-replace-objects",
-        f"--git-dir={git_dir or repo.git_dir}",
-        f"--work-tree={work_tree or repo.root}",
-    ]
-    for config in _BASE_CONFIGS:
-        command.extend(("-c", config))
-    command.extend(args)
+    command = _git_command(
+        repo,
+        *args,
+        git_dir=git_dir,
+        work_tree=work_tree,
+    )
     environment = _git_environment()
     if index_file is not None:
         environment["GIT_INDEX_FILE"] = str(index_file)
@@ -1273,6 +1339,24 @@ def _git_result(
         return subprocess.run(command, **options)  # type: ignore[arg-type]
     except (OSError, subprocess.TimeoutExpired) as error:
         raise WorktreeError(f"Git command failed: {' '.join(args)}") from error
+
+
+def _git_command(
+    repo: RepositoryBinding,
+    *args: str,
+    git_dir: Path | None = None,
+    work_tree: Path | None = None,
+) -> list[str]:
+    command = [
+        "git",
+        "--no-replace-objects",
+        f"--git-dir={git_dir or repo.git_dir}",
+        f"--work-tree={work_tree or repo.root}",
+    ]
+    for config in _BASE_CONFIGS:
+        command.extend(("-c", config))
+    command.extend(args)
+    return command
 
 
 def _git_environment() -> dict[str, str]:

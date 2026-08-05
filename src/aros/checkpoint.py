@@ -38,8 +38,10 @@ from .transitions import (
 from .worktrees import (
     RepositoryBinding,
     WorktreeError,
+    WorktreeLimitError,
     bind_repository,
     read_tree_into_index,
+    read_repository_refs_snapshot,
     read_repository_snapshot,
     read_repository_tree_entries,
     resolve_repository_commit,
@@ -1160,15 +1162,18 @@ def _snapshot_canonical_refs(
     repository: RepositoryBinding,
     description: str,
 ) -> bytes:
-    snapshot = _git_success(
-        run_git(
+    try:
+        snapshot = read_repository_refs_snapshot(
             repository,
-            "for-each-ref",
-            f"--count={MAX_CANONICAL_REFS + 1}",
-            "--format=%(refname)%00%(objectname)",
-        ),
-        description,
-    ).stdout
+            max_refs=MAX_CANONICAL_REFS,
+            max_bytes=MAX_CANONICAL_REF_SNAPSHOT_BYTES,
+        )
+    except WorktreeLimitError as error:
+        raise CheckpointError(
+            "canonical ref snapshot exceeds checkpoint bound"
+        ) from error
+    except WorktreeError as error:
+        raise CheckpointError(f"{description}: {error}") from error
     count = snapshot.count(b"\n")
     if snapshot and not snapshot.endswith(b"\n"):
         count += 1

@@ -72,6 +72,16 @@ def _init_repository(root: Path) -> tuple[str, str]:
     return commit, tree
 
 
+def _write_oversized_packed_ref(root: Path, commit: str) -> None:
+    (root / ".git" / "packed-refs").write_bytes(
+        b"# pack-refs with: peeled fully-peeled sorted\n"
+        + commit.encode("ascii")
+        + b" refs/heads/"
+        + b"x" * 5_000_000
+        + b"\n"
+    )
+
+
 def _binding_for_checkout(
     root: Path,
     checkout: Path,
@@ -370,6 +380,127 @@ def test_run_git_rejects_temp_index_drift_during_command(
             input_bytes=b"identity drift",
             index_file=index,
         )
+
+
+def test_read_repository_refs_snapshot_rejects_before_full_memory_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    commit, _tree = _init_repository(root)
+    repository = bind_repository(root)
+    _write_oversized_packed_ref(root, commit)
+    real_run = subprocess.run
+
+    def reject_full_ref_capture(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if "for-each-ref" in command and kwargs.get("capture_output") is True:
+            raise AssertionError("repository refs used unbounded subprocess capture")
+        return real_run(command, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module.subprocess, "run", reject_full_ref_capture)
+
+    with pytest.raises(WorktreeLimitError, match="ref.*bytes|bytes.*ref"):
+        worktrees_module.read_repository_refs_snapshot(
+            repository,
+            max_refs=20_000,
+            max_bytes=4_194_304,
+        )
+
+
+def test_read_repository_refs_snapshot_preserves_pinned_git_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    commit, _tree = _init_repository(root)
+    repository = bind_repository(root)
+    branch = _git(root, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(tmp_path / "hooks"))
+    real_popen = subprocess.Popen
+    real_validate = worktrees_module._validate_repository_binding
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    waits: list[float | None] = []
+    validated: list[RepositoryBinding] = []
+
+    class RecordingProcess:
+        def __init__(self, process: subprocess.Popen[bytes]):
+            self.process = process
+
+        @property
+        def returncode(self) -> int | None:
+            return self.process.returncode
+
+        def wait(self, timeout: float | None = None) -> int:
+            waits.append(timeout)
+            return self.process.wait(timeout=timeout)
+
+        def kill(self) -> None:
+            self.process.kill()
+
+    def recording_popen(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes] | RecordingProcess:
+        if "for-each-ref" not in command:
+            return real_popen(command, **kwargs)  # type: ignore[arg-type]
+        calls.append((command, dict(kwargs)))
+        return RecordingProcess(real_popen(command, **kwargs))  # type: ignore[arg-type]
+
+    def recording_validate(value: RepositoryBinding) -> None:
+        validated.append(value)
+        real_validate(value)
+
+    monkeypatch.setattr(worktrees_module.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(
+        worktrees_module,
+        "_validate_repository_binding",
+        recording_validate,
+    )
+
+    snapshot = worktrees_module.read_repository_refs_snapshot(
+        repository,
+        max_refs=10,
+        max_bytes=4_194_304,
+    )
+
+    assert snapshot == f"refs/heads/{branch}\0{commit}\n".encode("ascii")
+    assert validated == [repository, repository]
+    assert waits == [10]
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command[:4] == [
+        "git",
+        "--no-replace-objects",
+        f"--git-dir={repository.git_dir}",
+        f"--work-tree={repository.root}",
+    ]
+    configured = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "-c"
+    ]
+    assert configured == list(worktrees_module._BASE_CONFIGS)
+    assert command[-3:] == [
+        "for-each-ref",
+        "--count=11",
+        "--format=%(refname)%00%(objectname)",
+    ]
+    assert kwargs["stdin"] == subprocess.DEVNULL
+    assert kwargs["stdout"] != subprocess.PIPE
+    assert kwargs["stderr"] != subprocess.PIPE
+    assert kwargs["text"] is False
+    environment = kwargs["env"]
+    assert isinstance(environment, dict)
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert "GIT_CONFIG_COUNT" not in environment
+    assert "GIT_CONFIG_KEY_0" not in environment
+    assert "GIT_CONFIG_VALUE_0" not in environment
 
 
 def test_detached_checkout_is_exact_clean_and_hermetic(

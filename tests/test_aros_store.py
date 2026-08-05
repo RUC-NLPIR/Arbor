@@ -499,6 +499,18 @@ def test_anchored_workspace_reader_streams_without_oversized_capture(
     assert max(requested) <= 65_536
 
 
+def test_anchored_json_reader_preserves_large_strict_reader_compatibility(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "large.json"
+    value = {"payload": "x" * (1024 * 1024 + 128)}
+    assert create_json(target, value) is True
+    expected = store_module.read_json_strict_no_repair(target)
+
+    with store_module.AnchoredWorkspaceReader(tmp_path) as reader:
+        assert reader.read_json("large.json") == expected
+
+
 def test_anchored_workspace_reader_exit_revalidates_automatically(
     tmp_path: Path,
 ) -> None:

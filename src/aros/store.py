@@ -140,7 +140,6 @@ def read_json_strict_no_repair(path: str | Path) -> Any:
     return _read_json(path, strict=True, repair_aliases=False)
 
 
-_MAX_ANCHORED_JSON_BYTES = 1024 * 1024
 _DirectoryKey = tuple[str, ...]
 _DirectoryIdentity = tuple[int, int, int]
 _FileIdentity = tuple[int, int, int, int, int, int, int]
@@ -251,9 +250,6 @@ class AnchoredWorkspaceReader:
         if key in self._json:
             return self._json[key]
         anchored = self._open_file(key)
-        if anchored.identity[4] > _MAX_ANCHORED_JSON_BYTES:
-            self._stream_file(anchored, capture=False)
-            raise AnchoredReadError("workspace JSON authority exceeds 1 MiB")
         payload, _size, _digest = self._stream_file(anchored, capture=True)
         assert payload is not None
         value = _strict_json_loads(payload)

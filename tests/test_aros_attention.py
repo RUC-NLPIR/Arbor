@@ -795,6 +795,41 @@ def test_attention_context_is_deeply_immutable_and_bounded(
         )
 
 
+def test_attention_preserves_supplied_context_until_packet_requires_fitting(
+    tmp_path: Path,
+) -> None:
+    _init_workspace(tmp_path, with_question=False)
+    authority_source = {
+        "state": "available",
+        "nested": {"memo": "A" * 600, "flags": ["inspect", "audit"]},
+    }
+    budget_source = {"state": "available", "note": "界" * 600}
+    context = AttentionAuthorityContext(
+        authority=authority_source,
+        remaining_budget=budget_source,
+        institutional_obligations=(),
+    )
+    authority_source["nested"]["memo"] = "mutated"  # type: ignore[index]
+    budget_source["note"] = "mutated"
+    service = ResearchAttentionService(tmp_path)
+
+    roomy = service.build(max_chars=16_000, context=context)
+    minimum = service.build(max_chars=512, context=context)
+
+    assert roomy["authority"] == {
+        "state": "available",
+        "nested": {"memo": "A" * 600, "flags": ["inspect", "audit"]},
+    }
+    assert roomy["remaining_budget"] == {
+        "state": "available",
+        "note": "界" * 600,
+    }
+    assert minimum["authority"] == {"state": "available"}
+    assert minimum["remaining_budget"] == {"state": "available"}
+    assert minimum["omitted"]["aros boot"] >= 2
+    assert len(_compact_json(minimum)) <= 512
+
+
 def test_attention_snapshot_and_omitted_schema_are_stable_across_budgets(
     tmp_path: Path,
 ) -> None:

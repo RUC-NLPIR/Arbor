@@ -11,7 +11,6 @@ from types import MappingProxyType
 
 _MAX_OMISSION_POINTERS = 12
 _MAX_INSTITUTIONAL_OBLIGATIONS = 32
-_MAX_CONTEXT_VALUE_CHARS = 512
 
 
 def packet_json(packet: dict[str, object]) -> str:
@@ -99,36 +98,16 @@ def context_views(
     for item in obligations[:_MAX_INSTITUTIONAL_OBLIGATIONS]:
         thawed = _thaw_json(item)
         assert isinstance(thawed, dict)
-        if len(packet_json({"value": thawed})) > _MAX_CONTEXT_VALUE_CHARS:
-            add_omission(
-                omitted,
-                hashed_pointer("institutional obligation", thawed),
-            )
-            continue
         institutional.append(thawed)
     return (
-        _bounded_context_mapping(authority, "authority", omitted),
-        _bounded_context_mapping(budget, "remaining_budget", omitted),
+        _thaw_mapping(authority),
+        _thaw_mapping(budget),
         institutional,
     )
 
 
-def _bounded_context_mapping(
-    value: Mapping[str, object],
-    pointer: str,
-    omitted: dict[str, int],
-) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, item in value.items():
-        thawed = _thaw_json(item)
-        if (
-            key != "state"
-            and len(packet_json({"value": thawed})) > _MAX_CONTEXT_VALUE_CHARS
-        ):
-            add_omission(omitted, hashed_pointer(f"{pointer}.{key}", thawed))
-            continue
-        result[key] = thawed
-    return result
+def _thaw_mapping(value: Mapping[str, object]) -> dict[str, object]:
+    return {key: _thaw_json(item) for key, item in value.items()}
 
 
 def _thaw_json(value: object) -> object:
@@ -174,8 +153,7 @@ def fit_packet(packet: dict[str, object], max_chars: int) -> None:
             if len(packet_json(packet)) <= max_chars:
                 return
 
-    _retain_context_state(packet, "authority", omitted)
-    _retain_context_state(packet, "remaining_budget", omitted)
+    _reduce_context_to_fit(packet, max_chars, omitted)
     if len(packet_json(packet)) <= max_chars:
         return
 
@@ -216,16 +194,38 @@ def _shorten_excerpts(
             _shorten_excerpts(item, limit, omitted)
 
 
-def _retain_context_state(
+def _reduce_context_to_fit(
     packet: dict[str, object],
-    key: str,
+    max_chars: int,
     omitted: dict[str, int],
 ) -> None:
-    mapping = packet[key]
-    assert isinstance(mapping, dict)
-    for field in tuple(mapping):
-        if field == "state":
-            continue
+    candidates: list[tuple[int, str, str, dict[str, object]]] = []
+    for key in ("authority", "remaining_budget"):
+        mapping = packet[key]
+        assert isinstance(mapping, dict)
+        for field, value in mapping.items():
+            if field == "state":
+                continue
+            encoded_size = len(packet_json({field: value})) - 2
+            candidates.append((encoded_size, key, field, mapping))
+    deficit = len(packet_json(packet)) - max_chars
+    removed = 0
+    selected = 0
+    ordered = sorted(
+        candidates,
+        key=lambda item: (item[0], item[1], item[2]),
+        reverse=True,
+    )
+    for encoded_size, key, field, mapping in ordered:
+        add_omission(omitted, hashed_pointer(f"{key}.{field}", mapping[field]))
+        del mapping[field]
+        removed += encoded_size
+        selected += 1
+        if removed >= deficit:
+            break
+    if len(packet_json(packet)) <= max_chars:
+        return
+    for _size, key, field, mapping in ordered[selected:]:
         add_omission(omitted, hashed_pointer(f"{key}.{field}", mapping[field]))
         del mapping[field]
 

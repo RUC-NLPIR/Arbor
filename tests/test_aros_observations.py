@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -13,6 +14,7 @@ from types import MappingProxyType
 
 import pytest
 
+import arbor.aros.observations as observations_module
 import arbor.aros.tasks as tasks_module
 from arbor.aros.eval import EvalService, read_validated_eval_receipt
 from arbor.aros.eval_records import build_measurement_receipt
@@ -35,8 +37,9 @@ from arbor.aros.store import (
     manifest_sha256,
     read_json_strict_no_repair,
 )
-from arbor.aros.tasks import TaskService, read_validated_task_collection
-from arbor.aros.worktrees import bind_repository, create_execution_bundle
+from arbor.aros.tasks import TaskError, TaskService, read_validated_task_collection
+from arbor.aros.worktrees import create_execution_bundle
+from tests import test_aros_eval as eval_test_support
 from tests import test_aros_tasks as task_test_support
 
 
@@ -144,17 +147,25 @@ def _install_eval_receipt(
     root: Path,
     *,
     measurement_state: str = "valid",
+    stdout: bytes = b'{"schema_version":1,"metric":0.5,"sample_count":1}\n',
 ) -> dict[str, object]:
-    candidate_commit, apparatus_commit = _init_repo(root)
+    service, descriptor_manifest, candidate_commit = (
+        eval_test_support._registered_visible_run_service(root)
+    )
+    apparatus_commit = str(descriptor_manifest["apparatus_commit"])
     key_hash = hashlib.sha256(b"evaluation-observation").hexdigest()
     eval_id = f"EVAL-{key_hash}"
-    repository = bind_repository(root)
+    repository = service.repository
     bundle = create_execution_bundle(
         repository,
         root / ".worktree" / "eval" / eval_id,
         candidate_commit,
         apparatus_commit,
     )
+    descriptor = read_json_strict_no_repair(
+        root / ".aros" / "evaluators" / "quality" / "1" / "descriptor.json"
+    )
+    assert isinstance(descriptor, dict)
     runs = RunService(root)
     manifest = runs.prepare_bundle(
         bundle,
@@ -171,7 +182,7 @@ def _install_eval_receipt(
         "eval_id": eval_id,
         "evaluator_id": "quality",
         "evaluator_version": "1",
-        "descriptor_sha256": "d" * 64,
+        "descriptor_sha256": descriptor["descriptor_sha256"],
         "candidate_commit": candidate_commit,
         "apparatus_commit": apparatus_commit,
         "actor": "principal",
@@ -242,7 +253,7 @@ def _install_eval_receipt(
         prelaunch,
     )
     run_runtime = root / ".aros" / "runs" / run_id
-    (run_runtime / "stdout.log").write_bytes(b"")
+    (run_runtime / "stdout.log").write_bytes(stdout)
     (run_runtime / "stderr.log").write_bytes(b"")
     empty_sha256 = hashlib.sha256(b"").hexdigest()
     final = final_identity(manifest)
@@ -260,8 +271,8 @@ def _install_eval_receipt(
             "launch_receipt_sha256": prelaunch["receipt_sha256"],
             "stdout": {
                 "path": f".aros/runs/{run_id}/stdout.log",
-                "bytes": 0,
-                "sha256": empty_sha256,
+                "bytes": len(stdout),
+                "sha256": hashlib.sha256(stdout).hexdigest(),
             },
             "stderr": {
                 "path": f".aros/runs/{run_id}/stderr.log",
@@ -296,12 +307,13 @@ def _install_eval_receipt(
         final,
         measurement_state,
         measurement,
-        "preserved",
+        "removed",
     )
     receipt_ref = f"eval/evaluations/{eval_id}/receipt.json"
     atomic_write_json(root / receipt_ref, receipt)
     return {
-        "service": EvalService(root),
+        "service": service,
+        "descriptor": descriptor,
         "request": request,
         "execution": execution,
         "receipt": receipt,
@@ -377,6 +389,34 @@ def test_task_collection_reader_is_independent_of_task_service_methods(
     assert read_validated_task_collection(tmp_path, task_id) == collected
 
 
+def test_task_collection_reader_rejects_lineage_file_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _service, task_id, _collected = _collected_task(tmp_path)
+    real_read = tasks_module._read_object
+    replaced = False
+
+    def read_then_replace(
+        path: Path,
+        description: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        nonlocal replaced
+        value = real_read(path, description, **kwargs)  # type: ignore[arg-type]
+        if description == "task collection" and not replaced:
+            replaced = True
+            replacement = path.with_name("collected-replacement.json")
+            replacement.write_bytes(path.read_bytes())
+            os.replace(replacement, path)
+        return value
+
+    monkeypatch.setattr(tasks_module, "_read_object", read_then_replace)
+
+    with pytest.raises(TaskError, match="workspace|changed|identity"):
+        read_validated_task_collection(tmp_path, task_id)
+
+
 def test_run_final_reader_returns_canonical_record_hash(tmp_path: Path) -> None:
     service, manifest, final = _install_run_final(tmp_path)
     run_id = str(manifest["run_id"])
@@ -392,7 +432,8 @@ def test_run_final_reader_returns_canonical_record_hash(tmp_path: Path) -> None:
         ref,
     )
     assert record.candidate_commit is None
-    assert record.payload == final
+    assert record.payload["run_id"] == final["run_id"]
+    assert record.payload["state"] == final["state"]
     assert read_validated_run_manifest(tmp_path, run_id) == manifest
     assert read_validated_run_final(tmp_path, run_id) == service.read_validated_final(
         run_id,
@@ -422,6 +463,52 @@ def test_malformed_run_manifest_is_reported_as_observation_error(
         ObservationCatalog(tmp_path).resolve(f"runs/{run_id}/final.json")
 
 
+@pytest.mark.parametrize("race", ("parent", "git", "lineage_file"))
+def test_observation_read_rejects_workspace_identity_races(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race: str,
+) -> None:
+    _service, manifest, _final = _install_run_final(tmp_path)
+    run_id = str(manifest["run_id"])
+    ref = f"runs/{run_id}/final.json"
+    catalog = ObservationCatalog(tmp_path)
+    real_read = observations_module.read_validated_run_manifest
+    swapped = False
+
+    def read_then_swap(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal swapped
+        value = real_read(*args, **kwargs)  # type: ignore[arg-type]
+        if swapped:
+            return value
+        swapped = True
+        if race == "parent":
+            directory = tmp_path / "runs" / run_id
+            backing = directory.with_name(f"{run_id}-original")
+            directory.rename(backing)
+            shutil.copytree(backing, directory)
+        elif race == "git":
+            git_directory = tmp_path / ".git"
+            backing = tmp_path / ".git-original"
+            git_directory.rename(backing)
+            shutil.copytree(backing, git_directory)
+        else:
+            path = tmp_path / "runs" / run_id / "manifest.json"
+            replacement = path.with_name("manifest-replacement.json")
+            replacement.write_bytes(path.read_bytes())
+            os.replace(replacement, path)
+        return value
+
+    monkeypatch.setattr(
+        observations_module,
+        "read_validated_run_manifest",
+        read_then_swap,
+    )
+
+    with pytest.raises(ObservationError, match="binding|changed|identity"):
+        catalog.resolve(ref)
+
+
 @pytest.mark.parametrize("missing", ("run_link", "final", "output"))
 def test_eval_receipt_requires_full_run_lineage(
     tmp_path: Path,
@@ -441,6 +528,31 @@ def test_eval_receipt_requires_full_run_lineage(
 
     with pytest.raises(ObservationError, match="lineage|observation|Run|output"):
         ObservationCatalog(tmp_path).resolve(str(installed["receipt_ref"]))
+
+
+def test_eval_receipt_measurement_is_derived_from_descriptor_and_stdout(
+    tmp_path: Path,
+) -> None:
+    installed = _install_eval_receipt(
+        tmp_path,
+        measurement_state="valid",
+        stdout=b"",
+    )
+
+    with pytest.raises(ObservationError, match="measurement|receipt|lineage"):
+        ObservationCatalog(tmp_path).resolve(str(installed["receipt_ref"]))
+
+
+def test_eval_receipt_accepts_real_descriptor_and_matching_stdout(
+    tmp_path: Path,
+) -> None:
+    installed = _install_eval_receipt(tmp_path)
+
+    record = ObservationCatalog(tmp_path).resolve(str(installed["receipt_ref"]))
+
+    assert record.kind == "measurement"
+    assert record.payload["metric"] == 0.5
+    assert record.payload["sample_count"] == 1
 
 
 def test_eval_linked_run_is_not_a_second_observation(tmp_path: Path) -> None:
@@ -488,7 +600,7 @@ def test_eval_receipt_reader_ignores_missing_mutable_run_status(
 
     record = ObservationCatalog(tmp_path).resolve(str(installed["receipt_ref"]))
 
-    assert record.payload == installed["receipt"]
+    assert record.payload["receipt_sha256"] == installed["receipt"]["receipt_sha256"]
     assert not status_path.exists()
 
 
@@ -557,8 +669,34 @@ def test_task_and_measurement_joint_closure_requires_same_candidate_commit() -> 
         validate_task_measurement_lineage(missing, missing_measurement)
 
 
+def test_observation_record_payload_is_deeply_immutable() -> None:
+    source = {"nested": {"values": [1, 2]}}
+    record = ObservationRecord(
+        ref="runs/RUN-immutable/final.json",
+        kind="run_final",
+        record_sha256="f" * 64,
+        versioned_paths=("runs/RUN-immutable/final.json",),
+        candidate_commit=None,
+        measurement_state=None,
+        payload=source,
+    )
+
+    source["nested"]["values"].append(3)  # type: ignore[index,union-attr]
+
+    assert record.payload["nested"]["values"] == (1, 2)  # type: ignore[index]
+    with pytest.raises(TypeError):
+        record.payload["nested"]["extra"] = True  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        record.payload["nested"]["values"].append(4)  # type: ignore[index,union-attr]
+    assert record.record_sha256 == "f" * 64
+
+
 def test_invalid_or_lost_eval_cannot_resolve_as_measurement(tmp_path: Path) -> None:
-    installed = _install_eval_receipt(tmp_path, measurement_state="invalid_eval")
+    installed = _install_eval_receipt(
+        tmp_path,
+        measurement_state="invalid_eval",
+        stdout=b"",
+    )
     catalog = ObservationCatalog(tmp_path)
     record = catalog.resolve(str(installed["receipt_ref"]))
 

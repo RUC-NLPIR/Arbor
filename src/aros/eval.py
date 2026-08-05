@@ -27,6 +27,8 @@ from .eval_records import (
 from .receipts import record_sha256
 from .runs import RunService
 from .store import (
+    AnchoredReadError,
+    AnchoredWorkspaceReader,
     create_json,
     file_lock,
     json_sha256,
@@ -67,6 +69,34 @@ def read_validated_eval_receipt(
     """Strictly read one receipt and its immutable Eval-to-Run lineage."""
     evaluation_id = _evaluation_id(eval_id)
     service = EvalService(root)
+    if reader is read_json_strict_no_repair:
+        try:
+            with AnchoredWorkspaceReader(service.root) as anchored:
+                anchored.require_git_marker()
+                receipt = _read_validated_eval_receipt(
+                    service,
+                    evaluation_id,
+                    anchored,
+                )
+                _worktrees._validate_repository_binding(service.repository)
+                anchored.revalidate()
+                return receipt
+        except EvalError:
+            raise
+        except (
+            AnchoredReadError,
+            OSError,
+            _worktrees.WorktreeError,
+        ) as error:
+            raise EvalError(f"invalid evaluation workspace: {root}") from error
+    return _read_validated_eval_receipt(service, evaluation_id, reader)
+
+
+def _read_validated_eval_receipt(
+    service: EvalService,
+    evaluation_id: str,
+    reader: _JsonReader,
+) -> dict[str, object]:
     request = service._load_request(evaluation_id, reader=reader)
     execution = service._load_execution(request, reader=reader)
     receipt = service._load_bound_receipt(
@@ -86,13 +116,6 @@ def read_validated_eval_receipt(
         run_link,
         reader=reader,
     )
-    runs = RunService(service.root)
-    run_id = str(receipt["run_id"])
-    for stream in ("stdout", "stderr"):
-        try:
-            runs.verify_output(run_id, stream, reader=reader)
-        except ValueError as error:
-            raise EvalError("existing receipt Run output lineage is invalid") from error
     return receipt
 
 
@@ -659,34 +682,6 @@ class EvalService:
                     break
         metric_contract = descriptor["metric_output"]
         assert isinstance(metric_contract, dict)
-        if process_state == "completed":
-            if output_valid:
-                try:
-                    measurement = parse_scalar_metric(stdout, metric_contract)
-                except ValueError:
-                    measurement = {
-                        "measurement_state": "invalid_eval",
-                        "metric": None,
-                        "sample_count": None,
-                        "metric_name": metric_contract["metric_name"],
-                        "parser": metric_contract["parser"],
-                    }
-            else:
-                measurement = {
-                    "measurement_state": "invalid_eval",
-                    "metric": None,
-                    "sample_count": None,
-                    "metric_name": metric_contract["metric_name"],
-                    "parser": metric_contract["parser"],
-                }
-        else:
-            measurement = {
-                "measurement_state": "not_available",
-                "metric": None,
-                "sample_count": None,
-                "metric_name": metric_contract["metric_name"],
-                "parser": metric_contract["parser"],
-            }
         cleanup_state = "preserved"
         try:
             _worktrees.validate_execution_bundle(self.repository, bundle)
@@ -704,14 +699,13 @@ class EvalService:
             else:
                 if removed:
                     cleanup_state = "removed"
-        if cleanup_state == "preserved" and process_state == "completed":
-            measurement = {
-                "measurement_state": "invalid_eval",
-                "metric": None,
-                "sample_count": None,
-                "metric_name": metric_contract["metric_name"],
-                "parser": metric_contract["parser"],
-            }
+        measurement = _derive_visible_measurement(
+            str(process_state),
+            metric_contract,
+            stdout,
+            output_valid=output_valid,
+            cleanup_state=cleanup_state,
+        )
         try:
             receipt = build_measurement_receipt(
                 request,
@@ -1189,6 +1183,12 @@ class EvalService:
         run_id = str(run_link["run_id"])
         try:
             runs = RunService(self.root)
+            descriptor = self._load_descriptor(
+                str(request["evaluator_id"]),
+                str(request["evaluator_version"]),
+                reader=reader,
+            )
+            self._validate_descriptor_lineage(descriptor, request)
             manifest_value = _read_json_authority(
                 self.root / "runs" / run_id / "manifest.json",
                 reader,
@@ -1197,25 +1197,36 @@ class EvalService:
                 run_id,
                 reader=reader,
             )
+            output_valid = True
+            try:
+                stdout = runs.read_verified_output(run_id, "stdout", reader=reader)
+                runs.read_verified_output(run_id, "stderr", reader=reader)
+            except ValueError:
+                runs.verify_output(run_id, "stdout", reader=reader)
+                runs.verify_output(run_id, "stderr", reader=reader)
+                stdout = b""
+                output_valid = False
         except (OSError, ValueError) as error:
             raise EvalError("existing receipt Run final lineage is invalid") from error
         if not isinstance(manifest_value, dict):
             raise EvalError("linked Run manifest is invalid")
         self._validate_linked_run_manifest(request, run_link, manifest_value)
-        measurement = {
-            "measurement_state": receipt["measurement_state"],
-            "metric": receipt["metric"],
-            "sample_count": receipt["sample_count"],
-            "metric_name": receipt["metric_name"],
-            "parser": receipt["parser"],
-        }
+        metric_contract = descriptor["metric_output"]
+        assert isinstance(metric_contract, dict)
+        measurement = _derive_visible_measurement(
+            str(final_value["state"]),
+            metric_contract,
+            stdout,
+            output_valid=output_valid,
+            cleanup_state=str(receipt["bundle_cleanup_state"]),
+        )
         try:
             rebuilt = build_measurement_receipt(
                 request,
                 execution,
                 run_link,
                 final_value,
-                str(receipt["measurement_state"]),
+                str(measurement["measurement_state"]),
                 measurement,
                 str(receipt["bundle_cleanup_state"]),
             )
@@ -1449,6 +1460,35 @@ class EvalService:
             )
             if hashlib.sha256(blob).hexdigest() != entry["blob_sha256"]:
                 raise EvalError(f"evaluator apparatus blob hash mismatch: {path}")
+
+
+def _derive_visible_measurement(
+    process_state: str,
+    metric_contract: dict[str, object],
+    stdout: bytes,
+    *,
+    output_valid: bool,
+    cleanup_state: str,
+) -> dict[str, object]:
+    unavailable_state = (
+        "invalid_eval" if process_state == "completed" else "not_available"
+    )
+    if (
+        process_state == "completed"
+        and output_valid
+        and cleanup_state == "removed"
+    ):
+        try:
+            return parse_scalar_metric(stdout, metric_contract)
+        except ValueError:
+            pass
+    return {
+        "measurement_state": unavailable_state,
+        "metric": None,
+        "sample_count": None,
+        "metric_name": metric_contract["metric_name"],
+        "parser": metric_contract["parser"],
+    }
 
 
 def _manifest_reference(value: object) -> str:

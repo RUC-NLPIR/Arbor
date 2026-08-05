@@ -16,7 +16,7 @@ from .runs import (
     read_validated_run_final,
     read_validated_run_manifest,
 )
-from .store import json_sha256
+from .store import AnchoredReadError, AnchoredWorkspaceReader, json_sha256
 from .tasks import TaskError, read_validated_task_collection
 from .worktrees import WorktreeError, bind_repository
 
@@ -55,7 +55,13 @@ class ObservationRecord:
     payload: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
+        object.__setattr__(
+            self,
+            "payload",
+            MappingProxyType(
+                {key: _freeze_json(value) for key, value in self.payload.items()}
+            ),
+        )
 
 
 class ObservationCatalog:
@@ -63,22 +69,40 @@ class ObservationCatalog:
 
     def __init__(self, root: str | Path):
         try:
-            self.root = bind_repository(root).root
+            self._repository = bind_repository(root)
+            self.root = self._repository.root
         except WorktreeError as error:
             raise ObservationError(f"invalid observation workspace: {root}") from error
 
     def resolve(self, observation_ref: str) -> ObservationRecord:
         owner, record_id = _parse_observation_ref(observation_ref)
-        self._require_plain_path(observation_ref)
         try:
-            if owner == "task":
-                return self._resolve_task(observation_ref, record_id)
-            if owner == "run":
-                return self._resolve_run(observation_ref, record_id)
-            return self._resolve_eval(observation_ref, record_id)
+            with AnchoredWorkspaceReader(self.root) as reader:
+                reader.require_git_marker()
+                reader.require_file(observation_ref)
+                if owner == "task":
+                    record = self._resolve_task(observation_ref, record_id, reader)
+                elif owner == "run":
+                    record = self._resolve_run(observation_ref, record_id, reader)
+                else:
+                    record = self._resolve_eval(observation_ref, record_id, reader)
+                if bind_repository(self.root) != self._repository:
+                    raise WorktreeError(
+                        f"repository binding changed: {self.root}"
+                    )
+                reader.revalidate()
+                return record
         except ObservationError:
             raise
-        except (EvalError, OSError, RunError, TaskError, ValueError) as error:
+        except (
+            AnchoredReadError,
+            EvalError,
+            KeyError,
+            OSError,
+            RunError,
+            TaskError,
+            WorktreeError,
+        ) as error:
             raise ObservationError(
                 f"invalid observation lineage for {observation_ref}: {error}"
             ) from error
@@ -98,10 +122,19 @@ class ObservationCatalog:
             )
         )
 
-    def _resolve_task(self, ref: str, task_id: str) -> ObservationRecord:
+    def _resolve_task(
+        self,
+        ref: str,
+        task_id: str,
+        reader: AnchoredWorkspaceReader,
+    ) -> ObservationRecord:
         brief_ref = f"tasks/{task_id}/brief.json"
-        self._require_plain_path(brief_ref)
-        collected = read_validated_task_collection(self.root, task_id)
+        reader.require_file(brief_ref)
+        collected = read_validated_task_collection(
+            self.root,
+            task_id,
+            reader=reader,
+        )
         child_commit = collected["child_commit"]
         if not isinstance(child_commit, str) or _COMMIT.fullmatch(child_commit) is None:
             raise ObservationError(f"invalid Task candidate commit: {ref}")
@@ -115,12 +148,17 @@ class ObservationCatalog:
             payload=collected,
         )
 
-    def _resolve_run(self, ref: str, run_id: str) -> ObservationRecord:
+    def _resolve_run(
+        self,
+        ref: str,
+        run_id: str,
+        reader: AnchoredWorkspaceReader,
+    ) -> ObservationRecord:
         manifest_ref = f"runs/{run_id}/manifest.json"
-        self._require_plain_path(manifest_ref)
-        self._require_plain_path(f".aros/receipts/{run_id}-prelaunch.json")
-        manifest = read_validated_run_manifest(self.root, run_id)
-        final = read_validated_run_final(self.root, run_id)
+        reader.require_file(manifest_ref)
+        reader.require_file(f".aros/receipts/{run_id}-prelaunch.json")
+        manifest = read_validated_run_manifest(self.root, run_id, reader=reader)
+        final = read_validated_run_final(self.root, run_id, reader=reader)
         candidate_commit = final.get("candidate_commit", manifest.get("candidate_commit"))
         if candidate_commit is not None and (
             not isinstance(candidate_commit, str)
@@ -137,8 +175,13 @@ class ObservationCatalog:
             payload=final,
         )
 
-    def _resolve_eval(self, ref: str, eval_id: str) -> ObservationRecord:
-        receipt = read_validated_eval_receipt(self.root, eval_id)
+    def _resolve_eval(
+        self,
+        ref: str,
+        eval_id: str,
+        reader: AnchoredWorkspaceReader,
+    ) -> ObservationRecord:
+        receipt = read_validated_eval_receipt(self.root, eval_id, reader=reader)
         run_id = str(receipt["run_id"])
         manifest_ref = f"runs/{run_id}/manifest.json"
         final_ref = f"runs/{run_id}/final.json"
@@ -152,7 +195,7 @@ class ObservationCatalog:
             manifest_ref,
             final_ref,
         ):
-            self._require_plain_path(path)
+            reader.require_file(path)
         measurement_state = str(receipt["measurement_state"])
         kind: _ObservationKind = (
             "measurement"
@@ -268,30 +311,6 @@ class ObservationCatalog:
             refs.append(path.relative_to(self.root).as_posix())
         return refs
 
-    def _require_plain_path(self, relative: str) -> None:
-        current = self.root
-        parts = PurePosixPath(relative).parts
-        for index, part in enumerate(parts):
-            current /= part
-            try:
-                metadata = current.lstat()
-            except FileNotFoundError as error:
-                raise ObservationError(f"observation path does not exist: {relative}") from error
-            except OSError as error:
-                raise ObservationError(f"unable to inspect observation path: {relative}") from error
-            if stat.S_ISLNK(metadata.st_mode):
-                raise ObservationError(f"observation path must not contain a symlink: {relative}")
-            if index < len(parts) - 1:
-                if not stat.S_ISDIR(metadata.st_mode):
-                    raise ObservationError(
-                        f"observation path parent must be a directory: {relative}"
-                    )
-            elif not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise ObservationError(
-                    f"observation path must be a single-link plain file: {relative}"
-                )
-
-
 def validate_task_measurement_lineage(
     task_record: ObservationRecord,
     measurement_record: ObservationRecord,
@@ -340,3 +359,13 @@ def _parse_observation_ref(observation_ref: str) -> tuple[str, str]:
         if match is not None:
             return owner, match.group(1)
     raise ObservationError(f"unsupported observation reference: {observation_ref!r}")
+
+
+def _freeze_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value

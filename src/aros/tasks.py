@@ -27,6 +27,8 @@ from typing import Protocol
 from . import worktrees as worktrees_module
 from .receipts import content_receipt, digest_chunks, record_sha256
 from .store import (
+    AnchoredReadError,
+    AnchoredWorkspaceReader,
     atomic_write_json,
     create_json,
     file_lock,
@@ -279,6 +281,26 @@ def read_validated_task_collection(
     reader: _JsonReader = read_json_strict_no_repair,
 ) -> dict[str, object]:
     """Read one versioned Task collection without touching runtime state."""
+    if reader is read_json_strict_no_repair:
+        try:
+            repository = worktrees_module.bind_repository(root)
+            with AnchoredWorkspaceReader(repository.root) as anchored:
+                anchored.require_git_marker()
+                collected = _TaskCollectionReader(
+                    repository.root,
+                    reader=anchored,
+                ).read(task_id)
+                worktrees_module._validate_repository_binding(repository)
+                anchored.revalidate()
+                return collected
+        except TaskError:
+            raise
+        except (
+            AnchoredReadError,
+            OSError,
+            worktrees_module.WorktreeError,
+        ) as error:
+            raise TaskError(f"invalid task collection workspace: {root}") from error
     return _TaskCollectionReader(root, reader=reader).read(task_id)
 
 
@@ -1436,22 +1458,6 @@ class TaskService:
         if return_commit is None:
             return_commit = self._require_clean_owned_worktree(ownership)
         return _read_reviewed_task_return(self, brief, return_commit)
-
-    def _validate_return(
-        self,
-        returned: dict[str, object],
-        brief: dict[str, object],
-        *,
-        child_commit: str,
-    ) -> None:
-        changed_files = self._changed_files(
-            str(brief["base_commit"]),
-            child_commit,
-        )
-        _validate_task_return(returned, brief, child_commit, changed_files)
-
-    def _changed_files(self, base_commit: str, child_commit: str) -> list[str]:
-        return _task_changed_files(self, base_commit, child_commit)
 
     def _require_clean_owned_worktree(
         self,

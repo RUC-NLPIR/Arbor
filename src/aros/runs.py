@@ -28,6 +28,8 @@ from . import processes
 from .isolation import IsolationError, isolated_linux_policy, probe_isolated_linux
 from .receipts import record_sha256
 from .store import (
+    AnchoredReadError,
+    AnchoredWorkspaceReader,
     atomic_write_json,
     create_json,
     environment_fingerprint as _environment_fingerprint,
@@ -43,6 +45,7 @@ from .store import (
 from .worktrees import (
     ExecutionBundle,
     WorktreeError,
+    _validate_repository_binding,
     bind_repository,
     validate_execution_bundle,
 )
@@ -116,6 +119,22 @@ def read_validated_run_manifest(
     reader: _JsonReader = read_json_strict_no_repair,
 ) -> dict[str, object]:
     """Strictly read one immutable Run manifest without reconciliation."""
+    if reader is read_json_strict_no_repair:
+        try:
+            repository = bind_repository(root)
+            with AnchoredWorkspaceReader(repository.root) as anchored:
+                anchored.require_git_marker()
+                manifest = RunService(repository.root)._load_manifest(
+                    run_id,
+                    reader=anchored,
+                )
+                _validate_repository_binding(repository)
+                anchored.revalidate()
+                return manifest
+        except RunError:
+            raise
+        except (AnchoredReadError, OSError, WorktreeError) as error:
+            raise RunError(f"invalid Run workspace: {root}") from error
     return _pure_run_service(root)._load_manifest(run_id, reader=reader)
 
 
@@ -126,6 +145,22 @@ def read_validated_run_final(
     reader: _JsonReader = read_json_strict_no_repair,
 ) -> dict[str, object]:
     """Strictly read one immutable Run final without reconciliation."""
+    if reader is read_json_strict_no_repair:
+        try:
+            repository = bind_repository(root)
+            with AnchoredWorkspaceReader(repository.root) as anchored:
+                anchored.require_git_marker()
+                final = RunService(repository.root).read_validated_final(
+                    run_id,
+                    reader=anchored,
+                )
+                _validate_repository_binding(repository)
+                anchored.revalidate()
+                return final
+        except RunError:
+            raise
+        except (AnchoredReadError, OSError, WorktreeError) as error:
+            raise RunError(f"invalid Run workspace: {root}") from error
     return _pure_run_service(root).read_validated_final(run_id, reader=reader)
 
 
@@ -728,6 +763,19 @@ class RunService:
             or re.fullmatch(r"[0-9a-f]{64}", declared_sha256) is None
         ):
             raise RunError(f"invalid verified {stream} receipt: {run_id}")
+        if isinstance(reader, AnchoredWorkspaceReader):
+            try:
+                raw = reader.read_bytes(canonical)
+            except (AnchoredReadError, OSError) as error:
+                raise RunError(f"unable to read verified {stream}: {run_id}") from error
+            if (
+                len(raw) != declared_size
+                or hashlib.sha256(raw).hexdigest() != declared_sha256
+            ):
+                raise RunError(
+                    f"verified {stream} bytes differ from receipt: {run_id}"
+                )
+            return raw if capture else None
         path = self.root / canonical
         try:
             metadata = path.lstat()

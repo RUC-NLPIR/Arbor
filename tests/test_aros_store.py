@@ -437,6 +437,38 @@ def test_read_json_rejects_path_replaced_during_read(
         read_json(target)
 
 
+def test_anchored_workspace_reader_revalidates_lineage_and_closes_fds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "record.json"
+    replacement = tmp_path / "replacement.json"
+    assert create_json(target, {"version": 1}) is True
+    assert create_json(replacement, {"version": 1}) is True
+    reader_type = getattr(store_module, "AnchoredWorkspaceReader", None)
+    assert reader_type is not None
+    real_open = store_module.os.open
+    opened: list[int] = []
+
+    def recording_open(*args: object, **kwargs: object) -> int:
+        descriptor = real_open(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(store_module.os, "open", recording_open)
+
+    with pytest.raises(ValueError, match="changed|identity"):
+        with reader_type(tmp_path) as reader:
+            assert reader.read_json("record.json") == {"version": 1}
+            os.replace(replacement, target)
+            reader.revalidate()
+
+    assert opened
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def test_task_execution_claim_read_recovers_crashed_store_alias(
     tmp_path: Path,
 ) -> None:

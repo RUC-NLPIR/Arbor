@@ -116,6 +116,7 @@ def _terminal_receipt(
     execution: dict[str, object],
 ) -> dict[str, object]:
     run_id = f"RUN-visible-{str(request['eval_id'])[-12:]}"
+    stdout = b'{"schema_version":1,"metric":0.5,"sample_count":1}\n'
     empty_sha256 = hashlib.sha256(b"").hexdigest()
     portable = {
         "candidate": {
@@ -231,9 +232,9 @@ def _terminal_receipt(
             "actual_environment_sha256": "0" * 64,
             "launch_receipt_sha256": prelaunch["receipt_sha256"],
             "stdout": {
-            "path": f".aros/runs/{run_id}/stdout.log",
-            "bytes": 0,
-            "sha256": empty_sha256,
+                "path": f".aros/runs/{run_id}/stdout.log",
+                "bytes": len(stdout),
+                "sha256": hashlib.sha256(stdout).hexdigest(),
             },
             "stderr": {
                 "path": f".aros/runs/{run_id}/stderr.log",
@@ -261,6 +262,9 @@ def _terminal_receipt(
             "updated_at": execution["claimed_at"],
         },
     )
+    runtime = root / ".aros" / "runs" / run_id
+    (runtime / "stdout.log").write_bytes(stdout)
+    (runtime / "stderr.log").write_bytes(b"")
     return build_measurement_receipt(
         request,
         execution,
@@ -3745,9 +3749,7 @@ def test_audit_is_exact_nonpersisted_and_side_effect_free(
     def forbidden_side_effect(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("audit must only validate existing authorities")
 
-    monkeypatch.setattr(eval_module, "parse_scalar_metric", forbidden_side_effect)
     monkeypatch.setattr(eval_module, "create_json", forbidden_side_effect)
-    monkeypatch.setattr(RunService, "read_verified_output", forbidden_side_effect)
     monkeypatch.setattr(RunService, "prepare_bundle", forbidden_side_effect)
     monkeypatch.setattr(RunService, "start", forbidden_side_effect)
     monkeypatch.setattr(
@@ -4116,16 +4118,12 @@ def test_status_and_audit_never_parse_or_repair_missing_measurement(
         "public-audit-live-finalizing",
     )
     assert isinstance(live_lease, eval_module.ExecutionLease)
-    live_receipt = _terminal_receipt(
+    _terminal_receipt(
         root,
         live_lease.request,
         live_lease.execution,
     )
     live_eval_id = str(live_lease.request["eval_id"])
-    live_run_id = str(live_receipt["run_id"])
-    live_runtime = root / ".aros" / "runs" / live_run_id
-    (live_runtime / "stdout.log").write_bytes(b"")
-    (live_runtime / "stderr.log").write_bytes(b"")
     before = {
         path.relative_to(root): (path.stat().st_ino, path.read_bytes())
         for path in root.rglob("*")
@@ -4194,12 +4192,8 @@ def test_receiptless_audit_never_probes_execution_lock_or_distorts_status(
         "receiptless-concurrent-audit-status",
     )
     assert isinstance(lease, eval_module.ExecutionLease)
-    terminal = _terminal_receipt(root, lease.request, lease.execution)
+    _terminal_receipt(root, lease.request, lease.execution)
     eval_id = str(lease.request["eval_id"])
-    run_id = str(terminal["run_id"])
-    runtime = root / ".aros" / "runs" / run_id
-    (runtime / "stdout.log").write_bytes(b"")
-    (runtime / "stderr.log").write_bytes(b"")
     lease.close()
     receipt_path = root / "eval" / "evaluations" / eval_id / "receipt.json"
     assert not receipt_path.exists()

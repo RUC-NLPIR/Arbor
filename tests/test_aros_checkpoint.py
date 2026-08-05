@@ -15,6 +15,7 @@ import pytest
 import arbor.aros.checkpoint as checkpoint_module
 import arbor.aros.worktrees as worktrees_module
 from arbor.aros.checkpoint import CheckpointError, CheckpointService
+from arbor.aros.store import canonical_json_bytes
 from arbor.aros.worktrees import bind_repository
 from tests import test_aros_observations as observation_support
 from tests import test_aros_tasks as task_support
@@ -162,6 +163,942 @@ def _tree(root: Path, tree_oid: str) -> dict[str, tuple[str, str]]:
 
 def _blob(root: Path, tree_oid: str, path: str) -> bytes:
     return _git(root, "show", f"{tree_oid}:{path}").stdout
+
+
+def _hashed_record(record: dict[str, object], field: str) -> bytes:
+    payload = {key: value for key, value in record.items() if key != field}
+    encoded = {
+        **payload,
+        field: hashlib.sha256(canonical_json_bytes(payload)).hexdigest(),
+    }
+    return canonical_json_bytes(encoded)
+
+
+def _allow_receipt_bytes(
+    *,
+    candidate_subject_sha256: str = "a" * 64,
+    audit_payload_sha256: str = "b" * 64,
+    canonical_ref: str = "refs/heads/main",
+    revision: int = 1,
+    lease_expires_at: int = 3_000,
+) -> bytes:
+    return _hashed_record(
+        {
+            "schemaVersion": 1,
+            "decision": "allow",
+            "candidateSubjectSHA256": candidate_subject_sha256,
+            "auditPayloadSHA256": audit_payload_sha256,
+            "contractID": "pct_test",
+            "revision": revision,
+            "specHash": "c" * 64,
+            "workspaceID": "workspace-test",
+            "canonicalRef": canonical_ref,
+            "sessionID": "ses_test",
+            "promptID": "msg_test",
+            "attempt": 1,
+            "attemptKey": "1:",
+            "leaseOwner": "owner-test",
+            "leaseExpiresAt": lease_expires_at,
+            "capability": "checkpoint",
+            "budgetBefore": {
+                "turns": {"limit": 10, "used": 1, "remaining": 9},
+                "actions": {"limit": 10, "used": 1, "remaining": 9},
+                "deadline": 10_000,
+            },
+            "charge": {"actions": 1},
+            "budgetRemaining": {
+                "turns": {"limit": 10, "used": 1, "remaining": 9},
+                "actions": {"limit": 10, "used": 2, "remaining": 8},
+                "deadline": 10_000,
+            },
+            "evaluatorPolicyRefs": ["visible/quality@1"],
+            "researchContractBindingSHA256": "d" * 64,
+            "auditImplementationID": "aros-transition-audit-v1",
+            "trustedExecutionClosureSHA256": "e" * 64,
+            "enforcementClass": "mediated",
+            "authorityDomainID": "opencode/local-same-uid",
+            "issuedAt": 1_000,
+            "receiptSHA256": "",
+        },
+        "receiptSHA256",
+    )
+
+
+def _fence_bytes(
+    receipt: dict[str, object],
+    *,
+    revision: int | None = None,
+    issued_at: int = 1_400,
+    expires_at: int = 1_600,
+) -> bytes:
+    return _hashed_record(
+        {
+            "schemaVersion": 1,
+            "receiptSHA256": receipt["receiptSHA256"],
+            "reservationID": "reservation-test",
+            "revision": receipt["revision"] if revision is None else revision,
+            "researchContractBindingSHA256": receipt[
+                "researchContractBindingSHA256"
+            ],
+            "sessionID": receipt["sessionID"],
+            "promptID": receipt["promptID"],
+            "attempt": receipt["attempt"],
+            "attemptKey": receipt["attemptKey"],
+            "leaseOwner": receipt["leaseOwner"],
+            "leaseExpiresAt": receipt["leaseExpiresAt"],
+            "issuedAt": issued_at,
+            "expiresAt": expires_at,
+            "fenceSHA256": "",
+        },
+        "fenceSHA256",
+    )
+
+
+def _decoded(raw: bytes) -> dict[str, object]:
+    value = json.loads(raw)
+    assert isinstance(value, dict)
+    return value
+
+
+def _finalize_fixture(
+    root: Path,
+    *,
+    transition_id: str = "T-finalize",
+    message: str = "Principal café checkpoint.\nSecond line.\n",
+) -> tuple[
+    CheckpointService,
+    object,
+    bytes,
+    bytes,
+    Path,
+    Path,
+    str,
+    str,
+]:
+    candidate = root / "candidate"
+    canonical = root / "canonical"
+    base, canonical_ref = _init_repository(candidate)
+    _git(root, "clone", "-q", str(candidate), str(canonical))
+    _git(canonical, "config", "user.email", "checkpoint@example.invalid")
+    _git(canonical, "config", "user.name", "Checkpoint Test")
+    (candidate / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nFinalized finding.\n",
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        candidate,
+        transition_id,
+        base,
+        ["memory/NOW.md"],
+    )
+    service = CheckpointService(
+        candidate,
+        canonical_repository=bind_repository(canonical),
+        canonical_ref=canonical_ref,
+        clock=lambda: 1_500,
+    )
+    prepared = service.prepare(proposal_ref, message)
+    receipt_raw = _allow_receipt_bytes(
+        candidate_subject_sha256=prepared.candidate_subject_sha256,
+        audit_payload_sha256=prepared.audit_payload_sha256,
+        canonical_ref=canonical_ref,
+    )
+    receipt = _decoded(receipt_raw)
+    return (
+        service,
+        prepared,
+        receipt_raw,
+        _fence_bytes(receipt),
+        candidate,
+        canonical,
+        base,
+        message,
+    )
+
+
+def _task_finalize_fixture(
+    root: Path,
+) -> tuple[CheckpointService, object, bytes, bytes, Path, Path, str, str, str]:
+    candidate = root / "candidate"
+    canonical = root / "canonical"
+    task_service, brief, ownership, _final = task_support._create_terminal_task(
+        candidate
+    )
+    _git(root, "clone", "-q", str(candidate), str(canonical))
+    _git(canonical, "config", "user.email", "checkpoint@example.invalid")
+    _git(canonical, "config", "user.name", "Checkpoint Test")
+    _returned, _child_commit, return_commit = task_support._commit_child_return(
+        candidate,
+        brief,
+        ownership,
+    )
+    task_id = str(brief["task_id"])
+    collected = task_service.collect(task_id)
+    assert collected["return_commit"] == return_commit
+    base = _git_text(candidate, "rev-parse", "HEAD")
+    canonical_ref = _git_text(candidate, "symbolic-ref", "HEAD")
+    proposal_ref = _write_proposal(
+        candidate,
+        "T-task-cas",
+        base,
+        [f"tasks/{task_id}/collected.json"],
+    )
+    service = CheckpointService(
+        candidate,
+        canonical_repository=bind_repository(canonical),
+        canonical_ref=canonical_ref,
+        clock=lambda: 1_500,
+    )
+    prepared = service.prepare(proposal_ref, "Task observation checkpoint.\n")
+    receipt_raw = _allow_receipt_bytes(
+        candidate_subject_sha256=prepared.candidate_subject_sha256,
+        audit_payload_sha256=prepared.audit_payload_sha256,
+        canonical_ref=canonical_ref,
+    )
+    closure = prepared.audit_testimony["observation_closure"]
+    assert isinstance(closure, tuple) and len(closure) == 1
+    observation_ref = str(closure[0]["immutable_ref"])
+    receipt = _decoded(receipt_raw)
+    return (
+        service,
+        prepared,
+        receipt_raw,
+        _fence_bytes(receipt),
+        candidate,
+        canonical,
+        base,
+        observation_ref,
+        return_commit,
+    )
+
+
+def _eval_finalize_fixture(
+    root: Path,
+) -> tuple[CheckpointService, object, bytes, bytes, Path, Path, str, str, str]:
+    candidate = root / "candidate"
+    canonical = root / "canonical"
+    installed = observation_support._install_eval_receipt(candidate)
+    _git(root, "clone", "-q", str(candidate), str(canonical))
+    _git(canonical, "config", "user.email", "checkpoint@example.invalid")
+    _git(canonical, "config", "user.name", "Checkpoint Test")
+    base = _git_text(candidate, "rev-parse", "HEAD")
+    canonical_ref = _git_text(candidate, "symbolic-ref", "HEAD")
+    proposal_ref = _write_proposal(
+        candidate,
+        "T-eval-cas",
+        base,
+        [str(installed["receipt_ref"])],
+    )
+    service = CheckpointService(
+        candidate,
+        canonical_repository=bind_repository(canonical),
+        canonical_ref=canonical_ref,
+        clock=lambda: 1_500,
+    )
+    prepared = service.prepare(proposal_ref, "Eval observation checkpoint.\n")
+    receipt_raw = _allow_receipt_bytes(
+        candidate_subject_sha256=prepared.candidate_subject_sha256,
+        audit_payload_sha256=prepared.audit_payload_sha256,
+        canonical_ref=canonical_ref,
+    )
+    closure = prepared.audit_testimony["observation_closure"]
+    assert isinstance(closure, tuple) and len(closure) == 1
+    observation_ref = str(closure[0]["immutable_ref"])
+    receipt = installed["receipt"]
+    assert isinstance(receipt, dict)
+    candidate_commit = str(receipt["candidate_commit"])
+    authority = _decoded(receipt_raw)
+    return (
+        service,
+        prepared,
+        receipt_raw,
+        _fence_bytes(authority),
+        candidate,
+        canonical,
+        base,
+        observation_ref,
+        candidate_commit,
+    )
+
+
+def test_procontract_canonical_json_golden_vector_matches_typescript() -> None:
+    encoded = canonical_json_bytes(
+        {"z": 1, "a": "é", "nested": {"b": 2, "a": [True, None]}}
+    )
+
+    assert encoded.hex() == (
+        "7b2261223a22c3a9222c226e6573746564223a7b2261223a5b747275652c"
+        "6e756c6c5d2c2262223a327d2c227a223a317d"
+    )
+    assert hashlib.sha256(encoded).hexdigest() == (
+        "3d4ef4cab1709da1a1628556cd21d27c5c1c6478d92a03fda97ee98f1236cf44"
+    )
+
+
+def test_allow_receipt_codec_accepts_only_exact_canonical_self_hashed_bytes() -> None:
+    raw = _allow_receipt_bytes()
+
+    decoded = checkpoint_module._decode_admission_receipt(raw)
+
+    assert decoded["decision"] == "allow"
+    assert decoded["capability"] == "checkpoint"
+    assert canonical_json_bytes(decoded) == raw
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "deny",
+        "schema-bool",
+        "unknown",
+        "missing",
+        "hash",
+        "budget-shape",
+        "budget-negative",
+        "timestamp",
+        "snake-case",
+    ),
+)
+def test_allow_receipt_codec_rejects_non_allow_or_malformed_authority(
+    case: str,
+) -> None:
+    receipt = _decoded(_allow_receipt_bytes())
+    if case == "deny":
+        receipt["decision"] = "deny"
+    elif case == "schema-bool":
+        receipt["schemaVersion"] = True
+    elif case == "unknown":
+        receipt["actor"] = "principal"
+    elif case == "missing":
+        receipt.pop("contractID")
+    elif case == "hash":
+        receipt["receiptSHA256"] = "0" * 64
+    elif case == "budget-shape":
+        budget = receipt["budgetBefore"]
+        assert isinstance(budget, dict)
+        budget["extra"] = 1
+    elif case == "budget-negative":
+        budget = receipt["budgetRemaining"]
+        assert isinstance(budget, dict)
+        actions = budget["actions"]
+        assert isinstance(actions, dict)
+        actions["remaining"] = -1
+    elif case == "timestamp":
+        receipt["leaseExpiresAt"] = -1
+    else:
+        receipt = {
+            "schema_version": 1,
+            "receipt_kind": "human_direct",
+            "decision": "allow",
+        }
+    raw = (
+        canonical_json_bytes(receipt)
+        if case in {"hash", "snake-case"}
+        else _hashed_record(receipt, "receiptSHA256")
+    )
+
+    with pytest.raises(CheckpointError, match="receipt|budget|timestamp|field|allow"):
+        checkpoint_module._decode_admission_receipt(raw)
+
+
+def test_allow_receipt_codec_does_not_reimplement_budget_arithmetic_policy() -> None:
+    receipt = _decoded(_allow_receipt_bytes())
+    receipt["budgetBefore"] = {
+        "turns": {"limit": 2, "used": 7, "remaining": 11},
+        "actions": {"limit": 1, "used": 5, "remaining": 9},
+        "deadline": 10_000,
+    }
+    receipt["charge"] = {"actions": 0}
+    receipt["budgetRemaining"] = {
+        "turns": {"limit": 99, "used": 0, "remaining": 4},
+        "actions": {"limit": 8, "used": 3, "remaining": 17},
+        "deadline": 20_000,
+    }
+    raw = _hashed_record(receipt, "receiptSHA256")
+
+    decoded = checkpoint_module._decode_admission_receipt(raw)
+
+    assert decoded == _decoded(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b'{"a":1,"a":1}',
+        _allow_receipt_bytes() + b"\n",
+        b'{"schemaVersion":1}',
+    ),
+)
+def test_allow_receipt_codec_rejects_duplicate_or_noncanonical_json(raw: bytes) -> None:
+    with pytest.raises(CheckpointError, match="receipt|canonical|JSON|field"):
+        checkpoint_module._decode_admission_receipt(raw)
+
+
+def test_finalize_fence_codec_binds_receipt_authority_and_current_time() -> None:
+    receipt = checkpoint_module._decode_admission_receipt(_allow_receipt_bytes())
+    raw = _fence_bytes(receipt)
+
+    decoded = checkpoint_module._decode_finalize_fence(
+        raw,
+        receipt=receipt,
+        now_ms=1_500,
+    )
+
+    assert decoded["receiptSHA256"] == receipt["receiptSHA256"]
+    assert canonical_json_bytes(decoded) == raw
+
+
+@pytest.mark.parametrize(
+    ("case", "now_ms"),
+    (
+        ("receipt", 1_500),
+        ("schema-bool", 1_500),
+        ("revision", 1_500),
+        ("binding", 1_500),
+        ("session", 1_500),
+        ("expired", 1_601),
+        ("not-issued", 1_399),
+        ("lease-expired", 3_000),
+        ("hash", 1_500),
+    ),
+)
+def test_finalize_fence_codec_rejects_hash_expiry_or_authority_mismatch(
+    case: str,
+    now_ms: int,
+) -> None:
+    receipt = checkpoint_module._decode_admission_receipt(_allow_receipt_bytes())
+    fence = _decoded(_fence_bytes(receipt))
+    if case == "receipt":
+        fence["receiptSHA256"] = "0" * 64
+    elif case == "schema-bool":
+        fence["schemaVersion"] = True
+    elif case == "revision":
+        fence["revision"] = 2
+    elif case == "binding":
+        fence["researchContractBindingSHA256"] = "0" * 64
+    elif case == "session":
+        fence["sessionID"] = "other-session"
+    elif case == "lease-expired":
+        pass
+    elif case == "hash":
+        fence["fenceSHA256"] = "0" * 64
+    raw = (
+        canonical_json_bytes(fence)
+        if case == "hash"
+        else _hashed_record(fence, "fenceSHA256")
+    )
+
+    with pytest.raises(CheckpointError, match="fence|receipt|revision|binding|session|time|lease"):
+        checkpoint_module._decode_finalize_fence(
+            raw,
+            receipt=receipt,
+            now_ms=now_ms,
+        )
+
+
+def test_prepare_binds_exact_admitted_ordinary_index_projection_for_finalize(
+    tmp_path: Path,
+) -> None:
+    (
+        _service,
+        prepared,
+        _receipt,
+        _fence,
+        candidate,
+        _canonical,
+        _base,
+        _message,
+    ) = _finalize_fixture(tmp_path)
+    record = json.loads((candidate / prepared.prepared_ref).read_bytes())
+    base_tree = _tree(candidate, prepared.base_commit)
+
+    assert record["ordinary_index_entries"] == [
+        {
+            "path": "memory/NOW.md",
+            "mode": base_tree["memory/NOW.md"][0],
+            "blob_oid": base_tree["memory/NOW.md"][1],
+        }
+    ]
+
+
+def test_finalize_writes_exact_receipt_tree_message_and_sole_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        base,
+        message,
+    ) = _finalize_fixture(tmp_path)
+    (candidate / "unrelated.txt").write_text(
+        "unrelated staged during admission\n",
+        encoding="utf-8",
+    )
+    _git(candidate, "add", "unrelated.txt")
+    candidate_index = _index_bytes(candidate)
+
+    def forbidden_audit(_proposal_ref: str) -> dict[str, object]:
+        raise AssertionError("finalize reran TransitionAudit")
+
+    monkeypatch.setattr(service.audit_service, "audit", forbidden_audit)
+
+    result = service.finalize(prepared.prepared_ref, receipt, fence)
+
+    commit = str(result["commit"])
+    assert result == {
+        "schema_version": 1,
+        "transition_id": prepared.transition_id,
+        "canonical_ref": prepared.canonical_ref,
+        "commit": commit,
+        "state": "projection_pending",
+    }
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == commit
+    assert _git_text(candidate, "rev-parse", prepared.canonical_ref) == base
+    parent_line = _git_text(canonical, "rev-list", "--parents", "-n", "1", commit)
+    assert parent_line.split() == [commit, base]
+    commit_object = _git(canonical, "cat-file", "commit", commit).stdout
+    assert commit_object.split(b"\n\n", 1)[1] == message.encode("utf-8")
+
+    final_tree_oid = _git_text(canonical, "rev-parse", f"{commit}^{{tree}}")
+    candidate_tree = _tree(canonical, prepared.candidate_tree)
+    final_tree = _tree(canonical, final_tree_oid)
+    admission_ref = f"transitions/{prepared.transition_id}/admission.json"
+    assert set(final_tree) == set(candidate_tree) | {admission_ref}
+    assert {
+        path: entry for path, entry in final_tree.items() if path != admission_ref
+    } == candidate_tree
+    assert _blob(canonical, final_tree_oid, admission_ref) == receipt
+    assert not (candidate / admission_ref).exists()
+    assert not any("fence" in path for path in final_tree)
+    assert _index_bytes(candidate) == candidate_index
+
+
+def test_finalize_passes_non_newline_principal_message_exactly_to_commit_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = "Principal exact café message"
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        _base,
+        _message,
+    ) = _finalize_fixture(tmp_path, message=message)
+    commit_inputs: list[bytes] = []
+    real_git_result = worktrees_module._git_result
+
+    def record_commit_input(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args and args[0] == "commit-tree":
+            raw = kwargs.get("input_bytes")
+            assert isinstance(raw, bytes)
+            commit_inputs.append(raw)
+        return real_git_result(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_result", record_commit_input)
+
+    result = service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert commit_inputs == [message.encode("utf-8")]
+    assert (candidate / prepared.prepared_ref).with_name("message").read_bytes() == (
+        message.encode("utf-8")
+    )
+    commit = str(result["commit"])
+    body = _git(canonical, "cat-file", "commit", commit).stdout.split(b"\n\n", 1)[1]
+    assert body == message.encode("utf-8")
+
+
+def test_finalize_rejects_final_index_drift_immediately_before_cas(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path)
+    clock_calls = 0
+
+    def drift_on_second_time_check() -> int:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 2:
+            final_index = (candidate / prepared.index_ref).with_name("index-final")
+            final_index.write_bytes(final_index.read_bytes() + b"drift")
+        return 1_500
+
+    service.clock = drift_on_second_time_check
+
+    with pytest.raises(CheckpointError, match="final.*index|index.*drift"):
+        service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert clock_calls == 2
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == base
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "candidate-bytes",
+        "candidate-mode",
+        "proposal",
+        "audit",
+        "message",
+        "prepared",
+        "prepared-schema",
+        "temp-index",
+        "user-index",
+    ),
+)
+def test_finalize_revalidates_every_prepared_fact_before_cas(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path)
+    if target == "candidate-bytes":
+        (candidate / "memory/NOW.md").write_text("drift\n", encoding="utf-8")
+    elif target == "candidate-mode":
+        (candidate / "memory/NOW.md").chmod(0o755)
+    elif target == "proposal":
+        (candidate / prepared.proposal_ref).write_bytes(b"{}\n")
+    elif target == "audit":
+        audit = candidate / f"transitions/{prepared.transition_id}/audit.json"
+        audit.write_bytes(audit.read_bytes() + b" ")
+    elif target == "message":
+        (candidate / prepared.prepared_ref).with_name("message").write_bytes(
+            b"changed message"
+        )
+    elif target == "prepared":
+        path = candidate / prepared.prepared_ref
+        path.write_bytes(path.read_bytes() + b" ")
+    elif target == "prepared-schema":
+        path = candidate / prepared.prepared_ref
+        record = json.loads(path.read_bytes())
+        record["schema_version"] = True
+        path.write_text(
+            json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    elif target == "temp-index":
+        path = candidate / prepared.index_ref
+        path.write_bytes(path.read_bytes() + b"drift")
+    elif target == "user-index":
+        _git(candidate, "add", "memory/NOW.md")
+
+    with pytest.raises(CheckpointError, match="prepared|candidate|proposal|audit|message|index|admission|drift|conflict"):
+        service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == base
+
+
+def test_late_fence_failure_leaves_no_working_admission_and_new_receipt_retries(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        prepared,
+        first_receipt,
+        first_fence,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path)
+    times = iter((1_500, 1_601))
+    service.clock = lambda: next(times)
+
+    with pytest.raises(CheckpointError, match="fence|time|expired"):
+        service.finalize(prepared.prepared_ref, first_receipt, first_fence)
+
+    admission_ref = f"transitions/{prepared.transition_id}/admission.json"
+    assert not (candidate / admission_ref).exists()
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == base
+
+    second_receipt = _allow_receipt_bytes(
+        candidate_subject_sha256=prepared.candidate_subject_sha256,
+        audit_payload_sha256=prepared.audit_payload_sha256,
+        canonical_ref=prepared.canonical_ref,
+        revision=2,
+    )
+    second_decoded = _decoded(second_receipt)
+    service.clock = lambda: 1_500
+
+    result = service.finalize(
+        prepared.prepared_ref,
+        second_receipt,
+        _fence_bytes(second_decoded),
+    )
+
+    commit = str(result["commit"])
+    assert _blob(canonical, commit, admission_ref) == second_receipt
+    assert not (candidate / admission_ref).exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "deny",
+        "subject",
+        "audit",
+        "canonical-ref",
+        "expired-fence",
+        "revised-fence",
+    ),
+)
+def test_finalize_rejects_denial_binding_or_stale_fence_before_materialization(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt_raw,
+        fence_raw,
+        candidate,
+        canonical,
+        base,
+        _message,
+    ) = _finalize_fixture(tmp_path)
+    receipt = _decoded(receipt_raw)
+    if case == "deny":
+        receipt["decision"] = "deny"
+        receipt_raw = _hashed_record(receipt, "receiptSHA256")
+    elif case == "subject":
+        receipt["candidateSubjectSHA256"] = "0" * 64
+        receipt_raw = _hashed_record(receipt, "receiptSHA256")
+        fence_raw = _fence_bytes(_decoded(receipt_raw))
+    elif case == "audit":
+        receipt["auditPayloadSHA256"] = "0" * 64
+        receipt_raw = _hashed_record(receipt, "receiptSHA256")
+        fence_raw = _fence_bytes(_decoded(receipt_raw))
+    elif case == "canonical-ref":
+        receipt["canonicalRef"] = "refs/heads/other"
+        receipt_raw = _hashed_record(receipt, "receiptSHA256")
+        fence_raw = _fence_bytes(_decoded(receipt_raw))
+    elif case == "expired-fence":
+        fence_raw = _fence_bytes(receipt, expires_at=1_499)
+    else:
+        fence_raw = _fence_bytes(receipt, revision=2)
+
+    with pytest.raises(CheckpointError, match="receipt|allow|subject|audit|canonical|fence|revision|time"):
+        service.finalize(prepared.prepared_ref, receipt_raw, fence_raw)
+
+    admission = (
+        candidate / "transitions" / prepared.transition_id / "admission.json"
+    )
+    assert not admission.exists()
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == base
+
+
+def test_finalize_atomic_transaction_updates_canonical_and_creates_task_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        _candidate,
+        canonical,
+        base,
+        observation_ref,
+        return_commit,
+    ) = _task_finalize_fixture(tmp_path)
+    transactions: list[bytes] = []
+    real_git_result = worktrees_module._git_result
+
+    def record_transaction(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args[:2] == ("update-ref", "--stdin"):
+            raw = kwargs.get("input_bytes")
+            assert isinstance(raw, bytes)
+            transactions.append(raw)
+        return real_git_result(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_result", record_transaction)
+
+    result = service.finalize(prepared.prepared_ref, receipt, fence)
+
+    commit = str(result["commit"])
+    assert _git_text(canonical, "rev-parse", observation_ref) == return_commit
+    assert len(transactions) == 1
+    commands = transactions[0].decode("ascii").splitlines()
+    assert commands[0] == "start"
+    assert f"update {prepared.canonical_ref} {commit} {base}" in commands
+    assert f"create {observation_ref} {return_commit}" in commands
+    assert not any(
+        command.startswith(f"create {prepared.canonical_ref} ")
+        for command in commands
+    )
+    assert commands[-2:] == ["prepare", "commit"]
+
+
+def test_finalize_reuses_preexisting_exact_observation_ref(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        _candidate,
+        canonical,
+        _base,
+        observation_ref,
+        return_commit,
+    ) = _task_finalize_fixture(tmp_path)
+    _git(canonical, "update-ref", observation_ref, return_commit)
+
+    result = service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert result["state"] == "projection_pending"
+    assert _git_text(canonical, "rev-parse", observation_ref) == return_commit
+
+
+def test_conflicting_observation_ref_aborts_canonical_update(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        _candidate,
+        canonical,
+        base,
+        observation_ref,
+        return_commit,
+    ) = _task_finalize_fixture(tmp_path)
+    assert return_commit != base
+    _git(canonical, "update-ref", observation_ref, base)
+
+    with pytest.raises(CheckpointError, match="observation|ref|conflict"):
+        service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == base
+    assert _git_text(canonical, "rev-parse", observation_ref) == base
+
+
+def test_cas_loss_rolls_back_atomic_task_observation_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        _candidate,
+        canonical,
+        base,
+        observation_ref,
+        _return_commit,
+    ) = _task_finalize_fixture(tmp_path)
+    tree = _git_text(canonical, "rev-parse", f"{base}^{{tree}}")
+    drift = _git_text(
+        canonical,
+        "commit-tree",
+        tree,
+        "-p",
+        base,
+        "-m",
+        "concurrent winner",
+    )
+    real_git_result = worktrees_module._git_result
+    raced = False
+
+    def lose_cas(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        nonlocal raced
+        if args[:2] == ("update-ref", "--stdin") and not raced:
+            raced = True
+            _git(canonical, "update-ref", prepared.canonical_ref, drift, base)
+        return real_git_result(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_result", lose_cas)
+
+    with pytest.raises(CheckpointError, match="CAS|transaction|ref|update"):
+        service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert raced is True
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == drift
+    assert _git(canonical, "show-ref", "--verify", observation_ref, check=False).returncode != 0
+
+
+def test_fence_expiry_during_observation_preflight_never_reaches_ref_transaction(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        _candidate,
+        canonical,
+        base,
+        observation_ref,
+        _return_commit,
+    ) = _task_finalize_fixture(tmp_path)
+    times = iter((1_500, 1_500, 1_601))
+    service.clock = lambda: next(times)
+
+    with pytest.raises(CheckpointError, match="fence|time|expired"):
+        service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert _git_text(canonical, "rev-parse", prepared.canonical_ref) == base
+    assert _git(canonical, "show-ref", "--verify", observation_ref, check=False).returncode != 0
+
+
+def test_finalize_creates_eval_ref_at_validated_candidate_commit(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        prepared,
+        receipt,
+        fence,
+        _candidate,
+        canonical,
+        _base,
+        observation_ref,
+        candidate_commit,
+    ) = _eval_finalize_fixture(tmp_path)
+
+    service.finalize(prepared.prepared_ref, receipt, fence)
+
+    assert _git_text(canonical, "rev-parse", observation_ref) == candidate_commit
 
 
 def test_checkpoint_prepare_never_uses_or_changes_user_index(
@@ -547,6 +1484,209 @@ def test_checkpoint_prepare_is_exactly_idempotent_and_conflicting_retry_fails(
     with pytest.raises(CheckpointError, match="conflict|message|retry"):
         service.prepare(proposal_ref, "different message")
     assert prepared_path.read_bytes() == prepared_bytes
+
+
+def test_checkpoint_prepare_persists_exact_unstaged_principal_message(
+    tmp_path: Path,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    message = "Principal chose café evidence.\nSecond line."
+
+    prepared = service.prepare(proposal_ref, message)
+
+    message_path = (tmp_path / prepared.prepared_ref).with_name("message")
+    assert message_path.read_bytes() == message.encode("utf-8")
+    metadata = message_path.stat()
+    assert stat.S_ISREG(metadata.st_mode)
+    assert metadata.st_nlink == 1
+    assert stat.S_IMODE(metadata.st_mode) == 0o600
+    assert hashlib.sha256(message_path.read_bytes()).hexdigest() == (
+        prepared.message_sha256
+    )
+    assert all(path != ".aros" for path in _tree(tmp_path, prepared.candidate_tree))
+    assert "message" not in _tree(tmp_path, prepared.candidate_tree)
+
+
+def test_checkpoint_prepare_rejects_drifted_runtime_message_artifact(
+    tmp_path: Path,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    prepared = service.prepare(proposal_ref, "stable message")
+    message_path = (tmp_path / prepared.prepared_ref).with_name("message")
+    message_path.write_bytes(b"drifted message")
+
+    with pytest.raises(CheckpointError, match="message|conflict|hash"):
+        service.prepare(proposal_ref, "stable message")
+
+
+def test_checkpoint_prepare_exact_retry_reconstructs_missing_message_artifact(
+    tmp_path: Path,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    first = service.prepare(proposal_ref, "recover exact message")
+    message_path = (tmp_path / first.prepared_ref).with_name("message")
+    audit_path = tmp_path / "transitions/T-checkpoint/audit.json"
+    message_path.unlink()
+    audit_path.unlink()
+
+    second = service.prepare(proposal_ref, "recover exact message")
+
+    assert second == first
+    assert message_path.read_bytes() == b"recover exact message"
+    assert audit_path.exists()
+
+
+def test_checkpoint_message_publication_is_atomic_across_partial_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+    message_path = tmp_path / ".aros/checkpoints/T-checkpoint/message"
+    real_write_all = checkpoint_module._write_all
+
+    def partial_write(descriptor: int, content: bytes) -> None:
+        if content == b"atomic message":
+            os.write(descriptor, content[:3])
+            raise OSError("injected partial message write")
+        real_write_all(descriptor, content)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(checkpoint_module, "_write_all", partial_write)
+        with pytest.raises(CheckpointError, match="partial|message|preparation"):
+            service.prepare(proposal_ref, "atomic message")
+
+    assert not message_path.exists()
+    assert not any(
+        path.name.endswith(".tmp")
+        for path in message_path.parent.iterdir()
+    )
+
+    prepared = service.prepare(proposal_ref, "atomic message")
+
+    assert message_path.read_bytes() == b"atomic message"
+    assert prepared.message_sha256 == hashlib.sha256(b"atomic message").hexdigest()
+
+
+def test_checkpoint_prepare_never_calls_injected_admission_gateway(
+    tmp_path: Path,
+) -> None:
+    _base, canonical_ref = _init_repository(tmp_path)
+    (tmp_path / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nGateway-free prepare.\n",
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-gateway-free-prepare",
+        _git_text(tmp_path, "rev-parse", "HEAD"),
+        ["memory/NOW.md"],
+    )
+
+    class ForbiddenGateway:
+        def admit_transition(self, **_kwargs: object) -> bytes:
+            raise AssertionError("prepare called admission")
+
+        def revalidate_transition(self, _receipt: bytes) -> bytes:
+            raise AssertionError("prepare called revalidation")
+
+    service = CheckpointService(
+        tmp_path,
+        canonical_repository=bind_repository(tmp_path),
+        canonical_ref=canonical_ref,
+        gateway=ForbiddenGateway(),
+    )
+
+    service.prepare(proposal_ref, "prepare only")
+
+
+def test_checkpoint_requires_gateway_before_preparing(tmp_path: Path) -> None:
+    service, proposal_ref, _base = _valid_service(tmp_path)
+
+    with pytest.raises(CheckpointError, match="gateway|admission"):
+        service.checkpoint(proposal_ref, "requires authority")
+
+    assert not (tmp_path / ".aros/checkpoints/T-checkpoint/prepared.json").exists()
+
+
+def test_checkpoint_calls_gateway_admit_and_revalidate_once_each(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base, canonical_ref = _init_repository(tmp_path)
+    (tmp_path / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nComposite checkpoint.\n",
+        encoding="utf-8",
+    )
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-composite",
+        base,
+        ["memory/NOW.md"],
+    )
+    calls: list[tuple[str, object]] = []
+
+    class RecordingGateway:
+        def admit_transition(
+            self,
+            *,
+            candidate_subject_sha256: str,
+            audit_payload_sha256: str,
+            audit_testimony: object,
+        ) -> bytes:
+            calls.append(
+                (
+                    "admit",
+                    (
+                        candidate_subject_sha256,
+                        audit_payload_sha256,
+                        audit_testimony,
+                    ),
+                )
+            )
+            return b"exact receipt"
+
+        def revalidate_transition(self, receipt: bytes) -> bytes:
+            calls.append(("revalidate", receipt))
+            return b"exact fence"
+
+    service = CheckpointService(
+        tmp_path,
+        canonical_repository=bind_repository(tmp_path),
+        canonical_ref=canonical_ref,
+        gateway=RecordingGateway(),
+    )
+
+    def finalize(
+        prepared_ref: str,
+        admission_receipt: bytes,
+        finalize_fence: bytes,
+    ) -> dict[str, object]:
+        calls.append(
+            (
+                "finalize",
+                (prepared_ref, admission_receipt, finalize_fence),
+            )
+        )
+        return {"state": "projection_pending"}
+
+    monkeypatch.setattr(service, "finalize", finalize, raising=False)
+
+    result = service.checkpoint(proposal_ref, "composite message")
+
+    assert result == {"state": "projection_pending"}
+    assert [name for name, _value in calls] == ["admit", "revalidate", "finalize"]
+    prepared = service.prepare(proposal_ref, "composite message")
+    admitted = calls[0][1]
+    assert isinstance(admitted, tuple)
+    assert admitted[:2] == (
+        prepared.candidate_subject_sha256,
+        prepared.audit_payload_sha256,
+    )
+    assert calls[1] == ("revalidate", b"exact receipt")
+    assert calls[2] == (
+        "finalize",
+        (prepared.prepared_ref, b"exact receipt", b"exact fence"),
+    )
 
 
 @pytest.mark.parametrize(
@@ -1056,17 +2196,3 @@ def test_checkpoint_prepare_has_no_admission_finalize_or_user_index_commands(
 
     verbs = {args[0] for args in calls if args}
     assert verbs.isdisjoint({"add", "commit", "commit-tree", "reset", "update-ref"})
-    source = inspect.getsource(CheckpointService)
-    for forbidden in (
-        "AdmissionGateway",
-        "FinalizeFence",
-        "commit-tree",
-        "update-ref",
-        "compare-and-swap",
-    ):
-        assert forbidden not in source
-    assert not any(
-        fragment in name.casefold()
-        for name, _value in inspect.getmembers(CheckpointService)
-        for fragment in ("admit", "finalize")
-    )

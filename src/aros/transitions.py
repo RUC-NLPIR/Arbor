@@ -1063,16 +1063,85 @@ class TransitionAuditService:
                 if record.payload.get("base_commit") == proposal.base_commit
                 else "stale"
             )
+        immutable_ref, target_commit = self._observation_ref_testimony(
+            record,
+            issues,
+        )
         return {
             "observation_ref": record.ref,
             "kind": record.kind,
             "record_sha256": record.record_sha256,
+            "immutable_ref": immutable_ref,
+            "target_commit": target_commit,
             "versioned_paths": versioned_paths,
             "candidate_commit": record.candidate_commit,
             "measurement_state": record.measurement_state,
             "task_base_status": task_base_status,
             "paths": paths,
         }
+
+    def _observation_ref_testimony(
+        self,
+        record: ObservationRecord,
+        issues: list[dict[str, str]],
+    ) -> tuple[str | None, str | None]:
+        stable_id: str | None = None
+        if record.kind == "task_return":
+            matched = _TASK_PATH.fullmatch(record.ref)
+            if matched is not None and matched.group(2) == "collected":
+                stable_id = matched.group(1)
+            target = record.payload.get("return_commit")
+        elif record.kind == "run_final":
+            matched = _RUN_PATH.fullmatch(record.ref)
+            if matched is not None and matched.group(2) == "final":
+                stable_id = matched.group(1)
+            target = (
+                record.candidate_commit
+                if record.candidate_commit is not None
+                else record.payload.get("base_commit")
+            )
+        else:
+            matched = _EVAL_PATH.fullmatch(record.ref)
+            if matched is not None:
+                stable_id = matched.group(1)
+            target = record.candidate_commit
+
+        if stable_id is None or _SHA256.fullmatch(record.record_sha256) is None:
+            _add_issue(
+                issues,
+                "error",
+                "invalid_observation_ref_identity",
+                record.ref,
+                "observation kind, stable ID, or record SHA-256 is invalid",
+            )
+            return None, None
+        if not isinstance(target, str) or _COMMIT.fullmatch(target) is None:
+            _add_issue(
+                issues,
+                "error",
+                "invalid_observation_ref_target",
+                record.ref,
+                "observation immutable ref target must be a validated commit",
+            )
+            return None, None
+        immutable_ref = (
+            f"refs/aros/observations/{record.kind}/{stable_id}/"
+            f"{record.record_sha256}"
+        )
+        if _worktrees.run_git(
+            self.repository,
+            "check-ref-format",
+            immutable_ref,
+        ).returncode != 0:
+            _add_issue(
+                issues,
+                "error",
+                "invalid_observation_git_ref",
+                record.ref,
+                "derived immutable observation ref is not a valid Git ref",
+            )
+            return None, None
+        return immutable_ref, target
 
 
 def _parse_proposal(raw: bytes) -> TransitionProposal:

@@ -109,6 +109,7 @@ def _fake_observation(
     *,
     kind: str = "task_return",
     candidate_commit: str = "a" * 40,
+    target_commit: str = "b" * 40,
     versioned_paths: tuple[str, ...] = (),
     measurement_state: str | None = None,
     base_commit: str | None = None,
@@ -116,6 +117,7 @@ def _fake_observation(
     payload: dict[str, object] = {"candidate_commit": candidate_commit}
     if kind == "task_return":
         payload["child_commit"] = candidate_commit
+        payload["return_commit"] = target_commit
         payload["base_commit"] = base_commit or candidate_commit
     return ObservationRecord(
         ref=ref,
@@ -1565,6 +1567,103 @@ def test_direct_terminal_service_records_derive_complete_owner_closure(
         assert set(paths) == expected_paths
         assert paths[selected_ref]["state"] == "workspace"
         assert len(paths) == len(set(paths))
+
+
+def test_audit_binds_task_immutable_ref_to_validated_return_commit(
+    tmp_path: Path,
+) -> None:
+    _service, task_id, collected = observation_support._collected_task(tmp_path)
+    task_ref = f"tasks/{task_id}/collected.json"
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-task-observation-ref",
+        base_commit=_git(tmp_path, "rev-parse", "HEAD"),
+        workspace_paths=[task_ref],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    closure = audit["observation_closure"][0]
+    assert closure["immutable_ref"] == (
+        f"refs/aros/observations/task_return/{task_id}/"
+        f"{collected['collected_sha256']}"
+    )
+    assert closure["target_commit"] == collected["return_commit"]
+    payload = {
+        key: value
+        for key, value in audit.items()
+        if key not in {"audit_payload_sha256", "candidate_subject_sha256"}
+    }
+    assert audit["audit_payload_sha256"] == json_sha256(payload)
+
+
+def test_audit_binds_eval_immutable_ref_to_validated_candidate_commit(
+    tmp_path: Path,
+) -> None:
+    installed = observation_support._install_eval_receipt(tmp_path)
+    eval_ref = str(installed["receipt_ref"])
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-eval-observation-ref",
+        base_commit=_git(tmp_path, "rev-parse", "HEAD"),
+        workspace_paths=[eval_ref],
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is True
+    closure = audit["observation_closure"][0]
+    receipt = installed["receipt"]
+    assert isinstance(receipt, dict)
+    eval_id = eval_ref.split("/")[2]
+    assert closure["immutable_ref"] == (
+        f"refs/aros/observations/measurement/{eval_id}/"
+        f"{receipt['receipt_sha256']}"
+    )
+    assert closure["target_commit"] == receipt["candidate_commit"]
+
+
+def test_audit_rejects_invalid_immutable_observation_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _init_workspace(tmp_path)
+    (tmp_path / "memory" / "NOW.md").write_text(
+        "# Current State\n\n## Findings\n\nBound observation.\n",
+        encoding="utf-8",
+    )
+    observation_ref = "tasks/TASK-20260805-invalid-target/collected.json"
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-invalid-observation-target",
+        base_commit=base,
+        workspace_paths=["memory/NOW.md"],
+        assimilations=[
+            {
+                "observation_ref": observation_ref,
+                "affected_paths": ["memory/NOW.md"],
+                "rationale": "memory/NOW.md#Findings",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        transitions_module.ObservationCatalog,
+        "resolve",
+        lambda _self, _ref, **_kwargs: _fake_observation(
+            observation_ref,
+            target_commit="not-a-commit",
+            base_commit=base,
+        ),
+    )
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert any(
+        issue["code"] == "invalid_observation_ref_target"
+        for issue in audit["issues"]
+    )
 
 
 def test_overlapping_direct_observations_emit_each_closure_receipt_once(

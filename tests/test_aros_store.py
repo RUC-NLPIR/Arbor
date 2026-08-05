@@ -565,6 +565,33 @@ def test_anchored_json_limit_rejects_before_decode_and_defaults_unbounded(
     assert decoded is False
 
 
+def test_anchored_capture_budget_charges_unique_files_and_excludes_verify_stream(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps({"payload": "a" * 40}), encoding="utf-8")
+    second.write_text(json.dumps({"payload": "b" * 40}), encoding="utf-8")
+    log = tmp_path / "output.log"
+    log.write_bytes(b"z" * 10_000)
+    budget = first.stat().st_size + second.stat().st_size - 1
+
+    with store_module.AnchoredWorkspaceReader(
+        tmp_path,
+        max_capture_bytes=budget,
+    ) as reader:
+        first_value = reader.read_json("first.json")
+        assert reader.read_json("first.json") is first_value
+        assert reader.verify_stream(
+            "output.log",
+            expected_size=log.stat().st_size,
+            expected_sha256=hashlib.sha256(log.read_bytes()).hexdigest(),
+            capture_limit=None,
+        ) is None
+        with pytest.raises(store_module.AnchoredReadLimitError, match="aggregate|budget"):
+            reader.read_json("second.json")
+
+
 def test_anchored_stream_rejects_actual_size_before_declared_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

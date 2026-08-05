@@ -2070,6 +2070,7 @@ def test_transition_input_limits_are_explicit_and_enforced(tmp_path: Path) -> No
     assert transitions_module.MAX_VERSIONED_FILE_BYTES == 16_777_216
     assert transitions_module.MAX_EVIDENCE_LINKS_PER_FILE == 1_024
     assert transitions_module.MAX_EVIDENCE_LINKS_AGGREGATE == 4_096
+    assert transitions_module.MAX_AUDIT_CAPTURE_BYTES == 67_108_864
 
     base = _init_workspace(tmp_path)
     oversized_ref = _write_proposal(
@@ -2287,6 +2288,102 @@ def test_oversized_current_semantic_and_service_files_fail_before_parse(
         assert audit["mechanically_valid"] is False
         assert any("resource_limit" in issue["code"] for issue in audit["issues"])
         assert len(audit["issues"]) < 5
+
+
+def test_current_file_aggregate_budget_stops_before_over_budget_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _init_workspace(tmp_path)
+    record_size = 7 * 1024 * 1024
+    paths: list[str] = []
+    for index in range(10):
+        relative = f"runs/RUN-aggregate-{index:02d}/manifest.json"
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True)
+        payload = json.dumps({"padding": "x" * (record_size - 32)})
+        path.write_text(payload, encoding="utf-8")
+        assert path.stat().st_size < transitions_module.MAX_VERSIONED_FILE_BYTES
+        paths.append(relative)
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-current-aggregate",
+        base_commit=base,
+        workspace_paths=paths,
+    )
+    decoded_sizes: list[int] = []
+    real_loads = store_module._strict_json_loads
+
+    def recording_loads(raw: str | bytes | bytearray) -> object:
+        if len(raw) > 1024 * 1024:
+            decoded_sizes.append(len(raw))
+        return real_loads(raw)
+
+    monkeypatch.setattr(store_module, "_strict_json_loads", recording_loads)
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert any("resource_limit" in issue["code"] for issue in audit["issues"])
+    assert len(decoded_sizes) < len(paths)
+    assert sum(decoded_sizes) <= transitions_module.MAX_AUDIT_CAPTURE_BYTES
+
+
+def test_current_and_base_semantic_reads_share_aggregate_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_workspace(tmp_path)
+    relative = "knowledge/claims/C-shared-budget.md"
+    claim = tmp_path / relative
+    claim.parent.mkdir(parents=True)
+    claim.write_bytes(b"x" * (12 * 1024 * 1024))
+    _git(tmp_path, "add", relative)
+    _git(tmp_path, "commit", "-qm", "record large base semantic")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    base_blob_oid = _git(tmp_path, "rev-parse", f"{base}:{relative}")
+    claim.write_text(_claim_document("C-shared-budget", []), encoding="utf-8")
+
+    paths = [relative]
+    record_size = 7 * 1024 * 1024
+    for index in range(8):
+        eval_id = f"EVAL-{index:064x}"
+        eval_ref = f"eval/evaluations/{eval_id}/receipt.json"
+        path = tmp_path / eval_ref
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({"padding": "x" * (record_size - 32)}),
+            encoding="utf-8",
+        )
+        paths.append(eval_ref)
+    proposal_ref = _write_proposal(
+        tmp_path,
+        "T-shared-aggregate",
+        base_commit=base,
+        workspace_paths=sorted(paths),
+    )
+    blob_reads: list[str] = []
+    real_git_bytes = worktrees_module._git_bytes
+
+    def recording_git_bytes(
+        repository: object,
+        *args: str,
+        **kwargs: object,
+    ) -> bytes:
+        if args == ("cat-file", "blob", base_blob_oid):
+            blob_reads.append(base_blob_oid)
+        return real_git_bytes(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktrees_module, "_git_bytes", recording_git_bytes)
+
+    audit = _audit(tmp_path, proposal_ref)
+
+    assert audit["mechanically_valid"] is False
+    assert blob_reads == []
+    assert any(
+        issue["code"] == "resource_limit_base_semantic"
+        for issue in audit["issues"]
+    )
 
 
 @pytest.mark.parametrize("record_name", ("manifest.json", "final.json"))

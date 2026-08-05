@@ -203,6 +203,7 @@ class AnchoredWorkspaceReader:
         max_json_bytes: int | None = None,
         max_json_depth: int | None = None,
         max_json_nodes: int | None = None,
+        max_capture_bytes: int | None = None,
     ):
         if max_json_bytes is not None and (
             type(max_json_bytes) is not int or max_json_bytes < 0
@@ -213,6 +214,7 @@ class AnchoredWorkspaceReader:
         for value, field in (
             (max_json_depth, "max_json_depth"),
             (max_json_nodes, "max_json_nodes"),
+            (max_capture_bytes, "max_capture_bytes"),
         ):
             if value is not None and (type(value) is not int or value < 0):
                 raise AnchoredReadError(f"{field} must be nonnegative or null")
@@ -235,6 +237,9 @@ class AnchoredWorkspaceReader:
         self._max_json_bytes = max_json_bytes
         self._max_json_depth = max_json_depth
         self._max_json_nodes = max_json_nodes
+        self._max_capture_bytes = max_capture_bytes
+        self._captured_keys: set[object] = set()
+        self._captured_bytes = 0
         flags = _anchored_directory_flags()
         try:
             self._slash_descriptor = os.open(os.sep, flags)
@@ -319,6 +324,7 @@ class AnchoredWorkspaceReader:
                     "workspace JSON exceeds "
                     f"{self._max_json_bytes} bytes: {path}"
                 )
+            self._reserve_capture(key, anchored.identity[4])
             payload, _size, _digest = self._stream_file(
                 descriptor,
                 anchored,
@@ -338,6 +344,25 @@ class AnchoredWorkspaceReader:
                 raise AnchoredReadStructureError(str(error)) from error
         self._json[key] = value
         return value
+
+    def reserve_external_capture(self, key: str, size: int) -> None:
+        """Reserve one externally pinned payload in this capture budget."""
+        if not isinstance(key, str) or not key:
+            raise AnchoredReadError("external capture key must be non-empty")
+        self._reserve_capture(("external", key), size)
+
+    def _reserve_capture(self, key: object, size: int) -> None:
+        if type(size) is not int or size < 0:
+            raise AnchoredReadError("capture size must be nonnegative")
+        if self._max_capture_bytes is None or key in self._captured_keys:
+            return
+        if self._captured_bytes + size > self._max_capture_bytes:
+            raise AnchoredReadLimitError(
+                "workspace aggregate capture budget exceeds "
+                f"{self._max_capture_bytes} bytes"
+            )
+        self._captured_keys.add(key)
+        self._captured_bytes += size
 
     def require_file(self, path: str | Path) -> None:
         with self._open_file(self._workspace_file_key(path)) as (

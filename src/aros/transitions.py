@@ -86,6 +86,7 @@ MAX_EVIDENCE_LINKS_PER_FILE = 1_024
 MAX_EVIDENCE_LINKS_AGGREGATE = 4_096
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 10_000
+MAX_AUDIT_CAPTURE_BYTES = 67_108_864
 
 
 class TransitionError(ValueError):
@@ -258,6 +259,7 @@ class TransitionAuditService:
             max_json_bytes=MAX_VERSIONED_FILE_BYTES,
             max_json_depth=MAX_JSON_DEPTH,
             max_json_nodes=MAX_JSON_NODES,
+            max_capture_bytes=MAX_AUDIT_CAPTURE_BYTES,
         ) as reader:
             repository = _worktrees.bind_repository(reader.root)
             if repository != self.repository:
@@ -632,11 +634,15 @@ class TransitionAuditService:
                 evidence_link_count += len(document.evidence_links)
                 try:
                     base = _base_repository_file(
+                        reader,
                         repository,
                         path,
                         base_entries,
                     )
-                except _worktrees.WorktreeLimitError as error:
+                except (
+                    _ResourceLimitError,
+                    _worktrees.WorktreeLimitError,
+                ) as error:
                     base = None
                     _add_issue(
                         issues,
@@ -1283,6 +1289,7 @@ def _base_gitlink_ancestor(
 
 
 def _base_repository_file(
+    reader: AnchoredWorkspaceReader,
     repository: RepositoryBinding,
     path: str,
     entries: Mapping[str, _worktrees.RepositoryTreeEntry],
@@ -1300,8 +1307,24 @@ def _base_repository_file(
             repository,
             entry.oid,
             max_bytes=MAX_VERSIONED_FILE_BYTES,
+            reserve_bytes=lambda size: _reserve_base_blob(
+                reader,
+                entry.oid,
+                size,
+            ),
         ),
     )
+
+
+def _reserve_base_blob(
+    reader: AnchoredWorkspaceReader,
+    blob_oid: str,
+    size: int,
+) -> None:
+    try:
+        reader.reserve_external_capture(f"git-blob:{blob_oid}", size)
+    except AnchoredReadLimitError as error:
+        raise _ResourceLimitError(str(error)) from error
 
 
 def _base_regular_entry(
@@ -1425,6 +1448,10 @@ def _read_anchored_file(
             raise _ResourceLimitError(
                 f"file exceeds {max_bytes} bytes: {relative}"
             )
+        try:
+            reader._reserve_capture(key, anchored.identity[4])
+        except AnchoredReadLimitError as error:
+            raise _ResourceLimitError(str(error)) from error
         payload, _size, _digest = reader._stream_file(
             descriptor,
             anchored,
@@ -1715,6 +1742,7 @@ def _finalize_audit(
 __all__ = [
     "Assimilation",
     "MAX_AFFECTED_PATHS",
+    "MAX_AUDIT_CAPTURE_BYTES",
     "MAX_ASSIMILATIONS",
     "MAX_EVIDENCE_SCOPE_BYTES",
     "MAX_EVIDENCE_LINKS_AGGREGATE",

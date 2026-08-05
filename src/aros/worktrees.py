@@ -8,7 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -270,6 +270,7 @@ def read_repository_blob(
     blob_oid: str,
     *,
     max_bytes: int | None = None,
+    reserve_bytes: Callable[[int], None] | None = None,
 ) -> bytes:
     """Read and verify one exact SHA-1 blob without changing object storage."""
     _validate_repository_binding(repository)
@@ -277,16 +278,20 @@ def read_repository_blob(
         raise WorktreeError(f"invalid repository blob object ID: {blob_oid!r}")
     if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
         raise WorktreeError("max_bytes must be nonnegative or null")
+    if reserve_bytes is not None and not callable(reserve_bytes):
+        raise WorktreeError("reserve_bytes must be callable or null")
     expected_size: int | None = None
-    if max_bytes is not None:
+    if max_bytes is not None or reserve_bytes is not None:
         raw_size = _git_text(repository, "cat-file", "-s", blob_oid)
         if re.fullmatch(r"0|[1-9][0-9]*", raw_size) is None:
             raise WorktreeError("repository blob size is invalid")
         expected_size = int(raw_size)
-        if expected_size > max_bytes:
+        if max_bytes is not None and expected_size > max_bytes:
             raise WorktreeLimitError(
                 f"repository blob size exceeds {max_bytes} bytes"
             )
+        if reserve_bytes is not None:
+            reserve_bytes(expected_size)
     content = _git_bytes(repository, "cat-file", "blob", blob_oid)
     digest = hashlib.sha1(
         b"blob " + str(len(content)).encode("ascii") + b"\0" + content

@@ -85,6 +85,31 @@ def _require_clean_wheel_interpreter(aros: Path) -> None:
         raise CommissioningError("driver must run under the clean-wheel interpreter")
 
 
+def _provider_facts(provider: object) -> dict[str, str]:
+    model = getattr(provider, "model", None)
+    effort = getattr(provider, "reasoning_effort", None)
+    class_name = type(provider).__qualname__
+    if not isinstance(model, str) or not isinstance(effort, str):
+        raise CommissioningError("effective provider model/effort is unavailable")
+    return {
+        "provider": "openai-responses",
+        "provider_class": class_name,
+        "model": model,
+        "reasoning_effort": effort,
+    }
+
+
+def _require_primary_complete(agent: object, checkpoint_commits: list[str]) -> None:
+    if (
+        getattr(agent, "stop_reason", None) != "finished"
+        or getattr(agent, "total_turns", None) is None
+        or len(checkpoint_commits) != 2
+    ):
+        raise CommissioningError(
+            "primary scientific turn is incomplete; restart is forbidden"
+        )
+
+
 def _instruction() -> str:
     return """Complete exactly one scientific turn for Q-0001.
 
@@ -102,6 +127,12 @@ Evidence and artifact refs. The Idea must include headings: Target question;
 Why worth testing; Proposed action; Expected observations under focal and rival;
 Minimal controls and evaluator; Cost and capabilities; What failure would teach;
 Task and Eval links.
+
+The Idea must begin with exact navigation frontmatter:
+---
+id: I-0001-real-principal
+status: proposed
+---
 
 Write transitions/T-REAL-PREREGISTER/proposal.json with schema_version=1, the
 current Attention HEAD as base_commit, workspace_paths containing exactly
@@ -130,13 +161,24 @@ Model, Idea, and NOW. Use complete Write calls for:
 
 Preserve the exact human Question. Choose the answer, mechanism revision,
 relation/scope, counterevidence, assumptions, uncertainty, and what the result
-cannot establish. Claim C-0001 must contain one strict JSON EvidenceLink under
-"## Evidence links" naming the Eval receipt, relation supports/challenges/bounds
-or context, and a nonempty scope. The final proposal uses the latest Attention
-HEAD, lists the five semantic paths (not proposal) in workspace_paths, and has
-exactly two assimilations: Task collection with rationale under the Idea or NOW,
-and Eval receipt with rationale knowledge/claims/C-0001.md#Evidence links. Each
-affected path must be changed and contain its rationale anchor.
+cannot establish. Claim C-0001 must use these headings exactly:
+## Statement and scope
+## Evidence links
+## Counterevidence
+## Assumptions
+## Uncertainty and alternatives
+Under Evidence links write exactly one JSON object with exactly these keys and no extras:
+{"observation_ref":"<EVAL_RECEIPT_REF>","relation":"supports|challenges|bounds|context","scope":"<nonempty scoped interpretation>"}
+
+The final proposal has exactly four top-level keys: schema_version, base_commit,
+workspace_paths, assimilations. Use the latest Attention HEAD as base_commit and
+list exactly the five semantic paths (not proposal) in workspace_paths. Each of
+the exactly two assimilation objects has exactly these keys:
+{"observation_ref":"<TASK_COLLECTION_REF or EVAL_RECEIPT_REF>","affected_paths":["<changed semantic path>"],"rationale":"<changed path>#<existing heading>"}
+Use the exact Task collection ref for one and the exact Eval receipt ref for the
+other. The Eval rationale must be
+knowledge/claims/C-0001.md#Evidence links. Each affected path must be changed,
+listed in workspace_paths, and contain its rationale anchor.
 
 Audit the final proposal and checkpoint with message "Assimilate one real
 Principal Task and measurement." Stop after the admitted checkpoint. Never fill
@@ -282,20 +324,20 @@ def commission(aros: Path, runtime: Path, human_review: Path) -> Path:
         )
     primary_agent, primary_initial_messages = agents.pop()
     primary_messages = json.loads(json.dumps(primary_agent.messages))
+    checkpoint_commits = _checkpoint_commits(primary_messages)
+    _require_primary_complete(primary_agent, checkpoint_commits)
+    provider_facts = _provider_facts(primary_agent.provider)
     primary = {
         "class": f"{type(primary_agent).__module__}.{type(primary_agent).__qualname__}",
         "initial_message_count": primary_initial_messages,
-        "provider_class": f"{type(primary_agent.provider).__module__}.{type(primary_agent.provider).__qualname__}",
-        "provider": primary_agent.config.provider,
-        "model": primary_agent.provider.model,
-        "reasoning_effort": primary_agent.config.reasoning_effort,
+        **provider_facts,
         "turns": primary_agent.total_turns,
         "input_tokens": primary_agent.total_input_tokens,
         "output_tokens": primary_agent.total_output_tokens,
         "stop_reason": primary_agent.stop_reason,
         "tool_uses": json.loads(json.dumps(primary_agent.tool_uses)),
         "message_sha256": _message_sha256(primary_messages),
-        "checkpoint_commits": _checkpoint_commits(primary_messages),
+        "checkpoint_commits": checkpoint_commits,
     }
     primary_ref = weakref.ref(primary_agent)
     del primary_agent
@@ -329,11 +371,10 @@ def commission(aros: Path, runtime: Path, human_review: Path) -> Path:
             restart_result.output or f"restart exited {restart_result.exit_code}"
         )
     restart_agent, restart_initial_messages = agents.pop()
+    restart_provider_facts = _provider_facts(restart_agent.provider)
     restart = {
         "initial_message_count": restart_initial_messages,
-        "provider": restart_agent.config.provider,
-        "model": restart_agent.provider.model,
-        "reasoning_effort": restart_agent.config.reasoning_effort,
+        **restart_provider_facts,
         "turns": restart_agent.total_turns,
         "input_tokens": restart_agent.total_input_tokens,
         "output_tokens": restart_agent.total_output_tokens,

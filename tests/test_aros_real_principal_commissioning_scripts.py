@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -90,6 +91,56 @@ def test_real_principal_driver_exposes_bounded_cli() -> None:
     assert "--runtime" in result.stdout
     assert "--human-review" in result.stdout
     assert "retry" not in result.stdout.lower()
+
+
+def test_real_principal_driver_reads_effective_provider_facts() -> None:
+    module = _module(DRIVER, "aros_real_principal_driver_facts")
+    provider = type("OpenAIResponsesProvider", (), {})()
+    provider.model = "gpt-5.6-luna"
+    provider.reasoning_effort = "max"
+
+    facts = module._provider_facts(provider)
+
+    assert facts == {
+        "provider": "openai-responses",
+        "provider_class": "OpenAIResponsesProvider",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "max",
+    }
+
+
+def test_real_principal_driver_stops_before_restart_when_primary_is_incomplete() -> None:
+    module = _module(DRIVER, "aros_real_principal_driver_gate")
+    incomplete = SimpleNamespace(stop_reason="max_turns", total_turns=40)
+
+    try:
+        module._require_primary_complete(incomplete, ["a" * 40])
+    except module.CommissioningError as error:
+        assert "incomplete" in str(error)
+    else:
+        raise AssertionError("driver accepted an incomplete primary")
+
+    source = DRIVER.read_text(encoding="utf-8")
+    gate = source.index("_require_primary_complete(")
+    restart = source.index("restart_result = runner.invoke(")
+    assert gate < restart
+
+
+def test_real_principal_instruction_contains_exact_machine_schemas() -> None:
+    module = _module(DRIVER, "aros_real_principal_driver_prompt")
+    instruction = module._instruction()
+
+    for required in (
+        '"observation_ref"',
+        '"affected_paths"',
+        '"rationale"',
+        '"relation"',
+        '"scope"',
+        "## Statement and scope",
+        "## Evidence links",
+        "id: I-0001-real-principal",
+    ):
+        assert required in instruction
 
 
 def _valid_tool_uses() -> list[dict[str, object]]:

@@ -42,6 +42,15 @@ def _help(executable: Path) -> str:
     return result.stdout
 
 
+def _validate_navigation(frontier: bytes, now: bytes, metadata_ref: str) -> None:
+    if (
+        b"focus_question: Q-0001" not in frontier
+        or b"questions/Q-0001/question.md" not in now
+        or metadata_ref.encode("utf-8") not in now
+    ):
+        raise VerificationError("KnowledgeBank navigation is incomplete")
+
+
 def verify(evidence_path: Path) -> dict[str, object]:
     evidence = _object(evidence_path)
     if evidence.get("schema_version") != 1:
@@ -82,6 +91,14 @@ def verify(evidence_path: Path) -> dict[str, object]:
     extracted = _git(project, "show", f"{commit}:{source['extracted_ref']}")
     if not extracted.strip():
         raise VerificationError("source extraction is empty")
+    _validate_navigation(
+        _git(project, "show", f"{commit}:questions/FRONTIER.md"),
+        _git(project, "show", f"{commit}:memory/NOW.md"),
+        str(source["metadata_ref"]),
+    )
+    model = _git(project, "show", f"{commit}:model/CURRENT.md")
+    if b"No explanatory model has been admitted" not in model:
+        raise VerificationError("bootstrap model contains invented meaning")
 
     tree = _git(project, "ls-tree", "-r", "--name-only", commit).decode().splitlines()
     if any(path.startswith("ideas/I-") or path.startswith("knowledge/claims/C-") for path in tree):

@@ -171,3 +171,25 @@ def test_native_start_verifier_rejects_wrong_question_before_repository_io(
 
     assert result.returncode != 0
     assert "question" in result.stderr.lower()
+
+
+def test_native_start_verifier_requires_question_and_source_navigation() -> None:
+    module = _module(VERIFIER, "aros_native_start_verifier")
+    metadata_ref = "sources/papers/SRC-test/metadata.json"
+
+    module._validate_navigation(
+        b"---\nfocus_question: Q-0001\n---\n",
+        f"questions/Q-0001/question.md\n{metadata_ref}\n".encode(),
+        metadata_ref,
+    )
+
+    try:
+        module._validate_navigation(
+            b"---\nfocus_question:\n---\n",
+            b"questions/Q-0001/question.md\n",
+            metadata_ref,
+        )
+    except module.VerificationError as error:
+        assert "navigation" in str(error)
+    else:
+        raise AssertionError("verifier accepted missing KB navigation")

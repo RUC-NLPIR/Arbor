@@ -62,10 +62,17 @@ def _message_sha256(messages: object) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _require_clean_wheel_interpreter(
+    aros: Path,
+    executable: str | Path,
+) -> None:
+    if Path(executable).absolute().parent != aros.absolute().parent:
+        raise CommissioningError("driver must run under the clean-wheel interpreter")
+
+
 def commission(aros: Path, runtime: Path) -> Path:
     aros = aros.resolve(strict=True)
-    if Path(sys.executable).resolve().parent != aros.parent.resolve():
-        raise CommissioningError("driver must run under the clean-wheel interpreter")
+    _require_clean_wheel_interpreter(aros, sys.executable)
     arbor = aros.with_name("arbor")
     arbor.resolve(strict=True)
     runtime = runtime.absolute()

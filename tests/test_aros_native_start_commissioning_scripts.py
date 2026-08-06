@@ -109,6 +109,29 @@ def test_native_start_driver_uses_public_start_without_direct_kb_mutation() -> N
     assert "write_bytes" not in called_names
 
 
+def test_native_start_driver_compares_venv_entry_paths_without_resolving_symlinks(
+    tmp_path: Path,
+) -> None:
+    module = _module(DRIVER, "aros_native_start_driver")
+    bin_dir = tmp_path / "venv/bin"
+    bin_dir.mkdir(parents=True)
+
+    module._require_clean_wheel_interpreter(
+        bin_dir / "aros",
+        bin_dir / "python",
+    )
+
+    try:
+        module._require_clean_wheel_interpreter(
+            bin_dir / "aros",
+            tmp_path / "other/bin/python",
+        )
+    except module.CommissioningError as error:
+        assert "clean-wheel interpreter" in str(error)
+    else:
+        raise AssertionError("driver accepted a different interpreter directory")
+
+
 def test_native_start_scripts_expose_one_runtime_and_independent_verifier() -> None:
     driver = subprocess.run(
         [sys.executable, str(DRIVER), "--help"],

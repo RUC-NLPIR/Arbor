@@ -58,6 +58,14 @@
       "agent_visibility": "on_demand"
     },
     {
+      "id": "aros-real-principal-scientific-turn-design",
+      "title": "AROS Real Principal Scientific Turn Design",
+      "path": "docs/superpowers/specs/2026-08-06-aros-real-principal-scientific-turn-design.md",
+      "status": "proposed",
+      "authority": "implementation_baseline",
+      "agent_visibility": "on_demand"
+    },
+    {
       "id": "aros-public-guide",
       "title": "AROS Public Guide",
       "path": "docs/aros/README.md",

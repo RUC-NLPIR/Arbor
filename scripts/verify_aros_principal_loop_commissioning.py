@@ -74,6 +74,123 @@ def _refs(packet: dict[str, object]) -> set[str]:
     return refs
 
 
+def _tool_uses(section: dict[str, object]) -> list[dict[str, object]]:
+    value = section.get("tool_uses")
+    if not isinstance(value, list) or any(
+        not isinstance(item, dict) for item in value
+    ):
+        raise VerificationError("Agent tool_uses are invalid")
+    return value  # type: ignore[return-value]
+
+
+def _live_agent_sections(
+    evidence: dict[str, object],
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
+    agent = evidence.get("agent")
+    restart = evidence.get("restart")
+    if not isinstance(agent, dict):
+        raise VerificationError("live agent section is missing")
+    if not isinstance(restart, dict):
+        raise VerificationError("restart section is missing")
+    if agent.get("class") != "arbor.core.agent.Agent":
+        raise VerificationError("commissioning did not use the native Agent")
+    if agent.get("destroyed_before_restart") is not True:
+        raise VerificationError("primary Agent was not destroyed before restart")
+    if agent.get("stop_reason") != "finished" or restart.get("stop_reason") != "finished":
+        raise VerificationError("an Agent did not finish normally")
+    if restart.get("initial_message_count") != 0:
+        raise VerificationError("restart Agent reused prior messages")
+    primary_agent = agent.get("instance")
+    primary_provider = agent.get("provider_instance")
+    restart_agent = restart.get("agent_instance")
+    restart_provider = restart.get("provider_instance")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (
+            primary_agent,
+            primary_provider,
+            restart_agent,
+            restart_provider,
+        )
+    ):
+        raise VerificationError("Agent/provider identity is invalid")
+    if primary_agent == restart_agent or primary_provider == restart_provider:
+        raise VerificationError("restart did not use a fresh Agent/provider")
+    for section in (agent, restart):
+        digest = section.get("message_sha256")
+        if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+            raise VerificationError("Agent message hash is invalid")
+        if not isinstance(section.get("result"), str):
+            raise VerificationError("Agent terminal result is invalid")
+    return agent, restart, _tool_uses(agent), _tool_uses(restart)
+
+
+def _tool_identity(item: dict[str, object]) -> tuple[str, str]:
+    name = item.get("name")
+    tool_input = item.get("input")
+    if not isinstance(name, str) or not isinstance(tool_input, dict):
+        raise VerificationError("Agent tool use is invalid")
+    selector = (
+        tool_input.get("action")
+        if name in {"Research", "Task", "Eval"}
+        else tool_input.get("file_path")
+    )
+    if not isinstance(selector, str):
+        raise VerificationError("Agent tool selector is invalid")
+    return name, selector
+
+
+def _validate_primary_tool_sequence(
+    tool_uses: list[dict[str, object]],
+) -> dict[str, bytes]:
+    identities = [_tool_identity(item) for item in tool_uses]
+    cursor = 0
+
+    def require(expected: tuple[str, str]) -> None:
+        nonlocal cursor
+        if cursor >= len(identities) or identities[cursor] != expected:
+            raise VerificationError(
+                f"Agent tool sequence expected {expected!r} at position {cursor}"
+            )
+        cursor += 1
+
+    require(("Research", "attention"))
+    require(("Task", "create"))
+    require(("Task", "start"))
+    require(("Task", "status"))
+    while cursor < len(identities) and identities[cursor] == ("Task", "status"):
+        cursor += 1
+    require(("Task", "collect"))
+    require(("Eval", "run"))
+    require(("Research", "attention"))
+    require(("Read", "knowledge/claims/C-0001.md"))
+    require(("Read", "memory/NOW.md"))
+    write_paths = (
+        "knowledge/claims/C-0001.md",
+        "memory/NOW.md",
+        "transitions/T-E2E-ASSIMILATE/proposal.json",
+    )
+    payloads: dict[str, bytes] = {}
+    for path in write_paths:
+        require(("Write", path))
+        tool_input = tool_uses[cursor - 1]["input"]
+        assert isinstance(tool_input, dict)
+        content = tool_input.get("content")
+        if not isinstance(content, str):
+            raise VerificationError("semantic Write payload is invalid")
+        payloads[path] = content.encode("utf-8")
+    require(("Research", "transition_audit"))
+    require(("Research", "checkpoint"))
+    if cursor != len(identities):
+        raise VerificationError("Agent tool sequence contains extra calls")
+    return payloads
+
+
 def verify(evidence_path: Path) -> dict[str, object]:
     evidence = _json(evidence_path)
     if evidence.get("schema_version") != 1:
@@ -83,16 +200,19 @@ def verify(evidence_path: Path) -> dict[str, object]:
     task = evidence.get("task")
     evaluation = evidence.get("eval")
     checkpoint = evidence.get("checkpoint")
-    restart = evidence.get("restart")
-    if not all(isinstance(item, dict) for item in (task, evaluation, checkpoint, restart)):
+    if not all(isinstance(item, dict) for item in (task, evaluation, checkpoint)):
         raise VerificationError("evidence sections are incomplete")
     assert isinstance(task, dict)
     assert isinstance(evaluation, dict)
     assert isinstance(checkpoint, dict)
-    assert isinstance(restart, dict)
     if task.get("child_commit") != evaluation.get("candidate_commit"):
         raise VerificationError("Task and Eval candidate_commit mismatch")
-
+    _, restart, primary_tools, restart_tools = _live_agent_sections(evidence)
+    semantic_payloads = _validate_primary_tool_sequence(primary_tools)
+    if [_tool_identity(item) for item in restart_tools] != [
+        ("Research", "attention")
+    ]:
+        raise VerificationError("restart Agent tool sequence is not one attention")
     project_raw = evidence.get("project")
     if not isinstance(project_raw, str):
         raise VerificationError("project path is missing")
@@ -112,6 +232,23 @@ def verify(evidence_path: Path) -> dict[str, object]:
         raise VerificationError("canonical HEAD differs from checkpoint commit")
     if _git_text(project, "rev-parse", f"{final_commit}^") != base_commit:
         raise VerificationError("checkpoint sole parent differs from base_commit")
+    for path, expected in semantic_payloads.items():
+        if _git(project, "show", f"{final_commit}:{path}") != expected:
+            raise VerificationError(f"Git blob differs from Agent Write: {path}")
+
+    proposal_raw = semantic_payloads[
+        "transitions/T-E2E-ASSIMILATE/proposal.json"
+    ]
+    proposal = json.loads(proposal_raw)
+    if not isinstance(proposal, dict):
+        raise VerificationError("Agent proposal is not an object")
+    if proposal.get("base_commit") != base_commit:
+        raise VerificationError("Agent proposal base_commit differs")
+    if proposal.get("workspace_paths") != [
+        "knowledge/claims/C-0001.md",
+        "memory/NOW.md",
+    ]:
+        raise VerificationError("Agent proposal workspace_paths differ")
 
     collected_ref = str(task.get("collected_ref"))
     receipt_ref = str(evaluation.get("receipt_ref"))
@@ -141,30 +278,30 @@ def verify(evidence_path: Path) -> dict[str, object]:
     if _record_hash(admission, "receipt_sha256") != checkpoint.get("receipt_sha256"):
         raise VerificationError("checkpoint receipt_sha256 differs")
 
-    complete = restart.get("complete_packet")
-    missing = restart.get("missing_cache_packet")
-    rebuilt = restart.get("rebuilt_packet")
-    if not all(isinstance(item, dict) for item in (complete, missing, rebuilt)):
-        raise VerificationError("restart packets are incomplete")
-    assert isinstance(complete, dict)
-    assert isinstance(missing, dict)
-    assert isinstance(rebuilt, dict)
-    expected_refs = {collected_ref, receipt_ref}
-    if _refs(complete) or _refs(rebuilt):
+    assimilations = proposal.get("assimilations")
+    if not isinstance(assimilations, list) or len(assimilations) != 2:
+        raise VerificationError("Agent proposal requires two assimilations")
+    observed_refs = {
+        item.get("observation_ref")
+        for item in assimilations
+        if isinstance(item, dict)
+    }
+    if observed_refs != {collected_ref, receipt_ref}:
+        raise VerificationError("Agent proposal assimilation refs differ")
+
+    packet = restart.get("packet")
+    if not isinstance(packet, dict):
+        raise VerificationError("restart packet is incomplete")
+    if _refs(packet):
         raise VerificationError("assimilated observations remain pending after restart")
-    if _refs(missing) != expected_refs:
-        raise VerificationError("missing cache did not conservatively redisplay observations")
-    warnings = missing.get("warnings")
-    if not isinstance(warnings, list) or "index_incomplete" not in warnings:
-        raise VerificationError("missing cache packet lacks index_incomplete")
-    recent = rebuilt.get("recent_evidence_delta")
+    recent = packet.get("recent_evidence_delta")
     if (
         not isinstance(recent, list)
         or not recent
         or not isinstance(recent[0], dict)
         or recent[0].get("transition_id") != transition_id
     ):
-        raise VerificationError("rebuilt packet lacks latest evidence transition")
+        raise VerificationError("restart packet lacks latest evidence transition")
     commands = evidence.get("commands")
     if not isinstance(commands, list) or not commands:
         raise VerificationError("commissioning command receipts are missing")

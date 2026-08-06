@@ -12,6 +12,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parent.parent
 ADAPTER = ROOT / "commissioning/principal_loop/task_adapter.py"
@@ -25,6 +27,17 @@ def _provider_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location(
         "aros_principal_loop_provider",
         PROVIDER,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _verifier_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "aros_principal_loop_verifier",
+        VERIFIER,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -367,6 +380,149 @@ def test_verifier_rejects_unrelated_task_and_measurement(tmp_path: Path) -> None
 
     assert result.returncode != 0
     assert "candidate_commit" in result.stderr
+
+
+def _minimal_live_evidence(tmp_path: Path) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "enforcement_class": "cooperative",
+        "project": str(tmp_path),
+        "task": {
+            "task_id": "TASK-live",
+            "child_commit": "1" * 40,
+            "return_commit": "2" * 40,
+            "collected_ref": "tasks/TASK-live/collected.json",
+            "collected_sha256": "a" * 64,
+        },
+        "eval": {
+            "eval_id": "EVAL-" + "b" * 64,
+            "candidate_commit": "1" * 40,
+            "receipt_ref": "eval/evaluations/EVAL-" + "b" * 64 + "/receipt.json",
+            "receipt_sha256": "c" * 64,
+            "metric": 1.0,
+        },
+        "checkpoint": {
+            "transition_id": "T-E2E-ASSIMILATE",
+            "base_commit": "3" * 40,
+            "commit": "4" * 40,
+            "receipt_sha256": "d" * 64,
+        },
+        "restart": {
+            "agent_instance": 2,
+            "provider_instance": 4,
+            "initial_message_count": 0,
+            "stop_reason": "finished",
+            "result": "recovered",
+            "tool_uses": [
+                {"name": "Research", "input": {"action": "attention"}}
+            ],
+            "message_sha256": "e" * 64,
+            "packet": {
+                "unassimilated_returns": [],
+                "recent_evidence_delta": [
+                    {"transition_id": "T-E2E-ASSIMILATE"}
+                ],
+            },
+        },
+        "commands": [{"returncode": 0}],
+    }
+
+
+def _run_verifier(tmp_path: Path, evidence: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    path = tmp_path / "evidence.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, str(VERIFIER), str(path)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_verifier_requires_live_agent_section_before_repository_io(
+    tmp_path: Path,
+) -> None:
+    result = _run_verifier(tmp_path, _minimal_live_evidence(tmp_path))
+
+    assert result.returncode != 0
+    assert "agent section" in result.stderr
+
+
+def test_verifier_rejects_restart_reusing_primary_object_identity(
+    tmp_path: Path,
+) -> None:
+    evidence = _minimal_live_evidence(tmp_path)
+    evidence["agent"] = {
+        "class": "arbor.core.agent.Agent",
+        "instance": 2,
+        "provider_instance": 4,
+        "destroyed_before_restart": True,
+        "stop_reason": "finished",
+        "result": "admitted",
+        "tool_uses": [],
+        "message_sha256": "f" * 64,
+    }
+
+    result = _run_verifier(tmp_path, evidence)
+
+    assert result.returncode != 0
+    assert "fresh Agent/provider" in result.stderr
+
+
+def _valid_primary_tool_uses() -> list[dict[str, object]]:
+    return [
+        {"name": "Research", "input": {"action": "attention"}},
+        {"name": "Task", "input": {"action": "create"}},
+        {"name": "Task", "input": {"action": "start"}},
+        {"name": "Task", "input": {"action": "status"}},
+        {"name": "Task", "input": {"action": "collect"}},
+        {"name": "Eval", "input": {"action": "run"}},
+        {"name": "Research", "input": {"action": "attention"}},
+        {
+            "name": "Read",
+            "input": {"file_path": "knowledge/claims/C-0001.md"},
+        },
+        {"name": "Read", "input": {"file_path": "memory/NOW.md"}},
+        {
+            "name": "Write",
+            "input": {
+                "file_path": "knowledge/claims/C-0001.md",
+                "content": "claim\n",
+            },
+        },
+        {
+            "name": "Write",
+            "input": {"file_path": "memory/NOW.md", "content": "now\n"},
+        },
+        {
+            "name": "Write",
+            "input": {
+                "file_path": "transitions/T-E2E-ASSIMILATE/proposal.json",
+                "content": "{}\n",
+            },
+        },
+        {
+            "name": "Research",
+            "input": {"action": "transition_audit"},
+        },
+        {"name": "Research", "input": {"action": "checkpoint"}},
+    ]
+
+
+def test_verifier_requires_exact_agent_tool_sequence_and_write_payloads() -> None:
+    module = _verifier_module()
+    tool_uses = _valid_primary_tool_uses()
+
+    payloads = module._validate_primary_tool_sequence(tool_uses)
+
+    assert payloads == {
+        "knowledge/claims/C-0001.md": b"claim\n",
+        "memory/NOW.md": b"now\n",
+        "transitions/T-E2E-ASSIMILATE/proposal.json": b"{}\n",
+    }
+    with pytest.raises(module.VerificationError, match="Agent tool sequence"):
+        module._validate_primary_tool_sequence(
+            [item for item in tool_uses if item["name"] != "Eval"]
+        )
 
 
 def test_driver_exposes_one_explicit_aros_entry_and_runtime() -> None:

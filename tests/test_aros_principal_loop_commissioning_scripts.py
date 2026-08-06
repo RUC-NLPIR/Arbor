@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import ast
+import asyncio
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -13,6 +18,223 @@ ADAPTER = ROOT / "commissioning/principal_loop/task_adapter.py"
 SCORER = ROOT / "commissioning/principal_loop/evaluation/score.py"
 DRIVER = ROOT / "scripts/commission_aros_principal_loop.py"
 VERIFIER = ROOT / "scripts/verify_aros_principal_loop_commissioning.py"
+PROVIDER = ROOT / "commissioning/principal_loop/provider.py"
+
+
+def _provider_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "aros_principal_loop_provider",
+        PROVIDER,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _provider_result(
+    messages: list[dict[str, object]],
+    response: Any,
+    content: str,
+    *,
+    is_error: bool = False,
+) -> list[dict[str, object]]:
+    call = response.get_tool_calls()[0]
+    return [
+        *messages,
+        {"role": "assistant", "content": response.raw_content},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call.id,
+                    "content": content,
+                    **({"is_error": True} if is_error else {}),
+                }
+            ],
+        },
+    ]
+
+
+def test_commissioning_provider_has_no_reality_interface_imports() -> None:
+    source = PROVIDER.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imported.update(
+        node.module or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    )
+
+    assert not imported & {
+        "os",
+        "pathlib",
+        "shutil",
+        "subprocess",
+        "arbor.aros",
+    }
+
+
+def test_primary_provider_starts_with_attention_and_rejects_error_result() -> None:
+    module = _provider_module()
+    provider = module.PrincipalLoopProvider()
+    messages: list[dict[str, object]] = [{"role": "user", "content": "go"}]
+
+    first = asyncio.run(provider.create(system="boot", messages=messages))
+
+    call = first.get_tool_calls()[0]
+    assert (call.name, call.input) == ("Research", {"action": "attention"})
+    messages = _provider_result(messages, first, "failed", is_error=True)
+    try:
+        asyncio.run(provider.create(system="boot", messages=messages))
+    except ValueError as error:
+        assert "tool result is_error" in str(error)
+    else:
+        raise AssertionError("provider accepted an error tool result")
+
+
+def test_primary_provider_advances_only_from_exact_tool_results() -> None:
+    module = _provider_module()
+    provider = module.PrincipalLoopProvider()
+    messages: list[dict[str, object]] = [{"role": "user", "content": "go"}]
+    response = asyncio.run(provider.create(system="boot", messages=messages))
+    observed: list[tuple[str, dict[str, object]]] = []
+
+    def advance(value: object) -> Any:
+        nonlocal messages, response
+        call = response.get_tool_calls()[0]
+        observed.append((call.name, call.input))
+        content = value if isinstance(value, str) else json.dumps(value)
+        messages = _provider_result(messages, response, content)
+        response = asyncio.run(provider.create(system="boot", messages=messages))
+        return response
+
+    advance(
+        {
+            "snapshot": {"candidate": {"head": "0" * 40}},
+            "unassimilated_returns": [],
+            "recent_evidence_delta": [],
+        }
+    )
+    assert response.get_tool_calls()[0].name == "Task"
+    advance(
+        {
+            "task_id": "TASK-live",
+            "admission_required": False,
+        }
+    )
+    advance({"task_id": "TASK-live", "state": "running"})
+    advance({"task_id": "TASK-live", "state": "running"})
+    assert response.get_tool_calls()[0].input == {
+        "action": "status",
+        "task_id": "TASK-live",
+    }
+    advance({"task_id": "TASK-live", "state": "completed"})
+    child_commit = "1" * 40
+    return_commit = "2" * 40
+    advance(
+        {
+            "task_id": "TASK-live",
+            "child_commit": child_commit,
+            "return_commit": return_commit,
+            "collected_sha256": "a" * 64,
+            "admission_required": False,
+        }
+    )
+    eval_id = "EVAL-" + "b" * 64
+    advance(
+        {
+            "eval_id": eval_id,
+            "candidate_commit": child_commit,
+            "measurement_state": "valid",
+            "metric": 1.0,
+            "receipt_sha256": "c" * 64,
+            "admission_required": False,
+        }
+    )
+    collected_ref = "tasks/TASK-live/collected.json"
+    eval_ref = f"eval/evaluations/{eval_id}/receipt.json"
+    semantic_base = "3" * 40
+    advance(
+        {
+            "snapshot": {"candidate": {"head": semantic_base}},
+            "unassimilated_returns": [
+                {"ref": collected_ref},
+                {"ref": eval_ref},
+            ],
+            "recent_evidence_delta": [],
+        }
+    )
+    advance("initial claim")
+    advance("initial now")
+    claim_write = response.get_tool_calls()[0]
+    assert claim_write.name == "Write"
+    assert eval_ref in claim_write.input["content"]
+    advance("Overwrote claim")
+    now_write = response.get_tool_calls()[0]
+    assert now_write.name == "Write"
+    assert child_commit in now_write.input["content"]
+    advance("Overwrote now")
+    proposal_write = response.get_tool_calls()[0]
+    proposal = json.loads(proposal_write.input["content"])
+    assert proposal["base_commit"] == semantic_base
+    assert {item["observation_ref"] for item in proposal["assimilations"]} == {
+        collected_ref,
+        eval_ref,
+    }
+    advance("Created proposal")
+    advance({"mechanically_valid": True})
+    final = advance({"commit": "4" * 40})
+
+    assert final.get_tool_calls() == []
+    assert final.get_text() == "Cooperative research transition admitted."
+    assert [name for name, _ in observed] == [
+        "Research",
+        "Task",
+        "Task",
+        "Task",
+        "Task",
+        "Task",
+        "Eval",
+        "Research",
+        "Read",
+        "Read",
+        "Write",
+        "Write",
+        "Write",
+        "Research",
+        "Research",
+    ]
+
+
+def test_restart_provider_requires_admitted_attention_without_pending_returns() -> None:
+    module = _provider_module()
+    provider = module.PrincipalLoopProvider(restart=True)
+    messages: list[dict[str, object]] = [{"role": "user", "content": "recover"}]
+    attention = asyncio.run(provider.create(system="boot", messages=messages))
+
+    messages = _provider_result(
+        messages,
+        attention,
+        json.dumps(
+            {
+                "unassimilated_returns": [],
+                "recent_evidence_delta": [
+                    {"transition_id": "T-E2E-ASSIMILATE"}
+                ],
+            }
+        ),
+    )
+    final = asyncio.run(provider.create(system="boot", messages=messages))
+
+    assert final.get_tool_calls() == []
+    assert "T-E2E-ASSIMILATE" in final.get_text()
 
 
 def _git(root: Path, *args: str) -> str:

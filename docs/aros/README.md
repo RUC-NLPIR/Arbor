@@ -50,16 +50,16 @@ The exposed command surface for the direct `aros` entry is:
 - Arbor-native protected broker authority and non-bypass commissioning
 - project-local user-space Skills lifecycle and procedural memory
 - provider child profiles/adapters, `child_done`, and positive assimilation
-- semantic K/M/G plus one-way migration adapters
+- AROS-native semantic K/M/G
 - MCP parity and provider parity
 - distribution and namespace transition, including Arbor retirement
 
-## Compatibility
+## Architecture boundary
 
-The direct `aros` command is the public AROS entry. `arbor aros` is a temporary forwarding compatibility route.
+The direct `aros` command is the only public AROS entry. The legacy `arbor` root does not mount AROS.
 
-CI hard-gates machine-decidable boundaries: transitive project-import reachability from every `src/aros/**/*.py` module and the direct adapters, source-path growth, the compatibility-shim hash, and legacy LOC non-increase. The conservative module-scope static graph indexes every configured local Python package and follows project-local imports through `arbor.core`, `arbor.cli.user_config`, and `arbor._app`; direct AROS modules and adapters also retain their dynamic-execution checks, with a fresh runtime import as a secondary check.
+CI hard-gates machine-decidable boundaries: transitive project-import reachability from every `src/aros/**/*.py` module and the direct adapters, source-path growth, and legacy LOC non-increase. The conservative module-scope static graph indexes every configured local Python package and follows project-local imports through `arbor.core`, `arbor.cli.user_config`, and `arbor._app`; direct AROS modules and adapters also retain their dynamic-execution checks, with a fresh runtime import as a secondary check.
 
-Within `src/`, only `src/aros/`, `src/cli/aros_app.py`, and `src/cli/commands/aros_cmd.py` may gain source lines or files. All non-allowlisted legacy source paths under `src/` reject added lines and paths; `src/core/` remains legacy-frozen, so legacy source LOC may only stay level or decrease. The especially frozen paths are `src/coordinator`, `src/executor`, `src/run.py`, `src/review.py`, and `src/cli/commands/run.py`. Pure deletion is allowed. The warning in `src/cli/app.py` is not generally growth-allowlisted: the named sunset gate `AROS_RETIREMENT_GATE_E4` accepts only its exact approved Git blob until that shim is deleted.
+Within `src/`, only `src/aros/`, `src/cli/aros_app.py`, `src/cli/aros_start.py`, and `src/cli/commands/aros_cmd.py` may gain source lines or files. All non-allowlisted legacy source paths under `src/` reject added lines and paths; `src/core/` remains legacy-frozen, so legacy source LOC may only stay level or decrease. The especially frozen paths are `src/coordinator`, `src/executor`, `src/run.py`, `src/review.py`, and `src/cli/commands/run.py`. Pure deletion is allowed; legacy entry files receive no AROS-specific growth exception.
 
-These mechanical results do not establish semantic duplication or equivalence. A new or padded copy under `src/aros/` can pass the mechanical gate and still requires module commissioning review. A padded copy under `src/core/` or another non-allowlisted source path fails path growth independently of Git similarity. The path gate treats an exact `R100` move from `src/` to outside `src/` as no growth inside its guarded source scope; commissioning review must confirm that the destination is not configured as a Python package and that no remaining entry or import refers to the moved module. Other `arbor` commands remain legacy implementations until migrated.
+These mechanical results do not establish semantic duplication or equivalence. A new or padded copy under `src/aros/` can pass the mechanical gate and still requires module commissioning review. A padded copy under `src/core/` or another non-allowlisted source path fails path growth independently of Git similarity. The path gate treats an exact `R100` move from `src/` to outside `src/` as no growth inside its guarded source scope; commissioning review must confirm that the destination is not configured as a Python package and that no remaining entry or import refers to the moved module. Other `arbor` commands remain legacy implementations until equivalent AROS paths are commissioned and the old paths are deleted.

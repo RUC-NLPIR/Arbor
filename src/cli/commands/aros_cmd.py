@@ -36,7 +36,6 @@ from ...aros.workspace import (
     DEFAULT_BOOT_MAX_CHARS,
     boot_packet,
     boot_workspace,
-    init_workspace,
     render_boot_packet,
     status_workspace,
 )
@@ -171,23 +170,6 @@ class _RequireCommandSeparator(TyperCommand):
         if "--help" not in args and "-h" not in args and "--" not in args:
             ctx.fail("command argv must follow --")
         return super().parse_args(ctx, args)
-
-
-@aros_app.command("init")
-def init_command(
-    cwd: Path = typer.Option(Path("."), "--cwd", help="Git workspace root."),
-    mission: str = typer.Option(
-        ...,
-        "--mission",
-        help="Initial mission written into the new workspace skeleton.",
-    ),
-) -> None:
-    """Create a bootable AROS workspace without inventing research state."""
-    try:
-        result = init_workspace(_root(cwd), mission)
-    except (OSError, RuntimeError, ValueError) as exc:
-        _fail(exc)
-    _print_json(result)
 
 
 @aros_app.command("boot")

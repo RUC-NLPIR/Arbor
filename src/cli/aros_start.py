@@ -11,10 +11,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .style import console as shared_console
-
-
 Prompt = Callable[[str, str], str]
+_console = Console(highlight=False)
 
 
 @dataclass(frozen=True)
@@ -87,7 +85,7 @@ def render_start_transition(
     console: Console | None = None,
 ) -> None:
     """Render one bounded product transition without reading or mutating state."""
-    target = console or shared_console
+    target = console or _console
     table = Table.grid(padding=(0, 2))
     table.add_column(style="dim", justify="right")
     table.add_column(style="white", overflow="fold")

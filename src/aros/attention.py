@@ -191,7 +191,7 @@ class ResearchAttentionService:
         except WorktreeError as error:
             workspace = Path(candidate_root).expanduser().resolve()
             raise ValueError(
-                "workspace is not initialized; run `aros init` at the Git root: "
+                "workspace is not initialized; run `aros start` at the Git root: "
                 f"{workspace}"
             ) from error
         if canonical_repository is None:
@@ -430,7 +430,7 @@ def _require_initialized_candidate(repository: RepositoryBinding) -> None:
             reader.require_file("memory/NOW.md")
     except (AnchoredReadError, OSError) as error:
         raise ValueError(
-            "workspace is not initialized; run `aros init` at the Git root: "
+            "workspace is not initialized; run `aros start` at the Git root: "
             f"{repository.root}"
         ) from error
 

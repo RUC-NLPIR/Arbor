@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import shutil
 from pathlib import Path
 
@@ -98,7 +97,6 @@ def test_direct_aros_help_is_the_root_app() -> None:
     result = runner.invoke(aros_app, ["--help"])
     assert result.exit_code == 0, result.output
     for command in (
-        "init",
         "boot",
         "status",
         "start",
@@ -107,6 +105,8 @@ def test_direct_aros_help_is_the_root_app() -> None:
         "audit",
     ):
         assert command in result.output
+    registered = {command.name for command in aros_app.registered_commands}
+    assert "init" not in registered
     assert "\naros " not in result.output
 
 
@@ -134,7 +134,7 @@ def test_uninitialized_workspace_error_uses_direct_aros_command(
         workspace.boot_workspace(tmp_path)
 
     message = str(caught.value)
-    assert "`aros init`" in message
+    assert "`aros start`" in message
     assert "arbor aros init" not in message
 
 
@@ -224,41 +224,20 @@ def test_start_explicit_cooperative_mode_injects_host_owned_context(
     }
 
 
-def test_legacy_root_mounts_the_same_aros_app() -> None:
+def test_legacy_root_does_not_mount_aros() -> None:
     from arbor.cli import app as legacy
 
     registered = {
         group.name: group.typer_instance
         for group in legacy.app.registered_groups
     }
-    assert registered["aros"] is aros_app
+    assert "aros" not in registered
 
 
-def test_legacy_main_warns_when_forwarding_aros(
-    monkeypatch,
-    capsys,
-) -> None:
+def test_legacy_main_contains_no_aros_forwarding_code() -> None:
     from arbor.cli import app as legacy
 
-    calls: list[list[str]] = []
-    monkeypatch.setattr(sys, "argv", ["arbor", "aros", "--help"])
-    monkeypatch.setattr(legacy, "app", lambda: calls.append(list(sys.argv)))
-    legacy.main()
-    captured = capsys.readouterr()
-
-    assert calls == [["arbor", "aros", "--help"]]
-    assert "deprecated" in captured.err.lower()
-    assert "use aros" in captured.err.lower()
-
-
-def test_legacy_main_does_not_warn_for_non_aros_commands(
-    monkeypatch,
-    capsys,
-) -> None:
-    from arbor.cli import app as legacy
-
-    monkeypatch.setattr(sys, "argv", ["arbor", "report", "--help"])
-    monkeypatch.setattr(legacy, "app", lambda: None)
-    legacy.main()
-
-    assert capsys.readouterr().err == ""
+    source = Path(legacy.__file__).read_text(encoding="utf-8")
+    assert "aros_app" not in source
+    assert "_warn_aros_forward" not in source
+    assert "aros" not in legacy._KNOWN_COMMANDS

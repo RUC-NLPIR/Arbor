@@ -364,7 +364,7 @@ Require:
 - `arbor --help` and `_KNOWN_COMMANDS` contain no `aros`;
 - `arbor aros --help` is unknown and emits no forwarding warning;
 - `boot_workspace` tells uninitialized users to run `aros start`;
-- no `init_workspace` symbol remains;
+- `init_workspace` has no public CLI caller or direct-entry documentation;
 - architecture boundary includes `arbor.cli.aros_start` as the single new
   direct adapter;
 - legacy freeze checker has no `AROS_RETIREMENT_GATE_E4*` constants or special
@@ -386,8 +386,7 @@ sunset exception.
 
 Remove:
 
-- `init_workspace` and its templates/helpers that no current caller uses;
-- `init_command` and `init_workspace` import;
+- `init_command` and its `init_workspace` import from the public CLI;
 - `aros_app` import/mount, `"aros"` known command, `_warn_aros_forward`, and its
   call from legacy `src/cli/app.py`;
 - the E4 constants and special-case hash allowance.

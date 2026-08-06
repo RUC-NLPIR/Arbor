@@ -22,12 +22,9 @@ GROWTH_ROOTS = (
 )
 GROWTH_FILES = (
     "src/cli/aros_app.py",
+    "src/cli/aros_start.py",
     "src/cli/commands/aros_cmd.py",
 )
-AROS_RETIREMENT_GATE_E4_BASE = "0563f98a0d6061745c099c8fd32fbb64e668a866"
-AROS_RETIREMENT_GATE_E4 = "6e406e7fc783f6c7df5fa348dbed6e68790ba90a"
-AROS_RETIREMENT_GATE_E4_PATH = "src/cli/app.py"
-AROS_RETIREMENT_GATE_E4_MODE = "100644"
 Change = tuple[str, tuple[str, ...], str, str, str, str]
 
 
@@ -194,17 +191,10 @@ def _violates_source_growth(
         return False
     if new_mode == "120000":
         return True
-    if path == AROS_RETIREMENT_GATE_E4_PATH:
-        resulting_oid = new_oid if staged else _worktree_blob_oid(repo, path)
-        return not (
-            status == "M"
-            and old_mode == AROS_RETIREMENT_GATE_E4_MODE
-            and new_mode == AROS_RETIREMENT_GATE_E4_MODE
-            and old_oid == AROS_RETIREMENT_GATE_E4_BASE
-            and resulting_oid == AROS_RETIREMENT_GATE_E4
-        )
     if _allows_growth(path):
         return False
+    if old_mode != new_mode:
+        return True
     if kind in {"A", "R", "C", "T"} or new_mode in {"120000", "160000"}:
         return True
     if new_mode not in {"100644", "100755"}:

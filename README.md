@@ -21,23 +21,21 @@
   <b>English</b> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-> **AROS migration:** The Agent-centric AROS path is being commissioned now.
+> **AROS:** The Agent-centric AROS path is being commissioned now.
 > Installations from this repository expose `aros` as the direct entry for
 > bootable workspaces and durable runs; see the [AROS public guide](docs/aros/README.md).
-> `arbor aros` is a temporary forwarding compatibility route. CI hard-gates
-> transitive project-import reachability from every AROS module and the direct
+> The legacy `arbor` root does not mount AROS. CI hard-gates transitive
+> project-import reachability from every AROS module and the direct
 > adapters. Its conservative module-scope graph indexes every configured local
-> Python package. CI also hard-gates source-path growth, the compatibility-shim
-> hash, and legacy LOC non-increase. Within `src/`, only `src/aros/`,
-> `src/cli/aros_app.py`, and
+> Python package. CI also hard-gates source-path growth and legacy LOC
+> non-increase. Within `src/`, only `src/aros/`, `src/cli/aros_app.py`,
+> `src/cli/aros_start.py`, and
 > `src/cli/commands/aros_cmd.py` may gain source. All non-allowlisted legacy source paths under `src/`
 > are frozen against added lines or files;
 > `src/core/` remains legacy-frozen, so legacy source LOC may only stay level or
 > decrease. The especially frozen paths are `src/coordinator`, `src/executor`,
-> `src/run.py`, `src/review.py`, and `src/cli/commands/run.py`. The
-> `src/cli/app.py` warning is a narrow sunset exception:
-> `AROS_RETIREMENT_GATE_E4` accepts only its exact approved Git blob until the
-> shim is deleted.
+> `src/run.py`, `src/review.py`, and `src/cli/commands/run.py`. Pure deletion is
+> allowed; legacy entry files receive no AROS-specific growth exception.
 >
 > These mechanical gates do not prove the absence of semantic duplication. A
 > new or padded copy under `src/aros/` can pass and still requires module

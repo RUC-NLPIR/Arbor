@@ -10,7 +10,8 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from arbor.cli.app import app
+from arbor.aros.intake import initialize_knowledge_bank
+from arbor.aros.workspace import init_workspace
 from arbor.cli.aros_start import StartIntake
 from arbor.cli.commands import aros_cmd
 
@@ -18,46 +19,12 @@ from arbor.cli.commands import aros_cmd
 runner = CliRunner()
 
 
-def test_init_calls_workspace_api_and_prints_result(
-    tmp_path: Path, monkeypatch,
-) -> None:
-    calls: list[tuple[Path, str | None]] = []
+def test_public_aros_init_command_is_absent() -> None:
+    registered = {
+        command.name for command in aros_cmd.aros_app.registered_commands
+    }
 
-    def fake_init(root: Path, mission: str) -> dict[str, Any]:
-        calls.append((root, mission))
-        return {"workspace": str(root), "created": ["AROS.md"]}
-
-    monkeypatch.setattr(aros_cmd, "init_workspace", fake_init)
-
-    result = runner.invoke(
-        aros_cmd.aros_app,
-        ["init", "--cwd", str(tmp_path), "--mission", "Understand the system"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert calls == [(tmp_path.resolve(), "Understand the system")]
-    assert json.loads(result.output)["created"] == ["AROS.md"]
-
-
-def test_init_requires_mission_before_calling_workspace(
-    tmp_path: Path, monkeypatch,
-) -> None:
-    called = False
-
-    def fake_init(root: Path, mission: str) -> dict[str, Any]:
-        nonlocal called
-        called = True
-        return {}
-
-    monkeypatch.setattr(aros_cmd, "init_workspace", fake_init)
-
-    result = runner.invoke(
-        aros_cmd.aros_app,
-        ["init", "--cwd", str(tmp_path)],
-    )
-
-    assert result.exit_code == 2
-    assert called is False
+    assert "init" not in registered
 
 
 @pytest.mark.parametrize("as_json", [False, True])
@@ -102,7 +69,7 @@ def test_boot_json_wire_is_the_once_built_bounded_packet(
         ["git", "init", "-q", "-b", "main", str(tmp_path)],
         check=True,
     )
-    aros_cmd.init_workspace(tmp_path, "Bound the exact boot packet.")
+    init_workspace(tmp_path, "Bound the exact boot packet.")
     built: list[dict[str, object]] = []
     real_boot_packet = aros_cmd.boot_packet
 
@@ -356,27 +323,24 @@ def test_start_does_not_import_or_construct_coordinator() -> None:
     assert "coordinator" not in source.lower()
 
 
-def test_top_level_aros_init_status_and_boot_use_real_workspace(
+def test_direct_aros_status_and_boot_use_native_intake_workspace(
     tmp_path: Path,
 ) -> None:
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    init = runner.invoke(
-        app,
-        ["aros", "init", "--cwd", str(tmp_path), "--mission", "Real CLI smoke"],
-    )
-    assert init.exit_code == 0, init.output
-    assert (tmp_path / "AROS.md").exists()
+    workspace = tmp_path / "project"
+    receipt = initialize_knowledge_bank(workspace, "Real CLI smoke?")
 
     status = runner.invoke(
-        app,
-        ["aros", "status", "--cwd", str(tmp_path), "--json"],
+        aros_cmd.aros_app,
+        ["status", "--cwd", str(workspace), "--json"],
     )
     assert status.exit_code == 0, status.output
     assert json.loads(status.output)["initialized"] is True
 
-    boot = runner.invoke(app, ["aros", "boot", "--cwd", str(tmp_path)])
+    boot = runner.invoke(
+        aros_cmd.aros_app,
+        ["boot", "--cwd", str(workspace)],
+    )
     assert boot.exit_code == 0, boot.output
     packet = json.loads(boot.output)
     assert packet["schema_version"] == 1
-    assert packet["snapshot"]["canonical"] is None
-    assert "canonical_head_unavailable" in packet["warnings"]
+    assert packet["snapshot"]["canonical"] == receipt["commit"]

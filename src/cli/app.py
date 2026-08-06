@@ -21,7 +21,6 @@ from .commands.mcp_cmd import mcp_command
 from .commands.web_cmd import web_command
 from .commands.idea_check_cmd import idea_check_command
 from .commands.benchmark_cmd import benchmark_app
-from .commands.aros_cmd import aros_app
 
 
 # We don't use a Typer.callback() default because that would shadow flag
@@ -55,7 +54,6 @@ app.command("idea-check")(idea_check_command)
 app.add_typer(config_app, name="config")
 app.add_typer(login_app, name="login")
 app.add_typer(benchmark_app, name="benchmark")
-app.add_typer(aros_app, name="aros")
 
 
 @app.command("version")
@@ -79,19 +77,10 @@ def version_command() -> None:
 _KNOWN_COMMANDS = {
     "run", "report", "export", "replay", "config", "version", "doctor", "setup",
     "quickstart", "login", "install", "uninstall", "mcp", "web", "idea-check",
-    "benchmark", "aros",
+    "benchmark",
 }
 _ROOT_FLAGS = {"--help", "-h"}
 _VERSION_FLAGS = {"--version", "-V"}
-
-
-def _warn_aros_forward(argv: list[str]) -> None:
-    if argv and argv[0] == "aros":
-        typer.secho(
-            "warning: arbor aros is deprecated; use aros directly",
-            fg=typer.colors.YELLOW,
-            err=True,
-        )
 
 
 def main() -> None:
@@ -113,7 +102,6 @@ def main() -> None:
             pass
 
     argv = sys.argv[1:]
-    _warn_aros_forward(argv)
     first = argv[0] if argv else None
     if first in _VERSION_FLAGS:
         sys.argv = [sys.argv[0], "version", *argv[1:]]

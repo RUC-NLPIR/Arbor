@@ -3196,7 +3196,7 @@ class TaskService:
             _require_plain_directory(self.root / ".aros", "AROS runtime directory")
         except TaskError as error:
             raise TaskError(
-                f"workspace is not initialized; run `aros init` at the Git root: "
+                f"workspace is not initialized; run `aros start` at the Git root: "
                 f"{self.root}: {error}"
             ) from error
 

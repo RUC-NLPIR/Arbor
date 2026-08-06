@@ -33,6 +33,7 @@ ALLOWED_INTERNAL_PREFIXES = (
 )
 ALLOWED_INTERNAL_MODULES = (
     "arbor.cli.aros_app",
+    "arbor.cli.aros_start",
     "arbor.cli.commands.aros_cmd",
     "arbor.cli.user_config",
     "arbor._app",
@@ -47,6 +48,7 @@ SEMANTIC_LEGACY_PREFIXES = (
 BOUNDARY_PATHS = (
     *sorted((REPO_ROOT / "src" / "aros").rglob("*.py")),
     REPO_ROOT / "src" / "cli" / "aros_app.py",
+    REPO_ROOT / "src" / "cli" / "aros_start.py",
     REPO_ROOT / "src" / "cli" / "commands" / "aros_cmd.py",
 )
 WAVE1_PACKAGE_DIRS = {"arbor": "src", "arbor.skills_suite": "skills"}
@@ -226,8 +228,6 @@ def summarize_tokens(tokens):
         joined = joined[:80]
     return joined
 """
-APPROVED_E4_SHIM_BLOB = "6e406e7fc783f6c7df5fa348dbed6e68790ba90a"
-OLD_E4_SHIM_BLOB = "0563f98a0d6061745c099c8fd32fbb64e668a866"
 
 
 def test_eval_module_has_no_process_or_process_final_implementation() -> None:
@@ -392,6 +392,12 @@ def test_legacy_freeze_does_not_claim_a_semantic_equivalence_gate() -> None:
     assert "legacy semantic freeze violation" not in checker
 
 
+def test_legacy_freeze_contains_no_retired_aros_forwarding_exception() -> None:
+    checker = CHECKER.read_text(encoding="utf-8")
+
+    assert "AROS_RETIREMENT_GATE_E4" not in checker
+
+
 def test_aros_docs_describe_the_complete_source_growth_policy() -> None:
     for relative_path in ("README.md", "docs/aros/README.md"):
         text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
@@ -402,8 +408,8 @@ def test_aros_docs_describe_the_complete_source_growth_policy() -> None:
         assert "configured local Python package" in text
         assert "conservative module-scope" in text
         assert "legacy source LOC may only stay level or decrease" in text
-        assert "`AROS_RETIREMENT_GATE_E4`" in text
-        assert "exact approved Git blob" in text
+        assert "`AROS_RETIREMENT_GATE_E4`" not in text
+        assert "compatibility-shim hash" not in text
         assert "semantic duplication" in text
         assert "module commissioning review" in text
         assert "padded copy" in text
@@ -413,6 +419,7 @@ def test_aros_docs_describe_the_complete_source_growth_policy() -> None:
         for allowed in (
             "src/aros/",
             "src/cli/aros_app.py",
+            "src/cli/aros_start.py",
             "src/cli/commands/aros_cmd.py",
         ):
             assert f"`{allowed}`" in text
@@ -633,6 +640,7 @@ def _is_allowed_internal(module: str) -> bool:
         return False
     exact_paths = {
         "arbor.cli.aros_app": REPO_ROOT / "src" / "cli" / "aros_app.py",
+        "arbor.cli.aros_start": REPO_ROOT / "src" / "cli" / "aros_start.py",
         "arbor.cli.commands.aros_cmd": (
             REPO_ROOT / "src" / "cli" / "commands" / "aros_cmd.py"
         ),
@@ -1755,33 +1763,6 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _old_e4_shim_bytes() -> bytes:
-    approved = (REPO_ROOT / "src" / "cli" / "app.py").read_bytes()
-    warning = b'''def _warn_aros_forward(argv: list[str]) -> None:
-    if argv and argv[0] == "aros":
-        typer.secho(
-            "warning: arbor aros is deprecated; use aros directly",
-            fg=typer.colors.YELLOW,
-            err=True,
-        )
-
-
-'''
-    call = b"    _warn_aros_forward(argv)\n"
-    assert approved.count(warning) == 1
-    assert approved.count(call) == 1
-    old = approved.replace(warning, b"").replace(call, b"")
-    blob_oid = subprocess.run(
-        ["git", "hash-object", "--stdin"],
-        cwd=REPO_ROOT,
-        input=old,
-        check=True,
-        capture_output=True,
-    ).stdout.decode().strip()
-    assert blob_oid == OLD_E4_SHIM_BLOB
-    return old
-
-
 @pytest.fixture
 def legacy_repo(tmp_path: Path) -> tuple[Path, str]:
     repo = tmp_path / "repo"
@@ -2370,36 +2351,17 @@ def test_legacy_freeze_rejects_core_growth(
 
 
 @pytest.mark.parametrize("staged", (False, True))
-def test_legacy_freeze_permits_exact_old_to_approved_e4_transition(
+def test_legacy_freeze_rejects_legacy_cli_app_growth(
     legacy_repo: tuple[Path, str], staged: bool
 ) -> None:
     repo, _ = legacy_repo
-    shim = repo / "src" / "cli" / "app.py"
-    shim.parent.mkdir(parents=True, exist_ok=True)
-    shim.write_bytes(_old_e4_shim_bytes())
+    path = repo / "src/cli/app.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("legacy entry\n", encoding="utf-8")
     _git(repo, "add", "src/cli/app.py")
-    _git(repo, "commit", "-qm", "add old shim")
+    _git(repo, "commit", "-qm", "add legacy cli")
     base = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
-    if staged:
-        _git(repo, "add", "src/cli/app.py")
-
-    result = _run_checker(repo, base)
-
-    checker = CHECKER.read_text(encoding="utf-8")
-    assert f'AROS_RETIREMENT_GATE_E4_BASE = "{OLD_E4_SHIM_BLOB}"' in checker
-    assert f'AROS_RETIREMENT_GATE_E4 = "{APPROVED_E4_SHIM_BLOB}"' in checker
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-@pytest.mark.parametrize("staged", (False, True))
-def test_legacy_freeze_rejects_approved_e4_shim_when_base_is_absent(
-    legacy_repo: tuple[Path, str], staged: bool
-) -> None:
-    repo, base = legacy_repo
-    shim = repo / "src" / "cli" / "app.py"
-    shim.parent.mkdir(parents=True, exist_ok=True)
-    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    path.write_text("legacy entry\nnew behavior\n", encoding="utf-8")
     if staged:
         _git(repo, "add", "src/cli/app.py")
 
@@ -2410,23 +2372,17 @@ def test_legacy_freeze_rejects_approved_e4_shim_when_base_is_absent(
 
 
 @pytest.mark.parametrize("staged", (False, True))
-def test_legacy_freeze_rejects_e4_shim_resurrection_after_deletion(
+def test_legacy_freeze_rejects_legacy_cli_app_mode_change(
     legacy_repo: tuple[Path, str], staged: bool
 ) -> None:
     repo, _ = legacy_repo
-    shim = repo / "src" / "cli" / "app.py"
-    shim.parent.mkdir(parents=True, exist_ok=True)
-    shim.write_bytes(_old_e4_shim_bytes())
+    path = repo / "src/cli/app.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("legacy entry\n", encoding="utf-8")
     _git(repo, "add", "src/cli/app.py")
-    _git(repo, "commit", "-qm", "add old shim")
-    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
-    _git(repo, "add", "src/cli/app.py")
-    _git(repo, "commit", "-qm", "approve shim")
-    shim.unlink()
-    _git(repo, "add", "-u", "src/cli/app.py")
-    _git(repo, "commit", "-qm", "retire shim")
+    _git(repo, "commit", "-qm", "add legacy cli")
     base = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    path.chmod(0o755)
     if staged:
         _git(repo, "add", "src/cli/app.py")
 
@@ -2437,89 +2393,17 @@ def test_legacy_freeze_rejects_e4_shim_resurrection_after_deletion(
 
 
 @pytest.mark.parametrize("staged", (False, True))
-@pytest.mark.parametrize("transition", ("old-to-wrong", "other-to-approved"))
-def test_legacy_freeze_rejects_other_e4_blob_transitions(
-    legacy_repo: tuple[Path, str], staged: bool, transition: str
-) -> None:
-    repo, _ = legacy_repo
-    shim = repo / "src" / "cli" / "app.py"
-    shim.parent.mkdir(parents=True, exist_ok=True)
-    approved = (REPO_ROOT / "src" / "cli" / "app.py").read_bytes()
-    if transition == "old-to-wrong":
-        shim.write_bytes(_old_e4_shim_bytes())
-        result_content = approved + b"# wrong result\n"
-    else:
-        shim.write_bytes(b"other existing shim\n")
-        result_content = approved
-    _git(repo, "add", "src/cli/app.py")
-    _git(repo, "commit", "-qm", "add transition base")
-    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    shim.write_bytes(result_content)
-    if staged:
-        _git(repo, "add", "src/cli/app.py")
-
-    result = _run_checker(repo, base)
-
-    assert result.returncode == 2
-    assert "src/cli/app.py" in result.stdout + result.stderr
-
-
-@pytest.mark.parametrize("staged", (False, True))
-@pytest.mark.parametrize("deletion_only", (False, True))
-def test_legacy_freeze_rejects_e4_shim_hash_mutation(
-    legacy_repo: tuple[Path, str], staged: bool, deletion_only: bool
-) -> None:
-    repo, _ = legacy_repo
-    shim = repo / "src" / "cli" / "app.py"
-    shim.parent.mkdir(parents=True, exist_ok=True)
-    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
-    _git(repo, "add", "src/cli/app.py")
-    _git(repo, "commit", "-qm", "add approved shim")
-    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    content = shim.read_bytes()
-    shim.write_bytes(content[:-1] if deletion_only else content + b"# mutation\n")
-    if staged:
-        _git(repo, "add", "src/cli/app.py")
-
-    result = _run_checker(repo, base)
-
-    assert result.returncode == 2
-    assert "src/cli/app.py" in result.stdout + result.stderr
-
-
-@pytest.mark.parametrize("staged", (False, True))
-def test_legacy_freeze_rejects_e4_shim_mode_change(
+def test_legacy_freeze_permits_legacy_cli_app_deletion(
     legacy_repo: tuple[Path, str], staged: bool
 ) -> None:
     repo, _ = legacy_repo
-    shim = repo / "src" / "cli" / "app.py"
-    shim.parent.mkdir(parents=True, exist_ok=True)
-    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
+    path = repo / "src/cli/app.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("legacy entry\n", encoding="utf-8")
     _git(repo, "add", "src/cli/app.py")
-    _git(repo, "commit", "-qm", "add approved shim")
+    _git(repo, "commit", "-qm", "add legacy cli")
     base = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    shim.chmod(0o755)
-    if staged:
-        _git(repo, "add", "src/cli/app.py")
-
-    result = _run_checker(repo, base)
-
-    assert result.returncode == 2
-    assert "src/cli/app.py" in result.stdout + result.stderr
-
-
-@pytest.mark.parametrize("staged", (False, True))
-def test_legacy_freeze_permits_e4_shim_retirement_deletion(
-    legacy_repo: tuple[Path, str], staged: bool
-) -> None:
-    repo, _ = legacy_repo
-    shim = repo / "src" / "cli" / "app.py"
-    shim.parent.mkdir(parents=True, exist_ok=True)
-    shim.write_bytes((REPO_ROOT / "src" / "cli" / "app.py").read_bytes())
-    _git(repo, "add", "src/cli/app.py")
-    _git(repo, "commit", "-qm", "add approved shim")
-    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    shim.unlink()
+    path.unlink()
     if staged:
         _git(repo, "add", "-u", "src/cli/app.py")
 

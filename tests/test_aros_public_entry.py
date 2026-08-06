@@ -146,7 +146,6 @@ def test_direct_entry_reuses_the_single_app() -> None:
 
 def _capture_start(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     captured: dict[str, object] = {}
-    monkeypatch.setattr(aros_cmd, "llm_defaults", lambda: {})
     monkeypatch.setattr(aros_cmd, "create_provider", lambda config: object())
     monkeypatch.setattr(
         aros_cmd,

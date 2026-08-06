@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -25,6 +24,86 @@ def test_public_aros_init_command_is_absent() -> None:
     }
 
     assert "init" not in registered
+
+
+def _capture_start_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    captured: dict[str, object] = {}
+    fake_agent = object()
+    monkeypatch.setattr(
+        aros_cmd,
+        "status_workspace",
+        lambda root: {"initialized": True},
+    )
+    monkeypatch.setattr(
+        aros_cmd,
+        "boot_workspace",
+        lambda root, *, context: "boot",
+    )
+
+    def create(config: object) -> object:
+        captured["config"] = config
+        return object()
+
+    def build(*args: object, **kwargs: object) -> object:
+        return fake_agent
+
+    async def run(agent: object, instruction: str) -> str:
+        return "done"
+
+    monkeypatch.setattr(aros_cmd, "create_provider", create)
+    monkeypatch.setattr(aros_cmd, "build_principal_agent", build)
+    monkeypatch.setattr(aros_cmd, "run_principal", run)
+    return captured
+
+
+def test_start_uses_aros_owned_default_model_triple(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _capture_start_config(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        aros_cmd.aros_app,
+        ["start", "inspect", "--cwd", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert config.provider == "openai-responses"
+    assert config.model == "gpt-5.6-luna"
+    assert config.reasoning_effort == "max"
+
+
+def test_start_accepts_exact_model_triple_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _capture_start_config(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        aros_cmd.aros_app,
+        [
+            "start",
+            "inspect",
+            "--cwd",
+            str(tmp_path),
+            "--provider",
+            "openai-oauth",
+            "--model",
+            "gpt-custom",
+            "--reasoning-effort",
+            "high",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert config.provider == "openai-oauth"
+    assert config.model == "gpt-custom"
+    assert config.reasoning_effort == "high"
 
 
 @pytest.mark.parametrize("as_json", [False, True])
@@ -112,102 +191,6 @@ def test_status_json_forwards_workspace_snapshot(
     assert json.loads(result.output) == snapshot
 
 
-def test_start_uses_user_llm_defaults_with_cli_overrides(
-    tmp_path: Path, monkeypatch,
-) -> None:
-    seen: dict[str, Any] = {}
-    fake_agent = object()
-    fake_provider = object()
-
-    monkeypatch.setattr(
-        aros_cmd,
-        "llm_defaults",
-        lambda: {
-            "provider": "anthropic",
-            "model": "user-model",
-            "base_url": "https://user.invalid/v1",
-        },
-    )
-    monkeypatch.setattr(
-        aros_cmd,
-        "boot_workspace",
-        lambda root, *, context: "# Boot\nmission from workspace",
-    )
-    monkeypatch.setattr(
-        aros_cmd,
-        "status_workspace",
-        lambda root: {"initialized": True},
-    )
-
-    def fake_create_provider(config):
-        seen["config"] = config
-        return fake_provider
-
-    def fake_build(
-        provider,
-        root,
-        boot_context,
-        *,
-        max_turns,
-        allow_shell,
-        admission_gateway,
-        attention_context,
-    ):
-        seen["build"] = {
-            "provider": provider,
-            "root": root,
-            "boot_context": boot_context,
-            "max_turns": max_turns,
-            "allow_shell": allow_shell,
-            "admission_gateway": admission_gateway,
-            "attention_context": attention_context,
-        }
-        return fake_agent
-
-    async def fake_run(agent, instruction):
-        seen["run"] = (agent, instruction)
-        return "principal finished"
-
-    monkeypatch.setattr(aros_cmd, "create_provider", fake_create_provider)
-    monkeypatch.setattr(aros_cmd, "build_principal_agent", fake_build)
-    monkeypatch.setattr(aros_cmd, "run_principal", fake_run)
-
-    result = runner.invoke(
-        aros_cmd.aros_app,
-        [
-            "start",
-            "inspect the current evidence",
-            "--cwd",
-            str(tmp_path),
-            "--provider",
-            "openai-responses",
-            "--model",
-            "cli-model",
-            "--max-turns",
-            "7",
-            "--allow-shell",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert result.output == ""
-    assert seen["config"].provider == "openai-responses"
-    assert seen["config"].model == "cli-model"
-    assert seen["config"].base_url == "https://user.invalid/v1"
-    assert seen["config"].cwd == str(tmp_path.resolve())
-    assert seen["config"].auto_git is False
-    assert seen["build"] == {
-        "provider": fake_provider,
-        "root": tmp_path.resolve(),
-        "boot_context": "# Boot\nmission from workspace",
-        "max_turns": 7,
-        "allow_shell": True,
-        "admission_gateway": None,
-        "attention_context": None,
-    }
-    assert seen["run"] == (fake_agent, "inspect the current evidence")
-
-
 def test_start_initializes_before_context_and_runs_native_principal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -261,7 +244,6 @@ def test_start_initializes_before_context_and_runs_native_principal(
     )
     monkeypatch.setattr(aros_cmd, "render_start_transition", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(aros_cmd, "boot_workspace", boot)
-    monkeypatch.setattr(aros_cmd, "llm_defaults", lambda: {})
     monkeypatch.setattr(aros_cmd, "create_provider", lambda config: fake_provider)
     monkeypatch.setattr(aros_cmd, "build_principal_agent", build)
     monkeypatch.setattr(aros_cmd, "run_principal", run)

@@ -30,6 +30,11 @@ from .task_tool import TaskTool
 from .worktrees import RepositoryBinding, bind_repository, read_repository_snapshot
 
 
+AROS_DEFAULT_PROVIDER = "openai-responses"
+AROS_DEFAULT_MODEL = "gpt-5.6-luna"
+AROS_DEFAULT_REASONING_EFFORT = "max"
+
+
 PRINCIPAL_SYSTEM_PROMPT = """\
 You are the Principal Research Agent for this project.
 

@@ -1704,7 +1704,7 @@ print(json.dumps(sorted(sys.modules)))
     assert not forbidden, f"direct AROS import loaded forbidden modules: {forbidden}"
 
 
-def test_start_config_path_loads_config_helpers_but_not_semantic_legacy(
+def test_start_config_path_loads_no_legacy_user_or_semantic_config(
     tmp_path: Path,
 ) -> None:
     script = """
@@ -1725,7 +1725,6 @@ module = importlib.util.module_from_spec(spec)
 sys.modules["arbor"] = module
 spec.loader.exec_module(module)
 commands = importlib.import_module("arbor.cli.commands.aros_cmd")
-commands.llm_defaults()
 print(json.dumps(sorted(sys.modules)))
 """
     environment = dict(os.environ)
@@ -1741,7 +1740,7 @@ print(json.dumps(sorted(sys.modules)))
 
     assert result.returncode == 0, result.stderr
     loaded = json.loads(result.stdout)
-    assert {"arbor._app", "arbor.cli.user_config"} <= set(loaded)
+    assert "arbor.cli.user_config" not in loaded
     forbidden = sorted(
         module
         for module in loaded
@@ -1751,6 +1750,16 @@ print(json.dumps(sorted(sys.modules)))
         )
     )
     assert not forbidden, f"start config path loaded semantic legacy: {forbidden}"
+
+
+def test_direct_aros_start_has_no_legacy_user_config_dependency() -> None:
+    source = (REPO_ROOT / "src/cli/commands/aros_cmd.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "user_config" not in source
+    assert "llm_defaults" not in source
+    assert "fallback" not in source.lower()
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:

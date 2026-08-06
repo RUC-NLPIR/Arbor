@@ -1,4 +1,4 @@
-"""Native Principal commands exposed under ``arbor aros``."""
+"""Native Principal commands exposed by the direct ``aros`` entry."""
 
 from __future__ import annotations
 
@@ -21,7 +21,13 @@ from ...aros.checkpoint import (
 )
 from ...aros.eval import EvalService, ExistingEvaluation
 from ...aros.intake import initialize_knowledge_bank
-from ...aros.principal import build_principal_agent, run_principal
+from ...aros.principal import (
+    AROS_DEFAULT_MODEL,
+    AROS_DEFAULT_PROVIDER,
+    AROS_DEFAULT_REASONING_EFFORT,
+    build_principal_agent,
+    run_principal,
+)
 from ...aros.runs import RunService
 from ...aros.store import canonical_json_bytes
 from ...aros.tasks import TaskService
@@ -87,12 +93,6 @@ aros_app.add_typer(run_app, name="run")
 aros_app.add_typer(task_app, name="task")
 aros_app.add_typer(eval_app, name="eval")
 aros_app.add_typer(transition_app, name="transition")
-
-
-def llm_defaults() -> dict[str, Any]:
-    from ..user_config import llm_defaults as load_user_llm_defaults
-
-    return load_user_llm_defaults()
 
 
 def _root(cwd: Path) -> Path:
@@ -762,6 +762,11 @@ def start_command(
     max_turns: int = typer.Option(100, "--max-turns", min=1),
     provider: str | None = typer.Option(None, "--provider"),
     model: str | None = typer.Option(None, "--model"),
+    reasoning_effort: str | None = typer.Option(
+        None,
+        "--reasoning-effort",
+        help="OpenAI reasoning effort; AROS default is max.",
+    ),
     allow_shell: bool = typer.Option(
         False,
         "--allow-shell",
@@ -778,11 +783,17 @@ def start_command(
 ) -> None:
     """Start a fresh native Principal from workspace state, never transcript replay."""
     requested_root = _root(cwd or Path("."))
-    config_values = dict(llm_defaults())
+    config_values: dict[str, object] = {
+        "provider": AROS_DEFAULT_PROVIDER,
+        "model": AROS_DEFAULT_MODEL,
+        "reasoning_effort": AROS_DEFAULT_REASONING_EFFORT,
+    }
     if provider is not None:
         config_values["provider"] = provider
     if model is not None:
         config_values["model"] = model
+    if reasoning_effort is not None:
+        config_values["reasoning_effort"] = reasoning_effort
 
     try:
         gateway = HumanDirectGateway() if cooperative_human_direct else None

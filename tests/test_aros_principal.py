@@ -13,6 +13,9 @@ import pytest
 
 from arbor.aros.attention import AttentionAuthorityContext
 from arbor.aros.principal import (
+    AROS_DEFAULT_MODEL,
+    AROS_DEFAULT_PROVIDER,
+    AROS_DEFAULT_REASONING_EFFORT,
     build_principal_agent,
     run_principal,
 )
@@ -40,6 +43,12 @@ class _ScriptedProvider:
 
     def count_tokens(self, text: str) -> int:
         return max(1, len(text) // 4)
+
+
+def test_aros_principal_has_one_direct_default_model_triple() -> None:
+    assert AROS_DEFAULT_PROVIDER == "openai-responses"
+    assert AROS_DEFAULT_MODEL == "gpt-5.6-luna"
+    assert AROS_DEFAULT_REASONING_EFFORT == "max"
 
 
 def _workspace(root: Path) -> Path:

@@ -36,9 +36,9 @@ commissioned.
 - This proves live Agent-loop composition and restart continuity in cooperative
   mode. It does not prove external-model research quality, mediated/protected
   authority, or non-bypass same-UID containment.
-- Post-live-Agent full verification collected 2,130 tests and completed with
-  2,124 passed, 6 skipped, zero failures. Focused suites, Ruff, diff-check, and
-  the independent retained-evidence verifier also exited 0.
+- Current collection contains 2,146 tests. The latest full run completed with
+  2,140 passed, 6 skipped, zero failures; focused suites, Ruff, diff-check, and
+  both retained-evidence verifiers also exited 0.
 
 - Integrated implementation baseline: `main@56c5375` in `/workspace/Arbor`.
 - Current implementation baselines are deliberately separated: immutable Run

@@ -176,7 +176,7 @@ After the retained live-Agent run:
   suites exited 0;
 - the exact unqualified `/workspace/Arbor/.venv/bin/python -m pytest -q`
   command exited 0;
-- collection reported 2,130 tests; the run displayed 6 skips and no failures
-  (2,124 passed, 6 skipped);
+- collection reports 2,146 tests; the full run displayed 6 skips and no
+  failures (2,140 passed, 6 skipped);
 - Ruff reported `All checks passed!`;
 - `git diff --check` exited 0 and the worktree was clean.

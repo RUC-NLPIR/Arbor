@@ -85,3 +85,13 @@ This proves native product intake, canonical local source provenance, Principal
 boot, and restart. It does not prove remote sources, an external-model
 scientific result, child research, Source Gateway, Skills/MCP parity, or
 protected authority.
+
+## Repository verification
+
+- Native-start and Principal-loop commissioning verifiers exited 0.
+- Focused intake/UI/CLI/architecture/document suites exited 0.
+- The exact full `/workspace/Arbor/.venv/bin/python -m pytest -q` command
+  exited 0.
+- Collection contains 2,146 tests; the full run displayed 6 skips and no
+  failures (2,140 passed, 6 skipped).
+- Ruff and `git diff --check` exited 0.

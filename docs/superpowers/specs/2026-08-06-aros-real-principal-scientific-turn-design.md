@@ -13,6 +13,7 @@ and the real configured OpenAI Responses provider:
 native local intake
 -> real Principal reads Question/source/repo
 -> Principal authors ScientificModel and one Idea
+-> preregistration checkpoint freezes prediction and controls
 -> one deterministic Task candidate C/R
 -> one visible Eval and MeasurementReceipt
 -> Principal interprets result
@@ -71,6 +72,8 @@ Three options were considered:
 - One human-authored Question.
 - Principal-authored Question update, CURRENT model, one Idea, one Claim, and
   NOW update.
+- One pre-measurement semantic checkpoint freezing Model/Idea prediction and
+  controls with no observation assimilation.
 - One existing deterministic Task adapter operating in an isolated worktree.
 - One visible evaluator registered and run through current Eval/Run services.
 - Exact Task C == MeasurementReceipt candidate lineage.
@@ -207,6 +210,13 @@ Research.transition_audit/checkpoint
 Run may appear only as Eval's owned execution lineage; no duplicate standalone
 experiment is required.
 
+Before Task creation, the Principal reads the source, repo, and evaluator, then
+writes CURRENT and I-0001 with a discriminating prediction and controls. It
+authors a four-field preregistration proposal with those semantic paths and an
+empty assimilation list, audits it, and checkpoints it. Task creation therefore
+starts from a clean committed base, and the later measurement can be compared
+against prediction bytes that already existed in Git.
+
 The final proposal has exactly two assimilations:
 
 1. Task collection → Idea/NOW and any Model/Question paths genuinely changed by
@@ -277,6 +287,8 @@ The independent verifier checks only mechanically decidable facts:
 - exact provider/model/effort and turn caps recorded;
 - native Agent class and real provider call usage;
 - ordered Attention/source/repo/Task/Eval/semantic/audit/checkpoint tool trace;
+- preregistration commit is an ancestor of Task C and contains the prediction
+  before Task/Eval launch;
 - every final semantic blob equals one complete Agent Write output;
 - Task C/R and Eval/Run/Measurement immutable lineage;
 - exactly one Task, one Eval, two assimilations, and one strict EvidenceLink;
@@ -313,7 +325,7 @@ This slice is complete only when:
 2. Current credential preflight succeeds without printing or persisting a
    secret.
 3. One real-model primary run stays within 40 turns and performs exactly one
-   Task and Eval.
+   Task and Eval plus exactly one preregistration and one final checkpoint.
 4. Independent verifier accepts exact semantic/tool/Git/measurement lineage.
 5. One real-model restart stays within 6 turns, starts with zero messages, and
    explains canonical scientific state without mutation.

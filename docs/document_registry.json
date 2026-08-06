@@ -37,7 +37,7 @@
       "id": "aros-live-agent-cooperative-commissioning-design",
       "title": "AROS Live Agent Cooperative Commissioning Design",
       "path": "docs/superpowers/specs/2026-08-06-aros-live-agent-cooperative-commissioning-design.md",
-      "status": "proposed",
+      "status": "current",
       "authority": "implementation_baseline",
       "agent_visibility": "on_demand"
     },

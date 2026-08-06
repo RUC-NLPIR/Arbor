@@ -167,3 +167,16 @@ Neither failure retried or reinterpreted science under the same runtime root.
   broker/lease/fence domain and non-bypass commissioning remain.
 - Protected Eval, Source Gateway, project-local Skills, AROS MCP/provider
   parity, full K/M/G, and final Arbor retirement remain outside this proof.
+
+## Repository verification
+
+After the retained live-Agent run:
+
+- the focused AROS, architecture, public-entry, document, and commissioning
+  suites exited 0;
+- the exact unqualified `/workspace/Arbor/.venv/bin/python -m pytest -q`
+  command exited 0;
+- collection reported 2,130 tests; the run displayed 6 skips and no failures
+  (2,124 passed, 6 skipped);
+- Ruff reported `All checks passed!`;
+- `git diff --check` exited 0 and the worktree was clean.

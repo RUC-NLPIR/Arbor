@@ -167,8 +167,16 @@ def build_principal_agent(
         FileEditTool(**tool_kwargs),
         FileWriteTool(**tool_kwargs),
         research_tool,
-        EvalTool(cwd=str(workspace_root), persist_results=False),
-        RunTool(cwd=str(workspace_root), persist_results=False),
+        EvalTool(
+            cwd=str(workspace_root),
+            operational_admission=operational_admission,
+            persist_results=False,
+        ),
+        RunTool(
+            cwd=str(workspace_root),
+            operational_admission=operational_admission,
+            persist_results=False,
+        ),
         TaskTool(
             cwd=str(workspace_root),
             operational_admission=operational_admission,

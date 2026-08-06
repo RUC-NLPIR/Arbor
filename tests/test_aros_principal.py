@@ -197,6 +197,8 @@ def test_principal_research_defaults_to_attached_workspace_without_authority(
     assert research.attention_context is None
     assert research.checkpoint_service.gateway is None
     assert agent.tools["Task"].operational_admission is None
+    assert agent.tools["Run"].operational_admission is None
+    assert agent.tools["Eval"].operational_admission is None
 
 
 def test_principal_injects_explicit_research_host_context_without_schema_change(
@@ -229,10 +231,11 @@ def test_principal_injects_explicit_research_host_context_without_schema_change(
     assert research.attention_context is context
     assert research.checkpoint_service.gateway is gateway
     assert research.input_schema == expected_schema
-    task = agent.tools["Task"]
-    assert callable(task.operational_admission)
-    assert task.operational_admission.__self__ is research.checkpoint_service
-    assert task.operational_admission.__func__.__name__ == "checkpoint_operational"
+    for name in ("Task", "Run", "Eval"):
+        tool = agent.tools[name]
+        assert callable(tool.operational_admission)
+        assert tool.operational_admission.__self__ is research.checkpoint_service
+        assert tool.operational_admission.__func__.__name__ == "checkpoint_operational"
 
 
 def test_principal_directly_writes_workspace_without_legacy_runtime(tmp_path: Path):

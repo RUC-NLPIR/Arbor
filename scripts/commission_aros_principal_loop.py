@@ -99,42 +99,66 @@ class Driver:
             record=False,
         ).stdout.strip()
 
-    def task_tool(self, **kwargs: object) -> dict[str, object]:
+    def _checkpoint_service(self):  # type: ignore[no-untyped-def]
         from arbor.aros.checkpoint import CheckpointService
-        from arbor.aros.task_tool import TaskTool
         from arbor.aros.worktrees import bind_repository, read_repository_snapshot
         from arbor.cli.commands.aros_cmd import HumanDirectGateway
 
         repository = bind_repository(self.project)
         canonical_ref = read_repository_snapshot(repository).get("ref")
         if not isinstance(canonical_ref, str):
-            raise CommissioningError("TaskTool requires an attached canonical ref")
-        checkpoint = CheckpointService(
+            raise CommissioningError("Agent tool requires an attached canonical ref")
+        return CheckpointService(
             self.project,
             canonical_repository=repository,
             canonical_ref=canonical_ref,
             gateway=HumanDirectGateway(),
         )
-        tool = TaskTool(
-            cwd=str(self.project),
-            operational_admission=checkpoint.checkpoint_operational,
-            persist_results=False,
-        )
-        output = asyncio.run(tool.execute(**kwargs))
+
+    def _record_tool_result(
+        self,
+        name: str,
+        action: object,
+        output: str,
+    ) -> dict[str, object]:
         value = json.loads(output)
         if not isinstance(value, dict):
-            raise CommissioningError("TaskTool returned non-object JSON")
+            raise CommissioningError(f"{name} returned non-object JSON")
         self.commands.append(
             {
                 "sequence": len(self.commands) + 1,
                 "pid": os.getpid(),
-                "argv": ["TaskTool", str(kwargs.get("action"))],
+                "argv": [name, str(action)],
                 "returncode": 0,
                 "stdout_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
                 "stderr_sha256": hashlib.sha256(b"").hexdigest(),
             }
         )
         return value
+
+    def task_tool(self, **kwargs: object) -> dict[str, object]:
+        from arbor.aros.task_tool import TaskTool
+
+        checkpoint = self._checkpoint_service()
+        tool = TaskTool(
+            cwd=str(self.project),
+            operational_admission=checkpoint.checkpoint_operational,
+            persist_results=False,
+        )
+        output = asyncio.run(tool.execute(**kwargs))
+        return self._record_tool_result("TaskTool", kwargs.get("action"), output)
+
+    def eval_tool(self, **kwargs: object) -> dict[str, object]:
+        from arbor.aros.eval_tool import EvalTool
+
+        checkpoint = self._checkpoint_service()
+        tool = EvalTool(
+            cwd=str(self.project),
+            operational_admission=checkpoint.checkpoint_operational,
+            persist_results=False,
+        )
+        output = asyncio.run(tool.execute(**kwargs))
+        return self._record_tool_result("EvalTool", kwargs.get("action"), output)
 
     def cooperative_checkpoint(
         self,
@@ -315,18 +339,15 @@ def commission(aros: Path, runtime: Path) -> Path:
         raise CommissioningError("Task collection operational admission did not complete")
 
     child_commit = str(collected["child_commit"])
-    evaluation = driver.json_command(
-        "eval",
-        "run",
-        "principal-loop",
-        "1",
-        child_commit,
-        "--idempotency-key",
-        "principal-loop-eval",
-        "--actor",
-        "principal",
-        timeout=240,
+    evaluation = driver.eval_tool(
+        action="run",
+        evaluator_id="principal-loop",
+        version="1",
+        candidate_commit=child_commit,
+        idempotency_key="principal-loop-eval",
     )
+    if evaluation.get("admission_required") is not False:
+        raise CommissioningError("Eval operational admission did not complete")
     if evaluation.get("measurement_state") != "valid" or evaluation.get("metric") != 1.0:
         raise CommissioningError("Eval did not produce the expected valid metric")
     eval_id = str(evaluation["eval_id"])

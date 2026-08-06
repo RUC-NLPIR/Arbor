@@ -1964,6 +1964,47 @@ def test_operational_checkpoint_binds_current_base_and_reuses_shared_path(
     assert principal.read_text(encoding="utf-8") == "principal-owned\n"
 
 
+def test_operational_checkpoint_reuses_record_already_exact_at_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arbor.aros.operational import build_operational_intent
+
+    _base, canonical_ref = _init_repository(tmp_path)
+    record_path = "runs/RUN-operational/manifest.json"
+    path = tmp_path / record_path
+    path.parent.mkdir(parents=True)
+    path.write_text('{"manifest_sha256":"' + "a" * 64 + '"}\n', encoding="utf-8")
+    _git(tmp_path, "add", record_path)
+    _git(tmp_path, "commit", "-qm", "admit operational record")
+    head = _git_text(tmp_path, "rev-parse", "HEAD")
+    service = CheckpointService(
+        tmp_path,
+        canonical_repository=bind_repository(tmp_path),
+        canonical_ref=canonical_ref,
+    )
+    monkeypatch.setattr(
+        service,
+        "checkpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("already-admitted record called checkpoint")
+        ),
+    )
+    intent = build_operational_intent((record_path,), "a" * 64)
+
+    result = service.checkpoint_operational(intent)
+
+    assert result == {
+        "schema_version": 1,
+        "state": "admitted",
+        "commit": head,
+        "reused": True,
+    }
+    assert not any(
+        path.is_file() for path in (tmp_path / "transitions").glob("T-OPS-*/**/*")
+    )
+
+
 @pytest.mark.parametrize(
     "drift",
     ("message", "candidate", "proposal", "prepared_bytes"),

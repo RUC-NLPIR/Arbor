@@ -184,6 +184,33 @@ def _prepare(
     return service, manifest
 
 
+def test_run_prepare_returns_manifest_operational_intent_without_transition_dirt(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service = RunService(tmp_path)
+
+    manifest, intent = service.prepare_with_operational_intent(
+        [sys.executable, "-c", "print('run')"],
+        cwd=".",
+        timeout_seconds=10,
+        idempotency_key="run-operational-intent",
+        actor="principal",
+        label="intent",
+        security_profile="trusted-local",
+        writable_paths=[],
+    )
+
+    run_id = str(manifest["run_id"])
+    assert intent.to_json() == {
+        "schema_version": 1,
+        "workspace_paths": [f"runs/{run_id}/manifest.json"],
+        "record_sha256": manifest["manifest_sha256"],
+    }
+    assert json.loads((tmp_path / "runs" / run_id / "manifest.json").read_bytes()) == manifest
+    assert not (tmp_path / "transitions").exists()
+
+
 def _install_json_crash_alias(path: Path) -> Path:
     digest = hashlib.sha256(os.fsencode(path.name)).hexdigest()
     alias = path.parent / f".aros-json-{digest}.inspection-crash.tmp"
@@ -630,6 +657,31 @@ def test_read_verified_output_returns_exact_terminal_log_bytes(
 
     assert service.read_verified_output(run_id, "stdout") == b"exact metric bytes\n"
     assert service.read_verified_output(run_id, "stderr") == b""
+
+
+def test_run_terminal_operational_intent_is_derived_only_after_final(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "print('terminal intent')"],
+        key="terminal-operational-intent",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+
+    assert service.terminal_operational_intent(run_id) is None
+    assert runner_module.run(str(tmp_path), run_id) == 0
+    final = service.read_validated_final(run_id)
+
+    intent = service.terminal_operational_intent(run_id)
+
+    assert intent is not None
+    assert intent.to_json() == {
+        "schema_version": 1,
+        "workspace_paths": [f"runs/{run_id}/final.json"],
+        "record_sha256": store_module.json_sha256(final),
+    }
 
 
 def test_immutable_final_readers_ignore_missing_mutable_status_and_fail_closed(

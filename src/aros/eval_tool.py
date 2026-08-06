@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Callable
 from typing import Any
 
 from ..core.tools.base import PathAuthorizer, Tool
 from .eval import EvalError, EvalService, ExistingEvaluation
+from .operational import OperationalIntent
 
 
 _ACTIONS = ("register", "run", "status", "observe", "audit")
@@ -132,6 +134,8 @@ class EvalTool(Tool):
         workspace_dir: str | None = None,
         path_authorizer: PathAuthorizer | None = None,
         persist_results: bool = True,
+        operational_admission: Callable[[OperationalIntent], dict[str, object]]
+        | None = None,
     ) -> None:
         super().__init__(
             cwd=cwd,
@@ -139,6 +143,9 @@ class EvalTool(Tool):
             path_authorizer=path_authorizer,
             persist_results=persist_results,
         )
+        if operational_admission is not None and not callable(operational_admission):
+            raise TypeError("operational_admission must be callable or None")
+        self.operational_admission = operational_admission
         self.input_schema = copy.deepcopy(type(self).input_schema)
 
     def to_api_schema(self) -> dict[str, Any]:
@@ -177,13 +184,25 @@ class EvalTool(Tool):
                 actor="principal",
             )
         elif action == "run":
-            result = service.run(
+            result, intent = service.run_with_operational_intent(
                 kwargs["evaluator_id"],
                 kwargs["version"],
                 kwargs["candidate_commit"],
                 actor="principal",
                 idempotency_key=kwargs["idempotency_key"],
             )
+            if isinstance(result, ExistingEvaluation):
+                result = result.status
+            if intent is not None:
+                result = {
+                    **result,
+                    "admission_required": self.operational_admission is None,
+                    "operational_intent": intent.to_json(),
+                }
+                if self.operational_admission is not None:
+                    result["operational_checkpoint"] = self.operational_admission(
+                        intent
+                    )
         elif action == "status":
             result = service.status(kwargs["eval_id"])
         elif action == "observe":

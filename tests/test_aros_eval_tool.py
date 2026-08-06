@@ -15,6 +15,7 @@ from jsonschema import Draft202012Validator
 from arbor.aros import eval_tool
 from arbor.aros.eval import EvalError, ExistingEvaluation
 from arbor.aros.eval_tool import EvalTool
+from arbor.aros.operational import build_operational_intent
 
 
 class FakeEvalService:
@@ -57,7 +58,22 @@ class FakeEvalService:
                     "measurement_state": "not_available",
                 }
             )
-        return {"eval_id": "EVAL-new", "evaluation_state": "completed"}
+        return {
+            "eval_id": "EVAL-" + "a" * 64,
+            "evaluation_state": "completed",
+            "receipt_sha256": "b" * 64,
+        }
+
+    def run_with_operational_intent(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        result = self.run(*args, **kwargs)
+        projection = result.status if isinstance(result, ExistingEvaluation) else result
+        receipt_sha256 = projection.get("receipt_sha256")
+        if not isinstance(receipt_sha256, str):
+            return result, None
+        return result, build_operational_intent(
+            (f"eval/evaluations/{projection['eval_id']}/receipt.json",),
+            receipt_sha256,
+        )
 
     def status(self, eval_id: str) -> dict[str, object]:
         self.calls.append(("status", eval_id))
@@ -298,8 +314,46 @@ def test_register_and_run_forward_exact_requests_as_principal(tmp_path: Path) ->
         "evaluator_version": "1",
     }
     assert json.loads(completed) == {
-        "eval_id": "EVAL-new",
+        "eval_id": "EVAL-" + "a" * 64,
         "evaluation_state": "completed",
+        "receipt_sha256": "b" * 64,
+        "admission_required": True,
+        "operational_intent": {
+            "schema_version": 1,
+            "workspace_paths": [
+                "eval/evaluations/EVAL-" + "a" * 64 + "/receipt.json"
+            ],
+            "record_sha256": "b" * 64,
+        },
+    }
+
+
+def test_eval_run_admits_receipt_only_after_terminal_result(tmp_path: Path) -> None:
+    calls: list[object] = []
+
+    def admit(intent: object) -> dict[str, object]:
+        assert FakeEvalService.instances[0].calls[-1][0] == "run"
+        calls.append(intent)
+        return {"state": "admitted", "commit": "c" * 40}
+
+    tool = EvalTool(cwd=str(tmp_path), operational_admission=admit)
+
+    output = json.loads(
+        _execute(
+            tool,
+            action="run",
+            evaluator_id="quality",
+            version="1",
+            candidate_commit="a" * 40,
+            idempotency_key="visible-callback",
+        )
+    )
+
+    assert len(calls) == 1
+    assert output["admission_required"] is False
+    assert output["operational_checkpoint"] == {
+        "state": "admitted",
+        "commit": "c" * 40,
     }
 
 

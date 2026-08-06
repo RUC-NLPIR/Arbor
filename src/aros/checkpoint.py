@@ -648,6 +648,38 @@ class CheckpointService:
             self.canonical_repository,
             self.canonical_ref,
         )
+        entries = {
+            entry.path: entry
+            for entry in read_repository_tree_entries(
+                self.canonical_repository,
+                base_commit,
+                intent.workspace_paths,
+            )
+        }
+        if set(entries) == set(intent.workspace_paths):
+            exact = True
+            for relative in intent.workspace_paths:
+                raw = _read_plain_file(
+                    self.candidate_repository.root / relative,
+                    max_bytes=MAX_VERSIONED_FILE_BYTES,
+                )
+                mode = (
+                    "100755"
+                    if stat.S_IMODE((self.candidate_repository.root / relative).stat().st_mode)
+                    & 0o111
+                    else "100644"
+                )
+                entry = entries[relative]
+                if entry.kind != "blob" or entry.mode != mode or entry.oid != _blob_oid(raw):
+                    exact = False
+                    break
+            if exact:
+                return {
+                    "schema_version": 1,
+                    "state": "admitted",
+                    "commit": base_commit,
+                    "reused": True,
+                }
         transition_id, proposal = build_operational_proposal(
             base_commit,
             intent.workspace_paths,

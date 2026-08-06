@@ -37,6 +37,53 @@ requires_linux_claims = pytest.mark.skipif(
 )
 
 
+def test_eval_run_returns_receipt_operational_intent_only_for_terminal_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = EvalService.__new__(EvalService)
+    receipt = {
+        "eval_id": "EVAL-" + "a" * 64,
+        "receipt_sha256": "b" * 64,
+        "measurement_state": "valid",
+    }
+    monkeypatch.setattr(service, "run", lambda *_args, **_kwargs: dict(receipt))
+
+    record, intent = service.run_with_operational_intent(
+        "quality",
+        "1",
+        "c" * 40,
+        actor="principal",
+        idempotency_key="eval-intent",
+    )
+
+    assert record == receipt
+    assert intent is not None
+    assert intent.to_json() == {
+        "schema_version": 1,
+        "workspace_paths": [
+            f"eval/evaluations/{receipt['eval_id']}/receipt.json"
+        ],
+        "record_sha256": "b" * 64,
+    }
+
+    monkeypatch.setattr(
+        service,
+        "run",
+        lambda *_args, **_kwargs: {
+            "eval_id": "EVAL-" + "d" * 64,
+            "evaluation_state": "lost",
+        },
+    )
+    _lost, lost_intent = service.run_with_operational_intent(
+        "quality",
+        "1",
+        "c" * 40,
+        actor="principal",
+        idempotency_key="eval-lost",
+    )
+    assert lost_intent is None
+
+
 def _git(root: Path, *args: str) -> str:
     environment = {
         key: value

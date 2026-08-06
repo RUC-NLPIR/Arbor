@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 from ..core.tools.base import Tool
+from .operational import OperationalIntent
 from .runs import RunError, RunService
 
 
@@ -90,6 +92,32 @@ class RunTool(Tool):
     }
     persist_threshold = float("inf")
 
+    def __init__(
+        self,
+        *,
+        operational_admission: Callable[[OperationalIntent], dict[str, object]]
+        | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        if operational_admission is not None and not callable(operational_admission):
+            raise TypeError("operational_admission must be callable or None")
+        self.operational_admission = operational_admission
+
+    def _operational_result(
+        self,
+        record: dict[str, object],
+        intent: OperationalIntent,
+    ) -> dict[str, object]:
+        result = {
+            **record,
+            "admission_required": self.operational_admission is None,
+            "operational_intent": intent.to_json(),
+        }
+        if self.operational_admission is not None:
+            result["operational_checkpoint"] = self.operational_admission(intent)
+        return result
+
     async def execute(self, **kwargs: Any) -> str:
         action = kwargs.get("action")
         if action == "stop" and not kwargs.get("reason"):
@@ -97,7 +125,7 @@ class RunTool(Tool):
 
         service = RunService(self.cwd)
         if action == "start":
-            manifest = service.prepare(
+            manifest, intent = service.prepare_with_operational_intent(
                 kwargs.get("argv"),
                 cwd=kwargs.get("cwd", "."),
                 timeout_seconds=kwargs.get("timeout_seconds", 3600),
@@ -110,9 +138,22 @@ class RunTool(Tool):
                 ),
                 writable_paths=kwargs.get("writable_paths", []),
             )
-            result = service.start(str(manifest["run_id"]), actor="principal")
+            started = service.start(str(manifest["run_id"]), actor="principal")
+            result = self._operational_result(started, intent)
         elif action == "status":
-            result = service.status(kwargs.get("run_id"))
+            run_id = kwargs.get("run_id")
+            status = service.status(run_id)
+            intent = (
+                service.terminal_operational_intent(run_id)
+                if status.get("state")
+                in {"completed", "failed_process", "timed_out", "cancelled"}
+                else None
+            )
+            result = (
+                self._operational_result(status, intent)
+                if intent is not None
+                else status
+            )
         elif action == "list":
             result = service.list()
         elif action == "tail":

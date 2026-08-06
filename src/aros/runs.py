@@ -26,6 +26,7 @@ from pathlib import Path
 
 from . import processes
 from .isolation import IsolationError, isolated_linux_policy, probe_isolated_linux
+from .operational import OperationalIntent, build_operational_intent
 from .receipts import record_sha256
 from .store import (
     AnchoredReadError,
@@ -468,6 +469,35 @@ class RunService:
             repository_ref=".",
             candidate_commit=None,
             success_exit_codes=[0],
+        )
+
+    def prepare_with_operational_intent(
+        self,
+        argv: list[str],
+        *,
+        cwd: str = ".",
+        timeout_seconds: float = 3600,
+        idempotency_key: str,
+        actor: str,
+        label: str | None = None,
+        security_profile: str = "isolated-linux",
+        writable_paths: list[str] | None = None,
+    ) -> tuple[dict[str, object], OperationalIntent]:
+        """Return an unchanged manifest plus a pure foreground admission intent."""
+        manifest = self.prepare(
+            argv,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            idempotency_key=idempotency_key,
+            actor=actor,
+            label=label,
+            security_profile=security_profile,
+            writable_paths=writable_paths,
+        )
+        run_id = str(manifest["run_id"])
+        return manifest, build_operational_intent(
+            (f"runs/{run_id}/manifest.json",),
+            str(manifest["manifest_sha256"]),
         )
 
     def prepare_bundle(
@@ -1059,6 +1089,17 @@ class RunService:
         if digest.hexdigest() != declared_sha256:
             raise RunError(f"verified {stream} hash differs from receipt: {run_id}")
         return bytes(captured) if captured is not None else None
+
+    def terminal_operational_intent(self, run_id: str) -> OperationalIntent | None:
+        """Derive a pure final-record intent without reconciling or writing state."""
+        self._validate_run_id(run_id)
+        if not self._final_path(run_id).is_file():
+            return None
+        final = self.read_validated_final(run_id)
+        return build_operational_intent(
+            (f"runs/{run_id}/final.json",),
+            _sha256(final),
+        )
 
     def read_validated_final(
         self,

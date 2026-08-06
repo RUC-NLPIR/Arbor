@@ -311,6 +311,18 @@ meaning is never overwritten or merged. The host stages exact created paths
 and creates one initialization commit. It never runs reset, clean, rebase,
 merge, or an all-files `git add`.
 
+Two existing repository-owned files are explicit exceptions:
+
+- an existing `AGENTS.md` is preserved byte-for-byte and not staged; if absent,
+  AROS creates its minimal Principal instructions;
+- an existing plain `.gitignore` is preserved with only missing `/.aros/` and
+  `/.worktree/` lines appended, then staged. A symlink or non-file fails.
+
+All AROS-owned semantic paths (`AROS.md`, `memory/`, `questions/`, `model/`,
+`ideas/`, `knowledge/`, `sources/`, `eval/`, `tasks/`, `runs/`, and
+`transitions/`) must be absent before bootstrap. Intake never merges or guesses
+the meaning of partial AROS state.
+
 The commit uses a per-command system identity
 `AROS Intake <aros-intake@local.invalid>` without changing repository or global
 Git configuration. This identifies the mechanical bootstrap actor honestly and

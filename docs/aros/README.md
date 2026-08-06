@@ -36,12 +36,14 @@ The exposed command surface for the direct `aros` entry is:
   human-direct route is explicitly cooperative.
 - A real cooperative Task→Eval→Assimilation→restart loop is commissioned at
   `docs/analysis/aros-principal-loop-core-smoke.md`.
+- With a host-injected gateway, native Task/Run/Eval tools synchronously admit
+  service-owned records at safe foreground seams. Services and runners carry
+  only pure in-memory `OperationalIntent` values and no authority credentials.
 
 ## Not yet implemented
 
 - protected evaluation registration and admission
-- automatic Task/Run/Eval operational admission and shared Operations budgets,
-  leases, and search
+- shared Operations budgets, leases, and search
 - Arbor-native protected broker authority and non-bypass commissioning
 - project-local user-space Skills lifecycle and procedural memory
 - provider child profiles/adapters, `child_done`, and positive assimilation

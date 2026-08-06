@@ -105,8 +105,9 @@ site. The retained local evidence for this run is:
 
 - The semantic edits in this commissioning run were deterministic driver input,
   not a live LLM Principal turn.
-- Task/Run/Eval operational records still require explicit cooperative
-  checkpoints; automatic foreground operational admission remains Task 9 work.
+- Native Principal Task/Run/Eval tools now perform operational admission through
+  a foreground callback only when a host gateway is injected. Services and
+  runners still receive no authority credential.
 - Same-UID cooperative execution is not protected authority. The Arbor-native
   broker/lease/fence authority domain and non-bypass commissioning remain.
 - Protected Eval, Source Gateway, Skills/MCP/provider parity, and final Arbor
@@ -123,3 +124,34 @@ After the clean-wheel commissioning run:
   pytest -q` exited 0 in 833.44 seconds;
 - collection reported 2,105 tests; the run displayed 6 skips and no failures
   (2,099 passed, 6 skipped).
+
+## Operational-admission recommissioning
+
+After Task 9A/B, clean source commit `ff3f67f` repeated the same verified loop
+without manual Task or Eval operational checkpoint steps:
+
+- `TaskTool create` admitted the brief before Task start;
+- `TaskTool collect` admitted the collection before Eval;
+- `EvalTool run` admitted the Eval receipt and its exact Run manifest/final
+  closure after the terminal measurement existed;
+- the final scientific transition contained only ref-only Task/Eval/Run closure
+  paths and still required two explicit Principal assimilations.
+
+The recommissioning evidence contains 13 steps with zero failures:
+
+```text
+Task C:       922a311ea0e9865a90aa7ae94d371fd4cfbf7d9b
+Task R:       9325d57e4eed6952403030d67e93da97315ee02f
+Eval receipt: e6602d7211c87da9815f1cd594673a3a0767b7166927aa03203dd2fc20f4a247
+Final commit: d432ccf54b19f54974e8c78fb4981be0f8ed030c
+```
+
+The retained local evidence is:
+
+```text
+/workspace/Arbor/.worktree/commissioning/aros-task9-final-run-1/evidence.json
+```
+
+Post-Task-9 full verification collected 2,119 tests and completed with 2,113
+passed, 6 skipped, zero failures in 779.96 seconds. Ruff and diff checks also
+exited 0.

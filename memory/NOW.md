@@ -24,6 +24,14 @@ commissioned.
 - Final repository verification collected 2,105 tests and completed with
   2,099 passed, 6 skipped, zero failures in 833.44 seconds; full Ruff and diff
   checks also passed.
+- Task 9 recommissioning at clean source `ff3f67f` reduced the loop to 13
+  successful steps: TaskTool create/collect and EvalTool run admitted all
+  service records through the shared foreground checkpoint callback. The final
+  audit saw only ref-only Task/Eval/Run closure while scientific assimilation
+  remained explicit. Final commit:
+  `d432ccf54b19f54974e8c78fb4981be0f8ed030c`.
+- Post-Task-9 full verification collected 2,119 tests and completed with 2,113
+  passed, 6 skipped, zero failures in 779.96 seconds.
 
 - Integrated implementation baseline: `main@56c5375` in `/workspace/Arbor`.
 - Current implementation baselines are deliberately separated: immutable Run
@@ -106,9 +114,7 @@ commissioned.
 
 1. Run the same vertical slice with a live Arbor Principal/model while retaining
    explicit assimilation and deterministic verification.
-2. Automate Task/Run/Eval operational admission at the foreground service seams
-   without giving services or runners authority credentials.
-3. Implement the Arbor-native protected broker/lease/fence domain and commission
+2. Implement the Arbor-native protected broker/lease/fence domain and commission
    non-bypass authority; do not infer it from cooperative evidence.
-4. Complete protected Eval, Source Gateway, Skills/MCP/provider parity,
+3. Complete protected Eval, Source Gateway, Skills/MCP/provider parity,
    migration, and final Arbor compatibility retirement.

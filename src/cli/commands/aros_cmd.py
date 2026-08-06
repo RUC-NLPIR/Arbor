@@ -13,6 +13,7 @@ from typing import Any
 import typer
 from typer.core import TyperCommand
 
+from ...aros.attention import AttentionAuthorityContext
 from ...aros.checkpoint import (
     CheckpointService,
     _decode_human_direct_admission_receipt,
@@ -768,6 +769,14 @@ def start_command(
         "--allow-shell",
         help="Enable bounded foreground shell commands for this trusted-local session.",
     ),
+    cooperative_human_direct: bool = typer.Option(
+        False,
+        "--cooperative-human-direct",
+        help=(
+            "Allow explicitly cooperative same-UID checkpoints for this local "
+            "Principal session; this is not protected authority."
+        ),
+    ),
 ) -> None:
     """Start a fresh native Principal from workspace state, never transcript replay."""
     root = _root(cwd)
@@ -789,12 +798,31 @@ def start_command(
         request = instruction or (
             "Continue the research mission from the current workspace state."
         )
+        gateway = HumanDirectGateway() if cooperative_human_direct else None
+        attention_context = (
+            AttentionAuthorityContext(
+                authority={
+                    "state": "available",
+                    "enforcement_class": "cooperative",
+                    "issuer": "human-direct",
+                },
+                remaining_budget={
+                    "state": "not_configured",
+                    "enforcement_class": "cooperative",
+                },
+                institutional_obligations=(),
+            )
+            if cooperative_human_direct
+            else None
+        )
         agent = build_principal_agent(
             provider_obj,
             root,
             boot_context,
             max_turns=max_turns,
             allow_shell=allow_shell,
+            admission_gateway=gateway,
+            attention_context=attention_context,
         )
         asyncio.run(run_principal(agent, request))
     except KeyboardInterrupt:

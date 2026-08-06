@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import arbor.cli.commands.aros_cmd as aros_cmd
 from arbor.cli.commands.aros_cmd import aros_app
 
 try:
@@ -141,6 +142,77 @@ def test_direct_entry_reuses_the_single_app() -> None:
     from arbor.cli import aros_app as entry
 
     assert entry.app is aros_app
+
+
+def _capture_start(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(aros_cmd, "llm_defaults", lambda: {})
+    monkeypatch.setattr(aros_cmd, "create_provider", lambda config: object())
+    monkeypatch.setattr(aros_cmd, "boot_workspace", lambda root: "exact boot")
+
+    def build(provider: object, root: Path, boot: str, **kwargs: object) -> object:
+        captured.update(root=root, boot=boot, kwargs=kwargs)
+        return object()
+
+    async def run(agent: object, request: str) -> str:
+        captured.update(agent=agent, request=request)
+        return "done"
+
+    monkeypatch.setattr(aros_cmd, "build_principal_agent", build)
+    monkeypatch.setattr(aros_cmd, "run_principal", run)
+    return captured
+
+
+def test_start_has_no_checkpoint_authority_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _capture_start(monkeypatch)
+
+    result = runner.invoke(
+        aros_app,
+        ["start", "inspect", "--cwd", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["admission_gateway"] is None
+    assert kwargs["attention_context"] is None
+
+
+def test_start_explicit_cooperative_mode_injects_host_owned_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _capture_start(monkeypatch)
+
+    result = runner.invoke(
+        aros_app,
+        [
+            "start",
+            "inspect",
+            "--cooperative-human-direct",
+            "--cwd",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert isinstance(kwargs["admission_gateway"], aros_cmd.HumanDirectGateway)
+    context = kwargs["attention_context"]
+    assert isinstance(context, aros_cmd.AttentionAuthorityContext)
+    assert dict(context.authority) == {
+        "state": "available",
+        "enforcement_class": "cooperative",
+        "issuer": "human-direct",
+    }
+    assert dict(context.remaining_budget) == {
+        "state": "not_configured",
+        "enforcement_class": "cooperative",
+    }
 
 
 def test_legacy_root_mounts_the_same_aros_app() -> None:

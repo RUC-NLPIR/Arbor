@@ -170,13 +170,24 @@ def test_start_uses_user_llm_defaults_with_cli_overrides(
         seen["config"] = config
         return fake_provider
 
-    def fake_build(provider, root, boot_context, *, max_turns, allow_shell):
+    def fake_build(
+        provider,
+        root,
+        boot_context,
+        *,
+        max_turns,
+        allow_shell,
+        admission_gateway,
+        attention_context,
+    ):
         seen["build"] = {
             "provider": provider,
             "root": root,
             "boot_context": boot_context,
             "max_turns": max_turns,
             "allow_shell": allow_shell,
+            "admission_gateway": admission_gateway,
+            "attention_context": attention_context,
         }
         return fake_agent
 
@@ -218,6 +229,8 @@ def test_start_uses_user_llm_defaults_with_cli_overrides(
         "boot_context": "# Boot\nmission from workspace",
         "max_turns": 7,
         "allow_shell": True,
+        "admission_gateway": None,
+        "attention_context": None,
     }
     assert seen["run"] == (fake_agent, "inspect the current evidence")
 

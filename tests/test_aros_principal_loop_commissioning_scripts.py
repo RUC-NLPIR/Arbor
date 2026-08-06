@@ -380,3 +380,35 @@ def test_driver_exposes_one_explicit_aros_entry_and_runtime() -> None:
     assert "--aros" in result.stdout
     assert "--runtime" in result.stdout
     assert "opencode" not in result.stdout.lower()
+
+
+def test_driver_uses_native_agent_and_has_no_direct_tool_or_semantic_path() -> None:
+    source = DRIVER.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    methods = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    direct_execute = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "execute"
+    ]
+
+    assert "build_principal_agent" in source
+    assert "run_principal" in source
+    assert methods.isdisjoint(
+        {
+            "_checkpoint_service",
+            "_record_tool_result",
+            "task_tool",
+            "eval_tool",
+            "cooperative_checkpoint",
+            "_claim",
+            "_now",
+        }
+    )
+    assert direct_execute == []

@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import hashlib
+import importlib.util
 import json
-import os
 import shutil
 import subprocess
 import sys
-import time
+import weakref
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -99,83 +101,6 @@ class Driver:
             record=False,
         ).stdout.strip()
 
-    def _checkpoint_service(self):  # type: ignore[no-untyped-def]
-        from arbor.aros.checkpoint import CheckpointService
-        from arbor.aros.worktrees import bind_repository, read_repository_snapshot
-        from arbor.cli.commands.aros_cmd import HumanDirectGateway
-
-        repository = bind_repository(self.project)
-        canonical_ref = read_repository_snapshot(repository).get("ref")
-        if not isinstance(canonical_ref, str):
-            raise CommissioningError("Agent tool requires an attached canonical ref")
-        return CheckpointService(
-            self.project,
-            canonical_repository=repository,
-            canonical_ref=canonical_ref,
-            gateway=HumanDirectGateway(),
-        )
-
-    def _record_tool_result(
-        self,
-        name: str,
-        action: object,
-        output: str,
-    ) -> dict[str, object]:
-        value = json.loads(output)
-        if not isinstance(value, dict):
-            raise CommissioningError(f"{name} returned non-object JSON")
-        self.commands.append(
-            {
-                "sequence": len(self.commands) + 1,
-                "pid": os.getpid(),
-                "argv": [name, str(action)],
-                "returncode": 0,
-                "stdout_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
-                "stderr_sha256": hashlib.sha256(b"").hexdigest(),
-            }
-        )
-        return value
-
-    def task_tool(self, **kwargs: object) -> dict[str, object]:
-        from arbor.aros.task_tool import TaskTool
-
-        checkpoint = self._checkpoint_service()
-        tool = TaskTool(
-            cwd=str(self.project),
-            operational_admission=checkpoint.checkpoint_operational,
-            persist_results=False,
-        )
-        output = asyncio.run(tool.execute(**kwargs))
-        return self._record_tool_result("TaskTool", kwargs.get("action"), output)
-
-    def eval_tool(self, **kwargs: object) -> dict[str, object]:
-        from arbor.aros.eval_tool import EvalTool
-
-        checkpoint = self._checkpoint_service()
-        tool = EvalTool(
-            cwd=str(self.project),
-            operational_admission=checkpoint.checkpoint_operational,
-            persist_results=False,
-        )
-        output = asyncio.run(tool.execute(**kwargs))
-        return self._record_tool_result("EvalTool", kwargs.get("action"), output)
-
-    def cooperative_checkpoint(
-        self,
-        proposal_ref: str,
-        message: str,
-    ) -> dict[str, object]:
-        return self.json_command(
-            "checkpoint",
-            "--proposal",
-            proposal_ref,
-            "--message",
-            message,
-            "--cooperative-human-direct",
-            timeout=240,
-        )
-
-
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -183,41 +108,48 @@ def _write_json(path: Path, value: object) -> None:
         encoding="utf-8",
     )
 
+def _provider_class() -> type[Any]:
+    path = FIXTURE / "provider.py"
+    spec = importlib.util.spec_from_file_location(
+        "aros_principal_loop_provider",
+        path,
+    )
+    if spec is None or spec.loader is None:
+        raise CommissioningError("cannot load deterministic Principal provider")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    provider = getattr(module, "PrincipalLoopProvider", None)
+    if not isinstance(provider, type):
+        raise CommissioningError("deterministic Principal provider is invalid")
+    return provider
 
-def _claim(eval_ref: str, candidate_commit: str) -> str:
-    link = json.dumps(
-        {
-            "observation_ref": eval_ref,
-            "relation": "supports",
-            "scope": (
-                f"candidate {candidate_commit}; fixed seed 7; "
-                "visible principal-loop evaluator v1"
-            ),
-        },
+
+def _json_sha256(value: object) -> str:
+    raw = json.dumps(
+        value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-    )
-    return (
-        "---\nid: C-0001\n---\n# Claim C-0001\n\n"
-        "## Statement\n\n"
-        "The deterministic candidate produced the expected success value and "
-        "received a valid metric of 1.0.\n\n"
-        f"## Evidence links\n\n{link}\n\n"
-        "## Counterevidence\n"
-    )
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
-def _now(task_id: str, child_commit: str, return_commit: str, eval_id: str) -> str:
-    return (
-        "# Current State\n\n"
-        "## Assimilated task return\n\n"
-        f"Task `{task_id}` returned candidate commit `{child_commit}` and "
-        f"return commit `{return_commit}`.\n\n"
-        "## Measurement\n\n"
-        f"Evaluation `{eval_id}` measured `principal_loop_quality=1.0` with "
-        "state `valid` for the same candidate commit.\n"
-    )
+def _first_tool_result(messages: list[dict[str, Any]]) -> dict[str, object]:
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            raw = block.get("content")
+            if not isinstance(raw, str):
+                raise CommissioningError("Agent tool result content is invalid")
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise CommissioningError("Agent tool result is not a JSON object")
+            return value
+    raise CommissioningError("Agent messages contain no JSON tool result")
 
 
 def commission(aros: Path, runtime: Path) -> Path:
@@ -305,96 +237,93 @@ def commission(aros: Path, runtime: Path) -> Path:
     driver.git("commit", "-qm", "add commissioning evaluator manifest")
     driver.json_command("eval", "register", "--manifest", manifest_ref, "--actor", "principal")
 
-    brief = driver.task_tool(
-        action="create",
-        objective="Produce one deterministic success candidate and strict return.",
-        mode="write",
-        adapter_argv=[
-            "python3",
-            "commissioning/principal_loop/task_adapter.py",
-        ],
-        capabilities={"network": False, "shell": True},
-        deliverables=["candidate-mode.txt"],
-        acceptance=["candidate-mode.txt equals success"],
-        timeout_seconds=120,
-        idempotency_key="principal-loop-task",
-    )
-    task_id = str(brief["task_id"])
-    if brief.get("admission_required") is not False:
-        raise CommissioningError("Task brief operational admission did not complete")
-    driver.json_command("task", "start", task_id, "--actor", "principal", timeout=240)
-    deadline = time.monotonic() + 120
-    while True:
-        status = driver.json_command("task", "status", task_id, record=False)
-        if status.get("state") in {"completed", "failed", "lost", "timed_out", "stopped"}:
-            break
-        if time.monotonic() >= deadline:
-            raise CommissioningError("Task did not reach a terminal state")
-        time.sleep(0.2)
-    if status.get("state") != "completed":
-        raise CommissioningError(f"Task terminal state is {status.get('state')}")
-    collected = driver.task_tool(action="collect", task_id=task_id)
-    collected_ref = f"tasks/{task_id}/collected.json"
-    if collected.get("admission_required") is not False:
-        raise CommissioningError("Task collection operational admission did not complete")
+    from arbor.aros.attention import AttentionAuthorityContext
+    from arbor.aros.principal import build_principal_agent, run_principal
+    from arbor.aros.workspace import boot_workspace
+    from arbor.aros.worktrees import bind_repository, read_repository_snapshot
+    from arbor.cli.commands.aros_cmd import HumanDirectGateway
 
-    child_commit = str(collected["child_commit"])
-    evaluation = driver.eval_tool(
-        action="run",
-        evaluator_id="principal-loop",
-        version="1",
-        candidate_commit=child_commit,
-        idempotency_key="principal-loop-eval",
-    )
-    if evaluation.get("admission_required") is not False:
-        raise CommissioningError("Eval operational admission did not complete")
-    if evaluation.get("measurement_state") != "valid" or evaluation.get("metric") != 1.0:
-        raise CommissioningError("Eval did not produce the expected valid metric")
-    eval_id = str(evaluation["eval_id"])
-    eval_ref = f"eval/evaluations/{eval_id}/receipt.json"
-
-    claim_path.write_text(_claim(eval_ref, child_commit), encoding="utf-8")
-    (driver.project / "memory/NOW.md").write_text(
-        _now(task_id, child_commit, str(collected["return_commit"]), eval_id),
-        encoding="utf-8",
-    )
-    semantic_base = driver.git("rev-parse", "HEAD")
-    transition_id = "T-E2E-ASSIMILATE"
-    proposal_ref = f"transitions/{transition_id}/proposal.json"
-    _write_json(
-        driver.project / proposal_ref,
-        {
-            "schema_version": 1,
-            "base_commit": semantic_base,
-            "workspace_paths": [
-                "knowledge/claims/C-0001.md",
-                "memory/NOW.md",
-            ],
-            "assimilations": [
-                {
-                    "observation_ref": eval_ref,
-                    "affected_paths": [
-                        "knowledge/claims/C-0001.md",
-                        "memory/NOW.md",
-                    ],
-                    "rationale": "knowledge/claims/C-0001.md#Evidence links",
-                },
-                {
-                    "observation_ref": collected_ref,
-                    "affected_paths": ["memory/NOW.md"],
-                    "rationale": "memory/NOW.md#Assimilated task return",
-                },
-            ],
+    provider_type = _provider_class()
+    repository = bind_repository(driver.project)
+    canonical_ref = read_repository_snapshot(repository).get("ref")
+    if not isinstance(canonical_ref, str):
+        raise CommissioningError("Principal requires an attached canonical ref")
+    context = AttentionAuthorityContext(
+        authority={
+            "state": "available",
+            "enforcement_class": "cooperative",
+            "issuer": "human-direct",
         },
+        remaining_budget={
+            "state": "not_configured",
+            "enforcement_class": "cooperative",
+        },
+        institutional_obligations=(),
     )
-    audit = driver.json_command("transition", "audit", proposal_ref, timeout=240)
-    if audit.get("mechanically_valid") is not True:
-        raise CommissioningError("final assimilation transition is invalid")
-    checkpoint = driver.cooperative_checkpoint(
-        proposal_ref,
-        "Assimilate deterministic Task return and valid measurement.",
+    provider = provider_type()
+    agent = build_principal_agent(
+        provider,
+        driver.project,
+        boot_workspace(driver.project),
+        max_turns=100,
+        canonical_repository=repository,
+        canonical_ref=canonical_ref,
+        admission_gateway=HumanDirectGateway(),
+        attention_context=context,
     )
-    final_commit = str(checkpoint["commit"])
+    primary_result = asyncio.run(
+        run_principal(agent, "Complete the commissioned research transition.")
+    )
+    if agent.stop_reason != "finished":
+        raise CommissioningError(
+            f"primary Agent stopped with reason {agent.stop_reason!r}"
+        )
+    primary_agent_id = id(agent)
+    primary_provider_id = id(provider)
+    primary_agent_class = f"{type(agent).__module__}.{type(agent).__qualname__}"
+    primary_tool_uses = json.loads(json.dumps(agent.tool_uses))
+    primary_message_sha256 = _json_sha256(agent.messages)
+    task_id = provider.task_id
+    child_commit = provider.child_commit
+    return_commit = provider.return_commit
+    eval_id = provider.eval_id
+    collected_ref = provider.collected_ref
+    eval_ref = provider.eval_ref
+    semantic_base = provider.base_commit
+    if not all(
+        isinstance(value, str)
+        for value in (
+            task_id,
+            child_commit,
+            return_commit,
+            eval_id,
+            collected_ref,
+            eval_ref,
+            semantic_base,
+        )
+    ):
+        raise CommissioningError("primary Agent did not retain exact lineage")
+    primary_agent_ref = weakref.ref(agent)
+    primary_provider_ref = weakref.ref(provider)
+    del agent, provider
+    gc.collect()
+    if primary_agent_ref() is not None or primary_provider_ref() is not None:
+        raise CommissioningError("primary Agent/provider survived destruction")
+
+    final_commit = driver.git("rev-parse", "HEAD")
+    transition_id = "T-E2E-ASSIMILATE"
+    collected = json.loads(
+        driver.run(
+            ["git", "-C", str(driver.project), "show", f"{final_commit}:{collected_ref}"],
+            record=False,
+        ).stdout
+    )
+    evaluation = json.loads(
+        driver.run(
+            ["git", "-C", str(driver.project), "show", f"{final_commit}:{eval_ref}"],
+            record=False,
+        ).stdout
+    )
     admission = json.loads(
         driver.run(
             [
@@ -408,18 +337,37 @@ def commission(aros: Path, runtime: Path) -> Path:
         ).stdout
     )
 
-    driver.json_command("audit", "--rebuild-index", timeout=240)
-    complete_packet = driver.json_command("boot", "--json", "--max-chars", "8000")
-    cache = driver.project / ".aros/indexes/transition-index.json"
-    cache.replace(cache.with_suffix(".json.saved"))
-    missing_cache_packet = driver.json_command(
-        "boot",
-        "--json",
-        "--max-chars",
-        "8000",
+    restart_repository = bind_repository(driver.project)
+    restart_ref = read_repository_snapshot(restart_repository).get("ref")
+    if not isinstance(restart_ref, str):
+        raise CommissioningError("restart Principal lacks an attached ref")
+    restart_provider = provider_type(restart=True)
+    restart_agent = build_principal_agent(
+        restart_provider,
+        driver.project,
+        boot_workspace(driver.project),
+        max_turns=4,
+        canonical_repository=restart_repository,
+        canonical_ref=restart_ref,
+        admission_gateway=HumanDirectGateway(),
+        attention_context=context,
     )
-    driver.json_command("audit", "--rebuild-index", timeout=240)
-    rebuilt_packet = driver.json_command("boot", "--json", "--max-chars", "8000")
+    restart_initial_messages = len(restart_agent.messages)
+    restart_result = asyncio.run(
+        run_principal(restart_agent, "Recover the admitted research state.")
+    )
+    if restart_agent.stop_reason != "finished":
+        raise CommissioningError(
+            f"restart Agent stopped with reason {restart_agent.stop_reason!r}"
+        )
+    restart_packet = _first_tool_result(restart_agent.messages)
+    restart_agent_id = id(restart_agent)
+    restart_provider_id = id(restart_provider)
+    if (
+        restart_agent_id == primary_agent_id
+        or restart_provider_id == primary_provider_id
+    ):
+        raise CommissioningError("restart reused a primary object identity")
 
     evidence = {
         "schema_version": 1,
@@ -428,7 +376,7 @@ def commission(aros: Path, runtime: Path) -> Path:
         "task": {
             "task_id": task_id,
             "child_commit": child_commit,
-            "return_commit": collected["return_commit"],
+            "return_commit": return_commit,
             "collected_ref": collected_ref,
             "collected_sha256": collected["collected_sha256"],
         },
@@ -445,10 +393,25 @@ def commission(aros: Path, runtime: Path) -> Path:
             "commit": final_commit,
             "receipt_sha256": admission["receipt_sha256"],
         },
+        "agent": {
+            "class": primary_agent_class,
+            "instance": primary_agent_id,
+            "provider_instance": primary_provider_id,
+            "destroyed_before_restart": True,
+            "stop_reason": "finished",
+            "result": primary_result,
+            "tool_uses": primary_tool_uses,
+            "message_sha256": primary_message_sha256,
+        },
         "restart": {
-            "complete_packet": complete_packet,
-            "missing_cache_packet": missing_cache_packet,
-            "rebuilt_packet": rebuilt_packet,
+            "agent_instance": restart_agent_id,
+            "provider_instance": restart_provider_id,
+            "initial_message_count": restart_initial_messages,
+            "stop_reason": "finished",
+            "result": restart_result,
+            "tool_uses": json.loads(json.dumps(restart_agent.tool_uses)),
+            "message_sha256": _json_sha256(restart_agent.messages),
+            "packet": restart_packet,
         },
         "commands": driver.commands,
     }

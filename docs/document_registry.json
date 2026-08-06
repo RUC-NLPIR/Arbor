@@ -42,6 +42,14 @@
       "agent_visibility": "on_demand"
     },
     {
+      "id": "aros-native-start-intake-design",
+      "title": "AROS Native Start and Local Research Intake Design",
+      "path": "docs/superpowers/specs/2026-08-06-aros-native-start-intake-design.md",
+      "status": "proposed",
+      "authority": "implementation_baseline",
+      "agent_visibility": "on_demand"
+    },
+    {
       "id": "aros-public-guide",
       "title": "AROS Public Guide",
       "path": "docs/aros/README.md",

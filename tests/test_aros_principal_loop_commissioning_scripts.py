@@ -568,3 +568,13 @@ def test_driver_uses_native_agent_and_has_no_direct_tool_or_semantic_path() -> N
         }
     )
     assert direct_execute == []
+
+
+def test_driver_rebuilds_disposable_index_between_destroy_and_restart() -> None:
+    source = DRIVER.read_text(encoding="utf-8")
+
+    destroyed = source.index("del agent, provider")
+    rebuilt = source.index('driver.json_command("audit", "--rebuild-index"')
+    restarted = source.index("restart_provider = provider_type(restart=True)")
+
+    assert destroyed < rebuilt < restarted

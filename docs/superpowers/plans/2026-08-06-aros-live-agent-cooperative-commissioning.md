@@ -348,6 +348,7 @@ mkdir -p /workspace/Arbor/.worktree/commissioning/aros-live-agent-build/dist
   .
 python3 -m venv /workspace/Arbor/.worktree/commissioning/aros-live-agent-build/venv
 /workspace/Arbor/.worktree/commissioning/aros-live-agent-build/venv/bin/pip install \
+  --force-reinstall \
   /workspace/Arbor/.worktree/commissioning/aros-live-agent-build/dist/*.whl
 ```
 

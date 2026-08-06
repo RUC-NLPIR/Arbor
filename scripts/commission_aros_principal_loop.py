@@ -337,6 +337,7 @@ def commission(aros: Path, runtime: Path) -> Path:
         ).stdout
     )
 
+    driver.json_command("audit", "--rebuild-index", timeout=240)
     restart_repository = bind_repository(driver.project)
     restart_ref = read_repository_snapshot(restart_repository).get("ref")
     if not isinstance(restart_ref, str):

@@ -9,7 +9,7 @@ The exposed command surface for the direct `aros` entry is:
 - `aros init`
 - `aros boot [--json]`
 - `aros status`
-- `aros start`
+- `aros start [--cooperative-human-direct]`
 - `aros checkpoint --cooperative-human-direct`
 - `aros transition audit`
 - `aros audit --rebuild-index`
@@ -34,8 +34,11 @@ The exposed command surface for the direct `aros` entry is:
   observation-ref CAS, candidate projection, crash reconciliation, and the
   disposable Git-derived assimilation index are implemented. The CLI
   human-direct route is explicitly cooperative.
-- A real cooperative Task→Eval→Assimilation→restart loop is commissioned at
-  `docs/analysis/aros-principal-loop-core-smoke.md`.
+- A real cooperative Task→Eval→Assimilation→restart loop is commissioned
+  through the native Arbor `Agent.run` loop at
+  `docs/analysis/aros-principal-loop-core-smoke.md`. The retained verifier
+  binds the Agent's exact tool sequence and semantic `Write` payloads to the
+  admitted Git blobs, then verifies a zero-message fresh Agent restart.
 - With a host-injected gateway, native Task/Run/Eval tools synchronously admit
   service-owned records at safe foreground seams. Services and runners carry
   only pure in-memory `OperationalIntent` values and no authority credentials.

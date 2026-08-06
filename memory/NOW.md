@@ -12,26 +12,21 @@ commissioned.
   Research tool, strict TransitionAudit, cooperative/ProContract receipt
   dispatch, Git CAS, projection/reconcile barriers, and the zero-trust
   transition index.
-- Clean source commit `19e4cf5` completed a real cooperative
-  Task→Eval→Measurement→Assimilation→restart commissioning run. The independent
-  verifier accepted final commit
-  `8bf357569fa7a784a0879afa0552cadeb29da659`; exact evidence is recorded in
+- Clean source `884439f` completed the replacement live cooperative
+  Task→Eval→Measurement→Assimilation→restart commissioning through the real
+  Arbor `Agent.run` loop. The independent verifier accepted final commit
+  `3733acc61c06e652f0fd0dd90c07f81ed17bcc28`; exact evidence is recorded in
   `docs/analysis/aros-principal-loop-core-smoke.md`.
-- The run used 17 real `aros` subprocesses with zero failures. Missing cache
-  conservatively redisplayed both observations; explicit rebuild restored the
-  admitted assimilation view. This proves restart continuity without making a
-  mediated or protected authority claim.
-- Final repository verification collected 2,105 tests and completed with
-  2,099 passed, 6 skipped, zero failures in 833.44 seconds; full Ruff and diff
-  checks also passed.
-- Task 9 recommissioning at clean source `ff3f67f` reduced the loop to 13
-  successful steps: TaskTool create/collect and EvalTool run admitted all
-  service records through the shared foreground checkpoint callback. The final
-  audit saw only ref-only Task/Eval/Run closure while scientific assimilation
-  remained explicit. Final commit:
-  `d432ccf54b19f54974e8c78fb4981be0f8ed030c`.
-- Post-Task-9 full verification collected 2,119 tests and completed with 2,113
-  passed, 6 skipped, zero failures in 779.96 seconds.
+- The primary Agent executed 16 turns: Attention, Task create/start/status/
+  collect, Eval, Attention, two Reads, three semantic Writes, audit, and
+  checkpoint. The verifier matched every Write byte to the admitted Git blobs.
+- The primary Agent/provider were destroyed. A zero-message fresh Agent called
+  only Attention, recovered `T-E2E-ASSIMILATE`, and saw no unassimilated Task or
+  measurement. The derived transition index was explicitly rebuilt from Git
+  between sessions; it remains non-authoritative.
+- This proves live Agent-loop composition and restart continuity in cooperative
+  mode. It does not prove external-model research quality, mediated/protected
+  authority, or non-bypass same-UID containment.
 
 - Integrated implementation baseline: `main@56c5375` in `/workspace/Arbor`.
 - Current implementation baselines are deliberately separated: immutable Run
@@ -94,7 +89,7 @@ commissioned.
   retry; Task adapters remain trusted-local, application-scoped, and not a
   security sandbox. Their containment and filesystem-permission limits are
   unchanged.
-- Protected registration/admission, disclosure budgets, migration adapters,
+- Protected registration/admission, disclosure budgets, AROS-native K/M/G,
   MCP parity, and Arbor retirement remain unavailable.
 - This repair does not commission all Phase 3 exits, Phase 4, or the complete
   AROS target.
@@ -112,9 +107,10 @@ commissioned.
 
 ## Next obligations
 
-1. Run the same vertical slice with a live Arbor Principal/model while retaining
+1. Run a non-fixture scientific turn with a real external model while retaining
    explicit assimilation and deterministic verification.
 2. Implement the Arbor-native protected broker/lease/fence domain and commission
    non-bypass authority; do not infer it from cooperative evidence.
-3. Complete protected Eval, Source Gateway, Skills/MCP/provider parity,
-   migration, and final Arbor compatibility retirement.
+3. Complete protected Eval, Source Gateway, project Skills, MCP/provider
+   parity, AROS-native K/M/G, and direct Arbor retirement without a compatibility
+   layer.

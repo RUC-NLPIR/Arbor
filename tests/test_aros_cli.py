@@ -11,6 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from arbor.cli.app import app
+from arbor.cli.aros_start import StartIntake
 from arbor.cli.commands import aros_cmd
 
 
@@ -163,7 +164,12 @@ def test_start_uses_user_llm_defaults_with_cli_overrides(
     monkeypatch.setattr(
         aros_cmd,
         "boot_workspace",
-        lambda root: "# Boot\nmission from workspace",
+        lambda root, *, context: "# Boot\nmission from workspace",
+    )
+    monkeypatch.setattr(
+        aros_cmd,
+        "status_workspace",
+        lambda root: {"initialized": True},
     )
 
     def fake_create_provider(config):
@@ -233,6 +239,116 @@ def test_start_uses_user_llm_defaults_with_cli_overrides(
         "attention_context": None,
     }
     assert seen["run"] == (fake_agent, "inspect the current evidence")
+
+
+def test_start_initializes_before_context_and_runs_native_principal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = tmp_path / "requested"
+    paper = tmp_path / "paper.md"
+    events: list[object] = []
+    fake_provider = object()
+    fake_agent = object()
+
+    monkeypatch.setattr(
+        aros_cmd,
+        "status_workspace",
+        lambda root: {"initialized": False},
+    )
+
+    def collect(**kwargs: object) -> StartIntake:
+        events.append(("collect", kwargs))
+        return StartIntake(
+            workspace=requested,
+            question="What mechanism matters?",
+            materials=(paper,),
+        )
+
+    def initialize(
+        workspace: Path,
+        question: str,
+        materials: tuple[Path, ...],
+    ) -> dict[str, object]:
+        events.append(("initialize", workspace, question, materials))
+        return {"commit": "a" * 40}
+
+    def boot(root: Path, *, context: object) -> str:
+        events.append(("boot", root, context))
+        return "exact canonical attention"
+
+    def build(provider: object, root: Path, context: str, **kwargs: object) -> object:
+        events.append(("build", provider, root, context, kwargs))
+        return fake_agent
+
+    async def run(agent: object, request: str) -> str:
+        events.append(("run", agent, request))
+        return "done"
+
+    monkeypatch.setattr(aros_cmd, "collect_start_intake", collect, raising=False)
+    monkeypatch.setattr(
+        aros_cmd,
+        "initialize_knowledge_bank",
+        initialize,
+        raising=False,
+    )
+    monkeypatch.setattr(aros_cmd, "render_start_transition", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(aros_cmd, "boot_workspace", boot)
+    monkeypatch.setattr(aros_cmd, "llm_defaults", lambda: {})
+    monkeypatch.setattr(aros_cmd, "create_provider", lambda config: fake_provider)
+    monkeypatch.setattr(aros_cmd, "build_principal_agent", build)
+    monkeypatch.setattr(aros_cmd, "run_principal", run)
+
+    result = runner.invoke(
+        aros_cmd.aros_app,
+        [
+            "start",
+            "research now",
+            "--cwd",
+            str(requested),
+            "--question",
+            "What mechanism matters?",
+            "--material",
+            str(paper),
+            "--cooperative-human-direct",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [event[0] for event in events] == [
+        "collect",
+        "initialize",
+        "boot",
+        "build",
+        "run",
+    ]
+    assert events[1] == (
+        "initialize",
+        requested,
+        "What mechanism matters?",
+        (paper,),
+    )
+    assert events[2][1] == requested.resolve()
+    assert events[2][2].authority["enforcement_class"] == "cooperative"
+
+
+def test_start_rejects_intake_arguments_for_initialized_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        aros_cmd,
+        "status_workspace",
+        lambda root: {"initialized": True},
+    )
+
+    result = runner.invoke(
+        aros_cmd.aros_app,
+        ["start", "--cwd", str(tmp_path), "--question", "Do not replace?"],
+    )
+
+    assert result.exit_code == 2
+    assert "already initialized" in result.output
 
 
 def test_start_does_not_import_or_construct_coordinator() -> None:

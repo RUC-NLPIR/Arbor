@@ -148,7 +148,16 @@ def _capture_start(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     captured: dict[str, object] = {}
     monkeypatch.setattr(aros_cmd, "llm_defaults", lambda: {})
     monkeypatch.setattr(aros_cmd, "create_provider", lambda config: object())
-    monkeypatch.setattr(aros_cmd, "boot_workspace", lambda root: "exact boot")
+    monkeypatch.setattr(
+        aros_cmd,
+        "status_workspace",
+        lambda root: {"initialized": True},
+    )
+    monkeypatch.setattr(
+        aros_cmd,
+        "boot_workspace",
+        lambda root, *, context: "exact boot",
+    )
 
     def build(provider: object, root: Path, boot: str, **kwargs: object) -> object:
         captured.update(root=root, boot=boot, kwargs=kwargs)

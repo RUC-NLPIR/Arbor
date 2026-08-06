@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sys
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -19,6 +20,7 @@ from ...aros.checkpoint import (
     _decode_human_direct_admission_receipt,
 )
 from ...aros.eval import EvalService, ExistingEvaluation
+from ...aros.intake import initialize_knowledge_bank
 from ...aros.principal import build_principal_agent, run_principal
 from ...aros.runs import RunService
 from ...aros.store import canonical_json_bytes
@@ -39,6 +41,10 @@ from ...aros.workspace import (
     status_workspace,
 )
 from ...core import AgentConfig, create_provider
+from ..aros_start import (
+    collect_start_intake,
+    render_start_transition,
+)
 
 
 _TASK_TRUST_BOUNDARY = (
@@ -760,7 +766,17 @@ def start_command(
         None,
         help="Current request. Omit to continue from the durable workspace state.",
     ),
-    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
+    cwd: Path | None = typer.Option(None, "--cwd", help="AROS workspace root."),
+    question: str | None = typer.Option(
+        None,
+        "--question",
+        help="Key Research Question for a new workspace.",
+    ),
+    material: list[Path] | None = typer.Option(
+        None,
+        "--material",
+        help="Local PDF or Markdown for a new workspace; repeatable.",
+    ),
     max_turns: int = typer.Option(100, "--max-turns", min=1),
     provider: str | None = typer.Option(None, "--provider"),
     model: str | None = typer.Option(None, "--model"),
@@ -779,7 +795,7 @@ def start_command(
     ),
 ) -> None:
     """Start a fresh native Principal from workspace state, never transcript replay."""
-    root = _root(cwd)
+    requested_root = _root(cwd or Path("."))
     config_values = dict(llm_defaults())
     if provider is not None:
         config_values["provider"] = provider
@@ -787,17 +803,6 @@ def start_command(
         config_values["model"] = model
 
     try:
-        config = AgentConfig(
-            **config_values,
-            cwd=str(root),
-            max_turns=max_turns,
-            auto_git=False,
-        )
-        provider_obj = create_provider(config)
-        boot_context = boot_workspace(root)
-        request = instruction or (
-            "Continue the research mission from the current workspace state."
-        )
         gateway = HumanDirectGateway() if cooperative_human_direct else None
         attention_context = (
             AttentionAuthorityContext(
@@ -814,6 +819,51 @@ def start_command(
             )
             if cooperative_human_direct
             else None
+        )
+        status = status_workspace(requested_root)
+        initialized = status.get("initialized") is True
+        if initialized:
+            if question is not None or material:
+                raise ValueError(
+                    "workspace is already initialized; intake arguments are invalid"
+                )
+            root = requested_root
+        else:
+            interactive = bool(
+                getattr(sys.stdin, "isatty", lambda: False)()
+                and getattr(sys.stdout, "isatty", lambda: False)()
+            )
+            intake = collect_start_intake(
+                workspace=cwd,
+                question=question,
+                materials=material,
+                interactive=interactive,
+            )
+            initialize_knowledge_bank(
+                intake.workspace,
+                intake.question,
+                intake.materials,
+            )
+            root = _root(intake.workspace)
+            if interactive:
+                render_start_transition(
+                    intake,
+                    authority_class=(
+                        "cooperative" if cooperative_human_direct else "unavailable"
+                    ),
+                    max_turns=max_turns,
+                    allow_shell=allow_shell,
+                )
+        config = AgentConfig(
+            **config_values,
+            cwd=str(root),
+            max_turns=max_turns,
+            auto_git=False,
+        )
+        provider_obj = create_provider(config)
+        boot_context = boot_workspace(root, context=attention_context)
+        request = instruction or (
+            "Continue the research mission from the current workspace state."
         )
         agent = build_principal_agent(
             provider_obj,

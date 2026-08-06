@@ -184,11 +184,15 @@ def commission(aros: Path, runtime: Path, human_review: Path) -> Path:
         "resolved.\n",
         encoding="utf-8",
     )
+    question = (
+        "Does changing candidate mode activate the measured mediator under the "
+        "fixed evaluator?"
+    )
     from arbor.aros.intake import initialize_knowledge_bank
 
     intake = initialize_knowledge_bank(
         driver.project,
-        "Does changing candidate mode activate the measured mediator under the fixed evaluator?",
+        question,
         [source],
     )
     scorer_sha256 = hashlib.sha256(scorer.read_bytes()).hexdigest()
@@ -347,6 +351,7 @@ def commission(aros: Path, runtime: Path, human_review: Path) -> Path:
         "intake_commit": intake["commit"],
         "apparatus_commit": apparatus_commit,
         "final_commit": driver.git("rev-parse", "HEAD"),
+        "question": question,
         "primary": primary,
         "restart": restart,
         "aros_executable": str(aros),

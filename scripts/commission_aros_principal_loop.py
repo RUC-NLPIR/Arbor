@@ -157,17 +157,14 @@ def commission(aros: Path, runtime: Path) -> Path:
     if runtime.exists():
         raise CommissioningError(f"runtime must not already exist: {runtime}")
     runtime.mkdir(parents=True)
-    driver.project.mkdir()
-    driver.git("init", "-q", "-b", "main")
+    from arbor.aros.intake import initialize_knowledge_bank
+
+    initialize_knowledge_bank(
+        driver.project,
+        "Does the deterministic candidate produce the expected valid measurement?",
+    )
     driver.git("config", "user.email", "commissioning@example.invalid")
     driver.git("config", "user.name", "AROS Commissioning")
-    driver.json_command(
-        "init",
-        "--mission",
-        "Prove one real cooperative Task-to-Eval-to-assimilation restart loop.",
-    )
-    driver.git("add", ".")
-    driver.git("commit", "-qm", "initialize AROS commissioning workspace")
 
     adapter_target = driver.project / "commissioning/principal_loop/task_adapter.py"
     scorer_target = driver.project / "commissioning/principal_loop/evaluation/score.py"

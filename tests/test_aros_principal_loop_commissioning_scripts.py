@@ -556,6 +556,8 @@ def test_driver_uses_native_agent_and_has_no_direct_tool_or_semantic_path() -> N
 
     assert "build_principal_agent" in source
     assert "run_principal" in source
+    assert "initialize_knowledge_bank" in source
+    assert 'driver.json_command(\n        "init"' not in source
     assert methods.isdisjoint(
         {
             "_checkpoint_service",

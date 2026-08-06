@@ -104,6 +104,14 @@
       "status": "current",
       "authority": "informative",
       "agent_visibility": "on_demand"
+    },
+    {
+      "id": "aros-principal-loop-core-smoke",
+      "title": "AROS Principal Loop Cooperative E2E Evidence",
+      "path": "docs/analysis/aros-principal-loop-core-smoke.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
     }
   ]
 }

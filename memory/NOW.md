@@ -8,6 +8,23 @@ commissioned.
 
 ## Current position
 
+- The Arbor-native Principal Loop core is implemented through the sealed
+  Research tool, strict TransitionAudit, cooperative/ProContract receipt
+  dispatch, Git CAS, projection/reconcile barriers, and the zero-trust
+  transition index.
+- Clean source commit `19e4cf5` completed a real cooperative
+  Task→Eval→Measurement→Assimilation→restart commissioning run. The independent
+  verifier accepted final commit
+  `8bf357569fa7a784a0879afa0552cadeb29da659`; exact evidence is recorded in
+  `docs/analysis/aros-principal-loop-core-smoke.md`.
+- The run used 17 real `aros` subprocesses with zero failures. Missing cache
+  conservatively redisplayed both observations; explicit rebuild restored the
+  admitted assimilation view. This proves restart continuity without making a
+  mediated or protected authority claim.
+- Final repository verification collected 2,105 tests and completed with
+  2,099 passed, 6 skipped, zero failures in 833.44 seconds; full Ruff and diff
+  checks also passed.
+
 - Integrated implementation baseline: `main@56c5375` in `/workspace/Arbor`.
 - Current implementation baselines are deliberately separated: immutable Run
   terminal projection is `01a72f07ed6bc88fa6d7bd5fbe1527d985ffe558`;
@@ -87,9 +104,11 @@ commissioned.
 
 ## Next obligations
 
-1. Implement and commission protected registration/admission as a separate
-   Gate C-D change; do not infer it from visible evidence.
-2. Consolidate Run/Task into the shared Operations process core, including
-   delegated per-task cgroups for runner-death containment.
-3. Complete provider profiles, Principal lease, `child_done`, semantic
-   K/M/G/Skills, MCP/provider parity, migration, and Arbor retirement waves.
+1. Run the same vertical slice with a live Arbor Principal/model while retaining
+   explicit assimilation and deterministic verification.
+2. Automate Task/Run/Eval operational admission at the foreground service seams
+   without giving services or runners authority credentials.
+3. Implement the Arbor-native protected broker/lease/fence domain and commission
+   non-bypass authority; do not infer it from cooperative evidence.
+4. Complete protected Eval, Source Gateway, Skills/MCP/provider parity,
+   migration, and final Arbor compatibility retirement.

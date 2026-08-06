@@ -7,9 +7,12 @@ AROS is the Agent-centric research operating system being commissioned in this r
 The exposed command surface for the direct `aros` entry is:
 
 - `aros init`
-- `aros boot`
+- `aros boot [--json]`
 - `aros status`
 - `aros start`
+- `aros checkpoint --cooperative-human-direct`
+- `aros transition audit`
+- `aros audit --rebuild-index`
 - `aros run start|status|list|tail|stop`
 - `aros task create|start|status|list|message|stop|collect|preserve|prune`
 - `aros eval register|run|status|observe|audit`
@@ -23,12 +26,23 @@ The exposed command surface for the direct `aros` entry is:
 - V1 terminal truth covers the exact PGID plus descendants reparented to the live subreaper. A new-session process that outlives runner death is not claimed contained and cannot justify a clean final receipt or prune. Delegated per-task cgroups belong to the shared Operations process core, not the Wave 2 security claim.
 - Launch and final receipts record whether the filesystem enforces requested file modes. On a mode-normalizing filesystem, integrity checks remain active but `filesystem_permissions_enforced=false`.
 - Visible evaluation binds exact candidate and apparatus commits and executes through the durable Run service. The apparatus produces factual measurements, the Principal interprets them, and a lost evaluation is never retried with the same idempotency key; a new attempt requires a new Principal action and key.
+- The native Principal receives one sealed `Research` tool with only
+  `attention`, `transition_audit`, and `checkpoint`. Authority context and a
+  checkpoint gateway are host-injected; no human-direct selector is visible to
+  the model.
+- Checkpoint preparation, strict receipt/fence validation, atomic canonical and
+  observation-ref CAS, candidate projection, crash reconciliation, and the
+  disposable Git-derived assimilation index are implemented. The CLI
+  human-direct route is explicitly cooperative.
+- A real cooperative Task→Eval→Assimilation→restart loop is commissioned at
+  `docs/analysis/aros-principal-loop-core-smoke.md`.
 
 ## Not yet implemented
 
 - protected evaluation registration and admission
-- shared mechanical Operations events, budgets, leases, checkpoints, search,
-  and audit
+- automatic Task/Run/Eval operational admission and shared Operations budgets,
+  leases, and search
+- Arbor-native protected broker authority and non-bypass commissioning
 - project-local user-space Skills lifecycle and procedural memory
 - provider child profiles/adapters, `child_done`, and positive assimilation
 - semantic K/M/G plus one-way migration adapters

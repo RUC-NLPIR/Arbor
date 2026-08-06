@@ -44,7 +44,8 @@
 > from `src/` to outside `src/` as no growth inside its guarded source scope;
 > review must confirm that the destination is not configured as a Python package
 > and that no remaining entry or import refers to it.
-> Other `arbor` commands remain legacy implementations until migrated.
+> Other `arbor` commands remain legacy implementations until equivalent AROS
+> paths are commissioned and the old paths are deleted.
 
 <p align="center">
   <i>Give Arbor a benchmark and a goal. It proposes hypotheses, edits code, runs real

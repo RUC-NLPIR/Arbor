@@ -6,10 +6,9 @@ AROS is the Agent-centric research operating system being commissioned in this r
 
 The exposed command surface for the direct `aros` entry is:
 
-- `aros init`
 - `aros boot [--json]`
 - `aros status`
-- `aros start [--cooperative-human-direct]`
+- `aros start [--question TEXT] [--material PATH] [--cooperative-human-direct]`
 - `aros checkpoint --cooperative-human-direct`
 - `aros transition audit`
 - `aros audit --rebuild-index`
@@ -18,6 +17,11 @@ The exposed command surface for the direct `aros` entry is:
 - `aros eval register|run|status|observe|audit`
 
 ### Runtime requirements
+
+- On an uninitialized workspace, `aros start` requires an exact Key Research
+  Question and accepts repeatable local PDF/Markdown materials. It creates one
+  Question-centered Git KnowledgeBank commit, then starts the native Principal.
+  An initialized workspace skips intake and boots directly from Attention.
 
 - Durable launch with `aros run start` requires a clean committed Git HEAD and `tmux`.
 - `aros task start` requires its immutable brief to be committed at a clean parent HEAD and requires `tmux`; collection records reviewed B-C-R pointers without merging or cherry-picking the child.

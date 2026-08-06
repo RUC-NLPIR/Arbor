@@ -45,8 +45,16 @@
       "id": "aros-native-start-intake-design",
       "title": "AROS Native Start and Local Research Intake Design",
       "path": "docs/superpowers/specs/2026-08-06-aros-native-start-intake-design.md",
-      "status": "proposed",
+      "status": "current",
       "authority": "implementation_baseline",
+      "agent_visibility": "on_demand"
+    },
+    {
+      "id": "aros-native-start-smoke",
+      "title": "AROS Native Start and Local Intake E2E Evidence",
+      "path": "docs/analysis/aros-native-start-smoke.md",
+      "status": "current",
+      "authority": "informative",
       "agent_visibility": "on_demand"
     },
     {

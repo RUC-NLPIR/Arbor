@@ -181,14 +181,14 @@ def test_current_default_baseline_uses_direct_aros_entry() -> None:
     baseline = baseline_path.read_text(encoding="utf-8")
 
     assert "新原生入口直接使用 `aros`" in baseline
-    assert "`arbor aros` 仅作为临时转发兼容入口" in baseline
+    assert "legacy `arbor` root 不再挂载 AROS" in baseline
+    assert "转发兼容层" in baseline
 
 
 def test_aros_public_docs_use_direct_entry() -> None:
     text = (_ROOT / "docs" / "aros" / "README.md").read_text(encoding="utf-8")
 
     for command in (
-        "aros init",
         "aros boot",
         "aros status",
         "aros start",
@@ -197,11 +197,13 @@ def test_aros_public_docs_use_direct_entry() -> None:
         "aros eval register|run|status|observe|audit",
     ):
         assert command in text
-    assert "`arbor aros` is a temporary forwarding compatibility route" in text
+    assert "aros init" not in text
+    assert "The legacy `arbor` root does not mount AROS" in text
+    assert "temporary forwarding compatibility route" not in text
     assert "## Not yet implemented" in text
     for unavailable_capability in (
         "protected evaluation registration and admission",
-        "migration adapters",
+        "AROS-native semantic K/M/G",
         "MCP parity",
         "Arbor retirement",
     ):
@@ -269,16 +271,22 @@ def test_task_docs_publish_the_exact_v1_containment_claim() -> None:
         ) in text
 
 
-def test_aros_migration_docs_match_the_ci_freeze_scope() -> None:
+def test_aros_replacement_docs_match_the_ci_freeze_scope() -> None:
     root_readme = (_ROOT / "README.md").read_text(encoding="utf-8")
     public_guide = (_ROOT / "docs" / "aros" / "README.md").read_text(
         encoding="utf-8"
     )
 
     for text in (root_readme, public_guide):
+        normalized = " ".join(
+            " ".join(line.lstrip("> ") for line in text.splitlines()).split()
+        )
         for frozen_root in _FROZEN_ROOTS:
             assert f"`{frozen_root}`" in text
-        assert "Other `arbor` commands remain legacy implementations until migrated." in text
+        assert (
+            "Other `arbor` commands remain legacy implementations until equivalent "
+            "AROS paths are commissioned and the old paths are deleted."
+        ) in normalized
         assert "Existing Arbor research commands remain frozen" not in text
         assert "frozen compatibility paths" not in text
 

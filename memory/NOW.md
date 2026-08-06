@@ -8,16 +8,25 @@ commissioned.
 
 ## Current position
 
+- Native `aros start` now owns first boot and local intake. A clean-wheel run
+  created Q-0001, ingested exact local Markdown bytes/hash/extraction/provenance,
+  started a real Principal that read both Question and source, then recovered
+  Q-0001 in a zero-message Attention restart. Independent evidence:
+  `docs/analysis/aros-native-start-smoke.md`.
+- Public `aros init`, the `arbor aros` forwarding mount/warning, and the E4
+  compatibility hash exception are deleted. Direct `aros` is the only AROS
+  entry; no migration reader or alias was added.
+
 - The Arbor-native Principal Loop core is implemented through the sealed
   Research tool, strict TransitionAudit, cooperative/ProContract receipt
   dispatch, Git CAS, projection/reconcile barriers, and the zero-trust
   transition index.
-- Clean source `884439f` completed the replacement live cooperative
+- Clean product `9a51787` completed the replacement live cooperative
   Task→Eval→Measurement→Assimilation→restart commissioning through the real
   Arbor `Agent.run` loop. The independent verifier accepted final commit
-  `3733acc61c06e652f0fd0dd90c07f81ed17bcc28`; exact evidence is recorded in
+  `a0f10647738e16eb5b9d0f9a7a2926c8d35813d3`; exact evidence is recorded in
   `docs/analysis/aros-principal-loop-core-smoke.md`.
-- The primary Agent executed 16 turns: Attention, Task create/start/status/
+- The primary Agent executed 15 turns: Attention, Task create/start/status/
   collect, Eval, Attention, two Reads, three semantic Writes, audit, and
   checkpoint. The verifier matched every Write byte to the admitted Git blobs.
 - The primary Agent/provider were destroyed. A zero-message fresh Agent called

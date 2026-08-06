@@ -2,7 +2,8 @@
 
 ## Result
 
-Clean source commit `884439f` completed the real Arbor-native Agent loop:
+Clean product commit `9a51787` completed the real Arbor-native Agent loop after
+native Question-centered intake replaced the old initialization command:
 
 ```text
 fresh Agent.run + Research Attention
@@ -22,12 +23,12 @@ The commissioning command and a separate verifier invocation both returned:
 
 ```json
 {
-  "commit": "3733acc61c06e652f0fd0dd90c07f81ed17bcc28",
+  "commit": "a0f10647738e16eb5b9d0f9a7a2926c8d35813d3",
   "enforcement_class": "cooperative",
   "eval_id": "EVAL-3f8827231c530d3c42fc30f85e399d8f3b26f5999bec9664cf49da389cab64c2",
   "schema_version": 1,
   "state": "verified",
-  "task_id": "TASK-20260806-produce-one-deterministic-succes-9fb25637cb727da3"
+  "task_id": "TASK-20260806-produce-one-deterministic-succes-20ecf7da52eefed7"
 }
 ```
 
@@ -37,10 +38,10 @@ same-UID containment.
 
 ## Clean wheel
 
-- Source commit: `884439fe8`
-- Wheel: `arbor_agent-0.1.1.dev445+g884439fe8-py3-none-any.whl`
+- Source commit: `9a5178773`
+- Wheel: `arbor_agent-0.1.1.dev456+g9a5178773-py3-none-any.whl`
 - Wheel SHA-256:
-  `4b17dd0f4aedf8479e2e059bc779e7f4ac69113d52cd1645ea7e5c2b196e5075`
+  `0dc68243f6f55eae050fb2850cc218e121277e9b74b976a355918a0487a61a39`
 - Wheel environment used a normal dependency-resolving install from the
   existing `pyproject.toml`; it used no editable install, `.pth` dependency
   fallback, `PYTHONPATH`, or `uv`.
@@ -48,19 +49,18 @@ same-UID containment.
 The retained evidence is:
 
 ```text
-/workspace/Arbor/.worktree/commissioning/aros-live-agent-run-3/evidence.json
+/workspace/Arbor/.worktree/commissioning/aros-principal-loop-native-intake-run-1/evidence.json
 ```
 
 ## Agent provenance
 
-The primary object was `arbor.core.agent.Agent`. It finished after 16 provider
+The primary object was `arbor.core.agent.Agent`. It finished after 15 provider
 turns with this exact normalized tool sequence:
 
 ```text
 Research.attention
 Task.create
 Task.start
-Task.status
 Task.status
 Task.collect
 Eval.run
@@ -78,9 +78,9 @@ The verifier requires the complete sequence and compares each final Git blob
 byte-for-byte with its Agent `Write` argument:
 
 ```text
-46b6a1868006df8712ca83e1ef8b1b9f81475c699b93af3a71da7524374692b3  knowledge/claims/C-0001.md
-2eb75ef8a1b04602056cc4b7783368371d922c72b7498e931c6c7e7cfca51169  memory/NOW.md
-bacaf1809d68c102eabddfa1df8a4b38d6cbef11ab89d1d9c95343ca301fefba  transitions/T-E2E-ASSIMILATE/proposal.json
+f8f4e2ef30552fb8b30fb9e2fcf6f43864e0f903ca566a1cc30377caf9a35e49  knowledge/claims/C-0001.md
+652ecef4974ed6c576b619efd2852a33725c7c7889c017eaa671d292c9f4f8ba  memory/NOW.md
+9560bd5702fa80fd53c9444386939e504cf5071cfcdf0d4de8cbd9fa990ef824  transitions/T-E2E-ASSIMILATE/proposal.json
 ```
 
 The commissioning driver creates only the initial workspace, Task adapter,
@@ -91,22 +91,22 @@ the Agent starts.
 ## Exact lineage
 
 - Task candidate commit `C`:
-  `32a38a1b0481eb20eb6d1a290a72b4d2eb2e9516`
+  `062f069b85297d723f53137e00aaa8092642b961`
 - Task return commit `R`:
-  `2809d85fac9fe49a7487e0e0cef3ac63cf6c0beb`
+  `58dcc055258c25318e47831a31fab3a341371210`
 - Task collection SHA-256:
-  `5414078422c8019d410550882c123b37cf07292bb06391f2970b1f1f486653b7`
+  `e88dabd34f66269dda3cd37ca03dc637084ce1a93eb09f59d0273de521467453`
 - Eval candidate commit:
-  `32a38a1b0481eb20eb6d1a290a72b4d2eb2e9516`
+  `062f069b85297d723f53137e00aaa8092642b961`
 - Measurement: `principal_loop_quality=1.0`, `measurement_state=valid`
 - Eval receipt SHA-256:
-  `a90182a4c97e401914d167e200a314ad7caff5db09c5a76ac6d58abb26d15b0a`
+  `6a5bd5f153f83ed40b98099d361765afee92e4d869bb1f6a137dbea6b34dab58`
 - Assimilation base:
-  `08e07918dc63524973cef0bba46420e077589663`
+  `bdfc68b192f5d1a7d9e3a6a7ba573e9a76d77cad`
 - Final assimilation commit:
-  `3733acc61c06e652f0fd0dd90c07f81ed17bcc28`
+  `a0f10647738e16eb5b9d0f9a7a2926c8d35813d3`
 - Cooperative admission receipt SHA-256:
-  `2718961ef092daea9bbf50902f4cfa72e5fb7a5e61efe003e292f2d95c1eab51`
+  `806cac45ae99d68c403dd66b936b4eb1307c40e0b0443e79dfa0c3f03dda03ff`
 
 The final proposal contains one explicit Task assimilation and one explicit
 measurement assimilation. The Claim contains one strict `supports`
@@ -123,7 +123,7 @@ was constructed. The restart Agent began with zero messages, invoked only
 Recovered admitted transition T-E2E-ASSIMILATE.
 ```
 
-Its packet named final commit `3733acc`, contained transition
+Its packet named final commit `a0f1064`, contained transition
 `T-E2E-ASSIMILATE` as the recent evidence delta, and had an empty
 `unassimilated_returns` list. The driver used the existing explicit
 `aros audit --rebuild-index` mechanical operation between sessions; the index

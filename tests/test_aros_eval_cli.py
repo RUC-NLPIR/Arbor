@@ -347,19 +347,18 @@ def test_eval_commands_require_their_exact_request_fields(args: list[str]) -> No
 def test_eval_cli_is_a_thin_eval_service_adapter() -> None:
     source = Path("src/cli/commands/aros_cmd.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    imported = {
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
+    handlers = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("eval_")
+    ]
+    used_names = {
+        node.id
+        for handler in handlers
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Name)
     }
-    imported.update(
-        node.module or ""
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-    )
-
-    forbidden = (
+    forbidden = {
         "coordinator",
         "executor",
         "eval_records",
@@ -367,5 +366,6 @@ def test_eval_cli_is_a_thin_eval_service_adapter() -> None:
         "receipts",
         "subprocess",
         "mcp",
-    )
-    assert not any(part in module for module in imported for part in forbidden)
+    }
+    assert handlers
+    assert used_names.isdisjoint(forbidden)

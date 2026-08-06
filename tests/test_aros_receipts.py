@@ -69,7 +69,16 @@ def _init_repo(root: Path, *, task_workspace: bool = False) -> None:
     _git(root, "commit", "-qm", "initial state")
     if task_workspace:
         init_workspace(root, "Receipt compatibility")
-        _git(root, "add", ".gitignore", "AGENTS.md", "AROS.md", "memory/NOW.md")
+        _git(
+            root,
+            "add",
+            ".gitignore",
+            "AGENTS.md",
+            "AROS.md",
+            "memory/NOW.md",
+            "model/CURRENT.md",
+            "questions/FRONTIER.md",
+        )
         _git(root, "commit", "-qm", "initialize AROS")
 
 

@@ -1904,6 +1904,66 @@ def test_checkpoint_calls_gateway_admit_and_revalidate_once_each(
     )
 
 
+def test_operational_checkpoint_binds_current_base_and_reuses_shared_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arbor.aros.operational import build_operational_intent
+
+    base, canonical_ref = _init_repository(tmp_path)
+    record_path = "tasks/TASK-20260805-operational/brief.json"
+    path = tmp_path / record_path
+    path.parent.mkdir(parents=True)
+    path.write_text("{}\n", encoding="utf-8")
+    principal = tmp_path / "transitions/T-PRINCIPAL/proposal.json"
+    principal.parent.mkdir(parents=True)
+    principal.write_text("principal-owned\n", encoding="utf-8")
+    service = CheckpointService(
+        tmp_path,
+        canonical_repository=bind_repository(tmp_path),
+        canonical_ref=canonical_ref,
+    )
+    calls: list[tuple[str, str]] = []
+
+    def checkpoint(proposal_ref: str, message: str) -> dict[str, object]:
+        calls.append((proposal_ref, message))
+        return {
+            "state": "admitted",
+            "commit": _git_text(tmp_path, "rev-parse", "HEAD"),
+        }
+
+    monkeypatch.setattr(service, "checkpoint", checkpoint)
+    intent = build_operational_intent((record_path,), "a" * 64)
+
+    first = service.checkpoint_operational(intent)
+    second = service.checkpoint_operational(intent)
+
+    first_ref = f"transitions/T-OPS-{base[:12]}-aaaaaaaaaaaa/proposal.json"
+    assert calls == [
+        (first_ref, "Admit operational record aaaaaaaaaaaa."),
+        (first_ref, "Admit operational record aaaaaaaaaaaa."),
+    ]
+    assert first == second
+    assert json.loads((tmp_path / first_ref).read_bytes()) == {
+        "schema_version": 1,
+        "base_commit": base,
+        "workspace_paths": [record_path],
+        "assimilations": [],
+    }
+
+    (tmp_path / "unrelated.txt").write_text("next base\n", encoding="utf-8")
+    _git(tmp_path, "add", "unrelated.txt")
+    _git(tmp_path, "commit", "-qm", "advance operational base")
+    next_base = _git_text(tmp_path, "rev-parse", "HEAD")
+
+    service.checkpoint_operational(intent)
+
+    next_ref = f"transitions/T-OPS-{next_base[:12]}-aaaaaaaaaaaa/proposal.json"
+    assert calls[-1] == (next_ref, "Admit operational record aaaaaaaaaaaa.")
+    assert (tmp_path / next_ref).is_file()
+    assert principal.read_text(encoding="utf-8") == "principal-owned\n"
+
+
 @pytest.mark.parametrize(
     "drift",
     ("message", "candidate", "proposal", "prepared_bytes"),

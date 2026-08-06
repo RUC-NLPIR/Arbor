@@ -2975,3 +2975,43 @@ def test_operational_proposal_factory_validates_inputs(
 ) -> None:
     with pytest.raises(TransitionError):
         build_operational_proposal(base_commit, workspace_paths, record_sha256)
+
+
+def test_operational_intent_is_minimal_sorted_and_never_assimilates() -> None:
+    from arbor.aros.operational import build_operational_intent
+
+    intent = build_operational_intent(
+        [
+            "tasks/TASK-20260805-operational/brief.json",
+            "tasks/TASK-20260805-operational/brief.json",
+        ],
+        "a" * 64,
+    )
+
+    assert intent.schema_version == 1
+    assert intent.workspace_paths == (
+        "tasks/TASK-20260805-operational/brief.json",
+    )
+    assert intent.record_sha256 == "a" * 64
+    assert intent.to_json() == {
+        "schema_version": 1,
+        "workspace_paths": ["tasks/TASK-20260805-operational/brief.json"],
+        "record_sha256": "a" * 64,
+    }
+    assert {
+        "base_commit",
+        "actor",
+        "gateway",
+        "contract",
+        "lease",
+        "canonical_ref",
+        "credential",
+        "assimilations",
+    }.isdisjoint(intent.to_json())
+    transition_id, proposal = build_operational_proposal(
+        "b" * 40,
+        intent.workspace_paths,
+        intent.record_sha256,
+    )
+    assert transition_id == "T-OPS-bbbbbbbbbbbb-aaaaaaaaaaaa"
+    assert proposal["assimilations"] == []

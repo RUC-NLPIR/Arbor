@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from arbor.aros.operational import build_operational_intent
 from arbor.aros.tasks import TaskError
 
 
@@ -51,6 +52,13 @@ class FakeTaskService:
         )
         return {"task_id": "TASK-test", "state": "prepared"}
 
+    def create_with_operational_intent(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        record = self.create(*args, **kwargs)
+        return record, build_operational_intent(
+            ("tasks/TASK-test/brief.json",),
+            "b" * 64,
+        )
+
     def start(self, task_id: str, *, actor: str | None = None) -> dict[str, Any]:
         self.calls.append(("start", task_id, actor))
         return {"task_id": task_id, "state": "running"}
@@ -80,7 +88,18 @@ class FakeTaskService:
 
     def collect(self, task_id: str) -> dict[str, Any]:
         self.calls.append(("collect", task_id))
-        return {"task_id": task_id, "state": "collected"}
+        return {
+            "task_id": task_id,
+            "state": "collected",
+            "collected_sha256": "c" * 64,
+        }
+
+    def collect_with_operational_intent(self, task_id: str):  # type: ignore[no-untyped-def]
+        record = self.collect(task_id)
+        return record, build_operational_intent(
+            (f"tasks/{task_id}/collected.json",),
+            "c" * 64,
+        )
 
     def preserve(self, task_id: str) -> dict[str, Any]:
         self.calls.append(("preserve", task_id))
@@ -212,11 +231,50 @@ def test_create_freezes_default_brief_without_starting(tmp_path: Path) -> None:
             "seed-inspection",
         ),
     ]
-    assert output == json.dumps(
-        {"task_id": "TASK-test", "state": "prepared"},
-        ensure_ascii=False,
-        indent=2,
+    assert json.loads(output) == {
+        "task_id": "TASK-test",
+        "state": "prepared",
+        "admission_required": True,
+        "operational_intent": {
+            "schema_version": 1,
+            "workspace_paths": ["tasks/TASK-test/brief.json"],
+            "record_sha256": "b" * 64,
+        },
+    }
+    assert not any(tmp_path.rglob("proposal.json"))
+
+
+def test_create_callback_admits_operational_intent_once(tmp_path: Path) -> None:
+    calls: list[object] = []
+
+    def admit(intent: object) -> dict[str, object]:
+        calls.append(intent)
+        return {"state": "admitted", "commit": "d" * 40}
+
+    tool = _task_tool()(cwd=str(tmp_path), operational_admission=admit)
+
+    output = _execute(
+        tool,
+        action="create",
+        objective="inspect the failing seed",
+        mode="read_only",
+        adapter_argv=["adapter"],
+        idempotency_key="seed-callback",
     )
+
+    assert len(calls) == 1
+    assert getattr(calls[0], "record_sha256") == "b" * 64
+    assert json.loads(output) == {
+        "task_id": "TASK-test",
+        "state": "prepared",
+        "admission_required": False,
+        "operational_intent": {
+            "schema_version": 1,
+            "workspace_paths": ["tasks/TASK-test/brief.json"],
+            "record_sha256": "b" * 64,
+        },
+        "operational_checkpoint": {"state": "admitted", "commit": "d" * 40},
+    }
 
 
 def test_create_forwards_explicit_bounded_brief_fields(tmp_path: Path) -> None:
@@ -290,7 +348,17 @@ def test_start_message_and_stop_use_principal_actor(tmp_path: Path) -> None:
         (
             "collect",
             ("collect", "TASK-test"),
-            {"task_id": "TASK-test", "state": "collected"},
+            {
+                "task_id": "TASK-test",
+                "state": "collected",
+                "collected_sha256": "c" * 64,
+                "admission_required": True,
+                "operational_intent": {
+                    "schema_version": 1,
+                    "workspace_paths": ["tasks/TASK-test/collected.json"],
+                    "record_sha256": "c" * 64,
+                },
+            },
         ),
         (
             "preserve",

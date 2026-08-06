@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 from ..core.tools.base import Tool
+from .operational import OperationalIntent
 from .tasks import TaskError, TaskService
 
 
@@ -80,6 +82,34 @@ class TaskTool(Tool):
     is_read_only = False
     persist_threshold = float("inf")
 
+    def __init__(
+        self,
+        *,
+        operational_admission: Callable[[OperationalIntent], dict[str, object]]
+        | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        if operational_admission is not None and not callable(operational_admission):
+            raise TypeError("operational_admission must be callable or None")
+        self.operational_admission = operational_admission
+
+    def _operational_result(
+        self,
+        record: dict[str, object],
+        intent: OperationalIntent | None,
+    ) -> dict[str, object]:
+        if intent is None:
+            return record
+        result = {
+            **record,
+            "admission_required": self.operational_admission is None,
+            "operational_intent": intent.to_json(),
+        }
+        if self.operational_admission is not None:
+            result["operational_checkpoint"] = self.operational_admission(intent)
+        return result
+
     async def execute(self, **kwargs: Any) -> str:
         action = kwargs.get("action")
         if action is None:
@@ -105,7 +135,7 @@ class TaskTool(Tool):
 
         service = TaskService(self.cwd)
         if action == "create":
-            result = service.create(
+            record, intent = service.create_with_operational_intent(
                 kwargs["objective"],
                 actor="principal",
                 mode=kwargs["mode"],
@@ -119,6 +149,7 @@ class TaskTool(Tool):
                 timeout_seconds=kwargs.get("timeout_seconds", 3600),
                 idempotency_key=kwargs["idempotency_key"],
             )
+            result = self._operational_result(record, intent)
         elif action == "start":
             result = service.start(kwargs["task_id"], actor="principal")
         elif action == "status":
@@ -138,7 +169,10 @@ class TaskTool(Tool):
                 reason=kwargs["reason"],
             )
         elif action == "collect":
-            result = service.collect(kwargs["task_id"])
+            record, intent = service.collect_with_operational_intent(
+                kwargs["task_id"]
+            )
+            result = self._operational_result(record, intent)
         elif action == "preserve":
             result = service.preserve(kwargs["task_id"])
         else:

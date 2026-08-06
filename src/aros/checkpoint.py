@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Protocol
 
+from .operational import OperationalIntent
 from .store import (
     AnchoredReadError,
     AnchoredReadLimitError,
@@ -38,6 +39,7 @@ from .transitions import (
     MAX_VERSIONED_FILE_BYTES,
     MAX_WORKSPACE_PATHS,
     TransitionAuditService,
+    build_operational_proposal,
 )
 from .worktrees import (
     RepositoryBinding,
@@ -636,6 +638,35 @@ class CheckpointService:
         if not isinstance(fence, bytes):
             raise CheckpointError("admission gateway must return exact fence bytes")
         return self.finalize(prepared.prepared_ref, receipt, fence)
+
+    def checkpoint_operational(self, intent: OperationalIntent) -> dict[str, object]:
+        """Bind one pure service intent to the current base and shared checkpoint."""
+        if not isinstance(intent, OperationalIntent):
+            raise CheckpointError("operational checkpoint requires an OperationalIntent")
+        self._require_bindings()
+        base_commit = resolve_repository_commit(
+            self.canonical_repository,
+            self.canonical_ref,
+        )
+        transition_id, proposal = build_operational_proposal(
+            base_commit,
+            intent.workspace_paths,
+            intent.record_sha256,
+        )
+        directory = _ensure_runtime_directory(
+            self.candidate_repository.root,
+            ("transitions", transition_id),
+        )
+        proposal_path = directory / "proposal.json"
+        if not create_json(proposal_path, proposal):
+            existing = _read_plain_file(proposal_path, max_bytes=MAX_VERSIONED_FILE_BYTES)
+            if existing != _stored_json_bytes(proposal):
+                raise CheckpointError("operational proposal conflicts with existing bytes")
+        proposal_ref = f"transitions/{transition_id}/proposal.json"
+        return self.checkpoint(
+            proposal_ref,
+            f"Admit operational record {intent.record_sha256[:12]}.",
+        )
 
     def _recover_checkpoint_retry(
         self,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -97,6 +99,43 @@ class Driver:
             record=False,
         ).stdout.strip()
 
+    def task_tool(self, **kwargs: object) -> dict[str, object]:
+        from arbor.aros.checkpoint import CheckpointService
+        from arbor.aros.task_tool import TaskTool
+        from arbor.aros.worktrees import bind_repository, read_repository_snapshot
+        from arbor.cli.commands.aros_cmd import HumanDirectGateway
+
+        repository = bind_repository(self.project)
+        canonical_ref = read_repository_snapshot(repository).get("ref")
+        if not isinstance(canonical_ref, str):
+            raise CommissioningError("TaskTool requires an attached canonical ref")
+        checkpoint = CheckpointService(
+            self.project,
+            canonical_repository=repository,
+            canonical_ref=canonical_ref,
+            gateway=HumanDirectGateway(),
+        )
+        tool = TaskTool(
+            cwd=str(self.project),
+            operational_admission=checkpoint.checkpoint_operational,
+            persist_results=False,
+        )
+        output = asyncio.run(tool.execute(**kwargs))
+        value = json.loads(output)
+        if not isinstance(value, dict):
+            raise CommissioningError("TaskTool returned non-object JSON")
+        self.commands.append(
+            {
+                "sequence": len(self.commands) + 1,
+                "pid": os.getpid(),
+                "argv": ["TaskTool", str(kwargs.get("action"))],
+                "returncode": 0,
+                "stdout_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+                "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+            }
+        )
+        return value
+
     def cooperative_checkpoint(
         self,
         proposal_ref: str,
@@ -119,31 +158,6 @@ def _write_json(path: Path, value: object) -> None:
         json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
-
-
-def _checkpoint_record(
-    driver: Driver,
-    *,
-    path: str,
-    record_sha256: str,
-    message: str,
-) -> dict[str, object]:
-    base = driver.git("rev-parse", "HEAD")
-    transition_id = f"T-OPS-{base[:12]}-{record_sha256[:12]}"
-    proposal_ref = f"transitions/{transition_id}/proposal.json"
-    _write_json(
-        driver.project / proposal_ref,
-        {
-            "schema_version": 1,
-            "base_commit": base,
-            "workspace_paths": [path],
-            "assimilations": [],
-        },
-    )
-    audit = driver.json_command("transition", "audit", proposal_ref)
-    if audit.get("mechanically_valid") is not True:
-        raise CommissioningError(f"operational transition is invalid: {transition_id}")
-    return driver.cooperative_checkpoint(proposal_ref, message)
 
 
 def _claim(eval_ref: str, candidate_commit: str) -> str:
@@ -267,35 +281,23 @@ def commission(aros: Path, runtime: Path) -> Path:
     driver.git("commit", "-qm", "add commissioning evaluator manifest")
     driver.json_command("eval", "register", "--manifest", manifest_ref, "--actor", "principal")
 
-    brief = driver.json_command(
-        "task",
-        "create",
-        "--objective",
-        "Produce one deterministic success candidate and strict return.",
-        "--mode",
-        "write",
-        "--idempotency-key",
-        "principal-loop-task",
-        "--timeout-seconds",
-        "120",
-        "--shell",
-        "--deliverable",
-        "candidate-mode.txt",
-        "--acceptance",
-        "candidate-mode.txt equals success",
-        "--actor",
-        "principal",
-        "--",
-        "python3",
-        "commissioning/principal_loop/task_adapter.py",
+    brief = driver.task_tool(
+        action="create",
+        objective="Produce one deterministic success candidate and strict return.",
+        mode="write",
+        adapter_argv=[
+            "python3",
+            "commissioning/principal_loop/task_adapter.py",
+        ],
+        capabilities={"network": False, "shell": True},
+        deliverables=["candidate-mode.txt"],
+        acceptance=["candidate-mode.txt equals success"],
+        timeout_seconds=120,
+        idempotency_key="principal-loop-task",
     )
     task_id = str(brief["task_id"])
-    _checkpoint_record(
-        driver,
-        path=f"tasks/{task_id}/brief.json",
-        record_sha256=str(brief["brief_sha256"]),
-        message="Admit deterministic Task brief.",
-    )
+    if brief.get("admission_required") is not False:
+        raise CommissioningError("Task brief operational admission did not complete")
     driver.json_command("task", "start", task_id, "--actor", "principal", timeout=240)
     deadline = time.monotonic() + 120
     while True:
@@ -307,14 +309,10 @@ def commission(aros: Path, runtime: Path) -> Path:
         time.sleep(0.2)
     if status.get("state") != "completed":
         raise CommissioningError(f"Task terminal state is {status.get('state')}")
-    collected = driver.json_command("task", "collect", task_id)
+    collected = driver.task_tool(action="collect", task_id=task_id)
     collected_ref = f"tasks/{task_id}/collected.json"
-    _checkpoint_record(
-        driver,
-        path=collected_ref,
-        record_sha256=str(collected["collected_sha256"]),
-        message="Admit deterministic Task collection.",
-    )
+    if collected.get("admission_required") is not False:
+        raise CommissioningError("Task collection operational admission did not complete")
 
     child_commit = str(collected["child_commit"])
     evaluation = driver.json_command(

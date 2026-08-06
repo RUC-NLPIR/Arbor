@@ -146,6 +146,19 @@ def build_principal_agent(
         "path_authorizer": authorizer,
         "persist_results": False,
     }
+    research_tool = ResearchTool(
+        cwd=str(workspace_root),
+        canonical_repository=research_repository,
+        canonical_ref=research_ref,
+        admission_gateway=admission_gateway,
+        attention_context=attention_context,
+        persist_results=False,
+    )
+    operational_admission = (
+        research_tool.checkpoint_service.checkpoint_operational
+        if admission_gateway is not None
+        else None
+    )
 
     tools: list[Tool] = [
         FileReadTool(**tool_kwargs),
@@ -153,17 +166,14 @@ def build_principal_agent(
         GlobTool(**tool_kwargs),
         FileEditTool(**tool_kwargs),
         FileWriteTool(**tool_kwargs),
-        ResearchTool(
-            cwd=str(workspace_root),
-            canonical_repository=research_repository,
-            canonical_ref=research_ref,
-            admission_gateway=admission_gateway,
-            attention_context=attention_context,
-            persist_results=False,
-        ),
+        research_tool,
         EvalTool(cwd=str(workspace_root), persist_results=False),
         RunTool(cwd=str(workspace_root), persist_results=False),
-        TaskTool(cwd=str(workspace_root), persist_results=False),
+        TaskTool(
+            cwd=str(workspace_root),
+            operational_admission=operational_admission,
+            persist_results=False,
+        ),
     ]
     if allow_shell:
         tools.append(

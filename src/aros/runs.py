@@ -1295,6 +1295,50 @@ class RunService:
                 signal_name=signal_name,
             )
 
+    def _wait_for_stop_final(
+        self,
+        run_id: str,
+        request: dict[str, object],
+        expected_pgid: int | None,
+        deadline: float,
+    ) -> dict[str, object]:
+        receipt = _read_object(
+            self._receipts_path() / f"{run_id}-stop.json",
+            "stop receipt",
+        )
+        matching_fields = (
+            "run_id",
+            "actor",
+            "reason",
+            "signal",
+            "requested_at",
+            "process_pid",
+            "process_start_token",
+        )
+        receipt_pgid = receipt.get("process_pgid")
+        if (
+            receipt.get("schema_version") != 1
+            or receipt.get("kind") != "run_stop"
+            or type(receipt_pgid) is not int
+            or receipt_pgid <= 1
+            or (expected_pgid is not None and receipt_pgid != expected_pgid)
+            or type(receipt.get("delivered")) is not bool
+            or not isinstance(receipt.get("signal_sequence"), list)
+            or any(receipt.get(field) != request.get(field) for field in matching_fields)
+        ):
+            raise RunError(f"run stop acknowledgement mismatch: {run_id}")
+        if receipt["delivered"] is False:
+            return receipt
+        final_path = self._final_path(run_id)
+        while not final_path.is_file():
+            if time.monotonic() >= deadline:
+                raise RunError(f"run stop finalization timed out: {run_id}")
+            time.sleep(0.02)
+        final = self.read_validated_final(run_id)
+        if final.get("state") != "cancelled" or final.get("stop") != request:
+            raise RunError(f"run finalized without matching stop acknowledgement: {run_id}")
+        return receipt
+
     def _stop_locked(
         self,
         run_id: str,
@@ -1311,7 +1355,16 @@ class RunService:
         status = self._reconcile_locked(run_id)
         receipt_path = self._receipts_path() / f"{run_id}-stop.json"
         if receipt_path.is_file():
-            return _read_object(receipt_path, "stop receipt")
+            request = _read_object(
+                self._runtime_path(run_id) / "stop-request.json",
+                "stop request",
+            )
+            return self._wait_for_stop_final(
+                run_id,
+                request,
+                None,
+                time.monotonic() + _STOP_ACK_TIMEOUT_SECONDS,
+            )
         if status["state"] in (_TERMINAL_STATES - {"lost"}):
             final_path = self._final_path(run_id)
             if not final_path.is_file():
@@ -1417,32 +1470,10 @@ class RunService:
             artifact_refs=[f".aros/runs/{run_id}/stop-request.json"],
         )
 
-        deadline = time.monotonic() + _STOP_ACK_TIMEOUT_SECONDS
+        stop_deadline = time.monotonic() + _STOP_ACK_TIMEOUT_SECONDS
         while True:
             if receipt_path.is_file():
-                receipt = _read_object(receipt_path, "stop receipt")
-                matching_fields = (
-                    "run_id",
-                    "actor",
-                    "reason",
-                    "signal",
-                    "requested_at",
-                    "process_pid",
-                    "process_start_token",
-                )
-                if (
-                    receipt.get("schema_version") != 1
-                    or receipt.get("kind") != "run_stop"
-                    or receipt.get("process_pgid") != pgid
-                    or type(receipt.get("delivered")) is not bool
-                    or not isinstance(receipt.get("signal_sequence"), list)
-                    or any(
-                        receipt.get(field) != request.get(field)
-                        for field in matching_fields
-                    )
-                ):
-                    raise RunError(f"run stop acknowledgement mismatch: {run_id}")
-                return receipt
+                return self._wait_for_stop_final(run_id, request, pgid, stop_deadline)
             final_path = self._final_path(run_id)
             if final_path.is_file():
                 final = self.read_validated_final(run_id)
@@ -1451,7 +1482,7 @@ class RunService:
                 raise RunError(
                     f"run finalized without matching stop acknowledgement: {run_id}"
                 )
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= stop_deadline:
                 raise RunError(f"run stop acknowledgement timed out: {run_id}")
             time.sleep(0.02)
 

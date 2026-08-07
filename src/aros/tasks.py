@@ -227,9 +227,8 @@ class TaskService:
         self.root = resolved
         self._git_dir, self._git_common_dir = self._require_git_root()
         self._require_initialized_workspace()
-        self._filesystem_permission_probe = _validate_filesystem_permission_probe(
-            _probe_filesystem_permissions(self.root / ".aros"),
-            "workspace filesystem permission probe",
+        self._filesystem_permission_probe = _probe_filesystem_permissions(
+            self.root / ".aros"
         )
         self._filesystem_permissions_enforced = (
             self._filesystem_permission_probe["enforced"] is True
@@ -3388,39 +3387,6 @@ def _probe_filesystem_permissions(runtime: Path) -> dict[str, object]:
             raise TaskError(
                 f"unable to remove filesystem permission probe: {path}"
             ) from cleanup_error
-
-
-def _validate_filesystem_permission_probe(
-    value: object,
-    description: str,
-) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != {
-        "requested_mode",
-        "observed_mode",
-        "mode_request_supported",
-        "device",
-        "enforced",
-    }:
-        raise TaskError(f"invalid {description}")
-    requested_mode = value.get("requested_mode")
-    observed_mode = value.get("observed_mode")
-    mode_request_supported = value.get("mode_request_supported")
-    device = value.get("device")
-    enforced = value.get("enforced")
-    if (
-        type(requested_mode) is not int
-        or requested_mode != 0o600
-        or type(observed_mode) is not int
-        or stat.S_IMODE(observed_mode) != observed_mode
-        or type(mode_request_supported) is not bool
-        or type(device) is not int
-        or device < 0
-        or type(enforced) is not bool
-        or enforced
-        != (mode_request_supported and observed_mode == requested_mode)
-    ):
-        raise TaskError(f"invalid {description}")
-    return dict(value)
 
 
 def _normalize_request(

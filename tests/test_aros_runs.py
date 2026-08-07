@@ -2850,6 +2850,159 @@ def test_stop_signal_false_ack_does_not_cancel_successful_process(
     assert "signal_sequence" not in final
 
 
+def test_delivered_stop_waits_for_final_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+        key="stop-waits-for-final",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    finish_entered = threading.Event()
+    release_finish = threading.Event()
+    original_finish = runner_module._finish
+
+    def pause_finish(**kwargs: object) -> None:
+        finish_entered.set()
+        assert release_finish.wait(timeout=5)
+        original_finish(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner_module, "_finish", pause_finish)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+        _wait_for_running_status(service, run_id)
+        stopping = pool.submit(
+            service.stop,
+            run_id,
+            actor="owner",
+            reason="wait for final",
+        )
+        try:
+            assert finish_entered.wait(timeout=5)
+            with pytest.raises(TimeoutError):
+                stopping.result(timeout=0.2)
+            assert (tmp_path / ".aros/receipts" / f"{run_id}-stop.json").is_file()
+            assert not (tmp_path / "runs" / run_id / "final.json").exists()
+        finally:
+            release_finish.set()
+        receipt = stopping.result(timeout=5)
+        assert runner.result(timeout=5) == 0
+
+    final = service.read_validated_final(run_id)
+    request = json.loads(
+        (tmp_path / ".aros/runs" / run_id / "stop-request.json").read_text()
+    )
+    assert receipt["delivered"] is True
+    assert final["state"] == "cancelled"
+    assert final["stop"] == request
+
+
+def test_identity_wait_does_not_consume_stop_final_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+        key="identity-wait-before-stop-timeout",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    identity_read = threading.Event()
+    release_identity = threading.Event()
+    original_status = service.status
+
+    def delayed_status(*args: object, **kwargs: object) -> dict[str, object]:
+        identity_read.set()
+        assert release_identity.wait(timeout=5)
+        return original_status(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "status", delayed_status)
+    monkeypatch.setattr(runs_module, "_tmux_session_exists", lambda _name: True)
+    monkeypatch.setattr(runs_module, "_STOP_ACK_TIMEOUT_SECONDS", 0.5)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stopping = pool.submit(
+            service.stop,
+            run_id,
+            actor="owner",
+            reason="identity delay",
+        )
+        assert identity_read.wait(timeout=5)
+        runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+        runtime_status = tmp_path / ".aros/runs" / run_id / "status.json"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if json.loads(runtime_status.read_text()).get("process_pid") is not None:
+                break
+            time.sleep(0.02)
+        time.sleep(0.9)
+        release_identity.set()
+        receipt = stopping.result(timeout=5)
+        assert runner.result(timeout=5) == 0
+
+    assert receipt["delivered"] is True
+    assert service.read_validated_final(run_id)["state"] == "cancelled"
+
+
+def test_delivered_stop_final_timeout_preserves_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+        key="stop-final-timeout-retry",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    finish_entered = threading.Event()
+    release_finish = threading.Event()
+    original_finish = runner_module._finish
+
+    def pause_finish(**kwargs: object) -> None:
+        finish_entered.set()
+        assert release_finish.wait(timeout=5)
+        original_finish(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner_module, "_finish", pause_finish)
+    monkeypatch.setattr(runs_module, "_STOP_ACK_TIMEOUT_SECONDS", 1.0)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+        _wait_for_running_status(service, run_id)
+        stopping = pool.submit(
+            service.stop,
+            run_id,
+            actor="owner",
+            reason="retry final wait",
+        )
+        try:
+            assert finish_entered.wait(timeout=5)
+            with pytest.raises(RunError, match="stop finalization timed out"):
+                stopping.result(timeout=5)
+            runtime = tmp_path / ".aros/runs" / run_id
+            assert (runtime / "stop-request.json").is_file()
+            assert (tmp_path / ".aros/receipts" / f"{run_id}-stop.json").is_file()
+            retrying = pool.submit(
+                service.stop,
+                run_id,
+                actor="owner",
+                reason="retry final wait",
+            )
+            with pytest.raises(TimeoutError):
+                retrying.result(timeout=0.2)
+        finally:
+            release_finish.set()
+        receipt = retrying.result(timeout=5)
+        assert runner.result(timeout=5) == 0
+
+    final = service.read_validated_final(run_id)
+    assert receipt["delivered"] is True
+    assert final["state"] == "cancelled"
+
+
 def test_stop_request_remains_when_runner_acknowledgement_times_out(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

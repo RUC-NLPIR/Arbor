@@ -9,10 +9,11 @@ import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from arbor.aros.runs import RunService
+from arbor.aros.runs import RunError, RunService
 from arbor.aros.store import json_sha256, manifest_sha256
 from arbor.aros.task_run import (
     TaskRunError,
@@ -64,6 +65,23 @@ def _brief(service: TaskService) -> dict[str, object]:
         acceptance=["return commit is valid"],
         timeout_seconds=60,
         idempotency_key="task-on-run-contract",
+    )
+
+
+def _brief_with_key(
+    service: TaskService,
+    key: str,
+) -> dict[str, object]:
+    return service.create(
+        f"Produce reviewed return {key}.",
+        actor="principal",
+        mode="write",
+        adapter_argv=[sys.executable, "worker.py"],
+        capabilities={"network": False, "shell": True},
+        deliverables=["tasks/<task-id>/return.json"],
+        acceptance=["return commit is valid"],
+        timeout_seconds=60,
+        idempotency_key=key,
     )
 
 
@@ -130,6 +148,46 @@ def _prepared_task(
     _git(root, "commit", "-qm", "record task brief")
     service._ensure_worktree(task_id, actor="principal")
     return service, brief, service._load_ownership(brief)
+
+
+def _fail_bound_run_launch(
+    root: Path,
+    binding: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, object], dict[str, object]]:
+    import arbor.aros.runs as runs_module
+
+    real_run = subprocess.run
+
+    def fail_tmux(
+        command: list[str],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        if command[0] != "/test/tmux":
+            return real_run(command, **kwargs)
+        return subprocess.CompletedProcess(
+            command,
+            7,
+            stdout="",
+            stderr="injected carrier failure",
+        )
+
+    monkeypatch.setattr(runs_module.shutil, "which", lambda _name: "/test/tmux")
+    monkeypatch.setattr(runs_module.subprocess, "run", fail_tmux)
+    run_id = str(binding["run_id"])
+    service = RunService(root)
+    with pytest.raises(RunError, match="tmux launch failed"):
+        service.start(run_id, actor="principal")
+    return service.status(run_id), service.read_validated_final(run_id)
+
+
+def _task_runtime_snapshot(root: Path, task_id: str) -> dict[str, bytes]:
+    runtime = root / ".aros" / "tasks" / task_id
+    return {
+        path.relative_to(runtime).as_posix(): path.read_bytes()
+        for path in runtime.rglob("*")
+        if path.is_file()
+    }
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
@@ -1369,6 +1427,124 @@ def test_start_commits_fast_terminal_run_before_returning_final_ref(
     )
 
 
+@pytest.mark.parametrize("_attempt", range(20))
+def test_start_and_status_serialize_fast_terminal_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _attempt: int,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    terminal_ready = threading.Event()
+    terminal_seam = threading.Barrier(2)
+    commit_seam = threading.Barrier(2)
+    first_status_read = threading.Event()
+    terminal_statuses: dict[str, dict[str, object]] = {}
+    terminal_finals: dict[str, dict[str, object]] = {}
+
+    def fake_start(
+        _service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        manifest = json.loads(
+            (tmp_path / "runs" / run_id / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        finished_at = "2026-08-07T00:00:02.000Z"
+        final = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "completed",
+            "manifest_sha256": manifest["manifest_sha256"],
+        }
+        final_ref = f"runs/{run_id}/final.json"
+        _write_json(tmp_path / final_ref, final)
+        status = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "completed",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "updated_at": finished_at,
+            "finished_at": finished_at,
+            "exit_code": 0,
+            "final_ref": final_ref,
+        }
+        terminal_finals[run_id] = final
+        terminal_statuses[run_id] = status
+        terminal_ready.set()
+        terminal_seam.wait(timeout=5)
+        return dict(status)
+
+    def fake_terminal(
+        _service: RunService,
+        run_id: str,
+    ) -> tuple[dict[str, object], tuple[str, ...], str]:
+        return (
+            dict(terminal_finals[run_id]),
+            (f"runs/{run_id}/final.json",),
+            f"Record run {run_id} final",
+        )
+
+    def fake_status(
+        _service: RunService,
+        run_id: str,
+        *,
+        reconcile: bool = True,
+        reader: object | None = None,
+    ) -> dict[str, object]:
+        if not first_status_read.is_set():
+            first_status_read.set()
+            terminal_seam.wait(timeout=5)
+        return dict(terminal_statuses[run_id])
+
+    real_commit = _commit(tmp_path)
+
+    def synchronized_commit(
+        paths: tuple[str, ...],
+        message: str,
+    ) -> dict[str, object]:
+        try:
+            commit_seam.wait(timeout=0.25)
+        except threading.BrokenBarrierError:
+            pass
+        return real_commit(paths, message)
+
+    monkeypatch.setattr(RunService, "start", fake_start)
+    monkeypatch.setattr(RunService, "terminal_with_commit", fake_terminal)
+    monkeypatch.setattr(RunService, "status", fake_status)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        start_future = executor.submit(
+            service.start,
+            task_id,
+            actor="principal",
+            commit_paths=synchronized_commit,
+        )
+        assert terminal_ready.wait(timeout=5)
+        status_future = executor.submit(
+            service.status,
+            task_id,
+            commit_paths=synchronized_commit,
+        )
+        started = start_future.result(timeout=10)
+        status = status_future.result(timeout=10)
+
+    final_ref = str(started["final_ref"])
+    assert status == started
+    assert final_ref == f"runs/{started['run_id']}/final.json"
+    assert _git(tmp_path, "log", "--format=%H", "--", final_ref).splitlines() == [
+        _git(tmp_path, "rev-parse", "HEAD")
+    ]
+    assert _git(tmp_path, "status", "--short") == ""
+
+
 def test_start_rejects_terminal_status_without_run_final(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1379,6 +1555,7 @@ def test_start_rejects_terminal_status_without_run_final(
     task_id = str(brief["task_id"])
     _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
     _git(tmp_path, "commit", "-qm", "record task brief")
+    terminal_statuses: dict[str, dict[str, object]] = {}
 
     def terminal_without_final(
         _service: RunService,
@@ -1392,7 +1569,7 @@ def test_start_rejects_terminal_status_without_run_final(
             )
         )
         finished_at = "2026-08-07T00:00:02.000Z"
-        return {
+        status = {
             "schema_version": 1,
             "run_id": run_id,
             "state": "completed",
@@ -1402,8 +1579,20 @@ def test_start_rejects_terminal_status_without_run_final(
             "exit_code": 0,
             "final_ref": f"runs/{run_id}/final.json",
         }
+        terminal_statuses[run_id] = status
+        return dict(status)
+
+    def terminal_status(
+        _service: RunService,
+        run_id: str,
+        *,
+        reconcile: bool = True,
+        reader: object | None = None,
+    ) -> dict[str, object]:
+        return dict(terminal_statuses[run_id])
 
     monkeypatch.setattr(RunService, "start", terminal_without_final)
+    monkeypatch.setattr(RunService, "status", terminal_status)
 
     with pytest.raises(TaskError, match=task_id) as raised:
         service.start(
@@ -1563,6 +1752,655 @@ def test_status_projects_run_identity_without_task_process_claims(
     assert not {
         key for key in status if any(fragment in key for fragment in forbidden)
     }
+
+
+@pytest.mark.parametrize(
+    ("run_state", "task_state"),
+    [
+        pytest.param("prepared", "launched", id="prepared-projects-launched"),
+        pytest.param("launched", "launched", id="launched"),
+        pytest.param("running", "running", id="running"),
+        pytest.param("completed", "completed", id="completed"),
+        pytest.param("failed_process", "failed_process", id="failed-process"),
+        pytest.param("timed_out", "timed_out", id="timed-out"),
+        pytest.param("cancelled", "cancelled", id="cancelled"),
+        pytest.param("lost", "lost", id="lost"),
+    ],
+)
+def test_status_projects_every_run_state_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_state: str,
+    task_state: str,
+) -> None:
+    import arbor.aros.task_run as task_run_module
+
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    monkeypatch.setattr(
+        RunService,
+        "start",
+        lambda _service, run_id, *, actor=None: _launched_run_status(
+            tmp_path,
+            run_id,
+        ),
+    )
+    service.start(task_id, actor="principal", commit_paths=_commit(tmp_path))
+    binding = json.loads(
+        (tmp_path / ".aros" / "tasks" / task_id / "run.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    run_id = str(binding["run_id"])
+    final_ref = (
+        f"runs/{run_id}/final.json"
+        if run_state in {"completed", "failed_process", "timed_out", "cancelled"}
+        else None
+    )
+    run_status = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": run_state,
+        "manifest_sha256": binding["run_manifest_sha256"],
+        "updated_at": "2026-08-07T00:00:02.000Z",
+        "final_ref": final_ref,
+        "reason": None,
+        "carrier": "must-not-project",
+        "process_pid": 123,
+    }
+    monkeypatch.setattr(
+        RunService,
+        "status",
+        lambda _service, requested_run_id, **_kwargs: {
+            **run_status,
+            "run_id": requested_run_id,
+        },
+    )
+    monkeypatch.setattr(
+        task_run_module,
+        "commit_terminal_run_if_present",
+        lambda _root, _binding, status, _callback: status,
+    )
+
+    projected = service.status(
+        task_id,
+        commit_paths=lambda _paths, _message: {},
+    )
+
+    assert projected == {
+        "schema_version": 1,
+        "task_id": task_id,
+        "state": task_state,
+        "brief_sha256": brief["brief_sha256"],
+        "ownership_sha256": binding["ownership_sha256"],
+        "run_id": run_id,
+        "run_manifest_sha256": binding["run_manifest_sha256"],
+        "updated_at": "2026-08-07T00:00:02.000Z",
+        "final_ref": final_ref,
+        "reason": None,
+    }
+
+
+def test_terminal_status_without_callback_hides_uncommitted_final_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    run_id = str(binding["run_id"])
+    final_ref = f"runs/{run_id}/final.json"
+    final = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": "completed",
+        "manifest_sha256": binding["run_manifest_sha256"],
+    }
+    _write_json(tmp_path / final_ref, final)
+    terminal_status = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": "completed",
+        "manifest_sha256": binding["run_manifest_sha256"],
+        "updated_at": "2026-08-07T00:00:02.000Z",
+        "final_ref": final_ref,
+    }
+    monkeypatch.setattr(
+        RunService,
+        "status",
+        lambda _service, _run_id, **_kwargs: dict(terminal_status),
+    )
+    monkeypatch.setattr(
+        RunService,
+        "terminal_with_commit",
+        lambda _service, _run_id: (
+            dict(final),
+            (final_ref,),
+            f"Record run {run_id} final",
+        ),
+    )
+    before = (_git(tmp_path, "rev-parse", "HEAD"), _git(tmp_path, "status", "--short"))
+
+    status = TaskService(tmp_path).status(task_id)
+
+    assert status["state"] == "completed"
+    assert status["final_ref"] is None
+    assert (_git(tmp_path, "rev-parse", "HEAD"), _git(tmp_path, "status", "--short")) == before
+
+
+def test_terminal_status_with_callback_commits_and_exposes_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    run_id = str(binding["run_id"])
+    final_ref = f"runs/{run_id}/final.json"
+    final = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": "completed",
+        "manifest_sha256": binding["run_manifest_sha256"],
+    }
+    _write_json(tmp_path / final_ref, final)
+    terminal_status = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": "completed",
+        "manifest_sha256": binding["run_manifest_sha256"],
+        "updated_at": "2026-08-07T00:00:02.000Z",
+        "final_ref": final_ref,
+    }
+    monkeypatch.setattr(
+        RunService,
+        "status",
+        lambda _service, _run_id, **_kwargs: dict(terminal_status),
+    )
+    monkeypatch.setattr(
+        RunService,
+        "terminal_with_commit",
+        lambda _service, _run_id: (
+            dict(final),
+            (final_ref,),
+            f"Record run {run_id} final",
+        ),
+    )
+
+    status = TaskService(tmp_path).status(
+        task_id,
+        commit_paths=_commit(tmp_path),
+    )
+
+    assert status["final_ref"] == final_ref
+    assert _git_bytes(tmp_path, "show", f"HEAD:{final_ref}") == (
+        tmp_path / final_ref
+    ).read_bytes()
+
+
+def test_terminal_status_without_callback_exposes_valid_committed_final_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    run_status, final = _fail_bound_run_launch(tmp_path, binding, monkeypatch)
+    run_id = str(binding["run_id"])
+    final_ref = f"runs/{run_id}/final.json"
+    _commit(tmp_path)((final_ref,), f"Record run {run_id} final")
+    assert RunService(tmp_path).read_validated_final(run_id) == final
+    before = (
+        _git(tmp_path, "rev-parse", "HEAD"),
+        _git(tmp_path, "status", "--short"),
+    )
+
+    status = TaskService(tmp_path).status(task_id)
+
+    assert status["state"] == run_status["state"]
+    assert status["final_ref"] == final_ref
+    assert (
+        _git(tmp_path, "rev-parse", "HEAD"),
+        _git(tmp_path, "status", "--short"),
+    ) == before
+    assert RunService(tmp_path).read_validated_final(run_id) == final
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param("no-op", id="no-op"),
+        pytest.param("wrong-result", id="wrong-result"),
+        pytest.param("extra-path", id="commits-extra-path"),
+        pytest.param("dirty-final", id="leaves-final-dirty"),
+        pytest.param("runtime-error", id="raises-runtime-error"),
+        pytest.param("value-error", id="raises-value-error"),
+    ],
+)
+def test_status_rejects_adversarial_terminal_commit_callback_without_task_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    _run_status, _final = _fail_bound_run_launch(tmp_path, binding, monkeypatch)
+    run_id = str(binding["run_id"])
+    final_ref = f"runs/{run_id}/final.json"
+    final_path = tmp_path / final_ref
+    final_bytes = final_path.read_bytes()
+    main_dirt = tmp_path / "unrelated-main-dirt.bin"
+    child_dirt = Path(str(ownership["worktree_path"])) / "unrelated-child-dirt.bin"
+    main_dirt.write_bytes(b"main dirt\x00unchanged")
+    child_dirt.write_bytes(b"child dirt\x00unchanged")
+    dirt = {main_dirt: main_dirt.read_bytes(), child_dirt: child_dirt.read_bytes()}
+    runtime_before = _task_runtime_snapshot(tmp_path, task_id)
+
+    def bad_commit(
+        paths: tuple[str, ...],
+        _message: str,
+    ) -> dict[str, object]:
+        if failure == "runtime-error":
+            raise RuntimeError("injected terminal callback failure")
+        if failure == "value-error":
+            raise ValueError("injected terminal callback failure")
+        if failure == "wrong-result":
+            return {"commit": "not-a-commit", "paths": list(paths)}
+        if failure == "no-op":
+            return {
+                "commit": _git(tmp_path, "rev-parse", "HEAD"),
+                "paths": list(paths),
+                "reused": True,
+                "enforcement_class": "cooperative",
+            }
+        if failure == "extra-path":
+            extra_ref = "unexpected-terminal-commit.txt"
+            (tmp_path / extra_ref).write_text("unexpected\n", encoding="utf-8")
+            _git(tmp_path, "add", paths[0], extra_ref)
+            _git(tmp_path, "commit", "-qm", "commit terminal with extra path")
+        else:
+            _git(tmp_path, "add", paths[0])
+            _git(tmp_path, "commit", "-qm", "commit then dirty terminal")
+            final_path.write_bytes(final_bytes + b"mutated")
+        return {
+            "commit": _git(tmp_path, "rev-parse", "HEAD"),
+            "paths": list(paths),
+            "reused": False,
+            "enforcement_class": "cooperative",
+        }
+
+    result: dict[str, object] | None = None
+    with pytest.raises(TaskError, match=task_id) as raised:
+        result = TaskService(tmp_path).status(
+            task_id,
+            commit_paths=bad_commit,
+        )
+
+    assert result is None
+    assert raised.value.__cause__ is not None
+    assert _task_runtime_snapshot(tmp_path, task_id) == runtime_before
+    assert {path: path.read_bytes() for path in dirt} == dirt
+
+
+def test_lost_status_never_inspects_or_commits_a_terminal_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    monkeypatch.setattr(
+        RunService,
+        "status",
+        lambda _service, run_id, **_kwargs: {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "lost",
+            "manifest_sha256": binding["run_manifest_sha256"],
+            "updated_at": "2026-08-07T00:00:02.000Z",
+            "final_ref": None,
+            "reason": "process identity unavailable",
+        },
+    )
+    monkeypatch.setattr(
+        RunService,
+        "terminal_with_commit",
+        lambda *_args, **_kwargs: pytest.fail("lost must not inspect a final"),
+    )
+
+    status = TaskService(tmp_path).status(task_id, commit_paths=_commit(tmp_path))
+
+    assert status["state"] == "lost"
+    assert status["final_ref"] is None
+
+
+def test_stop_delegates_to_bound_run_without_task_stop_material(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    calls: list[tuple[object, ...]] = []
+    receipt = {"schema_version": 1, "kind": "run_stop_request"}
+
+    def fake_stop(
+        _service: RunService,
+        run_id: str,
+        *,
+        actor: str,
+        reason: str,
+        signal_name: str = "TERM",
+    ) -> dict[str, object]:
+        calls.append((run_id, actor, reason, signal_name))
+        return receipt
+
+    monkeypatch.setattr(RunService, "stop", fake_stop)
+
+    result = TaskService(tmp_path).stop(
+        task_id,
+        actor="principal",
+        reason="evidence complete",
+        signal_name="INT",
+    )
+
+    assert calls == [(binding["run_id"], "principal", "evidence complete", "INT")]
+    assert result == {
+        "schema_version": 1,
+        "task_id": task_id,
+        "run_id": binding["run_id"],
+        "run_stop": receipt,
+    }
+    assert list((tmp_path / ".aros" / "tasks" / task_id).glob("stop*.json")) == []
+
+
+def test_stop_before_run_binding_fails_without_stop_material(tmp_path: Path) -> None:
+    _service, brief, _ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    before = sorted(path.relative_to(runtime) for path in runtime.rglob("*"))
+
+    with pytest.raises(TaskError, match="Run binding|run binding|Task Run"):
+        TaskService(tmp_path).stop(
+            task_id,
+            actor="principal",
+            reason="not started",
+        )
+
+    assert sorted(path.relative_to(runtime) for path in runtime.rglob("*")) == before
+    assert list(runtime.glob("stop*.json")) == []
+
+
+def test_waiting_run_stop_does_not_hold_unrelated_task_status_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    stopping_brief = _brief_with_key(service, "waiting-stop")
+    unrelated_brief = _brief_with_key(service, "unrelated-status")
+    stopping_task_id = str(stopping_brief["task_id"])
+    unrelated_task_id = str(unrelated_brief["task_id"])
+    _git(
+        tmp_path,
+        "add",
+        f"tasks/{stopping_task_id}/brief.json",
+        f"tasks/{unrelated_task_id}/brief.json",
+    )
+    _git(tmp_path, "commit", "-qm", "record stop lock tasks")
+    service._ensure_worktree(stopping_task_id, actor="principal")
+    ownership = service._load_ownership(stopping_brief)
+    binding = ensure_task_run(
+        tmp_path,
+        stopping_brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+    status_finished = threading.Event()
+    receipt = {"schema_version": 1, "kind": "run_stop_request"}
+
+    def waiting_stop(
+        _service: RunService,
+        run_id: str,
+        *,
+        actor: str,
+        reason: str,
+        signal_name: str = "TERM",
+    ) -> dict[str, object]:
+        assert run_id == binding["run_id"]
+        stop_entered.set()
+        assert release_stop.wait(timeout=5)
+        return receipt
+
+    def read_unrelated_status() -> dict[str, object]:
+        status = TaskService(tmp_path).status(unrelated_task_id)
+        status_finished.set()
+        return status
+
+    monkeypatch.setattr(RunService, "stop", waiting_stop)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stop_future = executor.submit(
+            service.stop,
+            stopping_task_id,
+            actor="principal",
+            reason="bounded wait",
+        )
+        assert stop_entered.wait(timeout=5)
+        status_future = executor.submit(read_unrelated_status)
+        try:
+            assert status_finished.wait(timeout=1)
+        finally:
+            release_stop.set()
+        status = status_future.result(timeout=5)
+        stopped = stop_future.result(timeout=5)
+
+    assert status["state"] == "prepared"
+    assert stopped == {
+        "schema_version": 1,
+        "task_id": stopping_task_id,
+        "run_id": binding["run_id"],
+        "run_stop": receipt,
+    }
+
+
+@pytest.mark.parametrize("failure_source", ["binding", "run-status"])
+def test_list_translates_run_projection_failures_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_source: str,
+) -> None:
+    import arbor.aros.task_run as task_run_module
+
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    if failure_source == "binding":
+        injected: Exception = TaskRunError("injected strict binding failure")
+
+        def fail_binding(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise injected
+
+        monkeypatch.setattr(task_run_module, "load_task_run", fail_binding)
+    else:
+        injected = RunError("injected Run status failure")
+
+        def fail_run_status(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise injected
+
+        monkeypatch.setattr(RunService, "status", fail_run_status)
+    before = (
+        _git(tmp_path, "rev-parse", "HEAD"),
+        _git(tmp_path, "status", "--short"),
+        _task_runtime_snapshot(tmp_path, task_id),
+    )
+
+    with pytest.raises(TaskError, match=task_id) as raised:
+        TaskService(tmp_path).list()
+
+    assert raised.value.__cause__ is injected
+    assert (
+        _git(tmp_path, "rev-parse", "HEAD"),
+        _git(tmp_path, "status", "--short"),
+        _task_runtime_snapshot(tmp_path, task_id),
+    ) == before
+
+
+def test_list_mixes_prepared_worktree_and_run_status_in_task_id_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbor.aros.task_run as task_run_module
+
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    briefs = [_brief_with_key(service, f"mixed-{index}") for index in range(4)]
+    _git(tmp_path, "add", *(f"tasks/{brief['task_id']}/brief.json" for brief in briefs))
+    _git(tmp_path, "commit", "-qm", "record mixed task briefs")
+    worktree_brief = briefs[1]
+    service._ensure_worktree(str(worktree_brief["task_id"]), actor="principal")
+    run_brief = briefs[2]
+    run_task_id = str(run_brief["task_id"])
+    service._ensure_worktree(run_task_id, actor="principal")
+    run_ownership = service._load_ownership(run_brief)
+    running_binding = ensure_task_run(
+        tmp_path,
+        run_brief,
+        run_ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    terminal_brief = briefs[3]
+    terminal_task_id = str(terminal_brief["task_id"])
+    service._ensure_worktree(terminal_task_id, actor="principal")
+    terminal_ownership = service._load_ownership(terminal_brief)
+    terminal_binding = ensure_task_run(
+        tmp_path,
+        terminal_brief,
+        terminal_ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    terminal_run_status, _terminal_final = _fail_bound_run_launch(
+        tmp_path,
+        terminal_binding,
+        monkeypatch,
+    )
+    terminal_run_id = str(terminal_binding["run_id"])
+    terminal_final_ref = f"runs/{terminal_run_id}/final.json"
+    terminal_final_bytes = (tmp_path / terminal_final_ref).read_bytes()
+    real_status = RunService.status
+
+    def mixed_status(
+        run_service: RunService,
+        run_id: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        if run_id == running_binding["run_id"]:
+            return _running_run_status(tmp_path, run_id)
+        return real_status(run_service, run_id, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        RunService,
+        "status",
+        mixed_status,
+    )
+    monkeypatch.setattr(
+        task_run_module,
+        "commit_terminal_run_if_present",
+        lambda *_args, **_kwargs: pytest.fail("list must not commit a terminal final"),
+    )
+    reconcile_calls = 0
+    real_reconcile = service._reconcile_authoritative_briefs
+
+    def count_reconcile() -> None:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        real_reconcile()
+
+    monkeypatch.setattr(service, "_reconcile_authoritative_briefs", count_reconcile)
+    before = (
+        _git(tmp_path, "rev-parse", "HEAD"),
+        _git(tmp_path, "status", "--short"),
+        terminal_final_bytes,
+    )
+
+    statuses = service.list()
+
+    assert reconcile_calls == 1
+    assert [status["task_id"] for status in statuses] == sorted(
+        str(brief["task_id"]) for brief in briefs
+    )
+    assert {status["task_id"]: status["state"] for status in statuses} == {
+        briefs[0]["task_id"]: "prepared",
+        worktree_brief["task_id"]: "worktree_ready",
+        run_brief["task_id"]: "running",
+        terminal_brief["task_id"]: terminal_run_status["state"],
+    }
+    assert next(
+        status for status in statuses if status["task_id"] == run_brief["task_id"]
+    )["run_id"] == running_binding["run_id"]
+    terminal_status = next(
+        status
+        for status in statuses
+        if status["task_id"] == terminal_brief["task_id"]
+    )
+    assert terminal_status["run_id"] == terminal_run_id
+    assert terminal_status["final_ref"] is None
+    assert (
+        _git(tmp_path, "rev-parse", "HEAD"),
+        _git(tmp_path, "status", "--short"),
+        (tmp_path / terminal_final_ref).read_bytes(),
+    ) == before
 
 
 def test_task_runtime_contains_no_duplicate_process_authority(

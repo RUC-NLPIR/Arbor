@@ -514,7 +514,11 @@ def task_status_command(
 ) -> None:
     """Inspect one durable task."""
     try:
-        status = TaskService(_root(cwd)).status(task_id)
+        root = _root(cwd)
+        status = TaskService(root).status(
+            task_id,
+            commit_paths=GitCheckpoint(root).commit_paths,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         _fail(exc)
     _print_json(status)

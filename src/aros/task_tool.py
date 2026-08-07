@@ -164,7 +164,13 @@ class TaskTool(Tool):
             if isinstance(final_ref, str) and self.record_observation is not None:
                 self.record_observation(final_ref)
         elif action == "status":
-            result = service.status(kwargs["task_id"])
+            result = service.status(
+                kwargs["task_id"],
+                commit_paths=self.commit_paths,
+            )
+            final_ref = result.get("final_ref")
+            if isinstance(final_ref, str) and self.record_observation is not None:
+                self.record_observation(final_ref)
         elif action == "list":
             result = service.list()
         elif action == "message":

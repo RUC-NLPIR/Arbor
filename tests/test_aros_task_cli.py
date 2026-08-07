@@ -71,9 +71,14 @@ class FakeTaskService:
         self.calls.append(("start", task_id, actor, commit_paths))
         return {"state": "running", "task_id": task_id}
 
-    def status(self, task_id: str) -> dict[str, Any]:
+    def status(
+        self,
+        task_id: str,
+        *,
+        commit_paths: Any = None,
+    ) -> dict[str, Any]:
         self._raise_error()
-        self.calls.append(("status", task_id))
+        self.calls.append(("status", task_id, commit_paths))
         return {"state": "running", "task_id": task_id}
 
     def list(self) -> list[dict[str, Any]]:
@@ -342,10 +347,20 @@ def test_task_start_is_a_separate_human_attributed_action(tmp_path: Path) -> Non
 
 
 def test_task_status_and_list_emit_unwrapped_json(tmp_path: Path) -> None:
-    status = runner.invoke(
-        aros_cmd.aros_app,
-        ["task", "status", "TASK-test", "--cwd", str(tmp_path)],
-    )
+    checkpoints: list[Any] = []
+
+    class FakeCheckpoint:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+            self.commit_paths = object()
+            checkpoints.append(self)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(aros_cmd, "GitCheckpoint", FakeCheckpoint)
+        status = runner.invoke(
+            aros_cmd.aros_app,
+            ["task", "status", "TASK-test", "--cwd", str(tmp_path)],
+        )
     listed = runner.invoke(
         aros_cmd.aros_app,
         ["task", "list", "--cwd", str(tmp_path)],
@@ -360,7 +375,11 @@ def test_task_status_and_list_emit_unwrapped_json(tmp_path: Path) -> None:
     assert json.loads(listed.output) == [
         {"state": "completed", "task_id": "TASK-test"},
     ]
-    assert FakeTaskService.instances[0].calls == [("status", "TASK-test")]
+    assert len(checkpoints) == 1
+    assert checkpoints[0].root == tmp_path.resolve()
+    assert FakeTaskService.instances[0].calls == [
+        ("status", "TASK-test", checkpoints[0].commit_paths),
+    ]
     assert FakeTaskService.instances[1].calls == [("list",)]
 
 
@@ -443,7 +462,15 @@ def test_task_final_actions_forward_directly(
     }
 
 
-def test_task_service_errors_are_reported_with_exit_code_two(tmp_path: Path) -> None:
+def test_task_service_errors_are_reported_with_exit_code_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeCheckpoint:
+        def __init__(self, _root: Path) -> None:
+            self.commit_paths = lambda _paths, _message: {}
+
+    monkeypatch.setattr(aros_cmd, "GitCheckpoint", FakeCheckpoint)
     FakeTaskService.error = TaskError("invalid task brief")
 
     result = runner.invoke(

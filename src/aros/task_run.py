@@ -128,7 +128,7 @@ def project_task_status(
         "timed_out",
         "cancelled",
     }
-    if (terminal and final_ref != expected_final_ref) or (
+    if (terminal and final_ref not in (None, expected_final_ref)) or (
         not terminal and final_ref is not None
     ):
         raise TaskRunError(f"invalid Run status final_ref: {run_id}")
@@ -238,6 +238,69 @@ def commit_terminal_run_if_present(
         return RunService(workspace).status(run_id)
     except (OSError, RunError) as error:
         raise TaskRunError(f"unable to re-read terminal Run: {run_id}") from error
+
+
+def hide_uncommitted_terminal_run_ref(
+    root: Path,
+    binding: dict[str, object],
+    status: dict[str, object],
+) -> dict[str, object]:
+    """Hide a terminal final unless its exact create-once commit validates."""
+    workspace = _validate_root(root)
+    if not isinstance(binding, dict) or not isinstance(status, dict):
+        raise TaskRunError("Task terminal Run inputs must be JSON objects")
+    run_id = _validate_run_id(binding.get("run_id"))
+    manifest_sha256 = _validate_hash(
+        binding.get("run_manifest_sha256"),
+        "Task terminal Run manifest_sha256",
+    )
+    status_state = status.get("state")
+    if status_state == "lost":
+        if status.get("final_ref") is not None:
+            raise TaskRunError(f"lost Run cannot expose a final_ref: {run_id}")
+        return status
+    if status_state not in _TERMINAL_PROCESS_STATES:
+        return status
+    final_ref = f"runs/{run_id}/final.json"
+    if status.get("final_ref") != final_ref:
+        raise TaskRunError(f"terminal Run final is unavailable: {run_id}")
+    try:
+        terminal = RunService(workspace).terminal_with_commit(run_id)
+    except (OSError, RunError) as error:
+        raise TaskRunError(f"unable to load terminal Run: {run_id}") from error
+    if (
+        terminal is None
+        or not isinstance(terminal, tuple)
+        or len(terminal) != 3
+        or not isinstance(terminal[0], dict)
+        or terminal[1] != (final_ref,)
+        or not isinstance(terminal[2], str)
+        or not terminal[2]
+    ):
+        raise TaskRunError(f"invalid terminal Run commit request: {run_id}")
+    final = terminal[0]
+    if (
+        final.get("run_id") != run_id
+        or final.get("manifest_sha256") != manifest_sha256
+        or final.get("state") != status_state
+        or status.get("run_id") not in (None, run_id)
+        or status.get("manifest_sha256") not in (None, manifest_sha256)
+    ):
+        raise TaskRunError(f"terminal Run identity mismatch: {run_id}")
+    try:
+        final_bytes = (workspace / final_ref).read_bytes()
+    except OSError as error:
+        raise TaskRunError(f"unable to snapshot terminal Run: {run_id}") from error
+    _head, committed = _pre_callback_manifest_state(
+        workspace,
+        final_ref,
+        final_bytes,
+    )
+    if committed:
+        return status
+    hidden = dict(status)
+    hidden["final_ref"] = None
+    return hidden
 
 
 def _binding_path(root: Path, task_id: str) -> Path:

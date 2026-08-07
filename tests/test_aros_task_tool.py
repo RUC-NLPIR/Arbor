@@ -21,6 +21,11 @@ class FakeTaskService:
         "state": "running",
         "final_ref": None,
     }
+    status_result: dict[str, Any] = {
+        "task_id": "TASK-test",
+        "state": "running",
+        "final_ref": None,
+    }
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -74,9 +79,14 @@ class FakeTaskService:
         self.calls.append(("start", task_id, actor, commit_paths))
         return dict(self.start_result)
 
-    def status(self, task_id: str) -> dict[str, Any]:
-        self.calls.append(("status", task_id))
-        return {"task_id": task_id, "state": "running"}
+    def status(
+        self,
+        task_id: str,
+        *,
+        commit_paths: Any = None,
+    ) -> dict[str, Any]:
+        self.calls.append(("status", task_id, commit_paths))
+        return dict(self.status_result)
 
     def list(self) -> list[dict[str, Any]]:
         self.calls.append(("list",))
@@ -126,6 +136,11 @@ class FakeTaskService:
 def fake_task_service(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeTaskService.instances.clear()
     FakeTaskService.start_result = {
+        "task_id": "TASK-test",
+        "state": "running",
+        "final_ref": None,
+    }
+    FakeTaskService.status_result = {
         "task_id": "TASK-test",
         "state": "running",
         "final_ref": None,
@@ -380,6 +395,35 @@ def test_start_without_commit_callback_fails_before_service_preparation(
     assert FakeTaskService.instances == []
 
 
+def test_status_passes_commit_callback_and_records_terminal_observation_once(
+    tmp_path: Path,
+) -> None:
+    observations: list[str] = []
+
+    def commit(paths: tuple[str, ...], message: str) -> dict[str, object]:
+        raise AssertionError(f"fake service must own commit: {paths!r} {message!r}")
+
+    FakeTaskService.status_result = {
+        "task_id": "TASK-test",
+        "state": "completed",
+        "run_id": "RUN-test",
+        "final_ref": "runs/RUN-test/final.json",
+    }
+    tool = _task_tool()(
+        cwd=str(tmp_path),
+        commit_paths=commit,
+        record_observation=observations.append,
+    )
+
+    output = json.loads(_execute(tool, action="status", task_id="TASK-test"))
+
+    assert FakeTaskService.instances[0].calls == [
+        ("status", "TASK-test", commit),
+    ]
+    assert output == FakeTaskService.status_result
+    assert observations == ["runs/RUN-test/final.json"]
+
+
 def test_message_and_stop_use_principal_actor(tmp_path: Path) -> None:
     tool = _task_tool()(cwd=str(tmp_path))
 
@@ -409,8 +453,12 @@ def test_message_and_stop_use_principal_actor(tmp_path: Path) -> None:
     [
         (
             "status",
-            ("status", "TASK-test"),
-            {"task_id": "TASK-test", "state": "running"},
+            ("status", "TASK-test", None),
+            {
+                "task_id": "TASK-test",
+                "state": "running",
+                "final_ref": None,
+            },
         ),
         (
             "collect",

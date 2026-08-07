@@ -509,9 +509,7 @@ class TaskService:
         from .runs import RunError, RunService
         from .task_run import (
             TaskRunError,
-            commit_terminal_run_if_present,
             ensure_task_run,
-            project_task_status,
         )
 
         self._validate_task_id(task_id)
@@ -534,17 +532,24 @@ class TaskService:
                 actor=launch_actor,
                 commit_paths=commit_paths,
             )
-            run_status = RunService(self.root).start(
+            RunService(self.root).start(
                 str(binding["run_id"]),
                 actor=launch_actor,
             )
-            run_status = commit_terminal_run_if_present(
-                self.root,
-                binding,
-                run_status,
-                commit_paths,
+            publication_lock = self._publication_lock_path()
+            _ensure_durable_lock_file(
+                publication_lock,
+                "task record publication lock",
             )
-            return project_task_status(brief, ownership, binding, run_status)
+            with file_lock(publication_lock):
+                lifecycle_lock = self._lifecycle_lock_path(task_id)
+                _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+                with file_lock(lifecycle_lock):
+                    self._reconcile_authoritative_briefs()
+                    return self._project_bound_run_unlocked(
+                        task_id,
+                        commit_paths=commit_paths,
+                    )
         except (TaskRunError, RunError, OSError, RuntimeError, ValueError) as error:
             raise TaskError(f"unable to start Task Run: {task_id}") from error
 
@@ -684,18 +689,40 @@ class TaskService:
         self._require_parent_unchanged(brief, parent_head)
         return self._load_task_status(brief, self._load_ownership(brief))
 
-    def status(self, task_id: str) -> dict[str, object]:
-        """Return validated prepared or worktree-ready runtime state."""
+    def status(
+        self,
+        task_id: str,
+        *,
+        commit_paths: Callable[
+            [tuple[str, ...], str],
+            dict[str, object],
+        ]
+        | None = None,
+    ) -> dict[str, object]:
+        """Project one Task from its validated Run when bound."""
         self._validate_task_id(task_id)
-        self._ensure_record_roots()
-        publication_lock = self._publication_lock_path()
-        _ensure_durable_lock_file(publication_lock, "task record publication lock")
-        with file_lock(publication_lock):
-            lifecycle_lock = self._lifecycle_lock_path(task_id)
-            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
-            with file_lock(lifecycle_lock):
-                self._reconcile_authoritative_briefs()
-                return self._status_unlocked(task_id)
+        if commit_paths is not None and not callable(commit_paths):
+            raise TaskError("task status commit_paths must be callable or None")
+        try:
+            self._ensure_record_roots()
+            publication_lock = self._publication_lock_path()
+            _ensure_durable_lock_file(
+                publication_lock,
+                "task record publication lock",
+            )
+            with file_lock(publication_lock):
+                lifecycle_lock = self._lifecycle_lock_path(task_id)
+                _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+                with file_lock(lifecycle_lock):
+                    self._reconcile_authoritative_briefs()
+                    return self._public_status_unlocked(
+                        task_id,
+                        commit_paths=commit_paths,
+                    )
+        except TaskError:
+            raise
+        except (OSError, RuntimeError, ValueError) as error:
+            raise TaskError(f"unable to inspect Task Run: {task_id}") from error
 
     def stop(
         self,
@@ -705,33 +732,50 @@ class TaskService:
         reason: str,
         signal_name: str = "TERM",
     ) -> dict[str, object]:
-        """Persist one attributed stop request for the task runner."""
+        """Delegate one attributed stop to the bound Run."""
+        from .runs import RunError, RunService
+        from .task_run import TaskRunError, load_task_run
+
         self._validate_task_id(task_id)
-        self._ensure_record_roots()
-        publication_lock = self._publication_lock_path()
-        _ensure_durable_lock_file(publication_lock, "task record publication lock")
-        with file_lock(publication_lock):
-            lifecycle_lock = self._lifecycle_lock_path(task_id)
-            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
-            with file_lock(lifecycle_lock):
-                self._reconcile_authoritative_briefs()
-                from .task_runner import request_stop_locked
-
-                request = request_stop_locked(
-                    self,
-                    task_id,
-                    actor=actor,
-                    reason=reason,
-                    signal_name=signal_name,
-                )
-        from .task_runner import deliver_stop
-
-        _ensure_durable_lock_file(
-            self._stop_delivery_lock_path(task_id),
-            "task stop delivery lock",
-        )
-        deliver_stop(self, task_id)
-        return request
+        try:
+            self._ensure_record_roots()
+            publication_lock = self._publication_lock_path()
+            _ensure_durable_lock_file(
+                publication_lock,
+                "task record publication lock",
+            )
+            with file_lock(publication_lock):
+                lifecycle_lock = self._lifecycle_lock_path(task_id)
+                _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+                with file_lock(lifecycle_lock):
+                    self._reconcile_authoritative_briefs()
+                    brief = self._load_brief(task_id)
+                    self._load_bound_idempotency_index(brief)
+                    ownership = self._load_ownership(brief)
+                    binding = load_task_run(self.root, brief, ownership)
+                    run_id = str(binding["run_id"])
+            receipt = RunService(self.root).stop(
+                run_id,
+                actor=actor,
+                reason=reason,
+                signal_name=signal_name,
+            )
+            return {
+                "schema_version": 1,
+                "task_id": task_id,
+                "run_id": run_id,
+                "run_stop": receipt,
+            }
+        except TaskError:
+            raise
+        except (
+            TaskRunError,
+            RunError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as error:
+            raise TaskError(f"unable to stop Task Run: {task_id}") from error
 
     def message(
         self,
@@ -1465,6 +1509,75 @@ class TaskService:
             return self._reconcile_execution(brief, ownership, launch)
         return self._load_task_status(brief, ownership)
 
+    def _public_status_unlocked(
+        self,
+        task_id: str,
+        *,
+        commit_paths: Callable[
+            [tuple[str, ...], str],
+            dict[str, object],
+        ]
+        | None,
+    ) -> dict[str, object]:
+        brief = self._load_brief(task_id)
+        self._load_bound_idempotency_index(brief)
+        if _path_exists(self._pruned_path(task_id)):
+            pruned_ownership = self._load_ownership(brief, check_worktree=False)
+            return self._validated_pruned_status(brief, pruned_ownership)
+        binding_path = self._runtime_path(task_id) / "run.json"
+        if _path_exists(binding_path):
+            return self._project_bound_run_unlocked(
+                task_id,
+                commit_paths=commit_paths,
+            )
+        ownership = (
+            self._load_ownership(brief)
+            if _path_exists(self._ownership_path(task_id))
+            else None
+        )
+        if _path_exists(self._launch_path(task_id)):
+            raise TaskError(f"Task Run binding is missing: {task_id}")
+        return self._load_task_status(brief, ownership)
+
+    def _project_bound_run_unlocked(
+        self,
+        task_id: str,
+        *,
+        commit_paths: Callable[
+            [tuple[str, ...], str],
+            dict[str, object],
+        ]
+        | None,
+    ) -> dict[str, object]:
+        """Project a bound Run while Task publication and lifecycle locks are held."""
+        from .runs import RunService
+        from .task_run import (
+            commit_terminal_run_if_present,
+            hide_uncommitted_terminal_run_ref,
+            load_task_run,
+            project_task_status,
+        )
+
+        brief = self._load_brief(task_id)
+        self._load_bound_idempotency_index(brief)
+        ownership = self._load_ownership(brief)
+        binding = load_task_run(self.root, brief, ownership)
+        run_status = RunService(self.root).status(str(binding["run_id"]))
+        if commit_paths is not None:
+            run_status = commit_terminal_run_if_present(
+                self.root,
+                binding,
+                run_status,
+                commit_paths,
+            )
+        else:
+            run_status = hide_uncommitted_terminal_run_ref(
+                self.root,
+                binding,
+                run_status,
+            )
+        return project_task_status(brief, ownership, binding, run_status)
+
     def _load_task_status(
         self,
         brief: dict[str, object],
@@ -1545,10 +1658,20 @@ class TaskService:
             raise TaskError("task record inventory conflict between versioned and runtime paths")
         statuses: list[dict[str, object]] = []
         for task_id in sorted(versioned):
-            lifecycle_lock = self._lifecycle_lock_path(task_id)
-            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
-            with file_lock(lifecycle_lock):
-                statuses.append(self._status_unlocked(task_id))
+            try:
+                lifecycle_lock = self._lifecycle_lock_path(task_id)
+                _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+                with file_lock(lifecycle_lock):
+                    statuses.append(
+                        self._public_status_unlocked(
+                            task_id,
+                            commit_paths=None,
+                        )
+                    )
+            except TaskError:
+                raise
+            except (OSError, RuntimeError, ValueError) as error:
+                raise TaskError(f"unable to inspect Task Run: {task_id}") from error
         return statuses
 
     def _load_brief(

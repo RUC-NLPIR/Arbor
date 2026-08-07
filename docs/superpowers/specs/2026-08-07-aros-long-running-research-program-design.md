@@ -461,6 +461,26 @@ without rerunning research or duplicating the canonical result.
 This architecture is intentionally split into independent subprojects. It must
 not be implemented as one cross-cutting rewrite.
 
+The current `src/aros` tree already consumes the simple-kernel first-slice limit
+of 19,000 lines. Mission supervision must not create a temporary complexity
+spike. Task's duplicate process carrier is therefore removed before any new
+Supervisor module is added.
+
+### Phase 0: Task-on-Run simplification
+
+- preserve Task identity, immutable brief, isolated worktree, collection,
+  preservation, pruning, and return lineage;
+- replace the duplicate Task process carrier with the existing durable Run
+  substrate;
+- retain exact terminal, timeout, stop, lost, dirty-work, and descendant truth;
+- delete superseded Task runner/process code and reach `src/aros <= 12,000 LOC`;
+- recommission current Task, Run, Eval, and simple-loop behavior before adding
+  new long-running control code.
+
+Exit: one Task executes through Run with unchanged externally meaningful
+lineage and failure truth, the old carrier is absent, existing evidence remains
+verifiable, the full suite passes, and the 12,000-line gate is met.
+
 ### Phase A: Mission Supervisor and budgets
 
 - durable event inbox/outbox;
@@ -474,9 +494,8 @@ Exit: a synthetic long mission survives repeated Supervisor and Principal
 termination, never sleeps permanently, never exceeds budget, and never invents
 a scientific transition.
 
-### Phase B: Task-on-Run and real Researcher
+### Phase B: Real Researcher
 
-- reduce Task to isolated worktree plus shared durable Run substrate;
 - real provider-backed Researcher adapter;
 - bounded TaskBrief, heartbeat, return, stop, and renewal request;
 - one real exploratory inner loop with committed negative and positive evidence.

@@ -466,20 +466,33 @@ of 19,000 lines. Mission supervision must not create a temporary complexity
 spike. Task's duplicate process carrier is therefore removed before any new
 Supervisor module is added.
 
-### Phase 0: Task-on-Run simplification
+### Phase 0A: Task-on-Run carrier removal (complete)
 
 - preserve Task identity, immutable brief, isolated worktree, collection,
   preservation, pruning, and return lineage;
 - replace the duplicate Task process carrier with the existing durable Run
   substrate;
 - retain exact terminal, timeout, stop, lost, dirty-work, and descendant truth;
-- delete superseded Task runner/process code and reach `src/aros <= 12,000 LOC`;
+- delete superseded Task runner/process code and meet the human-approved interim
+  recursive `src/aros <= 17,700 LOC` gate;
 - recommission current Task, Run, Eval, and simple-loop behavior before adding
   new long-running control code.
 
-Exit: one Task executes through Run with unchanged externally meaningful
-lineage and failure truth, the old carrier is absent, existing evidence remains
-verifiable, the full suite passes, and the 12,000-line gate is met.
+Exit met: one Task executes through Run with unchanged externally meaningful
+lineage and failure truth, the old carrier is absent, retained evidence is
+verified, and the approved recursive `src/aros <= 17,700` interim gate is met.
+Task 8 evidence recorded exactly 17,700 lines; the reviewed post-commission
+stop/final race fix at `26fe611f` leaves current source at 17,697 lines and does
+not begin Phase 0B or Phase A functionality.
+
+### Phase 0B: Program-wide kernel consolidation (required)
+
+- preserve the commissioned Phase 0A behavior and receipts;
+- complete the remaining consolidation without adding Supervisor functionality;
+- meet the original program-wide `src/aros <= 12,000 LOC` gate.
+
+Exit: the full verification gates pass and recursive `src/aros <= 12,000 LOC`.
+Phase A must not begin before this exit is met.
 
 ### Phase A: Mission Supervisor and budgets
 

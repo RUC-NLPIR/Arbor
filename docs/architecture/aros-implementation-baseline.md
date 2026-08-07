@@ -33,9 +33,11 @@ Attention  Task  Run  Eval  Checkpoint
 
 - `Attention` 从 canonical Markdown、Git history 和 Task/Run/Eval facts 派生小型
   restart packet；`unread_returns` 来自终态 receipts 与 Git trailers 的差集。
-- `Task` 提供 durable child worktree/process/return；child 不能直接修改 canonical
-  scientific meaning。
-- `Run` 提供 durable experiment process 和 immutable final。
+- `Task` 提供 durable child brief/worktree/mailbox/return/collection/preserve/prune；
+  child 不能直接修改 canonical scientific meaning。Task 不再拥有 process carrier。
+- `Run` 是唯一 process carrier，提供 durable process、log、public stop、timeout、lost、
+  descendant truth 和 immutable final。每个启动的 Task 绑定一个幂等的 trusted-local
+  Run；Task collection 同时绑定 TaskRun manifest/final 与 B-C-R return lineage。
 - `Eval` 冻结 candidate/apparatus/input/seed/environment/parser，并返回 factual
   MeasurementReceipt；Principal 解释科学意义。
 - `Checkpoint(message, paths)` 使用普通 Git selected-path commit。host 自动追加
@@ -43,7 +45,12 @@ Attention  Task  Run  Eval  Checkpoint
   supports、proves、resolves 或 belief admission。
 
 Task/Run/Eval 的 versioned records 通过同一个内部 Git helper 提交。重复读取已提交的
-终态 record 幂等复用 HEAD。Principal checkpoint 仍要求真实语义变更。
+终态 record 幂等复用 HEAD。Principal 同时观察 Task-owned Run final 和 Task
+collection；checkpoint 仍要求真实语义变更。
+
+Generic Run 在 terminal reconciliation 中排空同 PGID 进程与被 live subreaper
+收养的 descendants。leader 退出后，public stop 只有在 exact bound local carrier 仍存活
+时才会投递；发现未被 containment 覆盖的 descendants 时不能签发 clean final。
 
 ## 明确删除的机制
 
@@ -52,6 +59,8 @@ index、rebuild-index、receipt fence 或双路径兼容层。旧 runtime 不迁
 
 执行边界是单用户、same-UID、cooperative Git。host 决定 Principal 是否获得
 `Checkpoint`；prompt 或 tool input 不能把 cooperative 机制升级为 protected authority。
+mode-normalizing filesystem integrity 与 controlled Git optional-lock 行为是事实记录，
+不是 protected authority。
 
 ## 已验证
 
@@ -68,19 +77,38 @@ fresh Question-centered KB
 → fresh Agent Attention with unread_returns=[]
 ```
 
-独立 verifier 将 Agent tool sequence 和 Write bytes 绑定到 Git blobs、Task collection、
-Eval receipt、final commit trailers 和 restart packet，并确认安装包没有已删除模块。
+在 product source `4f1eb3df2578f2ba45c8d542ff8fe0e07a37fe10` 上，独立
+`-I -S` verifier 将 Agent tool sequence 和 Write bytes 绑定到 Git blobs、Task-owned
+Run manifest/final、Task collection、Eval receipt、final commit trailers、restart
+packet，以及 source→wheel→installed distribution/RECORD/entrypoint provenance。clean
+wheel 包含 `task_adapter.py` 与 `task_run.py`，不包含 `task_runner.py` 或 installed
+bytecode。最终 research commit 是
+`7ca93fc634d08e4598016f7b4e9ad2fd276e4c57`。
+
+该 retained commissioning evidence 仍严格绑定上述 `4f1eb3d` source。当前 product
+source `26fe611fc88252a4667d24b0db92b742f654712e` 另行修复了 commissioning 后发现的
+public stop/final publication race：delivered stop 只有在 matching `cancelled` final
+可验证后才返回，delivered-false receipt 仍立即返回。基于该 commit 的 clean wheel
+full gate 收集 1,964 tests：1,958 passed、6 skipped、0 failed，exit 0；adopted-descendant
+stop test 连续 20/20 passed。
 
 ## 当前限制与下一阶段
 
-- Task 仍有独立 process carrier；下一阶段把它简化为 worktree + Run + Researcher
-  adapter，目标 `src/aros <= 12,000 LOC`。
-- 尚未 commissioning 真实 LLM Researcher 内循环与 async 多 Idea concurrency。
-- Source Gateway、project Skills 和 MCP transport 尚未加入。只有重复出现且 native
-  service 已证明稳定的问题才获得 Skill/MCP surface。
-- protected multi-process authority、budgets/leases 和 non-bypass enforcement 未实现。
+- human-approved Phase 0A interim gate 已在 Task 8 recursive
+  `src/aros = 17,700 LOC` 且旧 carrier 缺席时完成；post-commission race fix 后当前
+  count 是 17,697。原 program-wide Phase 0B `src/aros <= 12,000 LOC` gate 仍必须在
+  Phase A Mission Supervisor 之前完成。当前功能有意保持受限。
+- deterministic simple-loop commissioning 不证明真实 external-model research quality、
+  真实 Researcher inner loop 或 async portfolio。
+- Source Gateway、Independent Reviewer、budgets/Supervisor、project Skills 和 MCP
+  transport 尚未实现。
+- protected multi-process authority 与 non-bypass enforcement 未实现；filesystem/Git
+  的 factual enforcement 不能替代它。
 - AROS-native K/M/G 仍主要是 workspace 约定与 Principal 能力，不是独立产品层。
 - legacy Arbor 的其他公共命令尚未全部被等价 AROS 能力替换，因此尚未退休。
+
+AROS 仍是 limited implementation；当前 evidence 不支持“strictly better than Arbor”
+的声明。
 
 任何下一步不得重新引入 Coordinator state machine、transition ceremony、automatic
 scientific interpretation 或为了未来扩展而增加的配置/抽象层。

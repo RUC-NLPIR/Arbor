@@ -30,8 +30,10 @@ Principal 使用普通 `Read/Grep/Glob/Edit/Write`，以及至多五个 AROS too
 
 - `Attention`：Question、uncertainty、hypotheses、pending measurements、unread
   returns、obligations、budget 与 blockers 的有界 restart packet。
-- `Task`：durable Researcher worktree、process、return 与 collect。
-- `Run`：durable background experiment process。
+- `Task`：durable Researcher brief/worktree/mailbox/return/collection/preserve/prune；
+  不拥有 process carrier。
+- `Run`：唯一 durable process carrier，拥有 log、stop、timeout、lost 与 descendant
+  truth。启动的 Task 绑定一个幂等 trusted-local Run。
 - `Eval`：exact candidate/apparatus measurement receipt；不产生科学 verdict。
 - `Checkpoint`：`message + paths` 的 selected-path Git commit。
 
@@ -39,11 +41,14 @@ Task/Run/Eval 返回的终态 refs 由 host session 记录。下一次成功 Che
 
 ```text
 AROS-Observed: tasks/TASK-.../collected.json
+AROS-Observed: runs/RUN-.../final.json
 AROS-Observed: eval/evaluations/EVAL-.../receipt.json
 ```
 
-trailers 表示“本 session 收到过”，不表示“已证明或已吸收”。科学意义保留在普通
-Markdown；OS 不解析 relation enum、belief level 或 strict Evidence JSON。
+Task collection 绑定 TaskRun manifest/final 和 B-C-R return lineage；Principal 同时
+观察 Task-owned Run final 与 collection。trailers 表示“本 session 收到过”，不表示
+“已证明或已吸收”。科学意义保留在普通 Markdown；OS 不解析 relation enum、belief
+level 或 strict Evidence JSON。
 
 Visible Eval is available through `aros eval register|run|status|observe|audit`.
 The apparatus produces factual measurements, the Principal interprets them, and a
@@ -59,24 +64,36 @@ lost evaluation is never retried with the same idempotency key.
   network/shell flags 是 audit declarations，不是强制 containment，receipt 标记
   `capabilities_enforced=false`。
 - V1 terminal truth covers the exact PGID plus descendants reparented to the live
-  subreaper. A new-session process that outlives runner death is not claimed
-  contained and cannot justify a clean final receipt or prune. Delegated per-task
-  cgroups belong to the shared Operations process core, not the Wave 2 security
-  claim.
+  subreaper. Generic Run drains both sets before clean finalization. After leader
+  exit, public stop is delivered only when the exact bound local carrier remains
+  live. A new-session process that outlives runner death is not claimed contained
+  and cannot justify a clean final receipt or prune. Delegated per-task cgroups
+  belong to the shared Operations process core, not the Wave 2 security claim.
+- Current source `26fe611fc88252a4667d24b0db92b742f654712e` closes the
+  post-commission stop/final publication race: a delivered stop returns only after
+  its matching `cancelled` final is readable and validated; delivered-false remains
+  immediate.
 - mode-normalizing filesystem 上 integrity 仍启用，但 receipt 标记
-  `filesystem_permissions_enforced=false`。
+  `filesystem_permissions_enforced=false`。该行为与 controlled Git optional-lock
+  都是 factual enforcement，不是 protected authority。
 - Eval 绑定 exact candidate/apparatus commits；lost evaluation 不以同一 key 自动重试。
 - pre-existing staged Git changes 会阻止 Checkpoint；unselected unstaged dirt 不被修改。
 
 ## Not yet implemented
 
-- 真实 LLM Researcher inner-loop commissioning 与 async Idea concurrency；
-- Task-on-Run 简化；
+- Phase 0B program-wide `src/aros <= 12,000 LOC` gate；Phase 0A 已由 human
+  approved interim gate 在 Task 8 recursive `src/aros = 17,700 LOC` 且旧 carrier
+  缺席时完成；post-commission race fix 后当前 count 是 17,697；
+- 真实 external-model Researcher inner-loop commissioning 与 async portfolio；
 - protected evaluation registration and admission；
-- Source Gateway、project-local Skills 和 MCP parity；
-- protected authority、shared budgets/leases；
+- Source Gateway、Independent Reviewer、project-local Skills 和 MCP parity；
+- Mission Supervisor、protected authority、shared budgets/leases；
 - AROS-native semantic K/M/G；
 - 完整 K/M/G productization 与 Arbor retirement。
+
+当前 deterministic clean-wheel evidence 证明 exact provenance、tool writes 与 restart，
+不证明真实 research quality 或上述未实现能力。AROS 仍有意保持 limited；没有
+“strictly better than Arbor”的声明。
 
 ## Replacement boundary
 

@@ -4,7 +4,7 @@
 
 **Goal:** Remove Task's duplicate process carrier and project Task execution through the existing durable Run service while preserving brief, worktree, return, collection, and failure lineage.
 
-**Architecture:** Task remains the owner of immutable briefs, isolated worktrees, mailbox records, reviewed returns, collections, preservation, and pruning. A small `task_run` bridge creates one idempotent trusted-local Run whose command is a thin `exec` adapter; Task status and stop become validated projections of that Run. This plan is Phase 0A only and must reduce `src/aros` to at most 16,000 physical lines; Phase 0B performs the remaining consolidation needed for the program-wide 12,000-line gate.
+**Architecture:** Task remains the owner of immutable briefs, isolated worktrees, mailbox records, reviewed returns, collections, preservation, and pruning. A small `task_run` bridge creates one idempotent trusted-local Run whose command is a thin `exec` adapter; Task status and stop become validated projections of that Run. This plan is Phase 0A only and must reduce recursive `src/aros` to at most 17,700 physical lines under the human-approved interim gate; Phase 0B remains mandatory and performs the consolidation needed for the original program-wide 12,000-line gate before Phase A Mission Supervisor.
 
 **Tech Stack:** Python 3.10+, Git worktrees, existing `RunService`, `GitCheckpoint`, durable JSON primitives, Typer, pytest.
 
@@ -180,10 +180,15 @@ def test_phase0a_aros_source_budget() -> None:
     root = Path(__file__).resolve().parents[1] / "src/aros"
     lines = sum(
         len(path.read_bytes().splitlines())
-        for path in root.glob("*.py")
+        for path in root.rglob("*.py")
     )
-    assert lines <= 16_000
+    assert lines <= 17_700
 ```
+
+Final current measurement after the reviewed stop/final fix is 17,697 recursive
+physical lines. This remains only the approved Phase 0A interim gate; Phase 0B
+still requires the original program-wide `src/aros <= 12,000 LOC` before Phase A
+Mission Supervisor.
 
 - [ ] **Step 4: Run the tests and confirm the intended failures**
 
@@ -1327,10 +1332,11 @@ Expected: PASS and no import of `arbor.aros.task_runner`.
 Run:
 
 ```bash
-wc -l src/aros/*.py | tail -n 1
+find src/aros -type f -name '*.py' -print0 | sort -z | xargs -0 wc -l | tail -n 1
 ```
 
-Expected: total is at most `16000`.
+Expected: recursive total is at most `17700`. This is the approved Phase 0A
+interim gate; it does not replace the Phase 0B `src/aros <= 12000` obligation.
 
 - [ ] **Step 7: Commit**
 
@@ -1510,7 +1516,7 @@ ruff check src/aros src/cli/aros_app.py src/cli/aros_start.py \
   scripts/commission_aros_*.py scripts/verify_aros_*.py
 git diff --check
 git status --short
-wc -l src/aros/*.py | tail -n 1
+find src/aros -type f -name '*.py' -print0 | sort -z | xargs -0 wc -l | tail -n 1
 ```
 
 Expected:
@@ -1519,7 +1525,9 @@ Expected:
 - focused Ruff reports `All checks passed!`;
 - `git diff --check` exits 0;
 - worktree status contains only the intended documentation changes before the final commit;
-- `src/aros` is at most 16,000 physical lines.
+- recursive `src/aros` is at most 17,700 physical lines under the approved
+  Phase 0A interim gate; Phase 0B still requires `src/aros <= 12,000` before
+  Phase A Mission Supervisor.
 
 - [ ] **Step 6: Commit current truth and evidence**
 
@@ -1541,5 +1549,7 @@ git commit -m "docs(aros): record task-on-run commissioning"
 - `src/aros/task_adapter.py` performs validation/environment setup and `exec`, but no process supervision.
 - Existing Run stop/timeout/lost/descendant truth is the only execution truth.
 - Clean-wheel deterministic simple-loop commissioning passes.
-- `src/aros <= 16,000 LOC`; Phase 0B remains explicitly required for `<=12,000 LOC`.
+- recursive `src/aros <= 17,700 LOC` under the approved Phase 0A interim gate;
+  Phase 0B remains explicitly required for the original `<=12,000 LOC` gate
+  before Phase A Mission Supervisor.
 - No Mission Supervisor, budget scheduler, real Researcher, Source, Reviewer, or semantic workflow is added by this plan.

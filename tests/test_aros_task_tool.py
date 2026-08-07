@@ -11,7 +11,8 @@ from typing import Any
 
 import pytest
 
-from arbor.aros.tasks import TaskError
+from arbor.aros.checkpoint import CheckpointError, GitCheckpoint
+from arbor.aros.tasks import TaskError, TaskService
 
 
 class FakeTaskService:
@@ -113,6 +114,7 @@ class FakeTaskService:
             "task_id": task_id,
             "state": "collected",
             "collected_sha256": "c" * 64,
+            "run_final_ref": "runs/RUN-test/final.json",
         }
 
     def collect_with_commit(self, task_id: str):  # type: ignore[no-untyped-def]
@@ -123,6 +125,28 @@ class FakeTaskService:
             f"Record task {task_id} collection",
         )
 
+    def collect_and_commit(
+        self,
+        task_id: str,
+        commit_paths: Any,
+    ) -> tuple[dict[str, Any], dict[str, object]]:
+        self.calls.append(("collect_and_commit", task_id, commit_paths))
+        record = {
+            "task_id": task_id,
+            "state": "collected",
+            "collected_sha256": "c" * 64,
+            "run_final_ref": "runs/RUN-test/final.json",
+        }
+        paths = (f"tasks/{task_id}/collected.json",)
+        checkpoint = commit_paths(paths, f"Record task {task_id} collection")
+        if (
+            not isinstance(checkpoint, dict)
+            or checkpoint.get("paths") != list(paths)
+            or checkpoint.get("enforcement_class") != "cooperative"
+        ):
+            raise TaskError("invalid task collection checkpoint")
+        return record, checkpoint
+
     def preserve(self, task_id: str) -> dict[str, Any]:
         self.calls.append(("preserve", task_id))
         return {"task_id": task_id, "state": "preserved"}
@@ -130,6 +154,17 @@ class FakeTaskService:
     def prune(self, task_id: str) -> dict[str, Any]:
         self.calls.append(("prune", task_id))
         return {"task_id": task_id, "state": "pruned"}
+
+
+class FakeObservationCatalog:
+    resolved: list[str] = []
+
+    def __init__(self, _root: str | Path) -> None:
+        pass
+
+    def resolve(self, ref: str) -> object:
+        self.resolved.append(ref)
+        return object()
 
 
 @pytest.fixture(autouse=True)
@@ -145,11 +180,13 @@ def fake_task_service(monkeypatch: pytest.MonkeyPatch) -> None:
         "state": "running",
         "final_ref": None,
     }
+    FakeObservationCatalog.resolved.clear()
     try:
         module = importlib.import_module("arbor.aros.task_tool")
     except ModuleNotFoundError:
         return
     monkeypatch.setattr(module, "TaskService", FakeTaskService)
+    monkeypatch.setattr(module, "ObservationCatalog", FakeObservationCatalog)
 
 
 def _task_tool() -> Any:
@@ -298,12 +335,30 @@ def test_create_callback_commits_paths_once(tmp_path: Path) -> None:
     }
 
 
-def test_collect_records_terminal_ref_after_commit(tmp_path: Path) -> None:
+def test_collect_records_run_then_task_refs_after_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("arbor.aros.task_tool")
     events: list[object] = []
+
+    class OrderedCatalog:
+        def __init__(self, _root: str | Path) -> None:
+            pass
+
+        def resolve(self, ref: str) -> object:
+            events.append(("resolve", ref))
+            return object()
+
+    monkeypatch.setattr(module, "ObservationCatalog", OrderedCatalog)
 
     def commit(paths: tuple[str, ...], message: str) -> dict[str, object]:
         events.append((paths, message))
-        return {"commit": "e" * 40}
+        return {
+            "commit": "e" * 40,
+            "paths": list(paths),
+            "enforcement_class": "cooperative",
+        }
 
     tool = _task_tool()(
         cwd=str(tmp_path),
@@ -318,9 +373,129 @@ def test_collect_records_terminal_ref_after_commit(tmp_path: Path) -> None:
             ("tasks/TASK-test/collected.json",),
             "Record task TASK-test collection",
         ),
+        ("resolve", "runs/RUN-test/final.json"),
+        ("resolve", "tasks/TASK-test/collected.json"),
+        "runs/RUN-test/final.json",
         "tasks/TASK-test/collected.json",
     ]
-    assert output["checkpoint"] == {"commit": "e" * 40}
+    assert output["checkpoint"] == {
+        "commit": "e" * 40,
+        "paths": ["tasks/TASK-test/collected.json"],
+        "enforcement_class": "cooperative",
+    }
+    assert FakeTaskService.instances[0].calls == [
+        ("collect_and_commit", "TASK-test", commit)
+    ]
+
+
+def test_collect_callback_failure_records_no_observations(tmp_path: Path) -> None:
+    observations: list[str] = []
+
+    def fail_commit(_paths: tuple[str, ...], _message: str) -> dict[str, object]:
+        raise RuntimeError("injected commit failure")
+
+    tool = _task_tool()(
+        cwd=str(tmp_path),
+        commit_paths=fail_commit,
+        record_observation=observations.append,
+    )
+
+    with pytest.raises(RuntimeError, match="injected commit failure"):
+        _execute(tool, action="collect", task_id="TASK-test")
+
+    assert observations == []
+
+
+def test_collect_wrong_commit_result_records_no_observations(tmp_path: Path) -> None:
+    observations: list[str] = []
+    tool = _task_tool()(
+        cwd=str(tmp_path),
+        commit_paths=lambda _paths, _message: {
+            "commit": "not-a-commit",
+            "paths": ["wrong.json"],
+        },
+        record_observation=observations.append,
+    )
+
+    with pytest.raises(TaskError, match="commit|checkpoint"):
+        _execute(tool, action="collect", task_id="TASK-test")
+
+    assert observations == []
+
+
+def test_collect_forged_plausible_callback_records_no_observations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arbor.aros import task_tool as task_tool_module
+    from tests import test_aros_task_on_run as task_run_support
+
+    _service, brief, _ownership, _binding, _final, _child, _return = (
+        task_run_support._terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    observations: list[str] = []
+    monkeypatch.setattr(task_tool_module, "TaskService", TaskService)
+
+    def forged(
+        paths: tuple[str, ...],
+        _message: str,
+    ) -> dict[str, object]:
+        return {
+            "commit": task_run_support._git(tmp_path, "rev-parse", "HEAD"),
+            "paths": list(paths),
+            "enforcement_class": "cooperative",
+        }
+
+    tool = _task_tool()(
+        cwd=str(tmp_path),
+        commit_paths=forged,
+        record_observation=observations.append,
+    )
+
+    with pytest.raises(TaskError, match="commit|collection|Run final"):
+        _execute(tool, action="collect", task_id=task_id)
+
+    assert observations == []
+
+
+def test_collect_staged_exact_records_fail_closed_without_cleanup_or_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arbor.aros import task_tool as task_tool_module
+    from tests import test_aros_task_on_run as task_run_support
+
+    service, brief, _ownership, _binding, _final, _child, _return = (
+        task_run_support._terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    collected = service.collect(task_id)
+    refs = [
+        str(collected["run_final_ref"]),
+        f"tasks/{task_id}/collected.json",
+    ]
+    task_run_support._git(tmp_path, "add", *refs)
+    before = {ref: (tmp_path / ref).read_bytes() for ref in refs}
+    observations: list[str] = []
+    monkeypatch.setattr(task_tool_module, "TaskService", TaskService)
+    tool = _task_tool()(
+        cwd=str(tmp_path),
+        commit_paths=GitCheckpoint(tmp_path).commit_paths,
+        record_observation=observations.append,
+    )
+
+    with pytest.raises((TaskError, CheckpointError), match="Git state|index|staged"):
+        _execute(tool, action="collect", task_id=task_id)
+
+    assert observations == []
+    assert task_run_support._git(
+        tmp_path,
+        "diff",
+        "--cached",
+        "--name-only",
+    ).splitlines() == sorted(refs)
+    assert {ref: (tmp_path / ref).read_bytes() for ref in refs} == before
 
 
 def test_create_forwards_explicit_bounded_brief_fields(tmp_path: Path) -> None:
@@ -395,6 +570,17 @@ def test_start_without_commit_callback_fails_before_service_preparation(
     assert FakeTaskService.instances == []
 
 
+def test_collect_without_commit_callback_fails_before_service_collection(
+    tmp_path: Path,
+) -> None:
+    tool = _task_tool()(cwd=str(tmp_path))
+
+    with pytest.raises(TaskError, match="commit_paths|commit"):
+        _execute(tool, action="collect", task_id="TASK-test")
+
+    assert FakeTaskService.instances == []
+
+
 def test_status_passes_commit_callback_and_records_terminal_observation_once(
     tmp_path: Path,
 ) -> None:
@@ -458,15 +644,6 @@ def test_message_and_stop_use_principal_actor(tmp_path: Path) -> None:
                 "task_id": "TASK-test",
                 "state": "running",
                 "final_ref": None,
-            },
-        ),
-        (
-            "collect",
-            ("collect", "TASK-test"),
-            {
-                "task_id": "TASK-test",
-                "state": "collected",
-                "collected_sha256": "c" * 64,
             },
         ),
         (

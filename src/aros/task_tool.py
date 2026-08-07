@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
 from ..core.tools.base import Tool
+from .observations import ObservationCatalog, ObservationError
 from .tasks import TaskError, TaskService
 
 
@@ -103,13 +105,34 @@ class TaskTool(Tool):
         paths: tuple[str, ...] | None,
         message: str | None,
         *,
-        observation: str | None = None,
+        observations: tuple[str, ...] = (),
     ) -> dict[str, object]:
         result = dict(record)
+        committed = paths is None and message is None
         if paths is not None and message is not None and self.commit_paths is not None:
-            result["checkpoint"] = self.commit_paths(paths, message)
-        if observation is not None and self.record_observation is not None:
-            self.record_observation(observation)
+            checkpoint = self.commit_paths(paths, message)
+            checkpoint_commit = (
+                checkpoint.get("commit") if isinstance(checkpoint, dict) else None
+            )
+            if observations and (
+                not isinstance(checkpoint, dict)
+                or not isinstance(checkpoint_commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", checkpoint_commit) is None
+                or checkpoint.get("paths") != list(paths)
+                or checkpoint.get("enforcement_class") != "cooperative"
+            ):
+                raise TaskError("invalid task collection checkpoint result")
+            result["checkpoint"] = checkpoint
+            committed = True
+        if committed and self.record_observation is not None:
+            try:
+                catalog = ObservationCatalog(self.cwd)
+                for observation in dict.fromkeys(observations):
+                    catalog.resolve(observation)
+            except (OSError, ObservationError, RuntimeError, ValueError) as error:
+                raise TaskError("invalid committed task observation") from error
+            for observation in dict.fromkeys(observations):
+                self.record_observation(observation)
         return result
 
     async def execute(self, **kwargs: Any) -> str:
@@ -134,8 +157,8 @@ class TaskTool(Tool):
         if missing:
             fields = ", ".join(missing)
             raise TaskError(f"{fields} required for task action {action!r}")
-        if action == "start" and self.commit_paths is None:
-            raise TaskError("commit_paths required for task action 'start'")
+        if action in {"start", "collect"} and self.commit_paths is None:
+            raise TaskError(f"commit_paths required for task action {action!r}")
 
         service = TaskService(self.cwd)
         if action == "create":
@@ -186,16 +209,27 @@ class TaskTool(Tool):
                 reason=kwargs["reason"],
             )
         elif action == "collect":
-            record, paths, message = service.collect_with_commit(
-                kwargs["task_id"]
+            assert self.commit_paths is not None
+            collected_record, checkpoint = service.collect_and_commit(
+                kwargs["task_id"],
+                self.commit_paths,
             )
-            observation = paths[0] if paths is not None else None
+            run_final_ref = collected_record.get("run_final_ref")
+            observations: tuple[str, ...] = (
+                (str(run_final_ref),)
+                if isinstance(run_final_ref, str)
+                else ()
+            )
+            if isinstance(collected_record.get("collected_sha256"), str):
+                observations += (f"tasks/{kwargs['task_id']}/collected.json",)
             result = self._committed_result(
-                record,
-                paths,
-                message,
-                observation=observation,
+                collected_record,
+                None,
+                None,
+                observations=observations,
             )
+            if checkpoint is not None:
+                result["checkpoint"] = checkpoint
         elif action == "preserve":
             result = service.preserve(kwargs["task_id"])
         else:

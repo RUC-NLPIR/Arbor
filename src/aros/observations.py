@@ -161,9 +161,13 @@ class ObservationCatalog:
                     for ref in self._candidate_refs(reader)
                 ]
                 linked_run_finals = {
-                    f"runs/{record.payload['run_id']}/final.json"
+                    (
+                        str(record.payload["run_final_ref"])
+                        if record.kind == "task_return"
+                        else f"runs/{record.payload['run_id']}/final.json"
+                    )
                     for record in records
-                    if record.kind in {"measurement", "eval_outcome"}
+                    if record.kind in {"task_return", "measurement", "eval_outcome"}
                 }
                 result = tuple(
                     record
@@ -216,6 +220,32 @@ class ObservationCatalog:
             task_id,
             reader=reader,
         )
+        run_id = collected.get("run_id")
+        manifest_ref = collected.get("run_manifest_ref")
+        final_ref = collected.get("run_final_ref")
+        if (
+            not isinstance(run_id, str)
+            or not isinstance(manifest_ref, str)
+            or not isinstance(final_ref, str)
+            or manifest_ref != f"runs/{run_id}/manifest.json"
+            or final_ref != f"runs/{run_id}/final.json"
+        ):
+            raise ObservationError(f"invalid Task Run lineage: {ref}")
+        reader.require_file(manifest_ref)
+        reader.require_file(final_ref)
+        manifest = read_validated_run_manifest(self.root, run_id, reader=reader)
+        final = read_validated_run_final(self.root, run_id, reader=reader)
+        if (
+            manifest.get("run_id") != run_id
+            or manifest.get("manifest_sha256")
+            != collected.get("run_manifest_sha256")
+            or final.get("run_id") != run_id
+            or final.get("manifest_sha256")
+            != collected.get("run_manifest_sha256")
+            or final.get("state") != collected.get("final_state")
+            or json_sha256(final) != collected.get("run_final_sha256")
+        ):
+            raise ObservationError(f"Task Run lineage mismatch: {ref}")
         child_commit = collected["child_commit"]
         if not isinstance(child_commit, str) or _COMMIT.fullmatch(child_commit) is None:
             raise ObservationError(f"invalid Task candidate commit: {ref}")
@@ -223,7 +253,7 @@ class ObservationCatalog:
             ref=ref,
             kind="task_return",
             record_sha256=str(collected["collected_sha256"]),
-            versioned_paths=(brief_ref, ref),
+            versioned_paths=(brief_ref, manifest_ref, final_ref, ref),
             candidate_commit=child_commit,
             measurement_state=None,
             payload=collected,

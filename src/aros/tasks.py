@@ -39,6 +39,7 @@ _TASK_ID = re.compile(
 )
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_RUN_ID = re.compile(r"^RUN-[A-Za-z0-9][A-Za-z0-9-]*$")
 _TASK_STAGING_DIRECTORY = ".staging"
 _UTC_TIMESTAMP = re.compile(
     r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
@@ -109,7 +110,11 @@ _COLLECTED_FIELDS = {
     "child_commit",
     "return_commit",
     "final_state",
-    "final_sha256",
+    "run_id",
+    "run_manifest_ref",
+    "run_manifest_sha256",
+    "run_final_ref",
+    "run_final_sha256",
     "return",
     "collected_at",
     "collected_sha256",
@@ -136,7 +141,6 @@ _PRUNED_FIELDS = {
     "branch_ref",
     "return_commit",
     "final_state",
-    "final_sha256",
     "worktree_path",
     "removed_at",
     "prune_sha256",
@@ -898,76 +902,294 @@ class TaskService:
             lifecycle_lock = self._lifecycle_lock_path(task_id)
             _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
             with file_lock(lifecycle_lock):
-                self._reconcile_authoritative_briefs()
-                brief = self._load_brief(task_id)
-                self._load_bound_idempotency_index(brief)
-                collected_path = self._collected_path(task_id)
-                if _path_exists(collected_path):
-                    ownership = self._load_ownership(
-                        brief,
-                        check_worktree=False,
-                    )
-                    return self._load_historical_collection(
-                        brief,
-                        ownership,
-                    )
-                if _path_exists(self._pruned_path(task_id)):
-                    raise TaskError(f"pruned task is missing its collection: {task_id}")
-                snapshot = self._collection_snapshot(brief)
-                if snapshot.get("state") == "completed_no_return":
-                    if _path_exists(collected_path):
-                        raise TaskError(
-                            f"task collection conflicts with missing return: {task_id}"
-                        )
-                    if self._collection_snapshot(brief) != snapshot:
-                        raise TaskError(
-                            f"task collection changed before no-return result: {task_id}"
-                        )
-                    return snapshot
-                collected: dict[str, object] = {
-                    "schema_version": 1,
-                    "task_id": task_id,
-                    "brief_sha256": brief["brief_sha256"],
-                    "ownership_sha256": snapshot["ownership_sha256"],
-                    "branch_ref": snapshot["branch_ref"],
-                    "base_commit": brief["base_commit"],
-                    "child_commit": snapshot["child_commit"],
-                    "return_commit": snapshot["return_commit"],
-                    "final_state": snapshot["final_state"],
-                    "final_sha256": snapshot["final_sha256"],
-                    "return": snapshot["return"],
-                    "collected_at": utc_now(),
-                }
-                collected["collected_sha256"] = _record_sha256(
-                    collected,
-                    "collected_sha256",
-                )
+                return self._collect_unlocked(task_id)
 
-                if self._collection_snapshot(brief) != snapshot:
-                    raise TaskError(
-                        f"task collection changed before publication: {task_id}"
-                    )
-                if not create_json(collected_path, collected):
-                    return self._load_collected(brief, snapshot)
-                recorded = self._load_collected(brief, snapshot)
-                if recorded != collected:
-                    raise TaskError(f"task collection differs after write: {task_id}")
-                return recorded
+    def _collect_unlocked(self, task_id: str) -> dict[str, object]:
+        """Collect while the publication and Task lifecycle locks are held."""
+        self._reconcile_authoritative_briefs()
+        brief = self._load_brief(task_id)
+        self._load_bound_idempotency_index(brief)
+        collected_path = self._collected_path(task_id)
+        if _path_exists(collected_path):
+            ownership = self._load_ownership(
+                brief,
+                check_worktree=False,
+            )
+            return self._load_historical_collection(
+                brief,
+                ownership,
+            )
+        if _path_exists(self._pruned_path(task_id)):
+            raise TaskError(f"pruned task is missing its collection: {task_id}")
+        snapshot = self._collection_snapshot(brief)
+        if snapshot.get("state") == "completed_no_return":
+            if _path_exists(collected_path):
+                raise TaskError(
+                    f"task collection conflicts with missing return: {task_id}"
+                )
+            if self._collection_snapshot(brief) != snapshot:
+                raise TaskError(
+                    f"task collection changed before no-return result: {task_id}"
+                )
+            return snapshot
+        collected: dict[str, object] = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "brief_sha256": brief["brief_sha256"],
+            "ownership_sha256": snapshot["ownership_sha256"],
+            "branch_ref": snapshot["branch_ref"],
+            "base_commit": brief["base_commit"],
+            "child_commit": snapshot["child_commit"],
+            "return_commit": snapshot["return_commit"],
+            "final_state": snapshot["final_state"],
+            "run_id": snapshot["run_id"],
+            "run_manifest_ref": snapshot["run_manifest_ref"],
+            "run_manifest_sha256": snapshot["run_manifest_sha256"],
+            "run_final_ref": snapshot["run_final_ref"],
+            "run_final_sha256": snapshot["run_final_sha256"],
+            "return": snapshot["return"],
+            "collected_at": utc_now(),
+        }
+        collected["collected_sha256"] = _record_sha256(
+            collected,
+            "collected_sha256",
+        )
+
+        if self._collection_snapshot(brief) != snapshot:
+            raise TaskError(f"task collection changed before publication: {task_id}")
+        if not create_json(collected_path, collected):
+            return self._load_collected(brief, snapshot)
+        recorded = self._load_collected(brief, snapshot)
+        if recorded != collected:
+            raise TaskError(f"task collection differs after write: {task_id}")
+        return recorded
 
     def collect_with_commit(
         self,
         task_id: str,
     ) -> tuple[dict[str, object], tuple[str, ...] | None, str | None]:
-        """Return a collection and its direct Git commit request when present."""
+        """Return a request-only snapshot of changed Run/Task commit paths."""
         record = self.collect(task_id)
-        record_sha256 = record.get("collected_sha256")
-        if not isinstance(record_sha256, str):
-            return record, None, None
-        return (
-            record,
-            (f"tasks/{task_id}/collected.json",),
-            f"Record task {task_id} collection",
+        request = self._collection_commit_request(task_id, record)
+        if self.collect(task_id) != record:
+            raise TaskError(f"task collection changed before commit request: {task_id}")
+        return request
+
+    def _collection_commit_request(
+        self,
+        task_id: str,
+        record: dict[str, object],
+    ) -> tuple[dict[str, object], tuple[str, ...] | None, str | None]:
+        run_final_ref = record.get("run_final_ref")
+        if not isinstance(run_final_ref, str):
+            raise TaskError(f"task collection is missing its Run final: {task_id}")
+        collected_ref = f"tasks/{task_id}/collected.json"
+        has_collection = isinstance(record.get("collected_sha256"), str)
+        companion = collected_ref if has_collection else None
+        final_committed = self._record_commit_state(
+            run_final_ref,
+            record_sha256=str(record["run_final_sha256"]),
+            hash_field=None,
+            description="Task Run final",
+            companion=companion,
         )
+        collection_committed = False
+        if has_collection:
+            collection_committed = self._record_commit_state(
+                collected_ref,
+                record_sha256=str(record["collected_sha256"]),
+                hash_field="collected_sha256",
+                description="task collection",
+                companion=run_final_ref,
+            )
+            if collection_committed and not final_committed:
+                raise TaskError(
+                    f"committed task collection has an uncommitted Run final: {task_id}"
+                )
+        paths = tuple(
+            path
+            for path, committed in (
+                (run_final_ref, final_committed),
+                (collected_ref, collection_committed),
+            )
+            if (path != collected_ref or has_collection) and not committed
+        )
+        if not paths:
+            return record, None, None
+        message = (
+            f"Record task {task_id} collection"
+            if has_collection
+            else f"Record run {record['run_id']} final"
+        )
+        return record, paths, message
+
+    def collect_and_commit(
+        self,
+        task_id: str,
+        commit_paths: Callable[
+            [tuple[str, ...], str],
+            dict[str, object],
+        ],
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
+        """Select, commit, and strict-reload one collection under publication locks."""
+        self._validate_task_id(task_id)
+        if not callable(commit_paths):
+            raise TaskError("task collect commit_paths must be callable")
+        self._ensure_record_roots()
+        publication_lock = self._publication_lock_path()
+        _ensure_durable_lock_file(publication_lock, "task record publication lock")
+        with file_lock(publication_lock):
+            lifecycle_lock = self._lifecycle_lock_path(task_id)
+            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
+            with file_lock(lifecycle_lock):
+                record = self._collect_unlocked(task_id)
+                _record, paths, message = self._collection_commit_request(
+                    task_id,
+                    record,
+                )
+                if self._collect_unlocked(task_id) != record:
+                    raise TaskError(
+                        f"task collection changed before checkpoint: {task_id}"
+                    )
+                checkpoint: dict[str, object] | None = None
+                if paths is not None and message is not None:
+                    checkpoint = commit_paths(paths, message)
+                    self._validate_collection_checkpoint(
+                        task_id,
+                        checkpoint,
+                        paths,
+                    )
+                committed = self._strict_committed_collection(task_id, record)
+                return committed, checkpoint
+
+    def _strict_committed_collection(
+        self,
+        task_id: str,
+        record: dict[str, object],
+    ) -> dict[str, object]:
+        brief = self._load_brief(task_id)
+        ownership = self._load_ownership(brief, check_worktree=False)
+        if isinstance(record.get("collected_sha256"), str):
+            committed = self._load_historical_collection(
+                brief,
+                ownership,
+                require_committed=True,
+            )
+        else:
+            self._run_collection_lineage(
+                brief,
+                ownership,
+                require_committed=True,
+            )
+            committed = self._collection_snapshot(brief)
+        if committed != record:
+            raise TaskError(f"task collection changed after checkpoint: {task_id}")
+        return committed
+
+    @staticmethod
+    def _validate_collection_checkpoint(
+        task_id: str,
+        checkpoint: object,
+        paths: tuple[str, ...],
+    ) -> None:
+        if (
+            not isinstance(checkpoint, dict)
+            or not isinstance(checkpoint.get("commit"), str)
+            or _COMMIT.fullmatch(checkpoint["commit"]) is None
+            or checkpoint.get("paths") != list(paths)
+            or checkpoint.get("enforcement_class") != "cooperative"
+        ):
+            raise TaskError(f"invalid task collection checkpoint: {task_id}")
+
+    def _record_commit_state(
+        self,
+        relative: str,
+        *,
+        record_sha256: str,
+        hash_field: str | None,
+        description: str,
+        companion: str | None,
+    ) -> bool:
+        """Return whether exact immutable JSON bytes are already at current HEAD."""
+        path = self.root / relative
+        try:
+            working = path.read_bytes()
+            value = read_json_strict_no_repair(path)
+        except (OSError, TypeError, UnicodeError, ValueError) as error:
+            raise TaskError(f"unable to snapshot {description}: {relative}") from error
+        if not isinstance(value, dict):
+            raise TaskError(f"invalid {description}: {relative}")
+        observed_hash = (
+            json_sha256(value)
+            if hash_field is None
+            else value.get(hash_field)
+        )
+        if observed_hash != record_sha256:
+            raise TaskError(f"{description} hash changed before commit: {relative}")
+        status = self._safe_git_result(
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            relative,
+        )
+        if status.returncode != 0:
+            raise TaskError(f"unable to inspect {description} Git state: {relative}")
+        committed = self._safe_git_result("show", f"HEAD:{relative}")
+        if committed.returncode != 0:
+            if status.stdout != b"?? " + relative.encode("utf-8") + b"\0":
+                raise TaskError(
+                    f"new {description} has ambiguous Git state: {relative}"
+                )
+            return False
+        if committed.stdout != working or status.stdout:
+            raise TaskError(f"committed {description} was rewritten: {relative}")
+        touching = self._safe_git_text(
+            "log",
+            "--format=%H",
+            "--",
+            relative,
+        )
+        commits = touching.splitlines() if touching is not None else []
+        if len(commits) != 1 or _COMMIT.fullmatch(commits[0]) is None:
+            raise TaskError(f"{description} history is not immutable: {relative}")
+        introduced = commits[0]
+        changed_raw = self._safe_git_bytes(
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            introduced,
+        )
+        try:
+            changed = tuple(
+                sorted(
+                    item.decode("utf-8")
+                    for item in changed_raw.split(b"\0")
+                    if item
+                )
+            )
+        except UnicodeError as error:
+            raise TaskError(
+                f"{description} commit paths must be valid UTF-8: {relative}"
+            ) from error
+        allowed: set[tuple[str, ...]] = {(relative,)}
+        if companion is not None:
+            allowed.add(tuple(sorted((relative, companion))))
+        if (
+            changed not in allowed
+            or self._safe_git_bytes("show", f"{introduced}:{relative}") != working
+            or not self._safe_git_success(
+                "merge-base",
+                "--is-ancestor",
+                introduced,
+                "HEAD",
+            )
+        ):
+            raise TaskError(f"{description} introducing commit is invalid: {relative}")
+        return True
 
     def preserve(self, task_id: str) -> dict[str, object]:
         """Return an owned-worktree snapshot without changing child material."""
@@ -1027,6 +1249,7 @@ class TaskService:
                     collected = self._load_historical_collection(
                         brief,
                         ownership,
+                        require_committed=True,
                     )
                     self._require_collection_branch_tip(collected)
                     intent = self._load_prune_intent(brief, ownership, collected)
@@ -1040,8 +1263,12 @@ class TaskService:
                         )
                 else:
                     ownership = self._load_ownership(brief)
-                    snapshot = self._collection_snapshot(brief)
-                    collected = self._load_collected(brief, snapshot)
+                    collected = self._load_historical_collection(
+                        brief,
+                        ownership,
+                        require_committed=True,
+                    )
+                    self._require_collection_branch_tip(collected)
                     intent = self._create_prune_intent(
                         brief,
                         ownership,
@@ -1049,10 +1276,14 @@ class TaskService:
                     )
 
                 ownership = self._load_ownership(brief)
-                snapshot = self._collection_snapshot(brief)
-                current = self._load_collected(brief, snapshot)
+                current = self._load_historical_collection(
+                    brief,
+                    ownership,
+                    require_committed=True,
+                )
                 if current != collected:
                     raise TaskError(f"task collection changed before prune: {task_id}")
+                self._require_collection_branch_tip(current)
                 if self._load_prune_intent(brief, ownership, current) != intent:
                     raise TaskError(
                         f"task prune intent changed before removal: {task_id}"
@@ -1061,7 +1292,11 @@ class TaskService:
                 self._remove_task_worktree(target)
                 if self._worktree_removal_state(ownership) != "absent":
                     raise TaskError(f"task worktree remains after prune: {task_id}")
-                after = self._load_historical_collection(brief, ownership)
+                after = self._load_historical_collection(
+                    brief,
+                    ownership,
+                    require_committed=True,
+                )
                 self._require_collection_branch_tip(after)
                 if after != collected:
                     raise TaskError(f"task collection changed during prune: {task_id}")
@@ -1076,13 +1311,15 @@ class TaskService:
         self,
         brief: dict[str, object],
         ownership: dict[str, object],
+        *,
+        require_committed: bool = False,
     ) -> dict[str, object]:
         task_id = str(brief["task_id"])
-        status = self._load_task_status(brief, ownership, check_material=False)
-        if status["state"] not in _TERMINAL_STATES:
-            raise TaskError(f"task is not terminal for collection: {task_id}")
-        launch = self._load_launch(brief, ownership)
-        final = self._load_final(brief, ownership, launch)
+        run = self._run_collection_lineage(
+            brief,
+            ownership,
+            require_committed=require_committed,
+        )
         branch_ref = f"refs/heads/{ownership['branch']}"
         collected_raw = _read_object(
             self._collected_path(task_id),
@@ -1104,11 +1341,21 @@ class TaskService:
             "branch_ref": branch_ref,
             "child_commit": reviewed["child_commit"],
             "return_commit": reviewed["return_commit"],
-            "final_state": final["state"],
-            "final_sha256": final["final_sha256"],
+            **run,
             "return": reviewed["return"],
         }
-        return self._load_collected(brief, snapshot)
+        collected = self._load_collected(brief, snapshot)
+        collected_ref = f"tasks/{task_id}/collected.json"
+        committed = self._record_commit_state(
+            collected_ref,
+            record_sha256=str(collected["collected_sha256"]),
+            hash_field="collected_sha256",
+            description="task collection",
+            companion=str(collected["run_final_ref"]),
+        )
+        if require_committed and not committed:
+            raise TaskError(f"task collection is not committed: {task_id}")
+        return collected
 
     def _require_collection_branch_tip(
         self,
@@ -1212,7 +1459,6 @@ class TaskService:
             "branch_ref": collected["branch_ref"],
             "return_commit": collected["return_commit"],
             "final_state": collected["final_state"],
-            "final_sha256": collected["final_sha256"],
             "worktree_path": ownership["worktree_path"],
             "removed_at": utc_now(),
             "prune_sha256": intent["prune_sha256"],
@@ -1265,7 +1511,6 @@ class TaskService:
             "brief_sha256",
             "ownership_sha256",
             "collected_sha256",
-            "final_sha256",
             "prune_sha256",
             "pruned_sha256",
         ):
@@ -1277,7 +1522,6 @@ class TaskService:
             "branch_ref": collected["branch_ref"],
             "return_commit": collected["return_commit"],
             "final_state": collected["final_state"],
-            "final_sha256": collected["final_sha256"],
             "worktree_path": ownership["worktree_path"],
             "prune_sha256": intent["prune_sha256"],
         }
@@ -1296,7 +1540,11 @@ class TaskService:
         brief: dict[str, object],
         ownership: dict[str, object],
     ) -> dict[str, object]:
-        collected = self._load_historical_collection(brief, ownership)
+        collected = self._load_historical_collection(
+            brief,
+            ownership,
+            require_committed=True,
+        )
         intent = self._load_prune_intent(brief, ownership, collected)
         receipt = self._load_pruned_receipt(
             brief,
@@ -1359,14 +1607,8 @@ class TaskService:
         brief: dict[str, object],
     ) -> dict[str, object]:
         task_id = str(brief["task_id"])
-        status = self._status_unlocked(task_id)
-        if status["state"] not in _TERMINAL_STATES:
-            raise TaskError(f"task is not terminal for collection: {task_id}")
         ownership = self._load_ownership(brief)
-        launch = self._load_launch(brief, ownership)
-        final = self._load_final(brief, ownership, launch)
-        if status["state"] != final["state"]:
-            raise TaskError(f"task terminal state changed during collection: {task_id}")
+        run = self._run_collection_lineage(brief, ownership)
         return_commit = self._require_clean_owned_worktree(ownership)
         relative = f"tasks/{task_id}/return.json"
         if (
@@ -1377,7 +1619,7 @@ class TaskService:
             ).returncode
             != 0
         ):
-            if final["state"] != "completed":
+            if run["final_state"] != "completed":
                 raise TaskError(
                     f"terminal task requires a valid return for collection: {task_id}"
                 )
@@ -1390,8 +1632,7 @@ class TaskService:
                 "branch_ref": f"refs/heads/{ownership['branch']}",
                 "base_commit": brief["base_commit"],
                 "head_commit": return_commit,
-                "final_state": final["state"],
-                "final_sha256": final["final_sha256"],
+                **run,
             }
         reviewed = self._load_reviewed_return(
             brief,
@@ -1403,9 +1644,85 @@ class TaskService:
             "branch_ref": f"refs/heads/{ownership['branch']}",
             "child_commit": reviewed["child_commit"],
             "return_commit": reviewed["return_commit"],
-            "final_state": final["state"],
-            "final_sha256": final["final_sha256"],
+            **run,
             "return": reviewed["return"],
+        }
+
+    def _run_collection_lineage(
+        self,
+        brief: dict[str, object],
+        ownership: dict[str, object],
+        *,
+        require_committed: bool = False,
+    ) -> dict[str, object]:
+        from .runs import (
+            RunError,
+            RunService,
+            read_validated_run_final,
+            read_validated_run_manifest,
+        )
+        from .task_run import (
+            TaskRunError,
+            load_task_run,
+            project_task_status,
+        )
+
+        task_id = str(brief["task_id"])
+        try:
+            binding = load_task_run(self.root, brief, ownership)
+            run_id = str(binding["run_id"])
+            manifest_ref = f"runs/{run_id}/manifest.json"
+            final_ref = f"runs/{run_id}/final.json"
+            manifest = read_validated_run_manifest(self.root, run_id)
+            run_status = RunService(self.root).status(run_id)
+            public_status = project_task_status(
+                brief,
+                ownership,
+                binding,
+                run_status,
+            )
+            if public_status["state"] not in _TERMINAL_STATES:
+                raise TaskError(f"task is not terminal for collection: {task_id}")
+            if run_status.get("final_ref") != final_ref:
+                raise TaskError(f"terminal Task Run final is unavailable: {task_id}")
+            final = read_validated_run_final(self.root, run_id)
+        except TaskError:
+            raise
+        except (
+            OSError,
+            RunError,
+            TaskRunError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ) as error:
+            raise TaskError(f"invalid terminal Task Run: {task_id}") from error
+        if (
+            binding.get("run_manifest_ref") != manifest_ref
+            or binding.get("run_manifest_sha256") != manifest.get("manifest_sha256")
+            or final.get("run_id") != run_id
+            or final.get("manifest_sha256") != binding.get("run_manifest_sha256")
+            or final.get("state") != public_status.get("state")
+            or run_status.get("state") != final.get("state")
+        ):
+            raise TaskError(f"Task Run collection binding conflict: {task_id}")
+        final_sha256 = json_sha256(final)
+        final_committed = self._record_commit_state(
+            final_ref,
+            record_sha256=final_sha256,
+            hash_field=None,
+            description="Task Run final",
+            companion=f"tasks/{task_id}/collected.json",
+        )
+        if require_committed and not final_committed:
+            raise TaskError(f"Task Run final is not committed: {task_id}")
+        return {
+            "final_state": final["state"],
+            "run_id": run_id,
+            "run_manifest_ref": manifest_ref,
+            "run_manifest_sha256": binding["run_manifest_sha256"],
+            "run_final_ref": final_ref,
+            "run_final_sha256": final_sha256,
         }
 
     def _load_reviewed_return(
@@ -1563,7 +1880,13 @@ class TaskService:
         ownership = self._load_ownership(brief)
         binding = load_task_run(self.root, brief, ownership)
         run_status = RunService(self.root).status(str(binding["run_id"]))
-        if commit_paths is not None:
+        if _path_exists(self._collected_path(task_id)):
+            self._load_historical_collection(
+                brief,
+                ownership,
+                require_committed=True,
+            )
+        elif commit_paths is not None:
             run_status = commit_terminal_run_if_present(
                 self.root,
                 binding,
@@ -1778,6 +2101,7 @@ class TaskService:
             collected = self._load_historical_collection(
                 brief,
                 ownership,
+                require_committed=True,
             )
             self._require_collection_branch_tip(collected)
             intent = self._load_prune_intent(brief, ownership, collected)
@@ -3543,10 +3867,21 @@ def _validate_task_collection_header(
     for field in (
         "brief_sha256",
         "ownership_sha256",
-        "final_sha256",
+        "run_manifest_sha256",
+        "run_final_sha256",
         "collected_sha256",
     ):
         _validate_hash(collected[field], f"task collection {field}")
+    run_id = collected["run_id"]
+    if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
+        raise TaskError(f"invalid task collection Run ID: {task_id}")
+    if (
+        collected["run_manifest_ref"] != f"runs/{run_id}/manifest.json"
+        or collected["run_final_ref"] != f"runs/{run_id}/final.json"
+    ):
+        raise TaskError(f"task collection Run ref mismatch: {task_id}")
+    if collected["final_state"] not in _TERMINAL_STATES:
+        raise TaskError(f"invalid task collection final state: {task_id}")
 
 
 def _validate_task_collection(
@@ -3564,7 +3899,11 @@ def _validate_task_collection(
         "child_commit": snapshot["child_commit"],
         "return_commit": snapshot["return_commit"],
         "final_state": snapshot["final_state"],
-        "final_sha256": snapshot["final_sha256"],
+        "run_id": snapshot["run_id"],
+        "run_manifest_ref": snapshot["run_manifest_ref"],
+        "run_manifest_sha256": snapshot["run_manifest_sha256"],
+        "run_final_ref": snapshot["run_final_ref"],
+        "run_final_sha256": snapshot["run_final_sha256"],
         "return": snapshot["return"],
     }
     if any(collected[field] != value for field, value in expected.items()):
@@ -3591,6 +3930,9 @@ class _TaskCollectionReader:
         self._reader = reader
 
     def read(self, task_id: str) -> dict[str, object]:
+        from .runs import read_validated_run_final, read_validated_run_manifest
+        from .task_run import task_run_argv
+
         if not _valid_task_id(task_id):
             raise TaskError(f"invalid task ID: {task_id!r}")
         _require_plain_directory(self.root / "tasks", "versioned tasks directory")
@@ -3616,8 +3958,56 @@ class _TaskCollectionReader:
             raise TaskError(f"invalid task collection return commit: {task_id}")
         if collected["branch_ref"] != f"refs/heads/aros/task/{task_id}":
             raise TaskError(f"task collection branch binding conflict: {task_id}")
-        if collected["final_state"] not in _TERMINAL_STATES:
-            raise TaskError(f"invalid task collection final state: {task_id}")
+        run_id = str(collected["run_id"])
+        manifest_ref = str(collected["run_manifest_ref"])
+        final_ref = str(collected["run_final_ref"])
+        manifest = read_validated_run_manifest(
+            self.root,
+            run_id,
+            reader=self._reader,
+        )
+        final = read_validated_run_final(
+            self.root,
+            run_id,
+            reader=self._reader,
+        )
+        timeout_seconds = brief["timeout_seconds"]
+        if isinstance(timeout_seconds, bool) or not isinstance(
+            timeout_seconds,
+            (int, float),
+        ):
+            raise TaskError(f"invalid task timeout in collection: {task_id}")
+        if (
+            manifest.get("run_id") != run_id
+            or manifest.get("manifest_sha256")
+            != collected["run_manifest_sha256"]
+            or manifest.get("argv") != task_run_argv(self.root, task_id)
+            or manifest.get("idempotency_key")
+            != f"task-run-v1:{brief['brief_sha256']}"
+            or manifest.get("cwd") != "."
+            or manifest.get("timeout_seconds") != float(timeout_seconds)
+            or manifest.get("label") != f"task-{task_id.lower()}"[:32]
+            or manifest.get("security_profile") != "trusted-local"
+            or final.get("run_id") != run_id
+            or final.get("manifest_sha256") != collected["run_manifest_sha256"]
+            or final.get("state") != collected["final_state"]
+            or json_sha256(final) != collected["run_final_sha256"]
+        ):
+            raise TaskError(f"task collection Run binding conflict: {task_id}")
+        self._require_committed_record(
+            manifest_ref,
+            description="Task Run manifest",
+        )
+        self._require_committed_record(
+            final_ref,
+            description="Task Run final",
+            companion=path.relative_to(self.root).as_posix(),
+        )
+        self._require_committed_record(
+            path.relative_to(self.root).as_posix(),
+            description="task collection",
+            companion=final_ref,
+        )
         reviewed = _read_reviewed_task_return(self._git, brief, return_commit)
         snapshot = {
             "ownership_sha256": collected["ownership_sha256"],
@@ -3625,7 +4015,11 @@ class _TaskCollectionReader:
             "child_commit": reviewed["child_commit"],
             "return_commit": reviewed["return_commit"],
             "final_state": collected["final_state"],
-            "final_sha256": collected["final_sha256"],
+            "run_id": run_id,
+            "run_manifest_ref": manifest_ref,
+            "run_manifest_sha256": collected["run_manifest_sha256"],
+            "run_final_ref": final_ref,
+            "run_final_sha256": collected["run_final_sha256"],
             "return": reviewed["return"],
         }
         recorded = _validate_task_collection(
@@ -3636,6 +4030,73 @@ class _TaskCollectionReader:
         if recorded != collected:
             raise TaskError(f"task collection changed while reading: {task_id}")
         return recorded
+
+    def _require_committed_record(
+        self,
+        relative: str,
+        *,
+        description: str,
+        companion: str | None = None,
+    ) -> None:
+        try:
+            working = (self.root / relative).read_bytes()
+        except OSError as error:
+            raise TaskError(f"unable to snapshot {description}: {relative}") from error
+        committed = self._git._safe_git_result("show", f"HEAD:{relative}")
+        dirty = self._git._safe_git_bytes(
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            relative,
+        )
+        if committed.returncode != 0 or committed.stdout != working or dirty:
+            raise TaskError(f"{description} is not committed at current HEAD: {relative}")
+        touching = self._git._safe_git_text(
+            "log",
+            "--format=%H",
+            "--",
+            relative,
+        ).splitlines()
+        if len(touching) != 1 or _COMMIT.fullmatch(touching[0]) is None:
+            raise TaskError(f"{description} history is not immutable: {relative}")
+        introducing = touching[0]
+        raw_paths = self._git._safe_git_bytes(
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            introducing,
+        )
+        try:
+            changed = tuple(
+                sorted(
+                    value.decode("utf-8")
+                    for value in raw_paths.split(b"\0")
+                    if value
+                )
+            )
+        except UnicodeError as error:
+            raise TaskError(
+                f"{description} commit paths must be valid UTF-8: {relative}"
+            ) from error
+        allowed: set[tuple[str, ...]] = {(relative,)}
+        if companion is not None:
+            allowed.add(tuple(sorted((relative, companion))))
+        if (
+            changed not in allowed
+            or self._git._safe_git_bytes("show", f"{introducing}:{relative}")
+            != working
+            or not self._git._safe_git_success(
+                "merge-base",
+                "--is-ancestor",
+                introducing,
+                "HEAD",
+            )
+        ):
+            raise TaskError(f"{description} introducing commit is invalid: {relative}")
 
 
 def _record_sha256(record: dict[str, object], hash_field: str) -> str:

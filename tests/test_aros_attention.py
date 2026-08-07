@@ -150,6 +150,27 @@ def test_checkpoint_trailer_marks_return_read_and_exposes_recent_delta(
     ]
 
 
+def test_task_and_owned_run_observations_do_not_leave_duplicate_unread_final(
+    tmp_path: Path,
+) -> None:
+    _service, task_id, collected = observation_support._collected_task(tmp_path)
+    task_ref = f"tasks/{task_id}/collected.json"
+    run_final_ref = str(collected["run_final_ref"])
+    (tmp_path / "memory/NOW.md").write_text(
+        "# NOW\n\nThe Task return and owned Run final were reviewed together.\n",
+        encoding="utf-8",
+    )
+    GitCheckpoint(tmp_path).commit(
+        paths=["memory/NOW.md"],
+        message="Interpret the Task return",
+        observed_refs=[run_final_ref, task_ref],
+    )
+
+    packet = ResearchAttentionService(tmp_path).build()
+
+    assert packet["unread_returns"] == []
+
+
 def test_session_exit_before_checkpoint_keeps_return_unread(tmp_path: Path) -> None:
     _head, ref = _workspace_with_run_return(tmp_path)
     (tmp_path / "memory/NOW.md").write_text("# NOW\n\nUncommitted interpretation.\n")

@@ -197,6 +197,439 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
     )
 
 
+def _commit_child_return(
+    root: Path,
+    brief: dict[str, object],
+    ownership: dict[str, object],
+) -> tuple[dict[str, object], str, str]:
+    task_id = str(brief["task_id"])
+    worktree = Path(str(ownership["worktree_path"]))
+    artifact = worktree / "result.txt"
+    artifact.write_text("reviewed result\n", encoding="utf-8")
+    _git(worktree, "add", "result.txt")
+    _git(worktree, "commit", "-qm", "produce reviewed result")
+    child_commit = _git(worktree, "rev-parse", "HEAD")
+    returned: dict[str, object] = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "brief_sha256": brief["brief_sha256"],
+        "base_commit": brief["base_commit"],
+        "child_commit": child_commit,
+        "summary": "Produced one reviewed result.",
+        "work_performed": ["wrote the requested result"],
+        "changed_files": ["result.txt"],
+        "evidence": ["the child commit contains the result"],
+        "deviations": [],
+        "uncertainty": [],
+        "follow_up": [],
+    }
+    returned["return_sha256"] = json_sha256(returned)
+    return_ref = f"tasks/{task_id}/return.json"
+    return_path = worktree / return_ref
+    return_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(return_path, returned)
+    _git(worktree, "add", return_ref)
+    _git(worktree, "commit", "-qm", "record reviewed return")
+    return returned, child_commit, _git(worktree, "rev-parse", "HEAD")
+
+
+def _terminal_task_run(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    completed: bool = False,
+    with_return: bool = True,
+) -> tuple[
+    TaskService,
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object] | None,
+    str | None,
+    str | None,
+]:
+    service, brief, ownership = _prepared_task(root)
+    binding = ensure_task_run(
+        root,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(root),
+    )
+    _status, final = _fail_bound_run_launch(root, binding, monkeypatch)
+    if completed:
+        final = dict(final)
+        final["state"] = "completed"
+        final["exit_code"] = 0
+        final.pop("error", None)
+        _write_json(
+            root / "runs" / str(binding["run_id"]) / "final.json",
+            final,
+        )
+        final = RunService(root).read_validated_final(str(binding["run_id"]))
+    if not with_return:
+        return service, brief, ownership, binding, final, None, None
+    _returned, child_commit, return_commit = _commit_child_return(
+        root,
+        brief,
+        ownership,
+    )
+    return (
+        service,
+        brief,
+        ownership,
+        binding,
+        final,
+        child_commit,
+        return_commit,
+    )
+
+
+def test_task_collection_binds_exact_owned_run_and_commits_both_new_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, _ownership, binding, final, child_commit, return_commit = (
+        _terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    run_id = str(binding["run_id"])
+    run_final_ref = f"runs/{run_id}/final.json"
+    collected_ref = f"tasks/{task_id}/collected.json"
+
+    collected, paths, message = service.collect_with_commit(task_id)
+
+    assert set(collected) == {
+        "schema_version",
+        "task_id",
+        "brief_sha256",
+        "ownership_sha256",
+        "branch_ref",
+        "base_commit",
+        "child_commit",
+        "return_commit",
+        "final_state",
+        "run_id",
+        "run_manifest_ref",
+        "run_manifest_sha256",
+        "run_final_ref",
+        "run_final_sha256",
+        "return",
+        "collected_at",
+        "collected_sha256",
+    }
+    assert collected["run_id"] == run_id
+    assert collected["run_manifest_ref"] == binding["run_manifest_ref"]
+    assert collected["run_manifest_sha256"] == binding["run_manifest_sha256"]
+    assert collected["run_final_ref"] == run_final_ref
+    assert collected["run_final_sha256"] == json_sha256(final)
+    assert collected["final_state"] == final["state"]
+    assert collected["child_commit"] == child_commit
+    assert collected["return_commit"] == return_commit
+    assert "final_sha256" not in collected
+    assert paths == (run_final_ref, collected_ref)
+    assert message == f"Record task {task_id} collection"
+
+    checkpoint = _commit(tmp_path)(paths, message)
+    assert checkpoint["paths"] == sorted(paths)
+    assert _git(tmp_path, "status", "--porcelain") == ""
+    repeated, repeated_paths, repeated_message = service.collect_with_commit(task_id)
+    assert repeated == collected
+    assert repeated_paths is None
+    assert repeated_message is None
+
+
+def test_task_collection_requests_only_new_collection_when_run_final_is_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, _ownership, binding, _final, _child, _return = (
+        _terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    run_final_ref = f"runs/{binding['run_id']}/final.json"
+    _commit(tmp_path)((run_final_ref,), "record terminal Run")
+
+    _record, paths, _message = service.collect_with_commit(task_id)
+
+    assert paths == (f"tasks/{task_id}/collected.json",)
+
+
+def test_collect_rejects_rewritten_committed_run_final_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, _ownership, binding, _final, _child, _return = (
+        _terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    final_ref = f"runs/{binding['run_id']}/final.json"
+    final_path = tmp_path / final_ref
+    _commit(tmp_path)((final_ref,), "record terminal Run")
+    final_path.write_bytes(b" " + final_path.read_bytes())
+    main_dirt = tmp_path / "unrelated-main-dirt.bin"
+    main_dirt.write_bytes(b"main dirt\x00unchanged")
+    dirt = {main_dirt: main_dirt.read_bytes()}
+
+    with pytest.raises(TaskError, match="Run final|rewritten"):
+        service.collect(task_id)
+
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+    assert {path: path.read_bytes() for path in dirt} == dirt
+
+
+def test_collect_rejects_whitespace_dirty_committed_collection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, _ownership, _binding, _final, _child, _return = (
+        _terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    collected, paths, message = service.collect_with_commit(task_id)
+    assert paths is not None and message is not None
+    _commit(tmp_path)(paths, message)
+    collected_path = tmp_path / "tasks" / task_id / "collected.json"
+    collected_path.write_bytes(collected_path.read_bytes() + b" \n")
+
+    with pytest.raises(TaskError, match="collection|rewritten"):
+        service.collect(task_id)
+
+    assert json.loads(collected_path.read_bytes()) == collected
+
+
+def test_prune_rejects_whitespace_dirty_collection_without_removing_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, _binding, _final, _child, _return = (
+        _terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    _collected, paths, message = service.collect_with_commit(task_id)
+    assert paths is not None and message is not None
+    _commit(tmp_path)(paths, message)
+    collected_path = tmp_path / "tasks" / task_id / "collected.json"
+    collected_path.write_bytes(collected_path.read_bytes() + b" \n")
+    worktree = Path(str(ownership["worktree_path"]))
+
+    with pytest.raises(TaskError, match="collection|rewritten"):
+        service.prune(task_id)
+
+    assert worktree.is_dir()
+
+
+def test_uncommitted_exact_collection_recovers_then_prunes_after_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, binding, _final, _child, _return = (
+        _terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    final_ref = f"runs/{binding['run_id']}/final.json"
+    collected_ref = f"tasks/{task_id}/collected.json"
+    _commit(tmp_path)((final_ref,), "record terminal Run")
+    created = service.collect(task_id)
+
+    recovered, paths, message = service.collect_with_commit(task_id)
+
+    assert recovered == created
+    assert paths == (collected_ref,)
+    assert message == f"Record task {task_id} collection"
+    assert Path(str(ownership["worktree_path"])).is_dir()
+    _commit(tmp_path)(paths, message)
+    pruned = service.prune(task_id)
+    assert pruned["state"] == "pruned"
+    assert pruned["collected_sha256"] == created["collected_sha256"]
+
+
+def test_prune_rejects_advanced_return_branch_before_worktree_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, ownership, _binding, _final, _child, _return = (
+        _terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    _collected, paths, message = service.collect_with_commit(task_id)
+    assert paths is not None and message is not None
+    _commit(tmp_path)(paths, message)
+    worktree = Path(str(ownership["worktree_path"]))
+    (worktree / "post-collection.txt").write_text("advance\n", encoding="utf-8")
+    _git(worktree, "add", "post-collection.txt")
+    _git(worktree, "commit", "-qm", "advance retained task branch")
+    before = {
+        path.relative_to(worktree).as_posix(): path.read_bytes()
+        for path in worktree.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(TaskError, match="branch|collection"):
+        service.prune(task_id)
+
+    assert worktree.is_dir()
+    assert {
+        path.relative_to(worktree).as_posix(): path.read_bytes()
+        for path in worktree.rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_collection_normalizes_invalid_utf8_git_path_to_task_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, _ownership, binding, _final, _child, _return = (
+        _terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    final_ref = f"runs/{binding['run_id']}/final.json"
+    invalid = os.fsencode(tmp_path) + b"/invalid-\xff-path"
+    descriptor = os.open(invalid, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(descriptor, b"preserve invalid path\n")
+    os.close(descriptor)
+    subprocess.run(
+        [
+            b"git",
+            b"-C",
+            os.fsencode(tmp_path),
+            b"add",
+            os.fsencode(final_ref),
+            b"invalid-\xff-path",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [b"git", b"-C", os.fsencode(tmp_path), b"commit", b"-qm", b"invalid path"],
+        check=True,
+    )
+
+    with pytest.raises(TaskError, match="UTF-8|commit paths|Run final"):
+        service.collect(task_id)
+
+    assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
+    assert Path(os.fsdecode(invalid)).read_bytes() == b"preserve invalid path\n"
+
+
+def test_collect_and_status_serialize_terminal_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, _ownership, binding, _final, _child, _return = (
+        _terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    status_finished = threading.Event()
+    commits: list[tuple[str, ...]] = []
+
+    def blocking_commit(
+        paths: tuple[str, ...],
+        message: str,
+    ) -> dict[str, object]:
+        commits.append(paths)
+        callback_entered.set()
+        assert release_callback.wait(timeout=5)
+        return _commit(tmp_path)(paths, message)
+
+    def collect_once() -> tuple[dict[str, object], dict[str, object] | None]:
+        return service.collect_and_commit(task_id, blocking_commit)
+
+    def status_once() -> dict[str, object]:
+        result = service.status(task_id, commit_paths=_commit(tmp_path))
+        status_finished.set()
+        return result
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        collected_future = executor.submit(collect_once)
+        assert callback_entered.wait(timeout=5)
+        status_future = executor.submit(status_once)
+        try:
+            assert not status_finished.wait(timeout=0.2)
+        finally:
+            release_callback.set()
+        collected, checkpoint = collected_future.result(timeout=5)
+        status = status_future.result(timeout=5)
+
+    assert checkpoint is not None
+    assert checkpoint["commit"] == _git(tmp_path, "rev-parse", "HEAD")
+    assert commits == [
+        (
+            f"runs/{binding['run_id']}/final.json",
+            f"tasks/{task_id}/collected.json",
+        )
+    ]
+    assert status["final_ref"] == collected["run_final_ref"]
+    assert service.collect(task_id) == collected
+
+
+def test_task_prune_receipt_preserves_collection_run_lineage_transitively(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, brief, _ownership, binding, _final, _child, _return = (
+        _terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    collected, paths, message = service.collect_with_commit(task_id)
+    assert paths is not None and message is not None
+    _commit(tmp_path)(paths, message)
+
+    preserved = service.preserve(task_id)
+    pruned = service.prune(task_id)
+
+    assert preserved["head_commit"] == collected["return_commit"]
+    assert pruned["state"] == "pruned"
+    assert pruned["collected_sha256"] == collected["collected_sha256"]
+    assert pruned["final_state"] == collected["final_state"]
+    assert "final_sha256" not in pruned
+    assert service.collect(task_id) == collected
+    assert pruned["task_id"] == task_id
+    assert collected["run_id"] == binding["run_id"]
+
+
+@pytest.mark.parametrize("precommitted", [False, True])
+def test_completed_no_return_commits_only_uncommitted_run_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    precommitted: bool,
+) -> None:
+    service, brief, _ownership, binding, final, _child, _return = _terminal_task_run(
+        tmp_path,
+        monkeypatch,
+        completed=True,
+        with_return=False,
+    )
+    task_id = str(brief["task_id"])
+    run_final_ref = f"runs/{binding['run_id']}/final.json"
+    if precommitted:
+        _commit(tmp_path)((run_final_ref,), "record terminal Run")
+
+    result, paths, message = service.collect_with_commit(task_id)
+
+    assert result == {
+        "schema_version": 1,
+        "task_id": task_id,
+        "state": "completed_no_return",
+        "brief_sha256": brief["brief_sha256"],
+        "ownership_sha256": binding["ownership_sha256"],
+        "branch_ref": f"refs/heads/aros/task/{task_id}",
+        "base_commit": brief["base_commit"],
+        "head_commit": brief["base_commit"],
+        "final_state": "completed",
+        "run_id": binding["run_id"],
+        "run_manifest_ref": binding["run_manifest_ref"],
+        "run_manifest_sha256": binding["run_manifest_sha256"],
+        "run_final_ref": run_final_ref,
+        "run_final_sha256": json_sha256(final),
+    }
+    assert (tmp_path / "tasks" / task_id / "collected.json").exists() is False
+    assert paths == (None if precommitted else (run_final_ref,))
+    assert message == (None if precommitted else f"Record run {binding['run_id']} final")
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [

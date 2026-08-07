@@ -577,7 +577,11 @@ def task_collect_command(
 ) -> None:
     """Record reviewed child return pointers without assimilation."""
     try:
-        result = TaskService(_root(cwd)).collect(task_id)
+        root = _root(cwd)
+        result, _checkpoint = TaskService(root).collect_and_commit(
+            task_id,
+            GitCheckpoint(root).commit_paths,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         _fail(exc)
     _print_json(result)

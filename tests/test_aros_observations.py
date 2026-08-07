@@ -44,6 +44,7 @@ from arbor.aros.tasks import TaskError, TaskService, read_validated_task_collect
 from arbor.aros.worktrees import create_execution_bundle
 from tests import test_aros_eval as eval_test_support
 from tests import test_aros_tasks as task_test_support
+from tests import test_aros_task_on_run as task_run_test_support
 
 
 def _git(root: Path, *args: str) -> str:
@@ -343,10 +344,169 @@ def _snapshot_tree(root: Path) -> dict[str, tuple[int, bytes | None]]:
 def _collected_task(
     root: Path,
 ) -> tuple[TaskService, str, dict[str, object]]:
-    service, brief, ownership, _final = task_test_support._create_terminal_task(root)
+    from arbor.aros.checkpoint import GitCheckpoint
+    from arbor.aros.task_run import ensure_task_run
+
+    service, brief, ownership = task_run_test_support._prepared_task(root)
     task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        root,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=GitCheckpoint(root).commit_paths,
+    )
+    run_id = str(binding["run_id"])
+    manifest = read_validated_run_manifest(root, run_id)
+    timestamp = str(manifest["created_at"])
+    prelaunch: dict[str, object] = {
+        "schema_version": 1,
+        "receipt_id": f"{run_id}-prelaunch",
+        "kind": "run_prelaunch",
+        "run_id": run_id,
+        "actor": manifest["actor"],
+        "created_at": timestamp,
+        "base_commit": manifest["base_commit"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "carrier": "tmux",
+        "tmux_session": f"aros-{run_id.lower()}",
+        "host": socket.gethostname(),
+        "runner_version": 1,
+        "runner_invocation": [
+            sys.executable,
+            "-m",
+            "arbor.aros.runner",
+            "--workspace",
+            str(root),
+            "--run-id",
+            run_id,
+        ],
+    }
+    prelaunch["receipt_sha256"] = record_sha256(prelaunch, "receipt_sha256")
+    atomic_write_json(
+        root / ".aros" / "receipts" / f"{run_id}-prelaunch.json",
+        prelaunch,
+    )
+    runtime = root / ".aros" / "runs" / run_id
+    (runtime / "stdout.log").write_bytes(b"")
+    (runtime / "stderr.log").write_bytes(b"")
+    empty_sha256 = hashlib.sha256(b"").hexdigest()
+    final = final_identity(manifest)
+    final.update(
+        {
+            "schema_version": 1,
+            "state": "completed",
+            "exit_code": 0,
+            "started_at": timestamp,
+            "finished_at": timestamp,
+            "finalized_at": timestamp,
+            "duration_seconds": 0.0,
+            "resource_usage": {"wall_seconds": 0.0},
+            "host": prelaunch["host"],
+            "launch_receipt_sha256": prelaunch["receipt_sha256"],
+            "stdout": {
+                "path": f".aros/runs/{run_id}/stdout.log",
+                "bytes": 0,
+                "sha256": empty_sha256,
+            },
+            "stderr": {
+                "path": f".aros/runs/{run_id}/stderr.log",
+                "bytes": 0,
+                "sha256": empty_sha256,
+            },
+        }
+    )
+    atomic_write_json(root / "runs" / run_id / "final.json", final)
     task_test_support._commit_child_return(root, brief, ownership)
-    return service, task_id, service.collect(task_id)
+    collected, paths, message = service.collect_with_commit(task_id)
+    assert paths is not None and message is not None
+    GitCheckpoint(root).commit_paths(paths, message)
+    return service, task_id, collected
+
+
+def test_task_observation_binds_brief_manifest_final_and_collection(
+    tmp_path: Path,
+) -> None:
+    _service, task_id, collected = _collected_task(tmp_path)
+    ref = f"tasks/{task_id}/collected.json"
+
+    record = ObservationCatalog(tmp_path).resolve(ref)
+
+    assert record.kind == "task_return"
+    assert record.record_sha256 == collected["collected_sha256"]
+    assert record.candidate_commit == collected["child_commit"]
+    assert record.versioned_paths == (
+        f"tasks/{task_id}/brief.json",
+        collected["run_manifest_ref"],
+        collected["run_final_ref"],
+        ref,
+    )
+
+
+def test_task_observation_rejects_rewritten_run_final(tmp_path: Path) -> None:
+    _service, task_id, collected = _collected_task(tmp_path)
+    final_path = tmp_path / str(collected["run_final_ref"])
+    final = read_json_strict_no_repair(final_path)
+    assert isinstance(final, dict)
+    final["state"] = "cancelled"
+    atomic_write_json(final_path, final)
+
+    with pytest.raises(ObservationError, match="Run|final|lineage|committed"):
+        ObservationCatalog(tmp_path).resolve(f"tasks/{task_id}/collected.json")
+
+
+def test_task_observation_normalizes_invalid_utf8_introducing_path(
+    tmp_path: Path,
+) -> None:
+    _service, task_id, collected = _collected_task(tmp_path)
+    ref = f"tasks/{task_id}/collected.json"
+    invalid = os.fsencode(tmp_path) + b"/invalid-\xff-observation-path"
+    descriptor = os.open(invalid, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(descriptor, b"preserve invalid observation path\n")
+    os.close(descriptor)
+    subprocess.run(
+        [
+            b"git",
+            b"-C",
+            os.fsencode(tmp_path),
+            b"add",
+            b"invalid-\xff-observation-path",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            b"git",
+            b"-C",
+            os.fsencode(tmp_path),
+            b"commit",
+            b"--amend",
+            b"--no-edit",
+            b"-q",
+        ],
+        check=True,
+    )
+    watched = {
+        ref: (tmp_path / ref).read_bytes(),
+        str(collected["run_final_ref"]): (
+            tmp_path / str(collected["run_final_ref"])
+        ).read_bytes(),
+    }
+    before = (
+        _git(tmp_path, "rev-parse", "HEAD"),
+        _git(tmp_path, "status", "--porcelain=v1", "--untracked-files=all"),
+        Path(os.fsdecode(invalid)).read_bytes(),
+    )
+
+    with pytest.raises(ObservationError, match="UTF-8|commit paths|lineage"):
+        ObservationCatalog(tmp_path).resolve(ref)
+
+    assert (
+        _git(tmp_path, "rev-parse", "HEAD"),
+        _git(tmp_path, "status", "--porcelain=v1", "--untracked-files=all"),
+        Path(os.fsdecode(invalid)).read_bytes(),
+    ) == before
+    assert {path: (tmp_path / path).read_bytes() for path in watched} == watched
 
 
 def test_task_collection_reader_is_side_effect_free(

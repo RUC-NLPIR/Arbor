@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from arbor.aros.tasks import TaskError
+from arbor.aros.tasks import TaskError, TaskService
 from arbor.cli.commands import aros_cmd
 
 
@@ -107,6 +107,25 @@ class FakeTaskService:
         self._raise_error()
         self.calls.append(("collect", task_id))
         return {"state": "collected", "task_id": task_id}
+
+    def collect_with_commit(self, task_id: str):  # type: ignore[no-untyped-def]
+        record = self.collect(task_id)
+        return (
+            record,
+            (f"tasks/{task_id}/collected.json",),
+            f"Record task {task_id} collection",
+        )
+
+    def collect_and_commit(
+        self,
+        task_id: str,
+        commit_paths: Any,
+    ) -> tuple[dict[str, Any], dict[str, object]]:
+        self._raise_error()
+        self.calls.append(("collect_and_commit", task_id, commit_paths))
+        paths = (f"tasks/{task_id}/collected.json",)
+        checkpoint = commit_paths(paths, f"Record task {task_id} collection")
+        return {"state": "collected", "task_id": task_id}, checkpoint
 
     def preserve(self, task_id: str) -> dict[str, Any]:
         self._raise_error()
@@ -443,7 +462,91 @@ def test_task_stop_requires_reason_and_uses_implicit_term(tmp_path: Path) -> Non
     assert json.loads(result.output)["reason"] == "human requested shutdown"
 
 
-@pytest.mark.parametrize("action", ["collect", "preserve", "prune"])
+def test_task_collect_commits_service_paths_before_printing(tmp_path: Path) -> None:
+    checkpoints: list[Any] = []
+    events: list[object] = []
+
+    class FakeCheckpoint:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+            checkpoints.append(self)
+
+        def commit_paths(
+            self,
+            paths: tuple[str, ...],
+            message: str,
+        ) -> dict[str, object]:
+            events.append((paths, message))
+            return {
+                "commit": "a" * 40,
+                "paths": list(paths),
+                "enforcement_class": "cooperative",
+            }
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(aros_cmd, "GitCheckpoint", FakeCheckpoint)
+        result = runner.invoke(
+            aros_cmd.aros_app,
+            ["task", "collect", "TASK-test", "--cwd", str(tmp_path)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert len(checkpoints) == 1
+    assert checkpoints[0].root == tmp_path.resolve()
+    assert FakeTaskService.instances[0].calls == [
+        ("collect_and_commit", "TASK-test", checkpoints[0].commit_paths)
+    ]
+    assert events == [
+        (
+            ("tasks/TASK-test/collected.json",),
+            "Record task TASK-test collection",
+        )
+    ]
+    assert json.loads(result.output) == {
+        "state": "collected",
+        "task_id": "TASK-test",
+    }
+
+
+def test_task_collect_real_checkpoint_leaves_run_and_collection_at_clean_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests import test_aros_task_on_run as task_run_support
+
+    service, brief, _ownership, binding, _final, _child, _return = (
+        task_run_support._terminal_task_run(tmp_path, monkeypatch)
+    )
+    task_id = str(brief["task_id"])
+    monkeypatch.setattr(aros_cmd, "TaskService", TaskService)
+
+    result = runner.invoke(
+        aros_cmd.aros_app,
+        ["task", "collect", task_id, "--cwd", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    collected = json.loads(result.output)
+    assert collected["run_id"] == binding["run_id"]
+    assert service.collect(task_id) == collected
+    assert task_run_support._git(tmp_path, "status", "--porcelain") == ""
+    changed = task_run_support._git(
+        tmp_path,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        "HEAD",
+    ).splitlines()
+    assert changed == sorted(
+        [
+            str(collected["run_final_ref"]),
+            f"tasks/{task_id}/collected.json",
+        ]
+    )
+
+
+@pytest.mark.parametrize("action", ["preserve", "prune"])
 def test_task_final_actions_forward_directly(
     tmp_path: Path,
     action: str,

@@ -52,6 +52,14 @@ from .worktrees import (
 
 
 _RUN_ID = re.compile(r"^RUN-[A-Za-z0-9][A-Za-z0-9-]*$")
+_IDEMPOTENCY_INDEX_FIELDS = {
+    "schema_version",
+    "idempotency_key_sha256",
+    "request_sha256",
+    "run_id",
+    "manifest_sha256",
+    "created_at",
+}
 _UTC_TIMESTAMP = re.compile(
     r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
     r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{3}Z$"
@@ -405,6 +413,64 @@ class RunService:
     def __init__(self, root: str | Path):
         self.root = Path(root).expanduser().resolve()
         self._require_git_root()
+
+    def manifest_for_idempotency_key(
+        self,
+        key: str,
+    ) -> dict[str, object] | None:
+        """Strictly load the Run manifest already bound to an idempotency key."""
+        normalized = _validate_text(key, "idempotency_key")
+        try:
+            repository = bind_repository(self.root)
+            with AnchoredWorkspaceReader(self.root) as reader:
+                reader.require_repository(
+                    repository.root,
+                    repository.git_dir,
+                    repository.common_dir,
+                )
+                index_path = self._idempotency_index_path(normalized)
+                try:
+                    reader.lstat(index_path)
+                except FileNotFoundError:
+                    return None
+                entry = _read_object(
+                    index_path,
+                    "idempotency index",
+                    reader=reader,
+                )
+                run_id = entry.get("run_id")
+                if (
+                    set(entry) != _IDEMPOTENCY_INDEX_FIELDS
+                    or type(entry.get("schema_version")) is not int
+                    or entry["schema_version"] != 1
+                    or entry.get("idempotency_key_sha256")
+                    != hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+                    or not isinstance(entry.get("request_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", entry["request_sha256"])
+                    is None
+                    or not isinstance(run_id, str)
+                    or _RUN_ID.fullmatch(run_id) is None
+                    or not isinstance(entry.get("manifest_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", entry["manifest_sha256"])
+                    is None
+                    or not _valid_utc_timestamp(entry.get("created_at"))
+                ):
+                    raise RunError("invalid idempotency index")
+                manifest = self._load_manifest(run_id, reader=reader)
+                if (
+                    manifest.get("idempotency_key") != normalized
+                    or _request_sha256(manifest) != entry["request_sha256"]
+                    or manifest.get("run_id") != run_id
+                    or manifest.get("manifest_sha256") != entry["manifest_sha256"]
+                    or manifest.get("created_at") != entry["created_at"]
+                ):
+                    raise RunError("invalid idempotency index manifest linkage")
+                _validate_repository_binding(repository)
+                return manifest
+        except RunError:
+            raise
+        except (AnchoredReadError, OSError, WorktreeError) as error:
+            raise RunError("invalid idempotency index workspace") from error
 
     def prepare(
         self,

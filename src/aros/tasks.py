@@ -758,6 +758,33 @@ class TaskService:
                 brief = self._load_brief(task_id)
                 return self._ensure_worktree_locked(brief, actor)
 
+    def adapter_context(self, task_id: str) -> dict[str, object]:
+        """Return the validated command context for the shared Run adapter."""
+        from .task_adapter import build_adapter_environment
+        from .task_run import TaskRunError, load_task_run
+
+        self._validate_task_id(task_id)
+        brief = self._load_brief(task_id)
+        ownership = self._load_ownership(brief)
+        try:
+            load_task_run(self.root, brief, ownership)
+        except TaskRunError as error:
+            raise TaskError(f"invalid Task Run adapter context: {task_id}") from error
+        runtime = self._runtime_path(task_id)
+        worktree = Path(str(ownership["worktree_path"]))
+        return {
+            "argv": list(brief["adapter_argv"]),  # type: ignore[call-overload]
+            "worktree": str(worktree),
+            "environment": build_adapter_environment(
+                runtime,
+                task_id=task_id,
+                brief_path=self.root / "tasks" / task_id / "brief.json",
+                worktree=worktree,
+                base_commit=str(brief["base_commit"]),
+                brief_sha256=str(brief["brief_sha256"]),
+            ),
+        }
+
     def _ensure_worktree_locked(
         self,
         brief: dict[str, object],

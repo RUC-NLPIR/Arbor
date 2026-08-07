@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from arbor.aros.runs import RunService
-from arbor.aros.tasks import TaskService
+from arbor.aros.store import json_sha256, manifest_sha256
+from arbor.aros.task_run import TaskRunError, ensure_task_run, load_task_run
+from arbor.aros.tasks import TaskError, TaskService
 from arbor.aros.workspace import init_workspace
 
 
@@ -106,6 +112,969 @@ def _json_keys(value: object) -> Iterator[str]:
     elif isinstance(value, list):
         for nested in value:
             yield from _json_keys(nested)
+
+
+def _prepared_task(
+    root: Path,
+) -> tuple[TaskService, dict[str, object], dict[str, object]]:
+    _workspace(root)
+    service = TaskService(root)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(root, "add", f"tasks/{task_id}/brief.json")
+    _git(root, "commit", "-qm", "record task brief")
+    service._ensure_worktree(task_id, actor="principal")
+    return service, brief, service._load_ownership(brief)
+
+
+def _write_json(path: Path, value: dict[str, object]) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("result_error", ["no-op", "wrong-path", "wrong-commit"])
+def test_task_run_binding_rejects_invalid_commit_result(
+    tmp_path: Path,
+    result_error: str,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    real_commit = _commit(tmp_path)
+
+    def invalid_commit(paths: tuple[str, ...], message: str) -> dict[str, object]:
+        if result_error == "no-op":
+            return {
+                "commit": _git(tmp_path, "rev-parse", "HEAD"),
+                "paths": list(paths),
+                "reused": True,
+                "enforcement_class": "cooperative",
+            }
+        result = real_commit(paths, message)
+        if result_error == "wrong-path":
+            result["paths"] = ["README.md"]
+        else:
+            result["commit"] = _git(tmp_path, "rev-parse", "HEAD^")
+        return result
+
+    with pytest.raises(TaskRunError, match="commit"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=invalid_commit,
+        )
+
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+
+
+def test_task_run_binding_rejects_commit_with_extra_path(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+
+    def commit_extra_path(
+        paths: tuple[str, ...],
+        _message: str,
+    ) -> dict[str, object]:
+        extra_ref = "unexpected-task-run-file.txt"
+        (tmp_path / extra_ref).write_text("unexpected\n", encoding="utf-8")
+        _git(tmp_path, "add", paths[0], extra_ref)
+        _git(tmp_path, "commit", "-qm", "commit task run with extra path")
+        return {
+            "commit": _git(tmp_path, "rev-parse", "HEAD"),
+            "paths": list(paths),
+            "reused": False,
+            "enforcement_class": "cooperative",
+        }
+
+    with pytest.raises(TaskRunError, match="commit"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=commit_extra_path,
+        )
+
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+
+
+def test_task_run_binding_rejects_extra_path_commit_labeled_reused(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+
+    def lying_reused_commit(
+        paths: tuple[str, ...],
+        _message: str,
+    ) -> dict[str, object]:
+        extra_ref = "unexpected-reused-task-run-file.txt"
+        (tmp_path / extra_ref).write_text("unexpected\n", encoding="utf-8")
+        _git(tmp_path, "add", paths[0], extra_ref)
+        _git(tmp_path, "commit", "-qm", "lie about reused task run")
+        return {
+            "commit": _git(tmp_path, "rev-parse", "HEAD"),
+            "paths": list(paths),
+            "reused": True,
+            "enforcement_class": "cooperative",
+        }
+
+    with pytest.raises(TaskRunError, match="commit|reused"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=lying_reused_commit,
+        )
+
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+    manifest_path = next(tmp_path.glob("runs/RUN-*/manifest.json"))
+    original_manifest = manifest_path.read_bytes()
+    with manifest_path.open("ab") as handle:
+        handle.write(b" \n")
+    _git(tmp_path, "add", str(manifest_path.relative_to(tmp_path)))
+    _git(tmp_path, "commit", "-qm", "rewrite contaminated manifest")
+    manifest_path.write_bytes(original_manifest)
+    _git(tmp_path, "add", str(manifest_path.relative_to(tmp_path)))
+    _git(tmp_path, "commit", "-qm", "restore contaminated manifest")
+    with pytest.raises(TaskRunError, match="commit|manifest|path"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=_commit(tmp_path),
+        )
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+
+
+def test_task_run_binding_accepts_clean_manifest_reused_without_head_change(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    real_commit = _commit(tmp_path)
+
+    class CrashAfterCommit(RuntimeError):
+        pass
+
+    def commit_then_crash(
+        paths: tuple[str, ...],
+        message: str,
+    ) -> dict[str, object]:
+        real_commit(paths, message)
+        raise CrashAfterCommit("after commit")
+
+    with pytest.raises(CrashAfterCommit):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=commit_then_crash,
+        )
+    pre_head = _git(tmp_path, "rev-parse", "HEAD")
+
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=real_commit,
+    )
+
+    assert _git(tmp_path, "rev-parse", "HEAD") == pre_head
+    assert binding["run_manifest_ref"]
+
+
+def test_task_run_binding_rejects_callback_manifest_mutation_before_publication(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    real_commit = _commit(tmp_path)
+
+    def mutate_then_commit(
+        paths: tuple[str, ...],
+        message: str,
+    ) -> dict[str, object]:
+        manifest_path = tmp_path / paths[0]
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["resource_request"] = {"mutated-by-callback": True}
+        manifest["manifest_sha256"] = manifest_sha256(manifest)
+        _write_json(manifest_path, manifest)
+        return real_commit(paths, message)
+
+    with pytest.raises(TaskRunError, match="commit|manifest"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=mutate_then_commit,
+        )
+
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+
+
+def test_task_run_binding_rejects_manifest_left_dirty_by_callback(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    real_commit = _commit(tmp_path)
+
+    def commit_then_dirty(
+        paths: tuple[str, ...],
+        message: str,
+    ) -> dict[str, object]:
+        result = real_commit(paths, message)
+        with (tmp_path / paths[0]).open("ab") as handle:
+            handle.write(b" \n")
+        return result
+
+    with pytest.raises(TaskRunError, match="commit|manifest|snapshot"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=commit_then_dirty,
+        )
+
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+
+
+@pytest.mark.parametrize("invalid_field", ["brief", "ownership"])
+def test_ensure_task_run_rejects_non_object_authority(
+    tmp_path: Path,
+    invalid_field: str,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    supplied_brief: object = brief
+    supplied_ownership: object = ownership
+    if invalid_field == "brief":
+        supplied_brief = []
+    else:
+        supplied_ownership = []
+
+    with pytest.raises(TaskRunError, match="brief|ownership|object"):
+        ensure_task_run(
+            tmp_path,
+            supplied_brief,  # type: ignore[arg-type]
+            supplied_ownership,  # type: ignore[arg-type]
+            actor="principal",
+            commit_paths=_commit(tmp_path),
+        )
+
+
+def test_task_run_binding_preserves_unexpected_callback_exception(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+
+    class CallbackFailure(RuntimeError):
+        pass
+
+    def broken_commit(_paths: tuple[str, ...], _message: str) -> dict[str, object]:
+        raise CallbackFailure("injected callback failure")
+
+    with pytest.raises(CallbackFailure, match="injected callback failure"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=broken_commit,
+        )
+
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+
+
+def test_task_run_binding_preserves_unexpected_value_error_from_callback(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+
+    class CallbackValueError(ValueError):
+        pass
+
+    def broken_commit(_paths: tuple[str, ...], _message: str) -> dict[str, object]:
+        raise CallbackValueError("injected callback value failure")
+
+    with pytest.raises(CallbackValueError, match="injected callback value failure"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=broken_commit,
+        )
+
+
+def test_task_run_lock_context_preserves_body_task_error(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+
+    class SentinelTaskError(TaskError):
+        pass
+
+    def broken_commit(_paths: tuple[str, ...], _message: str) -> dict[str, object]:
+        raise SentinelTaskError("sentinel callback task error")
+
+    with pytest.raises(SentinelTaskError, match="sentinel callback task error"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=broken_commit,
+        )
+
+
+def test_load_task_run_requires_manifest_at_current_head(tmp_path: Path) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    manifest_ref = str(binding["run_manifest_ref"])
+    manifest_path = tmp_path / manifest_ref
+    manifest_bytes = manifest_path.read_bytes()
+    _git(tmp_path, "rm", "-q", manifest_ref)
+    _git(tmp_path, "commit", "-qm", "remove committed task run")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_bytes(manifest_bytes)
+
+    with pytest.raises(TaskRunError, match="HEAD|committed"):
+        load_task_run(tmp_path, brief, ownership)
+
+
+def test_load_task_run_rejects_rehashed_working_manifest(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    manifest_path = tmp_path / str(binding["run_manifest_ref"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["resource_request"] = {"tampered": True}
+    manifest["manifest_sha256"] = manifest_sha256(manifest)
+    _write_json(manifest_path, manifest)
+    binding["run_manifest_sha256"] = manifest["manifest_sha256"]
+    binding["binding_sha256"] = json_sha256(
+        {key: value for key, value in binding.items() if key != "binding_sha256"}
+    )
+    _write_json(
+        tmp_path / ".aros" / "tasks" / task_id / "run.json",
+        binding,
+    )
+
+    with pytest.raises(TaskRunError, match="HEAD|committed"):
+        load_task_run(tmp_path, brief, ownership)
+
+
+def test_task_run_load_rejects_restored_multi_touch_manifest_history(
+    tmp_path: Path,
+) -> None:
+    service, brief, ownership = _prepared_task(tmp_path)
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    manifest_path = tmp_path / str(binding["run_manifest_ref"])
+    original = manifest_path.read_bytes()
+    manifest = json.loads(original)
+    manifest["resource_request"] = {"post-binding-rewrite": True}
+    manifest["manifest_sha256"] = manifest_sha256(manifest)
+    _write_json(manifest_path, manifest)
+    _git(tmp_path, "add", str(manifest_path.relative_to(tmp_path)))
+    _git(tmp_path, "commit", "-qm", "rewrite bound task run manifest")
+    manifest_path.write_bytes(original)
+    _git(tmp_path, "add", str(manifest_path.relative_to(tmp_path)))
+    _git(tmp_path, "commit", "-qm", "restore bound task run manifest")
+
+    with pytest.raises(TaskRunError, match="history|commit|manifest"):
+        load_task_run(tmp_path, brief, ownership)
+    with pytest.raises(TaskError):
+        service.adapter_context(str(brief["task_id"]))
+
+
+def test_concurrent_task_run_binding_uses_one_publication(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    barrier = threading.Barrier(8)
+    callback_lock = threading.Lock()
+    callback_calls = 0
+    real_commit = _commit(tmp_path)
+
+    def serialized_commit(
+        paths: tuple[str, ...],
+        message: str,
+    ) -> dict[str, object]:
+        nonlocal callback_calls
+        with callback_lock:
+            callback_calls += 1
+            return real_commit(paths, message)
+
+    def bind() -> dict[str, object]:
+        barrier.wait()
+        return ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=serialized_commit,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        bindings = list(executor.map(lambda _index: bind(), range(8)))
+
+    assert all(binding == bindings[0] for binding in bindings)
+    assert callback_calls == 1
+    assert len(list(tmp_path.glob("runs/RUN-*/manifest.json"))) == 1
+
+
+def test_task_run_binding_serializes_validation_and_runtime_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbor.aros.task_run as task_run
+
+    _service, brief, ownership = _prepared_task(tmp_path)
+    state_lock = threading.Lock()
+    second_entered = threading.Event()
+    active = 0
+    overlapped = False
+    real_validate = task_run._validate_inputs
+
+    def observed_validate(*args: object) -> Path:
+        nonlocal active, overlapped
+        with state_lock:
+            active += 1
+            if active > 1:
+                overlapped = True
+                second_entered.set()
+        second_entered.wait(timeout=0.2)
+        try:
+            return real_validate(*args)  # type: ignore[arg-type]
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(task_run, "_validate_inputs", observed_validate)
+
+    def bind() -> dict[str, object]:
+        return ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=_commit(tmp_path),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        bindings = list(executor.map(lambda _index: bind(), range(2)))
+
+    assert bindings[0] == bindings[1]
+    assert not overlapped
+
+
+def test_task_run_binding_recovers_committed_manifest_after_environment_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    real_commit = _commit(tmp_path)
+
+    class CrashAfterCommit(RuntimeError):
+        pass
+
+    def commit_then_crash(
+        paths: tuple[str, ...],
+        message: str,
+    ) -> dict[str, object]:
+        real_commit(paths, message)
+        raise CrashAfterCommit("crash after manifest commit")
+
+    with pytest.raises(CrashAfterCommit, match="crash after manifest commit"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=commit_then_crash,
+        )
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+    manifests = list(tmp_path.glob("runs/RUN-*/manifest.json"))
+    assert len(manifests) == 1
+    manifest_bytes = manifests[0].read_bytes()
+    monkeypatch.setenv("LANG", "task-run-recovery-drift")
+
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=real_commit,
+    )
+
+    assert binding["run_manifest_ref"] == manifests[0].relative_to(tmp_path).as_posix()
+    assert manifests[0].read_bytes() == manifest_bytes
+    assert len(list(tmp_path.glob("runs/RUN-*/manifest.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    ("runtime_name", "mutation"),
+    [
+        pytest.param("runtime", "wrong-mode", id="runtime-wrong-mode"),
+        pytest.param("home", "missing", id="home-missing"),
+        pytest.param("tmp", "wrong-mode", id="tmp-wrong-mode"),
+    ],
+)
+def test_load_task_run_does_not_repair_runtime(
+    tmp_path: Path,
+    runtime_name: str,
+    mutation: str,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    runtime = tmp_path / ".aros" / "tasks" / str(brief["task_id"])
+    target = runtime if runtime_name == "runtime" else runtime / runtime_name
+    if mutation == "missing":
+        target.rmdir()
+    else:
+        target.chmod(0o755)
+    main_dirt = tmp_path / "unrelated-main-dirt.txt"
+    child_dirt = Path(str(ownership["worktree_path"])) / "unrelated-child-dirt.txt"
+    main_dirt.write_bytes(b"main dirt\x00unchanged")
+    child_dirt.write_bytes(b"child dirt\x00unchanged")
+    dirt = {main_dirt: main_dirt.read_bytes(), child_dirt: child_dirt.read_bytes()}
+
+    with pytest.raises(TaskRunError):
+        load_task_run(tmp_path, brief, ownership)
+
+    if mutation == "missing":
+        assert not target.exists()
+    else:
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+    assert {path: path.read_bytes() for path in dirt} == dirt
+    assert binding["task_id"] == brief["task_id"]
+
+
+def test_load_task_run_does_not_probe_filesystem_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbor.aros.tasks as tasks_module
+
+    _service, brief, ownership = _prepared_task(tmp_path)
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+
+    def forbidden_probe(_runtime: Path) -> dict[str, object]:
+        raise AssertionError("load_task_run must not probe filesystem permissions")
+
+    monkeypatch.setattr(tasks_module, "_probe_filesystem_permissions", forbidden_probe)
+
+    assert load_task_run(tmp_path, brief, ownership) == binding
+
+
+@pytest.mark.parametrize("authority_kind", ["hardlink", "symlink"])
+def test_load_task_run_rejects_linked_binding_authority(
+    tmp_path: Path,
+    authority_kind: str,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    binding_path = (
+        tmp_path / ".aros" / "tasks" / str(brief["task_id"]) / "run.json"
+    )
+    alias = tmp_path / f"binding-{authority_kind}.json"
+    if authority_kind == "hardlink":
+        os.link(binding_path, alias, follow_symlinks=False)
+    else:
+        binding_path.rename(alias)
+        binding_path.symlink_to(alias)
+
+    with pytest.raises(TaskRunError, match="binding"):
+        load_task_run(tmp_path, brief, ownership)
+
+
+def test_task_run_binding_revalidates_parent_identity_around_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbor.aros.task_run as task_run
+
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    observations = iter([(1, 1), (1, 2)])
+    monkeypatch.setattr(
+        task_run,
+        "_binding_parent_identity",
+        lambda _path: next(observations),
+        raising=False,
+    )
+
+    with pytest.raises(TaskRunError, match="parent|identity"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=_commit(tmp_path),
+        )
+
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+
+
+def test_failed_task_run_binding_preserves_parent_and_child_dirt(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    main_dirt = tmp_path / "unrelated-main-dirt.bin"
+    child_dirt = Path(str(ownership["worktree_path"])) / "unrelated-child-dirt.bin"
+    main_dirt.write_bytes(b"main dirt\x00unchanged")
+    child_dirt.write_bytes(b"child dirt\x00unchanged")
+    dirt = {main_dirt: main_dirt.read_bytes(), child_dirt: child_dirt.read_bytes()}
+
+    with pytest.raises(TaskRunError):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=_commit(tmp_path),
+        )
+
+    assert {path: path.read_bytes() for path in dirt} == dirt
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+
+
+def test_task_run_binding_normalizes_actor_like_run_service(
+    tmp_path: Path,
+) -> None:
+    _service, brief, ownership = _prepared_task(tmp_path)
+
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="  principal  ",
+        commit_paths=_commit(tmp_path),
+    )
+
+    manifest = json.loads(
+        (tmp_path / str(binding["run_manifest_ref"])).read_text(encoding="utf-8")
+    )
+    assert manifest["actor"] == "principal"
+
+
+def test_task_run_binding_is_create_once_idempotent_and_committed(
+    tmp_path: Path,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    service._ensure_worktree(task_id, actor="principal")
+    ownership = service._load_ownership(brief)
+
+    first = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    second = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+
+    assert first == second == load_task_run(tmp_path, brief, ownership)
+    run_id = str(first["run_id"])
+    manifest_ref = f"runs/{run_id}/manifest.json"
+    assert first["run_manifest_ref"] == manifest_ref
+    manifests = sorted(tmp_path.glob("runs/RUN-*/manifest.json"))
+    assert manifests == [tmp_path / manifest_ref]
+    assert _git_bytes(tmp_path, "show", f"HEAD:{manifest_ref}") == manifests[0].read_bytes()
+
+
+def test_task_run_binding_tampering_fails_closed_without_another_run(
+    tmp_path: Path,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    service._ensure_worktree(task_id, actor="principal")
+    ownership = service._load_ownership(brief)
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    manifests = sorted(tmp_path.glob("runs/RUN-*/manifest.json"))
+    binding_path = tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    tampered = dict(binding)
+    tampered["run_id"] = "RUN-tampered"
+    binding_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    with pytest.raises(TaskRunError, match="binding"):
+        load_task_run(tmp_path, brief, ownership)
+    with pytest.raises(TaskRunError, match="binding"):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=_commit(tmp_path),
+        )
+
+    assert sorted(tmp_path.glob("runs/RUN-*/manifest.json")) == manifests
+
+
+def test_adapter_context_is_bound_to_task_run_and_owned_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    service._ensure_worktree(task_id, actor="principal")
+    ownership = service._load_ownership(brief)
+    ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    monkeypatch.setenv("AMBIENT_TASK_SECRET", "must-not-pass")
+
+    context = service.adapter_context(task_id)
+
+    assert context["argv"] == brief["adapter_argv"]
+    assert context["worktree"] == ownership["worktree_path"]
+    environment = context["environment"]
+    assert isinstance(environment, dict)
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    assert environment["AROS_TASK_ID"] == task_id
+    assert environment["AROS_TASK_BRIEF"] == str(
+        tmp_path / "tasks" / task_id / "brief.json"
+    )
+    assert environment["AROS_TASK_WORKTREE"] == ownership["worktree_path"]
+    assert environment["AROS_TASK_BASE_COMMIT"] == brief["base_commit"]
+    assert environment["AROS_TASK_BRIEF_SHA256"] == brief["brief_sha256"]
+    assert environment["HOME"] == str(runtime / "home")
+    assert environment["TMPDIR"] == str(runtime / "tmp")
+    assert "AMBIENT_TASK_SECRET" not in environment
+    for name in ("home", "tmp"):
+        path = runtime / name
+        assert path.is_dir()
+        assert not path.is_symlink()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("runtime_name", ["home", "tmp"])
+def test_task_run_binding_rejects_symlinked_runtime_before_publication(
+    tmp_path: Path,
+    runtime_name: str,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    service._ensure_worktree(task_id, actor="principal")
+    ownership = service._load_ownership(brief)
+    outside = tmp_path / f"outside-{runtime_name}"
+    outside.mkdir()
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    (runtime / runtime_name).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(TaskRunError):
+        ensure_task_run(
+            tmp_path,
+            brief,
+            ownership,
+            actor="principal",
+            commit_paths=_commit(tmp_path),
+        )
+
+    assert not (runtime / "run.json").exists()
+    assert list(tmp_path.glob("runs/RUN-*/manifest.json")) == []
+
+
+@pytest.mark.parametrize(
+    ("authority", "field", "value"),
+    [
+        pytest.param(
+            "brief",
+            "created_at",
+            "not-a-timestamp",
+            id="brief-created-at",
+        ),
+        pytest.param(
+            "ownership",
+            "branch",
+            "aros/task/TASK-20260807-wrong",
+            id="ownership-branch",
+        ),
+    ],
+)
+def test_task_run_binding_rejects_rehashed_malformed_task_authority(
+    tmp_path: Path,
+    authority: str,
+    field: str,
+    value: str,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    service._ensure_worktree(task_id, actor="principal")
+    ownership = service._load_ownership(brief)
+    authority_path = (
+        tmp_path / "tasks" / task_id / "brief.json"
+        if authority == "brief"
+        else tmp_path / ".aros" / "tasks" / task_id / "ownership.json"
+    )
+    target = dict(brief) if authority == "brief" else dict(ownership)
+    hash_field = "brief_sha256" if authority == "brief" else "ownership_sha256"
+    target[field] = value
+    target[hash_field] = json_sha256(
+        {key: item for key, item in target.items() if key != hash_field}
+    )
+    _write_json(authority_path, target)
+    authority_bytes = authority_path.read_bytes()
+
+    with pytest.raises(TaskRunError):
+        ensure_task_run(
+            tmp_path,
+            target if authority == "brief" else brief,
+            target if authority == "ownership" else ownership,
+            actor="principal",
+            commit_paths=_commit(tmp_path),
+        )
+
+    assert authority_path.read_bytes() == authority_bytes
+    assert not (
+        tmp_path / ".aros" / "tasks" / task_id / "run.json"
+    ).exists()
+    assert list(tmp_path.glob("runs/RUN-*/manifest.json")) == []
+
+
+@pytest.mark.parametrize("substitution", ["runtime", "home"])
+def test_adapter_context_rejects_runtime_substitution_after_binding(
+    tmp_path: Path,
+    substitution: str,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    service._ensure_worktree(task_id, actor="principal")
+    ownership = service._load_ownership(brief)
+    ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+    runtime = tmp_path / ".aros" / "tasks" / task_id
+    if substitution == "runtime":
+        moved = tmp_path / "moved-runtime"
+        runtime.rename(moved)
+        runtime.symlink_to(moved, target_is_directory=True)
+    else:
+        home = runtime / "home"
+        home.rmdir()
+        outside = tmp_path / "outside-home-after-binding"
+        outside.mkdir()
+        home.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(TaskError):
+        service.adapter_context(task_id)
 
 
 def test_start_commits_one_run_manifest_before_launch(

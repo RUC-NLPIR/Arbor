@@ -208,6 +208,129 @@ def test_run_prepare_returns_manifest_with_direct_commit_request(
     assert not (tmp_path / "transitions").exists()
 
 
+def test_manifest_for_idempotency_key_normalizes_and_strictly_loads(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service = RunService(tmp_path)
+    manifest = service.prepare(
+        [sys.executable, "-c", "print('run')"],
+        idempotency_key="run-manifest-lookup",
+        actor="principal",
+        security_profile="trusted-local",
+    )
+
+    assert service.manifest_for_idempotency_key("  run-manifest-lookup  ") == manifest
+    assert service.manifest_for_idempotency_key("absent-run-key") is None
+    with pytest.raises(RunError, match="idempotency_key"):
+        service.manifest_for_idempotency_key("   ")
+
+
+def test_manifest_for_idempotency_key_rejects_invalid_index_linkage(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service = RunService(tmp_path)
+    service.prepare(
+        [sys.executable, "-c", "print('run')"],
+        idempotency_key="run-manifest-invalid-index",
+        actor="principal",
+        security_profile="trusted-local",
+    )
+    index_path = service._idempotency_index_path("run-manifest-invalid-index")
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["request_sha256"] = "0" * 64
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(RunError, match="idempotency index"):
+        service.manifest_for_idempotency_key("run-manifest-invalid-index")
+
+
+def test_manifest_for_idempotency_key_does_not_scan_or_repair_without_index(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service = RunService(tmp_path)
+    manifest = service.prepare(
+        [sys.executable, "-c", "print('run')"],
+        idempotency_key="run-manifest-no-index",
+        actor="principal",
+        security_profile="trusted-local",
+    )
+    service._idempotency_index_path("run-manifest-no-index").unlink()
+    manifest_path = tmp_path / "runs" / str(manifest["run_id"]) / "manifest.json"
+    crash_alias = _install_json_crash_alias(manifest_path)
+
+    assert service.manifest_for_idempotency_key("run-manifest-no-index") is None
+    assert crash_alias.exists()
+    assert manifest_path.stat().st_nlink == 2
+
+
+def test_manifest_for_idempotency_key_rejects_hardlinked_index(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service = RunService(tmp_path)
+    service.prepare(
+        [sys.executable, "-c", "print('run')"],
+        idempotency_key="run-manifest-hardlinked-index",
+        actor="principal",
+        security_profile="trusted-local",
+    )
+    index_path = service._idempotency_index_path("run-manifest-hardlinked-index")
+    os.link(index_path, tmp_path / "index-alias.json", follow_symlinks=False)
+
+    with pytest.raises(RunError, match="idempotency index"):
+        service.manifest_for_idempotency_key("run-manifest-hardlinked-index")
+
+
+def test_manifest_for_idempotency_key_rejects_rehashed_manifest(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service = RunService(tmp_path)
+    manifest = service.prepare(
+        [sys.executable, "-c", "print('run')"],
+        idempotency_key="run-manifest-rehashed",
+        actor="principal",
+        security_profile="trusted-local",
+    )
+    manifest_path = tmp_path / "runs" / str(manifest["run_id"]) / "manifest.json"
+    forged = dict(manifest)
+    forged["actor"] = "forged-actor"
+    forged["manifest_sha256"] = manifest_sha256(forged)
+    manifest_path.write_text(json.dumps(forged), encoding="utf-8")
+
+    with pytest.raises(RunError, match="idempotency index"):
+        service.manifest_for_idempotency_key("run-manifest-rehashed")
+
+
+@pytest.mark.parametrize("symlink_parent", ["index", "manifest"])
+def test_manifest_for_idempotency_key_rejects_symlinked_parent_directory(
+    tmp_path: Path,
+    symlink_parent: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service = RunService(tmp_path)
+    manifest = service.prepare(
+        [sys.executable, "-c", "print('run')"],
+        idempotency_key="run-manifest-symlinked-parent",
+        actor="principal",
+        security_profile="trusted-local",
+    )
+    if symlink_parent == "index":
+        parent = tmp_path / ".aros" / "runs" / "idempotency"
+        moved = parent.with_name("idempotency-real")
+    else:
+        parent = tmp_path / "runs" / str(manifest["run_id"])
+        moved = parent.with_name(f"{parent.name}-real")
+    parent.rename(moved)
+    parent.symlink_to(moved, target_is_directory=True)
+
+    with pytest.raises(RunError):
+        service.manifest_for_idempotency_key("run-manifest-symlinked-parent")
+
+
 def _install_json_crash_alias(path: Path) -> Path:
     digest = hashlib.sha256(os.fsencode(path.name)).hexdigest()
     alias = path.parent / f".aros-json-{digest}.inspection-crash.tmp"

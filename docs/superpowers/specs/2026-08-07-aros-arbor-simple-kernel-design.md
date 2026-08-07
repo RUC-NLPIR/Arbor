@@ -1,6 +1,6 @@
 # AROS Arbor-Simple Kernel Design
 
-Status: proposed implementation design
+Status: current implementation design
 Date: 2026-08-07
 Highest authority: `AR_OS_AGENT_PRINCIPAL_DESIGN_BOOK_v1_0_zh.md`
 

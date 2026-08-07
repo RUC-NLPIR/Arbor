@@ -5,8 +5,7 @@ from pathlib import Path
 
 
 def main() -> None:
-    mode = Path("candidate-mode.txt").read_text(encoding="utf-8")
-    if mode != "success\n":
+    if Path("candidate-mode.txt").read_text(encoding="utf-8") != "success\n":
         raise SystemExit("candidate-mode.txt is not the expected success value")
     print(json.dumps({"schema_version": 1, "metric": 1.0, "sample_count": 1}))
 

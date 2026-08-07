@@ -30,12 +30,10 @@ def main() -> None:
     task_id = os.environ["AROS_TASK_ID"]
     brief_sha256 = os.environ["AROS_TASK_BRIEF_SHA256"]
     base_commit = os.environ["AROS_TASK_BASE_COMMIT"]
-
     Path("candidate-mode.txt").write_text("success\n", encoding="utf-8")
     _git("add", "--", "candidate-mode.txt")
     _git("commit", "-qm", "produce deterministic candidate")
     child_commit = _git("rev-parse", "HEAD")
-
     returned: dict[str, object] = {
         "schema_version": 1,
         "task_id": task_id,

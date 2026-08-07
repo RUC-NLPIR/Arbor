@@ -2,127 +2,36 @@
 
 ## Mission
 
-Implement and validate Agent-centric AROS while preserving the Design Book
-invariants, then retire Arbor only after equivalent public capabilities are
-commissioned.
+Implement and validate the simplest Agent-centric AROS, then retire Arbor only
+after equivalent public capabilities are commissioned.
 
 ## Current position
 
-- Native `aros start` now owns first boot and local intake. A clean-wheel run
-  created Q-0001, ingested exact local Markdown bytes/hash/extraction/provenance,
-  started a real Principal that read both Question and source, then recovered
-  Q-0001 in a zero-message Attention restart. Independent evidence:
-  `docs/analysis/aros-native-start-smoke.md`.
-- Public `aros init`, the `arbor aros` forwarding mount/warning, and the E4
-  compatibility hash exception are deleted. Direct `aros` is the only AROS
-  entry; no migration reader or alias was added.
+- Principal owns the scientific outer loop; Researcher Task owns one direction's
+  inner loop. AROS owns workspace, Git/worktree, process, Eval receipts, and
+  restart Attention.
+- Model-visible AROS tools are `Attention`, `Task`, `Run`, `Eval`, and optionally
+  host-granted `Checkpoint`.
+- Checkpoint is ordinary selected-path Git. Host-observed Task/Run/Eval refs are
+  automatic `AROS-Observed:` trailers; scientific meaning remains Markdown.
+- Proposal, admission, assimilation, semantic index, strict Evidence relation,
+  rebuild commands, bridges, compatibility readers, and dual writes are deleted.
+- Deterministic clean-wheel E2E completed preregistration, one Task, one valid
+  Eval, final Question/Model/Idea/Claim/NOW prose, primary destruction, and a
+  fresh Attention restart with `unread_returns=[]`.
+- First-slice `src/aros` budget is at or below 19,000 LOC. The next structural
+  target is Task-on-Run and `src/aros <= 12,000 LOC`.
 
-- The Arbor-native Principal Loop core is implemented through the sealed
-  Research tool, strict TransitionAudit, cooperative/ProContract receipt
-  dispatch, Git CAS, projection/reconcile barriers, and the zero-trust
-  transition index.
-- Clean product `9a51787` completed the replacement live cooperative
-  Task→Eval→Measurement→Assimilation→restart commissioning through the real
-  Arbor `Agent.run` loop. The independent verifier accepted final commit
-  `a0f10647738e16eb5b9d0f9a7a2926c8d35813d3`; exact evidence is recorded in
-  `docs/analysis/aros-principal-loop-core-smoke.md`.
-- The primary Agent executed 15 turns: Attention, Task create/start/status/
-  collect, Eval, Attention, two Reads, three semantic Writes, audit, and
-  checkpoint. The verifier matched every Write byte to the admitted Git blobs.
-- The primary Agent/provider were destroyed. A zero-message fresh Agent called
-  only Attention, recovered `T-E2E-ASSIMILATE`, and saw no unassimilated Task or
-  measurement. The derived transition index was explicitly rebuilt from Git
-  between sessions; it remains non-authoritative.
-- This proves live Agent-loop composition and restart continuity in cooperative
-  mode. It does not prove external-model research quality, mediated/protected
-  authority, or non-bypass same-UID containment.
-- Current collection contains 2,146 tests. The latest full run completed with
-  2,140 passed, 6 skipped, zero failures; focused suites, Ruff, diff-check, and
-  both retained-evidence verifiers also exited 0.
+## Current limits
 
-- Integrated implementation baseline: `main@56c5375` in `/workspace/Arbor`.
-- Current implementation baselines are deliberately separated: immutable Run
-  terminal projection is `01a72f07ed6bc88fa6d7bd5fbe1527d985ffe558`;
-  read-only Eval audit compatibility is
-  `c6b80ee2a5b8df183d1c92b51d525b43d246a47c`; the final create-once
-  carrier-race evidence is `a9ee500379107d9f777f5b57b11917b5a472429b`.
-- The guarded Task carrier work is merged on `main` at
-  `904f7ae2786ce7f57c9d987c7d6c4608f7d37dc2`; this branch descends from that
-  baseline.
-- Visible Eval remains commissioned at code baseline
-  `d5cbc7ec4ddd4b677e55df341912394d32e55846`; its post-hardening evidence
-  checkpoint is `25db6fe7f6e24a703e2319783d2466fe59a98f4e`.
-- Wave 3 visible evaluation is implemented and commissioned through the direct
-  `aros eval register|run|status|observe|audit` surface. Registered evidence:
-  `docs/analysis/aros-wave3-visible-eval-smoke.md`.
-- Eval composes the durable Run service and separate exact candidate/apparatus
-  checkouts. It owns no second process, tmux, final-process, or recovery stack.
-- Real commissioning produced a `valid` scalar measurement from distinct exact
-  candidate/apparatus commits, proved clean removal, and proved direct factual
-  status, bounded observe, and lineage audit.
-- Post-hardening recommissioning proved that every stage-0 candidate/apparatus
-  index blob OID matched an OID recomputed from raw checkout bytes before clean
-  removal. The current exact Run again produced one valid measurement and a
-  valid audit; the original dirty/lost receipts remain pre-hardening behavior
-  evidence rather than proof of this raw-byte verifier.
-- External candidate dirt changed a completed process result to
-  `measurement_state=invalid_eval`; both checkouts were preserved until the
-  injected bytes were recorded, restored, and removed by the clean-only helper.
-- Killing only the foreground Eval broker made the request permanently `lost`
-  while the linked Run remained independently observable. Same-key replay
-  created no Run; a new key created exactly one new Eval/Run. Explicitly stopped
-  Runs became `cancelled`, and no measurement receipt was reconstructed.
-- A schema-valid absolute virtual-environment launcher failed under
-  `isolated-linux` because its outside-bundle `pyvenv.cfg` was unreadable. That
-  attempt remains factual `failed_process/not_available` evidence and was not
-  retried. The commissioned descriptor uses fixed `python3`; no isolation
-  policy was weakened.
-- Run terminal reads now use manifest + create-once prelaunch + immutable final
-  as authority. Mutable terminal status is a deterministic 16-field
-  projection repaired by `status`, `start`, or `reconcile`; immutable
-  final/output readers do not require or recreate it.
-- Eval audit observes Run status with reconciliation disabled. Missing mutable
-  status is an independent issue and does not prevent immutable final/log
-  validation; audit does not reconstruct status, final, measurement or retry.
-- Fresh current-branch gates reached `93 passed in 21.17s` for Run, `384 passed
-  in 63.98s` for the Run/Eval/Eval-records combination, `244 passed (exit 0)`
-  for the final documentation/architecture gate, and `1641 passed, 6 skipped in
-  350.36s (0:05:50)` for the final exact unqualified full pytest command. Full
-  Ruff reported `All checks passed!`; diff-check and the `uv.lock` comparison
-  both exited 0. No `uv` command ran and no commissioning receipt changed.
-- Post-merge main verification reached `1641 passed, 6 skipped in 326.85s`.
-  Direct CLI recovery smoke completed
-  `RUN-20260804-153546-projection-smoke-7f4b`, rebuilt a deleted mutable status
-  as the exact 16-field projection, preserved final SHA-256
-  `d831ac9dd3054e1e9b3707bae6a192d0b1263b9eee352d7368453c2f9a0d862d`, and
-  replayed the same idempotency key without another Run.
-- Wave 2 child-task evidence remains current. Exact carrier probing and the
-  per-task OFD guardian close the reviewed Task startup-loss intervals without
-  retry; Task adapters remain trusted-local, application-scoped, and not a
-  security sandbox. Their containment and filesystem-permission limits are
-  unchanged.
-- Protected registration/admission, disclosure budgets, AROS-native K/M/G,
-  MCP parity, and Arbor retirement remain unavailable.
-- This repair does not commission all Phase 3 exits, Phase 4, or the complete
-  AROS target.
-- The Phase 3 sequence deviation is already recorded in the current
-  implementation baseline; it is not a pending registration action.
-
-## Preserved operational evidence
-
-- The ignored commissioning repository retains exact v1 failure, v2 success,
-  dirty, and lost Run records. All commissioning execution bundles were removed
-  only through clean validation; no unexpected dirty material was discarded.
-- The two original Wave 2 task-worktree inspection failures and their receipts
-  remain historical process evidence for shared Run/Task process-core work, not
-  scientific negative results.
+- Cooperative same-UID Git is not protected authority.
+- A real external-model Researcher inner loop is not yet commissioned.
+- Source Gateway, project Skills, MCP parity, shared budgets/leases, complete
+  K/M/G productization, and Arbor retirement remain open.
 
 ## Next obligations
 
-1. Run a non-fixture scientific turn with a real external model while retaining
-   explicit assimilation and deterministic verification.
-2. Implement the Arbor-native protected broker/lease/fence domain and commission
-   non-bypass authority; do not infer it from cooperative evidence.
-3. Complete protected Eval, Source Gateway, project Skills, MCP/provider
-   parity, AROS-native K/M/G, and direct Arbor retirement without a compatibility
-   layer.
+1. Preserve the replacement E2E evidence and pass full repository tests/Ruff.
+2. Simplify Task to worktree + Run + Researcher adapter without weakening receipts.
+3. Commission one real Researcher inner loop before adding async concurrency.
+4. Add Skills or MCP only after a repeated native-service need is measured.

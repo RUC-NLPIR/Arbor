@@ -42,6 +42,14 @@
       "agent_visibility": "on_demand"
     },
     {
+      "id": "aros-simple-loop-smoke",
+      "title": "AROS Simple Agent Research Loop E2E Evidence",
+      "path": "docs/analysis/aros-simple-loop-smoke.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
+    },
+    {
       "id": "aros-real-principal-attempt-1",
       "title": "AROS Real Principal Scientific Turn Attempt 1",
       "path": "docs/analysis/aros-real-principal-attempt-1.md",

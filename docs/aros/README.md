@@ -84,3 +84,16 @@ CI keeps the remaining legacy implementation frozen at `src/coordinator`,
 `src/executor`, `src/run.py`, `src/review.py`, and `src/cli/commands/run.py`.
 Other `arbor` commands remain legacy implementations until equivalent AROS paths
 are commissioned and the old paths are deleted.
+
+CI hard-gates transitive project-import reachability from every AROS module and
+direct adapter. Its conservative module-scope graph indexes every configured local
+Python package. Only `src/aros/`, `src/cli/aros_app.py`, `src/cli/aros_start.py`,
+and `src/cli/commands/aros_cmd.py` may grow. All non-allowlisted legacy source paths
+under `src/` reject growth; `src/core/` remains legacy-frozen, so legacy source LOC
+may only stay level or decrease.
+
+These mechanical gates do not prove absence of semantic duplication. A padded copy
+inside an allowlisted path still requires module commissioning review. A padded copy
+outside it fails the path gate. A Git `R100` move outside `src/` is accepted only
+when the destination is not configured as a Python package and no remaining entry
+or import refers to the moved module.

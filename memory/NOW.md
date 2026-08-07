@@ -18,7 +18,8 @@ after equivalent public capabilities are commissioned.
   rebuild commands, bridges, compatibility readers, and dual writes are deleted.
 - Deterministic clean-wheel E2E completed preregistration, one Task, one valid
   Eval, final Question/Model/Idea/Claim/NOW prose, primary destruction, and a
-  fresh Attention restart with `unread_returns=[]`.
+  fresh Attention restart with `unread_returns=[]`. Exact current evidence is
+  `docs/analysis/aros-simple-loop-smoke.md` at product source `541b496`.
 - First-slice `src/aros` budget is at or below 19,000 LOC. The next structural
   target is Task-on-Run and `src/aros <= 12,000 LOC`.
 

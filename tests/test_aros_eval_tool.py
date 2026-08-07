@@ -60,6 +60,7 @@ class FakeEvalService:
         return {
             "eval_id": "EVAL-" + "a" * 64,
             "evaluation_state": "completed",
+            "run_id": "RUN-eval",
             "receipt_sha256": "b" * 64,
         }
 
@@ -70,9 +71,14 @@ class FakeEvalService:
         if not isinstance(receipt_sha256, str):
             return result, None, None
         eval_id = str(projection["eval_id"])
+        run_id = str(projection["run_id"])
         return (
             result,
-            (f"eval/evaluations/{eval_id}/receipt.json",),
+            (
+                f"eval/evaluations/{eval_id}/receipt.json",
+                f"runs/{run_id}/final.json",
+                f"runs/{run_id}/manifest.json",
+            ),
             f"Record evaluation {eval_id} receipt",
         )
 
@@ -331,6 +337,7 @@ def test_register_and_run_forward_exact_requests_as_principal(tmp_path: Path) ->
     assert json.loads(completed) == {
         "eval_id": "EVAL-" + "a" * 64,
         "evaluation_state": "completed",
+        "run_id": "RUN-eval",
         "receipt_sha256": "b" * 64,
     }
 
@@ -363,7 +370,11 @@ def test_eval_run_commits_receipt_then_records_observation(tmp_path: Path) -> No
     eval_id = "EVAL-" + "a" * 64
     assert events == [
         (
-            (f"eval/evaluations/{eval_id}/receipt.json",),
+            (
+                f"eval/evaluations/{eval_id}/receipt.json",
+                "runs/RUN-eval/final.json",
+                "runs/RUN-eval/manifest.json",
+            ),
             f"Record evaluation {eval_id} receipt",
         ),
         f"eval/evaluations/{eval_id}/receipt.json",

@@ -189,6 +189,8 @@ def verify(evidence_path: Path) -> dict[str, object]:
         raise VerificationError("HEAD differs from final checkpoint")
     if _git_text(project, "rev-parse", "HEAD^") != final_parent:
         raise VerificationError("final parent differs")
+    if _git_text(project, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise VerificationError("project is dirty after final checkpoint")
     if sorted(_git_text(project, "diff-tree", "--no-commit-id", "--name-only", "-r", final_commit).splitlines()) != _SEMANTIC_PATHS:
         raise VerificationError("final changed paths differ")
     if sorted(_git_text(project, "diff-tree", "--no-commit-id", "--name-only", "-r", prereg_commit).splitlines()) != ["ideas/I-E2E.md", "model/CURRENT.md"]:

@@ -1,5 +1,3 @@
-"""Principal-facing cooperative Git checkpoint."""
-
 from __future__ import annotations
 
 import json

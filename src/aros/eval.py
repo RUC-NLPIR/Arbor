@@ -1,5 +1,3 @@
-"""Visible evaluator registration and one-attempt request admission."""
-
 from __future__ import annotations
 
 import fcntl
@@ -598,11 +596,17 @@ class EvalService:
         projection = result.status if isinstance(result, ExistingEvaluation) else result
         eval_id = projection.get("eval_id")
         receipt_sha256 = projection.get("receipt_sha256")
-        if not isinstance(eval_id, str) or not isinstance(receipt_sha256, str):
+        run_id = projection.get("run_id")
+        if not all(isinstance(item, str) for item in (eval_id, receipt_sha256, run_id)):
             return result, None, None
+        assert isinstance(eval_id, str) and isinstance(run_id, str)
         return (
             result,
-            (f"eval/evaluations/{eval_id}/receipt.json",),
+            (
+                f"eval/evaluations/{eval_id}/receipt.json",
+                f"runs/{run_id}/final.json",
+                f"runs/{run_id}/manifest.json",
+            ),
             f"Record evaluation {eval_id} receipt",
         )
 

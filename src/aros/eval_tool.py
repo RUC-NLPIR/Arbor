@@ -1,5 +1,3 @@
-"""Principal-facing system call for visible AROS evaluation."""
-
 from __future__ import annotations
 
 import copy
@@ -219,7 +217,9 @@ class EvalTool(Tool):
                 if self.commit_paths is not None:
                     result["checkpoint"] = self.commit_paths(paths, message)
                 if self.record_observation is not None:
-                    self.record_observation(paths[0])
+                    self.record_observation(
+                        f"eval/evaluations/{result['eval_id']}/receipt.json"
+                    )
         elif action == "status":
             result = service.status(kwargs["eval_id"])
         elif action == "observe":

@@ -77,6 +77,7 @@ def test_eval_run_returns_plain_commit_request_only_for_receipt(
     receipt = {
         "eval_id": "EVAL-" + "a" * 64,
         "receipt_sha256": "b" * 64,
+        "run_id": "RUN-eval",
     }
     monkeypatch.setattr(service, "run", lambda *_args, **_kwargs: dict(receipt))
 
@@ -89,7 +90,11 @@ def test_eval_run_returns_plain_commit_request_only_for_receipt(
     )
 
     assert record == receipt
-    assert paths == (f"eval/evaluations/{receipt['eval_id']}/receipt.json",)
+    assert paths == (
+        f"eval/evaluations/{receipt['eval_id']}/receipt.json",
+        "runs/RUN-eval/final.json",
+        "runs/RUN-eval/manifest.json",
+    )
     assert message == f"Record evaluation {receipt['eval_id']} receipt"
 
     monkeypatch.setattr(

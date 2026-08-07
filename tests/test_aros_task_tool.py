@@ -16,6 +16,11 @@ from arbor.aros.tasks import TaskError
 
 class FakeTaskService:
     instances: list["FakeTaskService"] = []
+    start_result: dict[str, Any] = {
+        "task_id": "TASK-test",
+        "state": "running",
+        "final_ref": None,
+    }
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -59,9 +64,15 @@ class FakeTaskService:
             "Record task TASK-test brief",
         )
 
-    def start(self, task_id: str, *, actor: str | None = None) -> dict[str, Any]:
-        self.calls.append(("start", task_id, actor))
-        return {"task_id": task_id, "state": "running"}
+    def start(
+        self,
+        task_id: str,
+        *,
+        actor: str | None = None,
+        commit_paths: Any = None,
+    ) -> dict[str, Any]:
+        self.calls.append(("start", task_id, actor, commit_paths))
+        return dict(self.start_result)
 
     def status(self, task_id: str) -> dict[str, Any]:
         self.calls.append(("status", task_id))
@@ -114,6 +125,11 @@ class FakeTaskService:
 @pytest.fixture(autouse=True)
 def fake_task_service(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeTaskService.instances.clear()
+    FakeTaskService.start_result = {
+        "task_id": "TASK-test",
+        "state": "running",
+        "final_ref": None,
+    }
     try:
         module = importlib.import_module("arbor.aros.task_tool")
     except ModuleNotFoundError:
@@ -324,10 +340,49 @@ def test_create_forwards_explicit_bounded_brief_fields(tmp_path: Path) -> None:
     ]
 
 
-def test_start_message_and_stop_use_principal_actor(tmp_path: Path) -> None:
+def test_start_passes_commit_callback_and_records_terminal_observation(
+    tmp_path: Path,
+) -> None:
+    observations: list[str] = []
+
+    def commit(paths: tuple[str, ...], message: str) -> dict[str, object]:
+        raise AssertionError(f"fake service must own commit: {paths!r} {message!r}")
+
+    FakeTaskService.start_result = {
+        "task_id": "TASK-test",
+        "state": "completed",
+        "run_id": "RUN-test",
+        "final_ref": "runs/RUN-test/final.json",
+    }
+    tool = _task_tool()(
+        cwd=str(tmp_path),
+        commit_paths=commit,
+        record_observation=observations.append,
+    )
+
+    output = json.loads(_execute(tool, action="start", task_id="TASK-test"))
+
+    assert FakeTaskService.instances[0].calls == [
+        ("start", "TASK-test", "principal", commit),
+    ]
+    assert output == FakeTaskService.start_result
+    assert observations == ["runs/RUN-test/final.json"]
+
+
+def test_start_without_commit_callback_fails_before_service_preparation(
+    tmp_path: Path,
+) -> None:
     tool = _task_tool()(cwd=str(tmp_path))
 
-    _execute(tool, action="start", task_id="TASK-test")
+    with pytest.raises(TaskError, match="commit_paths|commit"):
+        _execute(tool, action="start", task_id="TASK-test")
+
+    assert FakeTaskService.instances == []
+
+
+def test_message_and_stop_use_principal_actor(tmp_path: Path) -> None:
+    tool = _task_tool()(cwd=str(tmp_path))
+
     _execute(
         tool,
         action="message",
@@ -342,12 +397,9 @@ def test_start_message_and_stop_use_principal_actor(tmp_path: Path) -> None:
     )
 
     assert FakeTaskService.instances[0].calls == [
-        ("start", "TASK-test", "principal"),
-    ]
-    assert FakeTaskService.instances[1].calls == [
         ("message", "TASK-test", "record exact evidence", "principal"),
     ]
-    assert FakeTaskService.instances[2].calls == [
+    assert FakeTaskService.instances[1].calls == [
         ("stop", "TASK-test", "principal", "evidence is sufficient", "TERM"),
     ]
 

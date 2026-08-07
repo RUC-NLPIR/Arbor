@@ -60,9 +60,15 @@ class FakeTaskService:
         )
         return {"state": "prepared", "task_id": "TASK-test"}
 
-    def start(self, task_id: str, *, actor: str | None = None) -> dict[str, Any]:
+    def start(
+        self,
+        task_id: str,
+        *,
+        actor: str | None = None,
+        commit_paths: Any = None,
+    ) -> dict[str, Any]:
         self._raise_error()
-        self.calls.append(("start", task_id, actor))
+        self.calls.append(("start", task_id, actor, commit_paths))
         return {"state": "running", "task_id": task_id}
 
     def status(self, task_id: str) -> dict[str, Any]:
@@ -307,15 +313,27 @@ def test_task_create_requires_adapter_argv(tmp_path: Path) -> None:
 
 
 def test_task_start_is_a_separate_human_attributed_action(tmp_path: Path) -> None:
-    result = runner.invoke(
-        aros_cmd.aros_app,
-        ["task", "start", "TASK-test", "--cwd", str(tmp_path)],
-    )
+    checkpoints: list[Any] = []
+
+    class FakeCheckpoint:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+            self.commit_paths = object()
+            checkpoints.append(self)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(aros_cmd, "GitCheckpoint", FakeCheckpoint)
+        result = runner.invoke(
+            aros_cmd.aros_app,
+            ["task", "start", "TASK-test", "--cwd", str(tmp_path)],
+        )
 
     assert result.exit_code == 0, result.output
     assert FakeTaskService.instances[0].root == tmp_path.resolve()
+    assert len(checkpoints) == 1
+    assert checkpoints[0].root == tmp_path.resolve()
     assert FakeTaskService.instances[0].calls == [
-        ("start", "TASK-test", "human"),
+        ("start", "TASK-test", "human", checkpoints[0].commit_paths),
     ]
     assert json.loads(result.output) == {
         "state": "running",

@@ -10,14 +10,11 @@ import math
 import os
 import re
 import secrets
-import shlex
 import shutil
-import signal
 import socket
 import stat
 import subprocess
 import sys
-import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -502,210 +499,54 @@ class TaskService:
         task_id: str,
         *,
         actor: str | None = None,
+        commit_paths: Callable[
+            [tuple[str, ...], str],
+            dict[str, object],
+        ]
+        | None = None,
     ) -> dict[str, object]:
-        """Ensure ownership and request the task's sole adapter launch attempt."""
+        """Commit one Task Run manifest before requesting its launch."""
+        from .runs import RunError, RunService
+        from .task_run import (
+            TaskRunError,
+            commit_terminal_run_if_present,
+            ensure_task_run,
+            project_task_status,
+        )
+
         self._validate_task_id(task_id)
-        self._ensure_record_roots()
-        if _path_exists(self._launch_path(task_id)):
-            return self._existing_execution_status(task_id, actor)
-
+        if not callable(commit_paths):
+            raise TaskError("task start commit_paths must be callable")
         self._ensure_worktree(task_id, actor=actor)
-        existing_launch = False
-        result: subprocess.CompletedProcess[str] | None = None
-        carrier_error: OSError | None = None
-        carrier_failure_detail: str | None = None
-        pending_interrupt: KeyboardInterrupt | None = None
-        with self._carrier_launch_guard(task_id) as carrier_launch_fd:
-            if _path_exists(self._launch_path(task_id)):
-                existing_launch = True
-            else:
-                old_mask = signal.pthread_sigmask(
-                    signal.SIG_BLOCK,
-                    {signal.SIGINT},
-                )
-                try:
-                    publication_lock = self._publication_lock_path()
-                    _ensure_durable_lock_file(
-                        publication_lock,
-                        "task record publication lock",
-                    )
-                    with file_lock(publication_lock):
-                        lifecycle_lock = self._lifecycle_lock_path(task_id)
-                        _ensure_durable_lock_file(
-                            lifecycle_lock,
-                            "task lifecycle lock",
-                        )
-                        with file_lock(lifecycle_lock):
-                            self._reconcile_authoritative_briefs()
-                            brief = self._load_brief(task_id)
-                            ownership = self._load_ownership(brief)
-                            if _path_exists(self._launch_path(task_id)):
-                                existing_launch = True
-                            else:
-                                status = self._load_task_status(brief, ownership)
-                                if status["state"] != "worktree_ready":
-                                    raise TaskError(
-                                        f"task is not ready for launch: {task_id}"
-                                    )
-                                launch_actor = _validate_text(
-                                    actor if actor is not None else ownership["actor"],
-                                    "actor",
-                                )
-                                if launch_actor != ownership["actor"]:
-                                    raise TaskError(
-                                        f"task ownership actor conflict: {task_id}"
-                                    )
-                                tmux = shutil.which("tmux")
-                                if tmux is None:
-                                    raise TaskError(
-                                        "tmux is required for durable child tasks"
-                                    )
-                                runtime = self._runtime_path(task_id)
-                                preparation = self._create_preparation(
-                                    brief,
-                                    ownership,
-                                    launch_actor,
-                                )
-                                self._prepare_execution_paths(
-                                    runtime,
-                                    filesystem_permissions_enforced=preparation[
-                                        "filesystem_permissions_enforced"
-                                    ],
-                                )
-                                launched_at = utc_now()
-                                session_name = f"aros-task-{task_id.lower()}"
-                                socket_name = _tmux_socket_name(self.root, task_id)
-                                runner_cwd = runtime / "home"
-                                runner_invocation = [
-                                    sys.executable,
-                                    "-I",
-                                    "-c",
-                                    _TASK_RUNNER_BOOTSTRAP,
-                                    str(runtime / "runner-import"),
-                                    "--workspace",
-                                    str(self.root),
-                                    "--task-id",
-                                    task_id,
-                                ]
-                                launch: dict[str, object] = {
-                                    "schema_version": 1,
-                                    "task_id": task_id,
-                                    "actor": launch_actor,
-                                    "brief_sha256": brief["brief_sha256"],
-                                    "ownership_sha256": ownership["ownership_sha256"],
-                                    "base_commit": brief["base_commit"],
-                                    "security_profile": "trusted-local",
-                                    "isolation_scope": "application",
-                                    "capabilities_enforced": False,
-                                    "filesystem_permissions_enforced": preparation[
-                                        "filesystem_permissions_enforced"
-                                    ],
-                                    "filesystem_permission_probe": dict(
-                                        preparation[  # type: ignore[arg-type]
-                                            "filesystem_permission_probe"
-                                        ]
-                                    ),
-                                    "carrier": "tmux",
-                                    "tmux_session": session_name,
-                                    "tmux_socket": socket_name,
-                                    "host": socket.gethostname(),
-                                    "runner_version": 1,
-                                    "runner_cwd": str(runner_cwd),
-                                    "runner_invocation": runner_invocation,
-                                    "launched_at": launched_at,
-                                }
-                                launch["launch_sha256"] = _record_sha256(
-                                    launch,
-                                    "launch_sha256",
-                                )
-                                if not create_json(self._launch_path(task_id), launch):
-                                    existing_launch = True
-                                else:
-                                    recorded_launch = self._load_launch(brief, ownership)
-                                    if recorded_launch != launch:
-                                        raise TaskError(
-                                            f"task launch differs after write: {task_id}"
-                                        )
-                                    from .task_runner import launched_status
-
-                                    atomic_write_json(
-                                        self._status_path(task_id),
-                                        launched_status(
-                                            brief,
-                                            ownership,
-                                            recorded_launch,
-                                        ),
-                                    )
-
-                    if not existing_launch:
-                        try:
-                            from .task_runner import runner_environment
-
-                            result = self._run_carrier_guardian(
-                                carrier_launch_fd,
-                                [
-                                    tmux,
-                                    "-L",
-                                    socket_name,
-                                    "new-session",
-                                    "-d",
-                                    "-s",
-                                    session_name,
-                                    "-c",
-                                    str(runner_cwd),
-                                    shlex.join(runner_invocation),
-                                ],
-                                runner_environment(runtime),
-                            )
-                        except OSError as error:
-                            carrier_error = error
-
-                        if carrier_error is not None:
-                            carrier_failure_detail = str(carrier_error)
-                            self._record_carrier_failure(
-                                task_id,
-                                carrier_failure_detail,
-                            )
-                        elif result is not None and result.returncode != 0:
-                            detail = (
-                                (result.stderr or result.stdout).strip()
-                                or "unknown tmux error"
-                            )
-                            if self._record_carrier_failure(
-                                task_id,
-                                detail,
-                                preserve_execution=True,
-                            ):
-                                carrier_failure_detail = detail
-                finally:
-                    try:
-                        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-                    except KeyboardInterrupt as error:
-                        pending_interrupt = error
-
-        if existing_launch:
-            return self._existing_execution_status(task_id, actor)
-        if carrier_error is not None:
-            if pending_interrupt is not None:
-                raise pending_interrupt
-            raise TaskError(
-                f"tmux launch failed for task {task_id}: {carrier_error}"
-            ) from carrier_error
-        if carrier_failure_detail is not None:
-            if pending_interrupt is not None:
-                raise pending_interrupt
-            raise TaskError(
-                f"tmux launch failed for task {task_id}: {carrier_failure_detail}"
+        brief = self._load_brief(task_id)
+        ownership = self._load_ownership(brief)
+        launch_actor = _validate_text(
+            actor if actor is not None else ownership["actor"],
+            "actor",
+        )
+        if launch_actor != ownership["actor"]:
+            raise TaskError(f"task ownership actor conflict: {task_id}")
+        try:
+            binding = ensure_task_run(
+                self.root,
+                brief,
+                ownership,
+                actor=launch_actor,
+                commit_paths=commit_paths,
             )
-        if pending_interrupt is not None:
-            raise pending_interrupt
-
-        deadline = time.monotonic() + _LAUNCH_GRACE_SECONDS
-        latest = self.status(task_id)
-        while latest["state"] == "launched" and time.monotonic() < deadline:
-            time.sleep(0.02)
-            latest = self.status(task_id)
-        return latest
+            run_status = RunService(self.root).start(
+                str(binding["run_id"]),
+                actor=launch_actor,
+            )
+            run_status = commit_terminal_run_if_present(
+                self.root,
+                binding,
+                run_status,
+                commit_paths,
+            )
+            return project_task_status(brief, ownership, binding, run_status)
+        except (TaskRunError, RunError, OSError, RuntimeError, ValueError) as error:
+            raise TaskError(f"unable to start Task Run: {task_id}") from error
 
     def _existing_execution_status(
         self,

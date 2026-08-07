@@ -14,7 +14,12 @@ import pytest
 
 from arbor.aros.runs import RunService
 from arbor.aros.store import json_sha256, manifest_sha256
-from arbor.aros.task_run import TaskRunError, ensure_task_run, load_task_run
+from arbor.aros.task_run import (
+    TaskRunError,
+    ensure_task_run,
+    load_task_run,
+    project_task_status,
+)
 from arbor.aros.tasks import TaskError, TaskService
 from arbor.aros.workspace import init_workspace
 
@@ -132,6 +137,57 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
         json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        pytest.param("run_id", None, id="missing-run-id"),
+        pytest.param("run_id", "RUN-other", id="mismatched-run-id"),
+        pytest.param("manifest_sha256", None, id="missing-manifest-hash"),
+        pytest.param(
+            "manifest_sha256",
+            "d" * 64,
+            id="mismatched-manifest-hash",
+        ),
+    ],
+)
+def test_project_task_status_requires_exact_run_identity(
+    field: str,
+    replacement: object,
+) -> None:
+    task_id = "TASK-20260807-projection"
+    brief_sha256 = "a" * 64
+    ownership_sha256 = "b" * 64
+    run_id = "RUN-projection"
+    manifest_sha256 = "c" * 64
+    brief = {"task_id": task_id, "brief_sha256": brief_sha256}
+    ownership = {
+        "task_id": task_id,
+        "brief_sha256": brief_sha256,
+        "ownership_sha256": ownership_sha256,
+    }
+    binding = {
+        "task_id": task_id,
+        "brief_sha256": brief_sha256,
+        "ownership_sha256": ownership_sha256,
+        "run_id": run_id,
+        "run_manifest_sha256": manifest_sha256,
+    }
+    run_status: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "state": "launched",
+        "manifest_sha256": manifest_sha256,
+        "updated_at": "2026-08-07T00:00:00.000Z",
+    }
+    if replacement is None:
+        run_status.pop(field)
+    else:
+        run_status[field] = replacement
+
+    with pytest.raises(TaskRunError, match="identity"):
+        project_task_status(brief, ownership, binding, run_status)
 
 
 @pytest.mark.parametrize("result_error", ["no-op", "wrong-path", "wrong-commit"])
@@ -1129,6 +1185,303 @@ def test_start_commits_one_run_manifest_before_launch(
     assert started_run_ids == [binding["run_id"]]
     assert _git(tmp_path, "show", f"HEAD:runs/{binding['run_id']}/manifest.json")
     assert not (tmp_path / ".aros/tasks" / str(brief["task_id"]) / "launch.json").exists()
+
+
+def test_start_reuses_committed_run_after_crash_before_launch_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    real_commit = _commit(tmp_path)
+    committed_paths: list[tuple[str, ...]] = []
+    start_calls: list[str] = []
+
+    def observed_commit(
+        paths: tuple[str, ...],
+        message: str,
+    ) -> dict[str, object]:
+        committed_paths.append(paths)
+        return real_commit(paths, message)
+
+    def crash_once(
+        _service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        start_calls.append(run_id)
+        binding_path = tmp_path / ".aros" / "tasks" / task_id / "run.json"
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        manifest_ref = f"runs/{run_id}/manifest.json"
+        assert binding["run_id"] == run_id
+        assert binding["run_manifest_ref"] == manifest_ref
+        assert _git_bytes(tmp_path, "show", f"HEAD:{manifest_ref}") == (
+            tmp_path / manifest_ref
+        ).read_bytes()
+        if len(start_calls) == 1:
+            raise RuntimeError("crash after durable Task Run publication")
+        return _launched_run_status(tmp_path, run_id)
+
+    monkeypatch.setattr(RunService, "start", crash_once)
+
+    with pytest.raises(TaskError, match=task_id):
+        service.start(
+            task_id,
+            actor="principal",
+            commit_paths=observed_commit,
+        )
+
+    binding = json.loads(
+        (tmp_path / ".aros" / "tasks" / task_id / "run.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    manifests = sorted(tmp_path.glob("runs/RUN-*/manifest.json"))
+    assert manifests == [tmp_path / str(binding["run_manifest_ref"])]
+
+    status = service.start(
+        task_id,
+        actor="principal",
+        commit_paths=observed_commit,
+    )
+
+    assert status["state"] == "launched"
+    assert status["run_id"] == binding["run_id"]
+    assert start_calls == [binding["run_id"], binding["run_id"]]
+    assert committed_paths == [(str(binding["run_manifest_ref"]),)]
+    assert sorted(tmp_path.glob("runs/RUN-*/manifest.json")) == manifests
+
+
+def test_start_requires_commit_callback_before_preparing_task_run(
+    tmp_path: Path,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+
+    with pytest.raises(TaskError, match="commit_paths|commit"):
+        service.start(task_id, actor="principal")
+
+    assert not (tmp_path / ".worktree" / "tasks" / task_id).exists()
+    assert not (tmp_path / ".aros" / "tasks" / task_id / "ownership.json").exists()
+    assert list(tmp_path.glob("runs/RUN-*/manifest.json")) == []
+
+
+def test_start_commits_fast_terminal_run_before_returning_final_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    terminal_statuses: dict[str, dict[str, object]] = {}
+    terminal_finals: dict[str, dict[str, object]] = {}
+
+    def fake_start(
+        _service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        manifest = json.loads(
+            (tmp_path / "runs" / run_id / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        finished_at = "2026-08-07T00:00:02.000Z"
+        final = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "completed",
+            "manifest_sha256": manifest["manifest_sha256"],
+        }
+        final_ref = f"runs/{run_id}/final.json"
+        _write_json(tmp_path / final_ref, final)
+        status = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "completed",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "updated_at": finished_at,
+            "finished_at": finished_at,
+            "exit_code": 0,
+            "final_ref": final_ref,
+        }
+        terminal_finals[run_id] = final
+        terminal_statuses[run_id] = status
+        return dict(status)
+
+    def fake_terminal(
+        _service: RunService,
+        run_id: str,
+    ) -> tuple[dict[str, object], tuple[str, ...], str]:
+        return (
+            dict(terminal_finals[run_id]),
+            (f"runs/{run_id}/final.json",),
+            f"Record run {run_id} final",
+        )
+
+    def fake_status(
+        _service: RunService,
+        run_id: str,
+        *,
+        reconcile: bool = True,
+        reader: object | None = None,
+    ) -> dict[str, object]:
+        return dict(terminal_statuses[run_id])
+
+    monkeypatch.setattr(RunService, "start", fake_start)
+    monkeypatch.setattr(RunService, "terminal_with_commit", fake_terminal)
+    monkeypatch.setattr(RunService, "status", fake_status)
+
+    status = service.start(
+        task_id,
+        actor="principal",
+        commit_paths=_commit(tmp_path),
+    )
+
+    final_ref = str(status["final_ref"])
+    assert final_ref == f"runs/{status['run_id']}/final.json"
+    assert _git_bytes(tmp_path, "show", f"HEAD:{final_ref}") == (
+        tmp_path / final_ref
+    ).read_bytes()
+    assert (
+        _git(
+            tmp_path,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "HEAD",
+        )
+        == final_ref
+    )
+
+
+def test_start_rejects_terminal_status_without_run_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+
+    def terminal_without_final(
+        _service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        manifest = json.loads(
+            (tmp_path / "runs" / run_id / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        finished_at = "2026-08-07T00:00:02.000Z"
+        return {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": "completed",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "updated_at": finished_at,
+            "finished_at": finished_at,
+            "exit_code": 0,
+            "final_ref": f"runs/{run_id}/final.json",
+        }
+
+    monkeypatch.setattr(RunService, "start", terminal_without_final)
+
+    with pytest.raises(TaskError, match=task_id) as raised:
+        service.start(
+            task_id,
+            actor="principal",
+            commit_paths=_commit(tmp_path),
+        )
+
+    assert isinstance(raised.value.__cause__, TaskRunError)
+    assert list(tmp_path.glob("runs/RUN-*/final.json")) == []
+
+
+@pytest.mark.parametrize("stage", ["ensure", "run", "terminal"])
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_start_translates_expected_operational_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error_type: type[Exception],
+) -> None:
+    import arbor.aros.task_run as task_run_module
+
+    _workspace(tmp_path)
+    service = TaskService(tmp_path)
+    brief = _brief(service)
+    task_id = str(brief["task_id"])
+    _git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    _git(tmp_path, "commit", "-qm", "record task brief")
+    injected = error_type(f"injected {stage} failure")
+    real_commit = _commit(tmp_path)
+
+    def commit_or_fail(
+        paths: tuple[str, ...],
+        message: str,
+    ) -> dict[str, object]:
+        if stage == "ensure":
+            raise injected
+        return real_commit(paths, message)
+
+    if stage == "run":
+
+        def fail_run(
+            _service: RunService,
+            run_id: str,
+            *,
+            actor: str | None = None,
+        ) -> dict[str, object]:
+            raise injected
+
+        monkeypatch.setattr(RunService, "start", fail_run)
+    elif stage == "terminal":
+
+        def launched(
+            _service: RunService,
+            run_id: str,
+            *,
+            actor: str | None = None,
+        ) -> dict[str, object]:
+            return _launched_run_status(tmp_path, run_id)
+
+        def fail_terminal(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise injected
+
+        monkeypatch.setattr(RunService, "start", launched)
+        monkeypatch.setattr(
+            task_run_module,
+            "commit_terminal_run_if_present",
+            fail_terminal,
+        )
+
+    with pytest.raises(TaskError, match=task_id) as raised:
+        service.start(
+            task_id,
+            actor="principal",
+            commit_paths=commit_or_fail,
+        )
+
+    assert raised.value.__cause__ is injected
 
 
 def test_status_projects_run_identity_without_task_process_claims(

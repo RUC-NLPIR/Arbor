@@ -40,6 +40,22 @@ _BINDING_FIELDS = {
     "created_at",
     "binding_sha256",
 }
+_TASK_RUN_STATES = {
+    "prepared",
+    "launched",
+    "running",
+    "completed",
+    "failed_process",
+    "timed_out",
+    "cancelled",
+    "lost",
+}
+_TERMINAL_PROCESS_STATES = {
+    "completed",
+    "failed_process",
+    "timed_out",
+    "cancelled",
+}
 class TaskRunError(ValueError):
     """Raised when a Task-to-Run binding is invalid or unsafe."""
 
@@ -55,6 +71,173 @@ def task_run_argv(root: Path, task_id: str) -> list[str]:
         "--task-id",
         task_id,
     ]
+
+
+def project_task_status(
+    brief: dict[str, object],
+    ownership: dict[str, object],
+    binding: dict[str, object],
+    run_status: dict[str, object],
+) -> dict[str, object]:
+    """Project one validated Run status without process-authority claims."""
+    if not all(
+        isinstance(value, dict)
+        for value in (brief, ownership, binding, run_status)
+    ):
+        raise TaskRunError("Task status projection inputs must be JSON objects")
+    task_id = _validate_task_id(brief.get("task_id"))
+    brief_sha256 = _validate_hash(
+        brief.get("brief_sha256"),
+        "Task status brief_sha256",
+    )
+    ownership_sha256 = _validate_hash(
+        ownership.get("ownership_sha256"),
+        "Task status ownership_sha256",
+    )
+    run_id = _validate_run_id(binding.get("run_id"))
+    manifest_sha256 = _validate_hash(
+        binding.get("run_manifest_sha256"),
+        "Task status run_manifest_sha256",
+    )
+    if (
+        ownership.get("task_id") != task_id
+        or ownership.get("brief_sha256") != brief_sha256
+        or binding.get("task_id") != task_id
+        or binding.get("brief_sha256") != brief_sha256
+        or binding.get("ownership_sha256") != ownership_sha256
+    ):
+        raise TaskRunError(f"Task status authority identity mismatch: {task_id}")
+    if run_status.get("schema_version") != 1:
+        raise TaskRunError(f"invalid Run status schema version: {run_id}")
+    if run_status.get("run_id") != run_id:
+        raise TaskRunError(f"Run status identity mismatch: {run_id}")
+    if run_status.get("manifest_sha256") != manifest_sha256:
+        raise TaskRunError(f"Run status manifest identity mismatch: {run_id}")
+    state = run_status.get("state")
+    if not isinstance(state, str) or state not in _TASK_RUN_STATES:
+        raise TaskRunError(f"invalid Run status state: {run_id}")
+    updated_at = _validate_timestamp(
+        run_status.get("updated_at"),
+        "Run status updated_at",
+    )
+    expected_final_ref = f"runs/{run_id}/final.json"
+    final_ref = run_status.get("final_ref")
+    terminal = state in {
+        "completed",
+        "failed_process",
+        "timed_out",
+        "cancelled",
+    }
+    if (terminal and final_ref != expected_final_ref) or (
+        not terminal and final_ref is not None
+    ):
+        raise TaskRunError(f"invalid Run status final_ref: {run_id}")
+    reason = run_status.get("reason")
+    if reason is not None and (
+        not isinstance(reason, str) or not reason.strip() or reason != reason.strip()
+    ):
+        raise TaskRunError(f"invalid Run status reason: {run_id}")
+    return {
+        "schema_version": 1,
+        "task_id": task_id,
+        "state": "launched" if state == "prepared" else state,
+        "brief_sha256": brief_sha256,
+        "ownership_sha256": ownership_sha256,
+        "run_id": run_id,
+        "run_manifest_sha256": manifest_sha256,
+        "updated_at": updated_at,
+        "final_ref": final_ref,
+        "reason": reason,
+    }
+
+
+def commit_terminal_run_if_present(
+    root: Path,
+    binding: dict[str, object],
+    status: dict[str, object],
+    commit_paths: _COMMIT_PATHS,
+) -> dict[str, object]:
+    """Commit one create-once Run final before exposing its reference."""
+    workspace = _validate_root(root)
+    if not isinstance(binding, dict) or not isinstance(status, dict):
+        raise TaskRunError("Task terminal Run inputs must be JSON objects")
+    if not callable(commit_paths):
+        raise TaskRunError("Task terminal Run commit_paths must be callable")
+    run_id = _validate_run_id(binding.get("run_id"))
+    manifest_sha256 = _validate_hash(
+        binding.get("run_manifest_sha256"),
+        "Task terminal Run manifest_sha256",
+    )
+    status_state = status.get("state")
+    status_final_ref = status.get("final_ref")
+    if status_state == "lost":
+        if status_final_ref is not None:
+            raise TaskRunError(f"lost Run cannot expose a final_ref: {run_id}")
+        return status
+    try:
+        terminal = RunService(workspace).terminal_with_commit(run_id)
+    except (OSError, RunError) as error:
+        raise TaskRunError(f"unable to load terminal Run: {run_id}") from error
+    if terminal is None:
+        if status_state in _TERMINAL_PROCESS_STATES:
+            raise TaskRunError(f"terminal Run final is unavailable: {run_id}")
+        return status
+    if (
+        not isinstance(terminal, tuple)
+        or len(terminal) != 3
+        or not isinstance(terminal[0], dict)
+        or terminal[1] != (f"runs/{run_id}/final.json",)
+        or not isinstance(terminal[2], str)
+        or not terminal[2]
+    ):
+        raise TaskRunError(f"invalid terminal Run commit request: {run_id}")
+    final, paths, message = terminal
+    final_ref = paths[0]
+    if (
+        final.get("run_id") != run_id
+        or final.get("manifest_sha256") != manifest_sha256
+        or status.get("run_id") not in (None, run_id)
+        or status.get("manifest_sha256") not in (None, manifest_sha256)
+    ):
+        raise TaskRunError(f"terminal Run identity mismatch: {run_id}")
+    if status_state in _TERMINAL_PROCESS_STATES and (
+        final.get("state") != status_state
+        or status.get("final_ref") != final_ref
+    ):
+        raise TaskRunError(f"terminal Run status mismatch: {run_id}")
+    try:
+        final_bytes = (workspace / final_ref).read_bytes()
+    except OSError as error:
+        raise TaskRunError(f"unable to snapshot terminal Run: {run_id}") from error
+    pre_head, already_committed_clean = _pre_callback_manifest_state(
+        workspace,
+        final_ref,
+        final_bytes,
+    )
+    try:
+        commit_result = commit_paths(paths, message)
+    except (CheckpointError, OSError, RunError) as error:
+        raise TaskRunError(f"unable to commit terminal Run: {run_id}") from error
+    _validate_commit_result(
+        workspace,
+        final_ref,
+        commit_result,
+        expected_bytes=final_bytes,
+        expected_manifest_sha256=manifest_sha256,
+        pre_head=pre_head,
+        already_committed_clean=already_committed_clean,
+    )
+    head, working = _require_committed_manifest(workspace, final_ref)
+    _validate_single_touch_manifest_history(
+        workspace,
+        final_ref,
+        working,
+        head,
+    )
+    try:
+        return RunService(workspace).status(run_id)
+    except (OSError, RunError) as error:
+        raise TaskRunError(f"unable to re-read terminal Run: {run_id}") from error
 
 
 def _binding_path(root: Path, task_id: str) -> Path:

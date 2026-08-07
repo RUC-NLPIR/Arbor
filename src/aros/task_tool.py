@@ -134,6 +134,8 @@ class TaskTool(Tool):
         if missing:
             fields = ", ".join(missing)
             raise TaskError(f"{fields} required for task action {action!r}")
+        if action == "start" and self.commit_paths is None:
+            raise TaskError("commit_paths required for task action 'start'")
 
         service = TaskService(self.cwd)
         if action == "create":
@@ -153,7 +155,14 @@ class TaskTool(Tool):
             )
             result = self._committed_result(record, paths, message)
         elif action == "start":
-            result = service.start(kwargs["task_id"], actor="principal")
+            result = service.start(
+                kwargs["task_id"],
+                actor="principal",
+                commit_paths=self.commit_paths,
+            )
+            final_ref = result.get("final_ref")
+            if isinstance(final_ref, str) and self.record_observation is not None:
+                self.record_observation(final_ref)
         elif action == "status":
             result = service.status(kwargs["task_id"])
         elif action == "list":

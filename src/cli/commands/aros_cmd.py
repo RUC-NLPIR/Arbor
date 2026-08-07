@@ -496,7 +496,12 @@ def task_start_command(
 ) -> None:
     """Launch one previously created task."""
     try:
-        status = TaskService(_root(cwd)).start(task_id, actor=actor)
+        root = _root(cwd)
+        status = TaskService(root).start(
+            task_id,
+            actor=actor,
+            commit_paths=GitCheckpoint(root).commit_paths,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         _fail(exc)
     _print_json(status)

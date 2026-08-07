@@ -66,6 +66,14 @@
       "agent_visibility": "on_demand"
     },
     {
+      "id": "aros-long-running-research-program-design",
+      "title": "AROS Long-Running Experimental Research Program Design",
+      "path": "docs/superpowers/specs/2026-08-07-aros-long-running-research-program-design.md",
+      "status": "current",
+      "authority": "implementation_baseline",
+      "agent_visibility": "on_demand"
+    },
+    {
       "id": "aros-public-guide",
       "title": "AROS Public Guide",
       "path": "docs/aros/README.md",

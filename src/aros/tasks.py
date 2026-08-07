@@ -3,26 +3,21 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import math
 import os
 import re
 import secrets
-import shutil
-import socket
 import stat
 import subprocess
-import sys
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
 from . import worktrees as worktrees_module
-from .receipts import content_receipt, digest_chunks, record_sha256
+from .receipts import record_sha256
 from .store import (
     AnchoredReadError,
     AnchoredWorkspaceReader,
@@ -146,7 +141,6 @@ _PRUNED_FIELDS = {
     "prune_sha256",
     "pruned_sha256",
 }
-_LAUNCH_GRACE_SECONDS = 2.0
 _OWNERSHIP_FIELDS = {
     "schema_version",
     "task_id",
@@ -158,18 +152,6 @@ _OWNERSHIP_FIELDS = {
     "parent_head",
     "acquired_at",
     "ownership_sha256",
-}
-_PREPARATION_FIELDS = {
-    "schema_version",
-    "task_id",
-    "brief_sha256",
-    "ownership_sha256",
-    "actor",
-    "filesystem_permissions_enforced",
-    "filesystem_permission_probe",
-    "paths",
-    "prepared_at",
-    "preparation_sha256",
 }
 _INDEX_FIELDS = {
     "schema_version",
@@ -184,83 +166,6 @@ _FILTER_CONFIG_KEY = re.compile(
     re.IGNORECASE,
 )
 _FILTER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_TASK_RUNNER_BOOTSTRAP = (
-    "import runpy,sys;"
-    "controlled=sys.argv.pop(1);"
-    "sys.path.insert(0,controlled);"
-    "runpy.run_module('arbor.aros.task_runner',run_name='__main__')"
-)
-_CARRIER_LAUNCH_GUARDIAN = """
-import ctypes
-import fcntl
-import os
-import signal
-import subprocess
-import sys
-import tempfile
-
-signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
-lock_fd = int(sys.argv[1])
-argv = sys.argv[2:]
-os.fstat(lock_fd)
-fcntl.fcntl(
-    lock_fd,
-    fcntl.F_SETFD,
-    fcntl.fcntl(lock_fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC,
-)
-guardian_pid = os.getpid()
-libc = ctypes.CDLL(None, use_errno=True)
-
-def child_setup():
-    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
-        os._exit(126)
-    if os.getppid() != guardian_pid:
-        os._exit(126)
-
-try:
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        try:
-            child = subprocess.Popen(
-                argv,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                close_fds=True,
-                preexec_fn=child_setup,
-            )
-        except OSError as error:
-            stdout = b""
-            stderr = f"tmux exec failed: {error}".encode("utf-8", "replace")
-            returncode = 127
-        else:
-            while True:
-                try:
-                    waited, status = os.waitpid(child.pid, 0)
-                except InterruptedError:
-                    continue
-                if waited == child.pid:
-                    break
-            returncode = os.waitstatus_to_exitcode(status)
-            child.returncode = returncode
-            stdout_file.seek(0)
-            stderr_file.seek(0)
-            stdout = stdout_file.read(1_048_576)
-            stderr = stderr_file.read(1_048_576)
-    for descriptor, output in ((1, stdout), (2, stderr)):
-        while output:
-            try:
-                written = os.write(descriptor, output)
-            except OSError:
-                break
-            output = output[written:]
-finally:
-    os.close(lock_fd)
-
-if returncode < 0:
-    os.kill(os.getpid(), -returncode)
-    os._exit(128 - returncode)
-raise SystemExit(returncode)
-"""
 _UNSUPPORTED_FILE_MODE_ERRNOS = {
     errno.ENOSYS,
     getattr(errno, "ENOTSUP", errno.ENOSYS),
@@ -442,11 +347,15 @@ class TaskService:
             return existing
 
         self._require_git_root()
-        base_commit = self._git_output(
+        base_result = self._safe_git_result(
             "rev-parse",
             "--verify",
             "HEAD^{commit}",
-            pinned=True,
+        )
+        base_commit = (
+            base_result.stdout.decode("ascii").strip()
+            if base_result.returncode == 0
+            else None
         )
         self._require_git_root()
         if base_commit is None or _COMMIT.fullmatch(base_commit) is None:
@@ -557,38 +466,6 @@ class TaskService:
         except (TaskRunError, RunError, OSError, RuntimeError, ValueError) as error:
             raise TaskError(f"unable to start Task Run: {task_id}") from error
 
-    def _existing_execution_status(
-        self,
-        task_id: str,
-        actor: str | None,
-    ) -> dict[str, object]:
-        publication_lock = self._publication_lock_path()
-        _ensure_durable_lock_file(publication_lock, "task record publication lock")
-        with file_lock(publication_lock):
-            lifecycle_lock = self._lifecycle_lock_path(task_id)
-            _ensure_durable_lock_file(lifecycle_lock, "task lifecycle lock")
-            with file_lock(lifecycle_lock):
-                self._reconcile_authoritative_briefs()
-                brief = self._load_brief(task_id)
-                ownership = self._load_ownership(brief)
-                return self._existing_execution_status_locked(
-                    brief,
-                    ownership,
-                    actor,
-                )
-
-    def _existing_execution_status_locked(
-        self,
-        brief: dict[str, object],
-        ownership: dict[str, object],
-        actor: str | None,
-    ) -> dict[str, object]:
-        task_id = str(brief["task_id"])
-        launch = self._load_launch(brief, ownership)
-        if actor is not None and _validate_text(actor, "actor") != launch["actor"]:
-            raise TaskError(f"task launch actor conflict: {task_id}")
-        return self._reconcile_execution(brief, ownership, launch)
-
     def _ensure_worktree(
         self,
         task_id: str,
@@ -664,7 +541,7 @@ class TaskService:
         self._require_unallocated_worktree(target, branch)
         self._add_task_worktree(target, branch, str(brief["base_commit"]))
         self._require_parent_unchanged(brief, parent_head)
-        self._validate_new_checkout(target, branch, str(brief["base_commit"]))
+        self._require_new_checkout_metadata(target, branch, str(brief["base_commit"]))
 
         acquired_at = utc_now()
         ownership: dict[str, object] = {
@@ -686,7 +563,7 @@ class TaskService:
         if recorded != ownership:
             raise TaskError(f"task ownership differs after write: {task_id}")
         self._require_parent_unchanged(brief, parent_head)
-        self._validate_new_checkout(target, branch, str(brief["base_commit"]))
+        self._require_new_checkout_metadata(target, branch, str(brief["base_commit"]))
 
         ready = _worktree_ready_status(brief, recorded)
         atomic_write_json(self._status_path(task_id), ready)
@@ -1288,6 +1165,9 @@ class TaskService:
                     raise TaskError(
                         f"task prune intent changed before removal: {task_id}"
                     )
+                _head, clean = self._owned_worktree_snapshot(ownership)
+                if not clean:
+                    raise TaskError(f"task worktree must be clean before prune: {task_id}")
                 target = Path(str(ownership["worktree_path"]))
                 self._remove_task_worktree(target)
                 if self._worktree_removal_state(ownership) != "absent":
@@ -1572,7 +1452,7 @@ class TaskService:
         path_matches = [
             item
             for item in registrations
-            if self._same_path(str(item["worktree"]), target)
+            if worktrees_module._same_path(str(item["worktree"]), target)
         ]
         branch_matches = [
             item for item in registrations if item.get("branch") == branch_ref
@@ -1821,9 +1701,6 @@ class TaskService:
             if _path_exists(self._ownership_path(task_id))
             else None
         )
-        if ownership is not None and _path_exists(self._launch_path(task_id)):
-            launch = self._load_launch(brief, ownership)
-            return self._reconcile_execution(brief, ownership, launch)
         return self._load_task_status(brief, ownership)
 
     def _public_status_unlocked(
@@ -1852,8 +1729,6 @@ class TaskService:
             if _path_exists(self._ownership_path(task_id))
             else None
         )
-        if _path_exists(self._launch_path(task_id)):
-            raise TaskError(f"Task Run binding is missing: {task_id}")
         return self._load_task_status(brief, ownership)
 
     def _project_bound_run_unlocked(
@@ -1918,18 +1793,7 @@ class TaskService:
         status = _read_object(runtime_directory / "status.json", "task status")
         state = status.get("state")
         if state not in {"prepared", "worktree_ready"}:
-            from .task_runner import validate_execution_status
-
-            if ownership is None:
-                raise TaskError(
-                    f"invalid task status: launched task ownership is missing: {task_id}"
-                )
-            return validate_execution_status(
-                self,
-                brief,
-                ownership,
-                status,
-            )
+            raise TaskError(f"invalid task status state: {task_id}")
         fields = _READY_STATUS_FIELDS if state == "worktree_ready" else _STATUS_FIELDS
         if set(status) != fields or type(status.get("schema_version")) is not int:
             raise TaskError(f"invalid task status schema: {task_id}")
@@ -2126,14 +1990,9 @@ class TaskService:
             if _path_exists(ownership_path)
             else None
         )
-        if ownership is not None and _path_exists(self._launch_path(task_id)):
-            launch = self._load_launch(brief, ownership)
-            self._reconcile_execution(brief, ownership, launch)
-            self._load_bound_idempotency_index(brief)
-            return
         if not _path_exists(status_path):
             if ownership is not None:
-                self._validate_new_checkout(
+                self._require_new_checkout_metadata(
                     Path(str(ownership["worktree_path"])),
                     str(ownership["branch"]),
                     str(ownership["base_commit"]),
@@ -2152,7 +2011,7 @@ class TaskService:
                     None,
                     check_material=False,
                 )
-                self._validate_new_checkout(
+                self._require_new_checkout_metadata(
                     Path(str(ownership["worktree_path"])),
                     str(ownership["branch"]),
                     str(ownership["base_commit"]),
@@ -2349,537 +2208,6 @@ class TaskService:
             self._validate_owned_worktree(ownership)
         return ownership
 
-    def _load_launch(
-        self,
-        brief: dict[str, object],
-        ownership: dict[str, object],
-    ) -> dict[str, object]:
-        from .task_runner import load_launch
-
-        return load_launch(self, brief, ownership)
-
-    def _load_final(
-        self,
-        brief: dict[str, object],
-        ownership: dict[str, object],
-        launch: dict[str, object],
-    ) -> dict[str, object]:
-        from .task_runner import load_final
-
-        return load_final(self, brief, ownership, launch)
-
-    def _reconcile_execution(
-        self,
-        brief: dict[str, object],
-        ownership: dict[str, object],
-        launch: dict[str, object],
-    ) -> dict[str, object]:
-        from .task_runner import (
-            adapter_claim_is_live,
-            execution_claim_is_live,
-            launched_status,
-            load_adapter_claim,
-            load_execution_claim,
-            lost_status,
-            process_status_is_live,
-            running_status_from,
-            running_status_from_claims,
-            terminal_status,
-        )
-
-        task_id = str(brief["task_id"])
-        final_path = self._final_path(task_id)
-        if _path_exists(final_path):
-            final = self._load_final(brief, ownership, launch)
-            terminal = terminal_status(brief, ownership, launch, final)
-            current = (
-                _read_object(self._status_path(task_id), "task status")
-                if _path_exists(self._status_path(task_id))
-                else None
-            )
-            if current != terminal:
-                atomic_write_json(self._status_path(task_id), terminal)
-            return self._load_task_status(brief, ownership)
-
-        raw_status = (
-            _read_object(self._status_path(task_id), "task status")
-            if _path_exists(self._status_path(task_id))
-            else None
-        )
-        if raw_status is not None and raw_status.get("state") in {
-            "launched",
-            "running",
-            "lost",
-        }:
-            status = self._load_task_status(brief, ownership)
-            if process_status_is_live(status):
-                running = running_status_from(status)
-                if running != status:
-                    atomic_write_json(self._status_path(task_id), running)
-                return running
-        elif raw_status is not None and raw_status.get("state") in _TERMINAL_STATES:
-            raise TaskError(f"terminal task is missing its final receipt: {task_id}")
-
-        execution = None
-        adapter = None
-        if _path_exists(self._adapter_path(task_id)):
-            execution = load_execution_claim(self, brief, ownership, launch)
-            adapter = load_adapter_claim(
-                self,
-                brief,
-                ownership,
-                launch,
-                execution,
-            )
-            if adapter_claim_is_live(adapter):
-                running = running_status_from_claims(
-                    brief,
-                    ownership,
-                    launch,
-                    execution,
-                    adapter,
-                )
-                atomic_write_json(self._status_path(task_id), running)
-                return self._load_task_status(brief, ownership)
-        elif _path_exists(self._execution_path(task_id)):
-            execution = load_execution_claim(self, brief, ownership, launch)
-
-        if execution is not None and execution_claim_is_live(execution):
-            if adapter is not None:
-                running = running_status_from_claims(
-                    brief,
-                    ownership,
-                    launch,
-                    execution,
-                    adapter,
-                )
-                atomic_write_json(self._status_path(task_id), running)
-                return self._load_task_status(brief, ownership)
-            launched = launched_status(brief, ownership, launch)
-            if raw_status != launched:
-                atomic_write_json(self._status_path(task_id), launched)
-            return launched
-
-        if self._carrier_launch_is_active(task_id):
-            launched = launched_status(brief, ownership, launch)
-            if raw_status != launched:
-                atomic_write_json(self._status_path(task_id), launched)
-            return launched
-
-        if self._carrier_is_live(launch):
-            launched = launched_status(brief, ownership, launch)
-            if raw_status != launched:
-                atomic_write_json(self._status_path(task_id), launched)
-            return launched
-
-        if _seconds_since(str(launch["launched_at"])) < _LAUNCH_GRACE_SECONDS:
-            launched = launched_status(brief, ownership, launch)
-            if raw_status != launched:
-                atomic_write_json(self._status_path(task_id), launched)
-            return launched
-
-        lost = lost_status(brief, ownership, launch, raw_status)
-        if raw_status != lost:
-            atomic_write_json(self._status_path(task_id), lost)
-        return lost
-
-    def _carrier_launch_is_active(self, task_id: str) -> bool:
-        path = self._carrier_launch_lock_path(task_id)
-        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(path, flags)
-        except FileNotFoundError:
-            return False
-        except OSError as error:
-            raise TaskError(f"unable to inspect task carrier launch lock: {task_id}") from error
-        try:
-            opened = os.fstat(descriptor)
-            observed = path.lstat()
-            identity = (opened.st_dev, opened.st_ino)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_nlink != 1
-                or not stat.S_ISREG(observed.st_mode)
-                or observed.st_nlink != 1
-                or (observed.st_dev, observed.st_ino) != identity
-            ):
-                raise TaskError(f"invalid task carrier launch lock: {task_id}")
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            return False
-        except OSError as error:
-            raise TaskError(f"unable to inspect task carrier launch lock: {task_id}") from error
-        finally:
-            os.close(descriptor)
-
-    @contextmanager
-    def _carrier_launch_guard(self, task_id: str) -> Iterator[int]:
-        path = self._carrier_launch_lock_path(task_id)
-        _ensure_durable_lock_file(path, "task carrier launch lock")
-        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(path, flags)
-        except OSError as error:
-            raise TaskError(f"unable to open task carrier launch lock: {task_id}") from error
-        try:
-            if descriptor < 3:
-                duplicate = fcntl.fcntl(descriptor, fcntl.F_DUPFD_CLOEXEC, 3)
-                os.close(descriptor)
-                descriptor = duplicate
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            locked = os.fstat(descriptor)
-            observed = path.lstat()
-            if (
-                not stat.S_ISREG(locked.st_mode)
-                or locked.st_nlink != 1
-                or not stat.S_ISREG(observed.st_mode)
-                or observed.st_nlink != 1
-                or (observed.st_dev, observed.st_ino)
-                != (locked.st_dev, locked.st_ino)
-            ):
-                raise TaskError(f"invalid task carrier launch lock: {task_id}")
-        except OSError as error:
-            os.close(descriptor)
-            raise TaskError(f"unable to hold task carrier launch lock: {task_id}") from error
-        except BaseException:
-            os.close(descriptor)
-            raise
-        try:
-            yield descriptor
-        finally:
-            os.close(descriptor)
-
-    def _run_carrier_guardian(
-        self,
-        lock_descriptor: int,
-        command: list[str],
-        environment: dict[str, str],
-    ) -> subprocess.CompletedProcess[str]:
-        guardian_command = [
-            sys.executable,
-            "-I",
-            "-c",
-            _CARRIER_LAUNCH_GUARDIAN,
-            str(lock_descriptor),
-            *command,
-        ]
-        guardian = subprocess.Popen(
-            guardian_command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            close_fds=True,
-            pass_fds=(lock_descriptor,),
-            start_new_session=True,
-            env=environment,
-        )
-        stdout, stderr = guardian.communicate()
-        return subprocess.CompletedProcess(
-            command,
-            guardian.returncode,
-            stdout,
-            stderr,
-        )
-
-    def _carrier_is_live(self, launch: dict[str, object]) -> bool:
-        task_id = str(launch["task_id"])
-        if launch["host"] != socket.gethostname():
-            raise TaskError(f"task carrier belongs to a different host: {task_id}")
-        tmux = shutil.which("tmux")
-        if tmux is None:
-            raise TaskError(f"tmux is required to inspect task carrier: {task_id}")
-        from .task_runner import runner_environment
-
-        command = [
-            tmux,
-            "-L",
-            str(launch["tmux_socket"]),
-            "has-session",
-            "-t",
-            f"={launch['tmux_session']}",
-        ]
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-                env=runner_environment(self._runtime_path(task_id)),
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise TaskError(f"unable to inspect task carrier: {task_id}") from error
-        if result.returncode == 0:
-            return True
-        if result.returncode == 1:
-            return False
-        detail = (result.stderr or result.stdout).strip() or str(result.returncode)
-        raise TaskError(f"unable to inspect task carrier {task_id}: {detail}")
-
-    def _create_preparation(
-        self,
-        brief: dict[str, object],
-        ownership: dict[str, object],
-        actor: str,
-    ) -> dict[str, object]:
-        task_id = str(brief["task_id"])
-        path = self._preparation_path(task_id)
-        if _path_exists(path):
-            return self._load_preparation(brief, ownership, actor)
-
-        runtime = self._runtime_path(task_id)
-        _require_plain_directory(runtime, "task runtime directory")
-        for name, description in (
-            ("home", "task adapter HOME"),
-            ("tmp", "task adapter TMPDIR"),
-            ("runner-import", "task runner import root"),
-            ("stdout.log", "task stdout log"),
-            ("stderr.log", "task stderr log"),
-            ("adapter.json", "task adapter claim"),
-            ("final.json", "task final receipt"),
-        ):
-            _require_absent(runtime / name, description)
-
-        preparation: dict[str, object] = {
-            "schema_version": 1,
-            "task_id": task_id,
-            "brief_sha256": brief["brief_sha256"],
-            "ownership_sha256": ownership["ownership_sha256"],
-            "actor": actor,
-            "filesystem_permissions_enforced": (
-                self._filesystem_permissions_enforced
-            ),
-            "filesystem_permission_probe": dict(
-                self._filesystem_permission_probe
-            ),
-            "paths": _preparation_paths(task_id),
-            "prepared_at": utc_now(),
-        }
-        preparation["preparation_sha256"] = _record_sha256(
-            preparation,
-            "preparation_sha256",
-        )
-        if not create_json(path, preparation):
-            return self._load_preparation(brief, ownership, actor)
-        recorded = self._load_preparation(brief, ownership, actor)
-        if recorded != preparation:
-            raise TaskError(f"task preparation differs after write: {task_id}")
-        return recorded
-
-    def _load_preparation(
-        self,
-        brief: dict[str, object],
-        ownership: dict[str, object],
-        actor: str,
-    ) -> dict[str, object]:
-        task_id = str(brief["task_id"])
-        path = self._preparation_path(task_id)
-        preparation = _read_object(path, "task preparation")
-        _require_restrictive_plain_file(
-            path,
-            "task preparation",
-            permissions_enforced=self._filesystem_permissions_enforced,
-        )
-        if (
-            set(preparation) != _PREPARATION_FIELDS
-            or type(preparation.get("schema_version")) is not int
-        ):
-            raise TaskError(f"invalid task preparation schema: {task_id}")
-        if preparation["schema_version"] != 1 or preparation["task_id"] != task_id:
-            raise TaskError(f"task preparation identity mismatch: {task_id}")
-        for field in (
-            "brief_sha256",
-            "ownership_sha256",
-            "preparation_sha256",
-        ):
-            _validate_hash(preparation[field], f"task preparation {field}")
-        preparation_actor = _validate_text(
-            preparation["actor"],
-            "task preparation actor",
-        )
-        probe = _validate_filesystem_permission_probe(
-            preparation["filesystem_permission_probe"],
-            "task preparation filesystem permission probe",
-        )
-        permissions_enforced = preparation["filesystem_permissions_enforced"]
-        if (
-            type(permissions_enforced) is not bool
-            or permissions_enforced is not (probe["enforced"] is True)
-        ):
-            raise TaskError(f"invalid task preparation permission policy: {task_id}")
-        expected = {
-            "brief_sha256": brief["brief_sha256"],
-            "ownership_sha256": ownership["ownership_sha256"],
-            "actor": actor,
-            "filesystem_permissions_enforced": (
-                self._filesystem_permissions_enforced
-            ),
-            "filesystem_permission_probe": self._filesystem_permission_probe,
-            "paths": _preparation_paths(task_id),
-        }
-        if preparation_actor != preparation["actor"] or any(
-            preparation[field] != value for field, value in expected.items()
-        ):
-            raise TaskError(f"task preparation binding mismatch: {task_id}")
-        _validate_timestamp(
-            preparation["prepared_at"],
-            "task preparation prepared_at",
-        )
-        if preparation["preparation_sha256"] != _record_sha256(
-            preparation,
-            "preparation_sha256",
-        ):
-            raise TaskError(f"task preparation hash mismatch: {task_id}")
-        return preparation
-
-    def _prepare_execution_paths(
-        self,
-        runtime: Path,
-        *,
-        reuse_logs: bool = False,
-        filesystem_permissions_enforced: bool | None = None,
-    ) -> None:
-        if filesystem_permissions_enforced is None:
-            filesystem_permissions_enforced = (
-                self._filesystem_permissions_enforced
-            )
-        if type(filesystem_permissions_enforced) is not bool:
-            raise TaskError("invalid task filesystem permission policy")
-        _require_plain_directory(runtime, "task runtime directory")
-        home = runtime / "home"
-        temporary = runtime / "tmp"
-        import_root = runtime / "runner-import"
-        if reuse_logs:
-            _require_directory_entries(home, "task adapter HOME", set())
-            _require_directory_entries(temporary, "task adapter TMPDIR", set())
-            _require_directory_entries(
-                import_root,
-                "task runner import root",
-                {"arbor"},
-            )
-        else:
-            home_entries = _ensure_preparation_directory_entries(
-                home,
-                "task adapter HOME",
-                permissions_enforced=filesystem_permissions_enforced,
-            )
-            if home_entries:
-                raise TaskError(f"task adapter HOME must be empty: {home}")
-            temporary_entries = _ensure_preparation_directory_entries(
-                temporary,
-                "task adapter TMPDIR",
-                permissions_enforced=filesystem_permissions_enforced,
-            )
-            if temporary_entries:
-                raise TaskError(f"task adapter TMPDIR must be empty: {temporary}")
-            import_entries = _ensure_preparation_directory_entries(
-                import_root,
-                "task runner import root",
-                permissions_enforced=filesystem_permissions_enforced,
-            )
-            if import_entries not in (set(), {"arbor"}):
-                raise TaskError(
-                    "task runner import root must contain only the controlled alias: "
-                    f"{import_root}"
-                )
-        package_alias = import_root / "arbor"
-        package_source = Path(__file__).resolve().parent.parent
-        _require_plain_directory(package_source, "AROS Python package source")
-        if not reuse_logs and not _path_exists(package_alias):
-            try:
-                package_alias.symlink_to(package_source, target_is_directory=True)
-            except OSError as error:
-                raise TaskError("unable to create task runner package alias") from error
-        if reuse_logs:
-            _require_directory_entries(
-                import_root,
-                "task runner import root",
-                {"arbor"},
-            )
-        elif _ensure_preparation_directory_entries(
-            import_root,
-            "task runner import root",
-            permissions_enforced=filesystem_permissions_enforced,
-        ) != {"arbor"}:
-            raise TaskError(
-                "task runner import root must contain only the controlled alias: "
-                f"{import_root}"
-            )
-        try:
-            alias_metadata = package_alias.lstat()
-            alias_target = package_alias.resolve(strict=True)
-        except OSError as error:
-            raise TaskError("invalid task runner package alias") from error
-        if (
-            not stat.S_ISLNK(alias_metadata.st_mode)
-            or alias_metadata.st_nlink != 1
-            or alias_target != package_source
-        ):
-            raise TaskError("task runner package alias does not bind workspace source")
-        if not reuse_logs:
-            alias_identity = (alias_metadata.st_dev, alias_metadata.st_ino)
-            _fsync_directory(import_root)
-            if _ensure_preparation_directory_entries(
-                import_root,
-                "task runner import root",
-                permissions_enforced=filesystem_permissions_enforced,
-            ) != {"arbor"}:
-                raise TaskError(
-                    "task runner import root must contain only the controlled alias: "
-                    f"{import_root}"
-                )
-            try:
-                synced_alias = package_alias.lstat()
-                synced_target = package_alias.resolve(strict=True)
-            except OSError as error:
-                raise TaskError("invalid task runner package alias") from error
-            if (
-                not stat.S_ISLNK(synced_alias.st_mode)
-                or synced_alias.st_nlink != 1
-                or (synced_alias.st_dev, synced_alias.st_ino) != alias_identity
-                or synced_target != package_source
-            ):
-                raise TaskError(
-                    "task runner package alias changed while synchronizing"
-                )
-        _require_absent(runtime / "adapter.json", "task adapter claim")
-        _ensure_restrictive_plain_file(
-            runtime / "stdout.log",
-            "task stdout log",
-            allow_existing=True,
-            permissions_enforced=filesystem_permissions_enforced,
-        )
-        _ensure_restrictive_plain_file(
-            runtime / "stderr.log",
-            "task stderr log",
-            allow_existing=True,
-            permissions_enforced=filesystem_permissions_enforced,
-        )
-        _require_absent(runtime / "final.json", "task final receipt")
-
-    def _record_carrier_failure(
-        self,
-        task_id: str,
-        detail: str,
-        *,
-        preserve_execution: bool = False,
-    ) -> bool:
-        from .task_runner import record_carrier_failure
-
-        return record_carrier_failure(
-            self,
-            task_id,
-            detail,
-            preserve_execution=preserve_execution,
-        )
-
     def _require_startable_parent(
         self,
         brief: dict[str, object],
@@ -2983,7 +2311,7 @@ class TaskService:
             raise TaskError(f"unowned task worktree path exists: {target}")
         registrations = self._worktree_registrations()
         if any(
-            self._same_path(str(item["worktree"]), target)
+            worktrees_module._same_path(str(item["worktree"]), target)
             or item.get("branch") == branch_ref
             for item in registrations
         ):
@@ -2998,7 +2326,7 @@ class TaskService:
         branch_ref = f"refs/heads/{branch}"
         registrations = self._worktree_registrations()
         if any(
-            self._same_path(str(item["worktree"]), target)
+            worktrees_module._same_path(str(item["worktree"]), target)
             for item in registrations
         ):
             raise TaskError(f"task worktree target is already registered: {target}")
@@ -3020,14 +2348,6 @@ class TaskService:
             raise TaskError(
                 f"unable to create task worktree: {_git_error(result)}"
             )
-
-    def _validate_new_checkout(
-        self,
-        target: Path,
-        branch: str,
-        base_commit: str,
-    ) -> None:
-        self._require_new_checkout_metadata(target, branch, base_commit)
 
     def _require_new_checkout_metadata(
         self,
@@ -3096,7 +2416,7 @@ class TaskService:
         path_matches = [
             item
             for item in registrations
-            if self._same_path(str(item["worktree"]), target)
+            if worktrees_module._same_path(str(item["worktree"]), target)
         ]
         if len(path_matches) != 1:
             raise TaskError(f"owned task worktree is not uniquely registered: {target}")
@@ -3212,7 +2532,7 @@ class TaskService:
             if "prunable" in record:
                 if (
                     allowed_prunable is not None
-                    and self._same_path(str(record["worktree"]), allowed_prunable[0])
+                    and worktrees_module._same_path(str(record["worktree"]), allowed_prunable[0])
                     and record.get("branch") == allowed_prunable[1]
                 ):
                     registrations.append(record)
@@ -3358,7 +2678,7 @@ class TaskService:
                 text=False,
                 timeout=10,
                 check=False,
-                env=_git_environment(),
+                env=worktrees_module._git_environment(),
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise TaskError(f"Git command failed: {' '.join(args)}") from error
@@ -3382,18 +2702,6 @@ class TaskService:
             command.extend(("-c", config))
         command.extend(args)
         return command
-
-    @staticmethod
-    def _same_path(raw: str, target: Path) -> bool:
-        raw_absolute = Path(raw).absolute()
-        target_absolute = target.absolute()
-        if os.path.normcase(str(raw_absolute)) == os.path.normcase(
-            str(target_absolute)
-        ):
-            return True
-        return os.path.normcase(str(raw_absolute.resolve(strict=False))) == os.path.normcase(
-            str(target_absolute.resolve(strict=False))
-        )
 
     def _ensure_record_roots(self) -> None:
         _require_plain_directory(self.root / ".aros", "AROS runtime directory")
@@ -3437,68 +2745,15 @@ class TaskService:
     def _require_git_root(
         self,
     ) -> tuple[Path, Path]:
-        pinned = hasattr(self, "_git_dir")
-        top = self._git_output("rev-parse", "--show-toplevel", pinned=pinned)
-        if top is None or Path(top).resolve() != self.root:
-            raise TaskError(f"workspace must be the Git repository root: {self.root}")
-        raw_git_dir = self._git_output(
-            "rev-parse",
-            "--absolute-git-dir",
-            pinned=pinned,
-        )
-        if raw_git_dir is None:
-            raise TaskError(f"unable to resolve Git directory association: {self.root}")
-        git_dir = Path(raw_git_dir).resolve()
-        marker_git_dir = self._git_directory_from_marker()
-        if git_dir != marker_git_dir:
-            raise TaskError(f"invalid Git directory association: {self.root}")
-        pinned_git_dir = getattr(self, "_git_dir", git_dir)
-        if git_dir != pinned_git_dir:
+        try:
+            repository = worktrees_module.bind_repository(self.root)
+        except worktrees_module.WorktreeError as error:
+            raise TaskError(f"workspace must be the Git repository root: {self.root}") from error
+        if hasattr(self, "_git_dir") and repository.git_dir != self._git_dir:
             raise TaskError(f"Git directory association changed: {self.root}")
-
-        raw_common_dir = self._git_output(
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-            pinned=pinned,
-        )
-        if raw_common_dir is None:
-            raise TaskError(f"unable to resolve common Git directory: {self.root}")
-        common_dir = Path(raw_common_dir)
-        if not common_dir.is_absolute():
-            common_dir = self.root / common_dir
-        common_dir = common_dir.resolve()
-        pinned_common_dir = getattr(self, "_git_common_dir", common_dir)
-        if common_dir != pinned_common_dir:
+        if hasattr(self, "_git_dir") and repository.common_dir != self._git_common_dir:
             raise TaskError(f"common Git directory association changed: {self.root}")
-        return git_dir, common_dir
-
-    def _git_directory_from_marker(self) -> Path:
-        marker = self.root / ".git"
-        try:
-            mode = marker.lstat().st_mode
-        except OSError as error:
-            raise TaskError(f"invalid Git directory association: {self.root}") from error
-        if stat.S_ISDIR(mode):
-            return marker.resolve()
-        if not stat.S_ISREG(mode):
-            raise TaskError(f"invalid Git directory association: {self.root}")
-        try:
-            lines = marker.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError) as error:
-            raise TaskError(f"invalid Git directory association: {self.root}") from error
-        if len(lines) != 1 or not lines[0].startswith("gitdir: "):
-            raise TaskError(f"invalid Git directory association: {self.root}")
-        target = Path(lines[0].removeprefix("gitdir: "))
-        if not target.is_absolute():
-            target = self.root / target
-        try:
-            resolved = target.resolve(strict=True)
-        except OSError as error:
-            raise TaskError(f"invalid Git directory association: {self.root}") from error
-        if not resolved.is_dir():
-            raise TaskError(f"invalid Git directory association: {self.root}")
-        return resolved
+        return repository.git_dir, repository.common_dir
 
     def _require_initialized_workspace(self) -> None:
         try:
@@ -3511,31 +2766,6 @@ class TaskService:
                 f"workspace is not initialized; run `aros start` at the Git root: "
                 f"{self.root}: {error}"
             ) from error
-
-    def _git_output(self, *args: str, pinned: bool = False) -> str | None:
-        command = ["git", "--no-replace-objects"]
-        if pinned:
-            command.extend(
-                (
-                    f"--git-dir={self._git_dir}",
-                    f"--work-tree={self.root}",
-                )
-            )
-        else:
-            command.extend(("-C", str(self.root)))
-        command.extend(args)
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-                env=_git_environment(),
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise TaskError(f"Git command failed: {' '.join(args)}") from error
-        return result.stdout.strip() if result.returncode == 0 else None
 
     def _new_task_id(self, objective: str) -> str:
         date = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -3556,12 +2786,6 @@ class TaskService:
     def _lifecycle_lock_path(self, task_id: str) -> Path:
         return self.root / ".aros" / "locks" / f"task-lifecycle-{task_id}.lock"
 
-    def _carrier_launch_lock_path(self, task_id: str) -> Path:
-        return self.root / ".aros" / "locks" / f"task-carrier-launch-{task_id}.lock"
-
-    def _stop_delivery_lock_path(self, task_id: str) -> Path:
-        return self.root / ".aros" / "locks" / f"task-stop-delivery-{task_id}.lock"
-
     def _status_path(self, task_id: str) -> Path:
         return self.root / ".aros" / "tasks" / task_id / "status.json"
 
@@ -3571,27 +2795,6 @@ class TaskService:
 
     def _ownership_path(self, task_id: str) -> Path:
         return self.root / ".aros" / "tasks" / task_id / "ownership.json"
-
-    def _launch_path(self, task_id: str) -> Path:
-        return self._runtime_path(task_id) / "launch.json"
-
-    def _preparation_path(self, task_id: str) -> Path:
-        return self._runtime_path(task_id) / "preparation.json"
-
-    def _final_path(self, task_id: str) -> Path:
-        return self._runtime_path(task_id) / "final.json"
-
-    def _execution_path(self, task_id: str) -> Path:
-        return self._runtime_path(task_id) / "execution.json"
-
-    def _adapter_path(self, task_id: str) -> Path:
-        return self._runtime_path(task_id) / "adapter.json"
-
-    def _stop_path(self, task_id: str) -> Path:
-        return self._runtime_path(task_id) / "stop.json"
-
-    def _stop_result_path(self, task_id: str) -> Path:
-        return self._runtime_path(task_id) / "stop-result.json"
 
     def _messages_path(self, task_id: str) -> Path:
         return self._runtime_path(task_id) / "messages"
@@ -4106,17 +3309,6 @@ def _record_sha256(record: dict[str, object], hash_field: str) -> str:
         raise TaskError("task execution record must be canonical UTF-8 JSON") from error
 
 
-def _preparation_paths(task_id: str) -> dict[str, str]:
-    prefix = f".aros/tasks/{task_id}"
-    return {
-        "home": f"{prefix}/home",
-        "tmp": f"{prefix}/tmp",
-        "runner_import": f"{prefix}/runner-import",
-        "stdout": f"{prefix}/stdout.log",
-        "stderr": f"{prefix}/stderr.log",
-    }
-
-
 def _request_file_mode(descriptor: int, mode: int) -> bool:
     try:
         os.fchmod(descriptor, mode)
@@ -4224,67 +3416,6 @@ def _validate_filesystem_permission_probe(
     return dict(value)
 
 
-def _tmux_socket_name(root: Path, task_id: str) -> str:
-    digest = hashlib.sha256(f"{root}\0{task_id}".encode("utf-8")).hexdigest()[:20]
-    return f"aros-task-{digest}"
-
-
-def _seconds_since(timestamp: str) -> float:
-    _validate_timestamp(timestamp, "task launch timestamp")
-    launched = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
-        tzinfo=timezone.utc
-    )
-    return max(0.0, (datetime.now(timezone.utc) - launched).total_seconds())
-
-
-def _file_receipt(
-    path: Path,
-    relative: str,
-    *,
-    permissions_enforced: bool,
-) -> dict[str, object]:
-    if type(permissions_enforced) is not bool:
-        raise TaskError("invalid task filesystem permission policy")
-    _require_plain_file(path, "task output log")
-    identity = _plain_file_identity(path, "task output log")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise TaskError(f"unable to open task output log: {path}") from error
-    try:
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or (
-                permissions_enforced
-                and stat.S_IMODE(metadata.st_mode) != 0o600
-            )
-            or (metadata.st_dev, metadata.st_ino) != identity
-        ):
-            raise TaskError(f"task output log is not a restrictive plain file: {path}")
-        expected_size = metadata.st_size
-        os.fsync(descriptor)
-        with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            size, sha256 = digest_chunks(
-                iter(lambda: handle.read(1024 * 1024), b"")
-            )
-        final_metadata = os.fstat(descriptor)
-        if (
-            size != expected_size
-            or final_metadata.st_size != expected_size
-            or (final_metadata.st_dev, final_metadata.st_ino) != identity
-            or _plain_file_identity(path, "task output log") != identity
-        ):
-            raise TaskError(f"task output log changed while reading: {path}")
-    except OSError as error:
-        raise TaskError(f"unable to read task output log: {path}") from error
-    finally:
-        os.close(descriptor)
-    return content_receipt(relative, size, sha256)
-
-
 def _normalize_request(
     *,
     objective: object,
@@ -4308,10 +3439,6 @@ def _normalize_request(
         "timeout_seconds": _validate_timeout(timeout_seconds),
         "idempotency_key": _validate_text(idempotency_key, "idempotency_key"),
     }
-
-
-def _git_environment() -> dict[str, str]:
-    return worktrees_module._git_environment()
 
 
 def _brief_sha256(brief: dict[str, object]) -> str:
@@ -4653,85 +3780,6 @@ def _ensure_durable_lock_file(path: Path, description: str) -> None:
     _require_plain_file(path, description)
 
 
-def _ensure_restrictive_plain_file(
-    path: Path,
-    description: str,
-    *,
-    allow_existing: bool = False,
-    permissions_enforced: bool,
-) -> None:
-    if type(permissions_enforced) is not bool:
-        raise TaskError("invalid task filesystem permission policy")
-    _require_plain_directory(path.parent, f"{description} parent")
-    flags = (
-        os.O_WRONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        if not allow_existing:
-            raise TaskError(f"{description} must not exist before publication: {path}")
-        _require_plain_file(path, description)
-        try:
-            descriptor = os.open(path, flags)
-        except OSError as error:
-            raise TaskError(f"unable to open {description}: {path}") from error
-    except OSError as error:
-        raise TaskError(f"unable to create {description}: {path}") from error
-    identity: tuple[int, int] | None = None
-    try:
-        metadata = os.fstat(descriptor)
-        identity = (metadata.st_dev, metadata.st_ino)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or (
-                permissions_enforced
-                and stat.S_IMODE(metadata.st_mode) != 0o600
-            )
-            or metadata.st_size != 0
-            or identity != _plain_file_identity(path, description)
-        ):
-            raise TaskError(f"{description} must be a restrictive plain file: {path}")
-        os.fsync(descriptor)
-        synced = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(synced.st_mode)
-            or synced.st_nlink != 1
-            or (
-                permissions_enforced
-                and stat.S_IMODE(synced.st_mode) != 0o600
-            )
-            or synced.st_size != 0
-            or (synced.st_dev, synced.st_ino) != identity
-            or _plain_file_identity(path, description) != identity
-        ):
-            raise TaskError(f"{description} changed while synchronizing: {path}")
-    except OSError as error:
-        raise TaskError(f"unable to sync {description}: {path}") from error
-    finally:
-        os.close(descriptor)
-    _fsync_directory(path.parent)
-    try:
-        published = path.lstat()
-    except OSError as error:
-        raise TaskError(f"unable to inspect {description}: {path}") from error
-    if (
-        identity is None
-        or not stat.S_ISREG(published.st_mode)
-        or published.st_nlink != 1
-        or (
-            permissions_enforced
-            and stat.S_IMODE(published.st_mode) != 0o600
-        )
-        or published.st_size != 0
-        or (published.st_dev, published.st_ino) != identity
-    ):
-        raise TaskError(f"{description} changed after synchronizing: {path}")
-
-
 def _ensure_plain_directory(path: Path, description: str) -> None:
     created = False
     try:
@@ -4744,74 +3792,6 @@ def _ensure_plain_directory(path: Path, description: str) -> None:
     _require_plain_directory(path, description)
     if created:
         _fsync_directory(path.parent)
-
-
-def _ensure_preparation_directory_entries(
-    path: Path,
-    description: str,
-    *,
-    permissions_enforced: bool,
-) -> set[str]:
-    if type(permissions_enforced) is not bool:
-        raise TaskError("invalid task filesystem permission policy")
-    _ensure_plain_directory(path, description)
-    try:
-        before = path.lstat()
-        entries = {entry.name for entry in path.iterdir()}
-        after = path.lstat()
-    except OSError as error:
-        raise TaskError(f"unable to inspect {description}: {path}") from error
-    identity = (before.st_dev, before.st_ino)
-    if (
-        not stat.S_ISDIR(before.st_mode)
-        or stat.S_ISLNK(before.st_mode)
-        or (permissions_enforced and stat.S_IMODE(before.st_mode) != 0o700)
-        or not stat.S_ISDIR(after.st_mode)
-        or stat.S_ISLNK(after.st_mode)
-        or (after.st_dev, after.st_ino) != identity
-        or (permissions_enforced and stat.S_IMODE(after.st_mode) != 0o700)
-    ):
-        raise TaskError(f"{description} changed or has an invalid mode: {path}")
-    _fsync_directory(path.parent)
-    try:
-        synced_before = path.lstat()
-        synced_entries = {entry.name for entry in path.iterdir()}
-        synced_after = path.lstat()
-    except OSError as error:
-        raise TaskError(f"unable to inspect {description}: {path}") from error
-    if (
-        not stat.S_ISDIR(synced_before.st_mode)
-        or stat.S_ISLNK(synced_before.st_mode)
-        or (synced_before.st_dev, synced_before.st_ino) != identity
-        or (
-            permissions_enforced
-            and stat.S_IMODE(synced_before.st_mode) != 0o700
-        )
-        or synced_entries != entries
-        or not stat.S_ISDIR(synced_after.st_mode)
-        or stat.S_ISLNK(synced_after.st_mode)
-        or (synced_after.st_dev, synced_after.st_ino) != identity
-        or (
-            permissions_enforced
-            and stat.S_IMODE(synced_after.st_mode) != 0o700
-        )
-    ):
-        raise TaskError(f"{description} changed while synchronizing: {path}")
-    return entries
-
-
-def _require_directory_entries(
-    path: Path,
-    description: str,
-    expected: set[str],
-) -> None:
-    _require_plain_directory(path, description)
-    try:
-        actual = {entry.name for entry in path.iterdir()}
-    except OSError as error:
-        raise TaskError(f"unable to inspect {description}: {path}") from error
-    if actual != expected:
-        raise TaskError(f"{description} must contain exactly {sorted(expected)}: {path}")
 
 
 def _create_plain_directory(path: Path, description: str) -> None:

@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -24,7 +25,9 @@ import pytest
 
 import arbor.aros.tasks as tasks_module
 import arbor.aros.worktrees as worktrees_module
-from arbor.aros.store import atomic_write_json, create_json, json_sha256
+from arbor.aros.checkpoint import GitCheckpoint
+from arbor.aros.store import atomic_write_json, json_sha256
+from arbor.aros.runs import RunService
 from arbor.aros.tasks import TaskError, TaskService
 from arbor.aros.workspace import init_workspace
 
@@ -82,6 +85,7 @@ def _request(*, key: str = "task-key") -> dict[str, object]:
 
 
 def test_task_git_environment_delegates_to_shared_helper(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     expected = {
@@ -96,9 +100,21 @@ def test_task_git_environment_delegates_to_shared_helper(
         calls += 1
         return dict(expected)
 
-    monkeypatch.setattr(worktrees_module, "_git_environment", shared_environment)
+    environments: list[dict[str, str]] = []
 
-    assert tasks_module._git_environment() == expected
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        environments.append(kwargs["env"])  # type: ignore[arg-type]
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(worktrees_module, "_git_environment", shared_environment)
+    monkeypatch.setattr(tasks_module.subprocess, "run", run)
+    service = TaskService.__new__(TaskService)
+    service.root = tmp_path
+    service._git_dir = tmp_path / ".git"
+
+    service._pinned_git_result("status")
+
+    assert environments == [expected]
     assert calls == 1
 
 
@@ -376,74 +392,6 @@ def _commit_brief(root: Path, brief: dict[str, object]) -> str:
     return _git(root, "rev-parse", "HEAD")
 
 
-def _fake_tmux_carrier(
-    monkeypatch: pytest.MonkeyPatch,
-) -> list[list[str]]:
-    original_run = tasks_module.subprocess.run
-    carrier_calls: list[list[str]] = []
-
-    def run_carrier(
-        _service: TaskService,
-        _lock_descriptor: int,
-        command: list[str],
-        _environment: dict[str, str],
-    ) -> subprocess.CompletedProcess[str]:
-        carrier_calls.append(command)
-        return subprocess.CompletedProcess(command, 0, "", "")
-
-    def run(command: list[str], *args: object, **kwargs: object) -> object:
-        if "has-session" in command:
-            return subprocess.CompletedProcess(command, 1, "", "")
-        return original_run(command, *args, **kwargs)
-
-    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: "/fake/tmux")
-    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(TaskService, "_run_carrier_guardian", run_carrier)
-    monkeypatch.setattr(tasks_module.subprocess, "run", run)
-    return carrier_calls
-
-
-def _create_committed_task(
-    root: Path,
-    *,
-    key: str,
-) -> tuple[TaskService, dict[str, object], str, Path]:
-    _init_workspace(root)
-    service = TaskService(root)
-    brief = _create(service, key=key)
-    task_id = str(brief["task_id"])
-    _commit_brief(root, brief)
-    return service, brief, task_id, root / ".aros" / "tasks" / task_id
-
-
-def _publish_preparation_intent(
-    service: TaskService,
-    task_id: str,
-    runtime: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service._ensure_worktree(task_id, actor="principal")
-
-    def stop_after_intent(_runtime: Path, **_kwargs: object) -> None:
-        raise RuntimeError("stop after preparation intent")
-
-    with monkeypatch.context() as preparation_context:
-        preparation_context.setattr(
-            tasks_module.shutil,
-            "which",
-            lambda _name: "/fake/tmux",
-        )
-        preparation_context.setattr(
-            service,
-            "_prepare_execution_paths",
-            stop_after_intent,
-        )
-        with pytest.raises(RuntimeError, match="after preparation"):
-            service.start(task_id, actor="principal")
-    assert (runtime / "preparation.json").is_file()
-    assert not (runtime / "launch.json").exists()
-
-
 def _create_terminal_task(
     root: Path,
     *,
@@ -459,101 +407,48 @@ def _create_terminal_task(
     service = TaskService(root)
     request = _request()
     request["mode"] = mode
+    if state == "completed":
+        request["adapter_argv"] = [sys.executable, "-c", "pass"]
+    elif state == "failed_process":
+        request["adapter_argv"] = [sys.executable, "-c", "raise SystemExit(1)"]
+    elif state == "timed_out":
+        request["adapter_argv"] = [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(5)",
+        ]
+        request["timeout_seconds"] = 0.05
+    else:
+        raise AssertionError(f"unsupported terminal fixture state: {state}")
     brief = service.create("bounded objective", **request)  # type: ignore[arg-type]
     _commit_brief(root, brief)
     task_id = str(brief["task_id"])
-    service._ensure_worktree(task_id)
-    runtime = root / ".aros" / "tasks" / task_id
-    ownership = json.loads((runtime / "ownership.json").read_text(encoding="utf-8"))
-    timestamp = str(ownership["acquired_at"])
-    launch: dict[str, object] = {
-        "schema_version": 1,
-        "task_id": task_id,
-        "actor": ownership["actor"],
-        "brief_sha256": brief["brief_sha256"],
-        "ownership_sha256": ownership["ownership_sha256"],
-        "base_commit": brief["base_commit"],
-        "security_profile": "trusted-local",
-        "isolation_scope": "application",
-        "capabilities_enforced": False,
-        "filesystem_permissions_enforced": (
-            service._filesystem_permissions_enforced
-        ),
-        "filesystem_permission_probe": service._filesystem_permission_probe,
-        "carrier": "tmux",
-        "tmux_session": f"aros-task-{task_id.lower()}",
-        "tmux_socket": tasks_module._tmux_socket_name(root, task_id),
-        "host": tasks_module.socket.gethostname(),
-        "runner_version": 1,
-        "runner_cwd": str(runtime / "home"),
-        "runner_invocation": [
-            sys.executable,
-            "-I",
-            "-c",
-            tasks_module._TASK_RUNNER_BOOTSTRAP,
-            str(runtime / "runner-import"),
-            "--workspace",
-            str(root),
-            "--task-id",
-            task_id,
-        ],
-        "launched_at": timestamp,
-    }
-    launch["launch_sha256"] = json_sha256(launch)
-    assert create_json(runtime / "launch.json", launch)
-    for name in ("stdout.log", "stderr.log"):
-        descriptor = os.open(
-            runtime / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
-        os.close(descriptor)
-    empty_sha256 = hashlib.sha256(b"").hexdigest()
-    final: dict[str, object] = {
-        "schema_version": 1,
-        "task_id": task_id,
-        "state": state,
-        "brief_sha256": brief["brief_sha256"],
-        "ownership_sha256": ownership["ownership_sha256"],
-        "launch_sha256": launch["launch_sha256"],
-        "security_profile": "trusted-local",
-        "isolation_scope": "application",
-        "capabilities_enforced": False,
-        "filesystem_permissions_enforced": launch[
-            "filesystem_permissions_enforced"
-        ],
-        "filesystem_permission_probe": launch["filesystem_permission_probe"],
-        "host": launch["host"],
-        "runner_pid": None,
-        "runner_pgid": None,
-        "runner_start_token": None,
-        "adapter_pid": None,
-        "adapter_pgid": None,
-        "adapter_start_token": None,
-        "started_at": timestamp,
-        "finished_at": timestamp,
-        "duration_seconds": 0,
-        "exit_code": 0 if state in {"completed", "timed_out"} else 1,
-        "timeout": {
-            "timeout_seconds": brief["timeout_seconds"],
-            "triggered": state == "timed_out",
-        },
-        "stop": None,
-        "signal_sequence": ["TERM"] if state == "timed_out" else [],
-        "stdout": {
-            "path": f".aros/tasks/{task_id}/stdout.log",
-            "bytes": 0,
-            "sha256": empty_sha256,
-        },
-        "stderr": {
-            "path": f".aros/tasks/{task_id}/stderr.log",
-            "bytes": 0,
-            "sha256": empty_sha256,
-        },
-        "error": None,
-    }
-    final["final_sha256"] = json_sha256(final)
-    assert create_json(runtime / "final.json", final)
-    assert service.status(task_id)["state"] == state
+    status = service.start(
+        task_id,
+        actor="principal",
+        commit_paths=GitCheckpoint(root).commit_paths,
+    )
+    deadline = time.monotonic() + 10
+    while status["state"] not in {"completed", "failed_process", "timed_out"}:
+        assert time.monotonic() < deadline, status
+        time.sleep(0.02)
+        status = service.status(task_id)
+    assert status["state"] == state
+    ownership = service._load_ownership(brief)
+    final = RunService(root).read_validated_final(str(status["run_id"]))
     return service, brief, ownership, final
+
+
+def _collect_and_commit(
+    service: TaskService,
+    task_id: str,
+) -> dict[str, object]:
+    collected, checkpoint = service.collect_and_commit(
+        task_id,
+        GitCheckpoint(service.root).commit_paths,
+    )
+    assert checkpoint is not None
+    return collected
 
 
 def _commit_child_return(
@@ -596,694 +491,6 @@ def _commit_child_return(
     _git(worktree, "commit", "-qm", "record child return")
     return_commit = _git(worktree, "rev-parse", "HEAD")
     return returned, child_commit, return_commit
-
-
-@pytest.mark.parametrize("mode", ("read_only", "write"))
-def test_start_prepares_a_branch_attached_owned_worktree_without_execution(
-    tmp_path: Path,
-    mode: str,
-) -> None:
-    base_commit = _init_workspace(tmp_path)
-    marker = tmp_path / "adapter-ran"
-    service = TaskService(tmp_path)
-    request = _request(key=f"start-{mode}")
-    request["mode"] = mode
-    request["adapter_argv"] = [
-        sys.executable,
-        "-c",
-        f"from pathlib import Path; Path({str(marker)!r}).touch()",
-    ]
-    brief = service.create("prepare isolated child", **request)  # type: ignore[arg-type]
-    task_id = str(brief["task_id"])
-    parent_head = _commit_brief(tmp_path, brief)
-    worktree = (tmp_path / ".worktree" / "tasks" / task_id).absolute()
-    branch = f"aros/task/{task_id}"
-
-    status = service._ensure_worktree(task_id, actor="delegate-principal")
-
-    ownership_path = tmp_path / ".aros" / "tasks" / task_id / "ownership.json"
-    ownership = json.loads(ownership_path.read_text(encoding="utf-8"))
-    assert set(ownership) == {
-        "schema_version",
-        "task_id",
-        "brief_sha256",
-        "actor",
-        "worktree_path",
-        "branch",
-        "base_commit",
-        "parent_head",
-        "acquired_at",
-        "ownership_sha256",
-    }
-    assert ownership == {
-        **ownership,
-        "schema_version": 1,
-        "task_id": task_id,
-        "brief_sha256": brief["brief_sha256"],
-        "actor": "delegate-principal",
-        "worktree_path": str(worktree),
-        "branch": branch,
-        "base_commit": base_commit,
-        "parent_head": parent_head,
-        "ownership_sha256": json_sha256(
-            {
-                key: value
-                for key, value in ownership.items()
-                if key != "ownership_sha256"
-            }
-        ),
-    }
-    assert status == {
-        "schema_version": 1,
-        "task_id": task_id,
-        "state": "worktree_ready",
-        "brief_sha256": brief["brief_sha256"],
-        "ownership_sha256": ownership["ownership_sha256"],
-        "updated_at": ownership["acquired_at"],
-    }
-    assert service.status(task_id) == status
-    assert service.list() == [status]
-    assert worktree.is_dir()
-    assert Path(_git(worktree, "rev-parse", "--show-toplevel")) == worktree
-    assert _git(worktree, "branch", "--show-current") == branch
-    assert _git(worktree, "rev-parse", "HEAD") == base_commit
-    assert _git(tmp_path, "rev-parse", "HEAD") == parent_head
-    assert not marker.exists()
-
-
-@pytest.mark.parametrize(
-    "checkpoint",
-    ("home", "tmp", "import_alias", "stdout", "stderr"),
-)
-def test_start_resumes_owned_path_preparation_after_crash(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    checkpoint: str,
-) -> None:
-    service, brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key=f"preparation-crash-{checkpoint}",
-    )
-    service._ensure_worktree(task_id, actor="principal")
-    ownership = json.loads(
-        (runtime / "ownership.json").read_text(encoding="utf-8")
-    )
-    original_fsync_directory = tasks_module._fsync_directory
-    crashed = False
-
-    def crash_after_checkpoint(path: Path) -> None:
-        nonlocal crashed
-        original_fsync_directory(path)
-        reached = (
-            checkpoint == "home"
-            and path == runtime
-            and (runtime / "home").is_dir()
-            and not (runtime / "tmp").exists()
-        ) or (
-            checkpoint == "tmp"
-            and path == runtime
-            and (runtime / "tmp").is_dir()
-            and not (runtime / "runner-import").exists()
-        ) or (
-            checkpoint == "import_alias"
-            and path == runtime / "runner-import"
-            and (runtime / "runner-import" / "arbor").is_symlink()
-        ) or (
-            checkpoint == "stdout"
-            and path == runtime
-            and (runtime / "stdout.log").is_file()
-            and not (runtime / "stderr.log").exists()
-        ) or (
-            checkpoint == "stderr"
-            and path == runtime
-            and (runtime / "stderr.log").is_file()
-            and not (runtime / "launch.json").exists()
-        )
-        if reached and not crashed:
-            crashed = True
-            raise RuntimeError(f"injected crash after {checkpoint}")
-
-    with monkeypatch.context() as crash_context:
-        crash_context.setattr(
-            tasks_module,
-            "_fsync_directory",
-            crash_after_checkpoint,
-        )
-        crash_context.setattr(
-            tasks_module.shutil,
-            "which",
-            lambda _name: "/fake/tmux",
-        )
-        with pytest.raises(RuntimeError, match=f"after {checkpoint}"):
-            service.start(task_id, actor="principal")
-
-    assert crashed
-    preparation_path = runtime / "preparation.json"
-    preparation = json.loads(preparation_path.read_text(encoding="utf-8"))
-    assert set(preparation) == {
-        "schema_version",
-        "task_id",
-        "brief_sha256",
-        "ownership_sha256",
-        "actor",
-        "filesystem_permissions_enforced",
-        "filesystem_permission_probe",
-        "paths",
-        "prepared_at",
-        "preparation_sha256",
-    }
-    assert preparation == {
-        **preparation,
-        "schema_version": 1,
-        "task_id": task_id,
-        "brief_sha256": brief["brief_sha256"],
-        "ownership_sha256": ownership["ownership_sha256"],
-        "actor": "principal",
-        "filesystem_permissions_enforced": (
-            service._filesystem_permissions_enforced
-        ),
-        "filesystem_permission_probe": service._filesystem_permission_probe,
-        "paths": {
-            "home": f".aros/tasks/{task_id}/home",
-            "tmp": f".aros/tasks/{task_id}/tmp",
-            "runner_import": f".aros/tasks/{task_id}/runner-import",
-            "stdout": f".aros/tasks/{task_id}/stdout.log",
-            "stderr": f".aros/tasks/{task_id}/stderr.log",
-        },
-        "preparation_sha256": json_sha256(
-            {
-                key: value
-                for key, value in preparation.items()
-                if key != "preparation_sha256"
-            }
-        ),
-    }
-    assert not (runtime / "launch.json").exists()
-
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-    restarted = TaskService(tmp_path)
-
-    assert restarted.start(task_id, actor="principal")["state"] == "lost"
-    assert len(carrier_calls) == 1
-    assert json.loads(preparation_path.read_text(encoding="utf-8")) == preparation
-    assert (runtime / "launch.json").is_file()
-    assert not (runtime / "final.json").exists()
-
-
-@pytest.mark.parametrize("preseed", ("path", "symlink", "nonempty"))
-def test_start_rejects_preseeded_paths_without_publishing_preparation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    preseed: str,
-) -> None:
-    service, _brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key=f"preparation-preseed-{preseed}",
-    )
-    outside = tmp_path / ".git" / "preparation-outside"
-    if preseed == "path":
-        seeded = runtime / "home"
-        seeded.mkdir()
-    elif preseed == "symlink":
-        outside.mkdir()
-        (outside / "preserve.txt").write_text("preserve\n", encoding="utf-8")
-        seeded = runtime / "tmp"
-        seeded.symlink_to(outside, target_is_directory=True)
-    else:
-        seeded = runtime / "stdout.log"
-        seeded.write_bytes(b"preserve pre-launch bytes\n")
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-
-    with pytest.raises(TaskError, match="conflict|exist|symlink|preparation"):
-        service.start(task_id, actor="principal")
-
-    assert seeded.exists()
-    if preseed == "nonempty":
-        assert seeded.read_bytes() == b"preserve pre-launch bytes\n"
-    elif preseed == "symlink":
-        assert seeded.is_symlink()
-        assert (outside / "preserve.txt").read_text(encoding="utf-8") == "preserve\n"
-    assert not (runtime / "preparation.json").exists()
-    assert not (runtime / "launch.json").exists()
-    assert carrier_calls == []
-
-
-@pytest.mark.parametrize(
-    "problem",
-    ("schema", "probe", "mode", "hardlink", "symlink"),
-)
-def test_start_rejects_tampered_or_linked_preparation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    problem: str,
-) -> None:
-    service, _brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key=f"invalid-preparation-{problem}",
-    )
-    _publish_preparation_intent(service, task_id, runtime, monkeypatch)
-
-    preparation_path = runtime / "preparation.json"
-    outside = tmp_path / ".git" / f"preparation-{problem}"
-    if problem in {"schema", "probe"}:
-        preparation = json.loads(preparation_path.read_text(encoding="utf-8"))
-        if problem == "schema":
-            preparation["unexpected"] = True
-        else:
-            probe = preparation["filesystem_permission_probe"]
-            assert isinstance(probe, dict)
-            probe["device"] = int(probe["device"]) + 1
-        preparation["preparation_sha256"] = json_sha256(
-            {
-                key: value
-                for key, value in preparation.items()
-                if key != "preparation_sha256"
-            }
-        )
-        atomic_write_json(preparation_path, preparation)
-    elif problem == "mode":
-        preparation_path.chmod(0o666)
-    elif problem == "hardlink":
-        os.link(preparation_path, outside)
-    else:
-        preparation_path.replace(outside)
-        preparation_path.symlink_to(outside)
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-
-    with pytest.raises(
-        TaskError,
-        match="preparation|restrictive|plain|link|permission|schema|binding",
-    ):
-        TaskService(tmp_path).start(task_id, actor="principal")
-
-    assert not (runtime / "launch.json").exists()
-    assert carrier_calls == []
-    if problem == "hardlink":
-        assert preparation_path.stat().st_nlink == outside.stat().st_nlink == 2
-    elif problem == "symlink":
-        assert preparation_path.is_symlink()
-        assert outside.is_file()
-
-
-def test_start_recovers_interrupted_preparation_temp_alias(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service, _brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key="recover-preparation-temp-alias",
-    )
-    _publish_preparation_intent(service, task_id, runtime, monkeypatch)
-    preparation_path = runtime / "preparation.json"
-    digest = hashlib.sha256(os.fsencode(preparation_path.name)).hexdigest()
-    temporary = runtime / f".aros-json-{digest}.crash.tmp"
-    os.link(preparation_path, temporary, follow_symlinks=False)
-    identity = (preparation_path.stat().st_dev, preparation_path.stat().st_ino)
-    assert preparation_path.stat().st_nlink == 2
-    assert (temporary.stat().st_dev, temporary.stat().st_ino) == identity
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-
-    assert TaskService(tmp_path).start(task_id, actor="principal")["state"] == "lost"
-
-    assert not temporary.exists()
-    assert preparation_path.stat().st_nlink == 1
-    assert (preparation_path.stat().st_dev, preparation_path.stat().st_ino) == identity
-    assert (runtime / "launch.json").is_file()
-    assert len(carrier_calls) == 1
-
-
-@pytest.mark.parametrize("name", ("home", "tmp", "runner-import"))
-def test_start_rejects_permissive_directory_during_preparation_resume(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    name: str,
-) -> None:
-    service, _brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key=f"permissive-preparation-{name}",
-    )
-    _publish_preparation_intent(service, task_id, runtime, monkeypatch)
-
-    directory = runtime / name
-    directory.mkdir(mode=0o700)
-    directory.chmod(0o777)
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-
-    with pytest.raises(TaskError, match="directory|mode|restrictive|preparation"):
-        TaskService(tmp_path).start(task_id, actor="principal")
-
-    assert stat.S_IMODE(directory.lstat().st_mode) == 0o777
-    assert not (runtime / "launch.json").exists()
-    assert carrier_calls == []
-
-
-def test_start_rejects_directory_replacement_during_preparation_resume(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service, _brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key="replaced-preparation-directory",
-    )
-    _publish_preparation_intent(service, task_id, runtime, monkeypatch)
-
-    home = runtime / "home"
-    displaced = runtime / "displaced-home"
-    home.mkdir(mode=0o700)
-    original_iterdir = Path.iterdir
-    replaced = False
-
-    def replace_before_iterdir(path: Path):  # type: ignore[no-untyped-def]
-        nonlocal replaced
-        if path == home and not replaced:
-            home.rename(displaced)
-            home.mkdir(mode=0o700)
-            replaced = True
-        return original_iterdir(path)
-
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-    monkeypatch.setattr(Path, "iterdir", replace_before_iterdir)
-
-    with pytest.raises(TaskError, match="directory|identity|changed|preparation"):
-        TaskService(tmp_path).start(task_id, actor="principal")
-
-    assert replaced
-    assert displaced.is_dir()
-    assert not (runtime / "launch.json").exists()
-    assert carrier_calls == []
-
-
-def test_start_rejects_directory_entry_added_during_preparation_sync(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service, _brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key="changed-preparation-directory-entries",
-    )
-    _publish_preparation_intent(service, task_id, runtime, monkeypatch)
-
-    home = runtime / "home"
-    home.mkdir(mode=0o700)
-    injected = home / "injected"
-    original_fsync_directory = tasks_module._fsync_directory
-
-    def inject_after_parent_sync(path: Path) -> None:
-        original_fsync_directory(path)
-        if path == runtime and not injected.exists():
-            injected.write_text("hostile\n", encoding="utf-8")
-
-    monkeypatch.setattr(
-        tasks_module,
-        "_fsync_directory",
-        inject_after_parent_sync,
-    )
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-
-    with pytest.raises(TaskError, match="directory|entries|empty|changed"):
-        TaskService(tmp_path).start(task_id, actor="principal")
-
-    assert injected.read_text(encoding="utf-8") == "hostile\n"
-    assert not (runtime / "launch.json").exists()
-    assert carrier_calls == []
-
-
-def test_start_resyncs_import_alias_after_crash_before_first_sync(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service, _brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key="preparation-alias-presync-crash",
-    )
-    service._ensure_worktree(task_id, actor="principal")
-    import_root = runtime / "runner-import"
-    alias = import_root / "arbor"
-    original_fsync_directory = tasks_module._fsync_directory
-    crashed = False
-
-    def crash_before_alias_sync(path: Path) -> None:
-        nonlocal crashed
-        if path == import_root and alias.is_symlink() and not crashed:
-            crashed = True
-            raise RuntimeError("injected crash before alias sync")
-        original_fsync_directory(path)
-
-    with monkeypatch.context() as crash_context:
-        crash_context.setattr(
-            tasks_module,
-            "_fsync_directory",
-            crash_before_alias_sync,
-        )
-        crash_context.setattr(
-            tasks_module.shutil,
-            "which",
-            lambda _name: "/fake/tmux",
-        )
-        with pytest.raises(RuntimeError, match="before alias sync"):
-            service.start(task_id, actor="principal")
-
-    assert crashed
-    assert alias.is_symlink()
-    assert not (runtime / "launch.json").exists()
-    synced: list[Path] = []
-
-    def record_sync(path: Path) -> None:
-        original_fsync_directory(path)
-        synced.append(path)
-
-    monkeypatch.setattr(tasks_module, "_fsync_directory", record_sync)
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-
-    assert TaskService(tmp_path).start(task_id, actor="principal")["state"] == "lost"
-    assert import_root in synced
-    assert len(carrier_calls) == 1
-
-
-@pytest.mark.parametrize(
-    ("log_name", "replacement_stage"),
-    (
-        ("stdout.log", "file_sync"),
-        ("stdout.log", "parent_sync"),
-        ("stderr.log", "file_sync"),
-        ("stderr.log", "parent_sync"),
-    ),
-)
-def test_start_rejects_log_replacement_during_preparation_sync(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    log_name: str,
-    replacement_stage: str,
-) -> None:
-    service, _brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key=f"replaced-{log_name}-{replacement_stage}",
-    )
-    service._ensure_worktree(task_id, actor="principal")
-    original_fsync_directory = tasks_module._fsync_directory
-    crashed = False
-
-    def crash_after_stderr(path: Path) -> None:
-        nonlocal crashed
-        original_fsync_directory(path)
-        if (
-            path == runtime
-            and (runtime / "stderr.log").is_file()
-            and not (runtime / "launch.json").exists()
-            and not crashed
-        ):
-            crashed = True
-            raise RuntimeError("injected crash after stderr")
-
-    with monkeypatch.context() as crash_context:
-        crash_context.setattr(
-            tasks_module,
-            "_fsync_directory",
-            crash_after_stderr,
-        )
-        crash_context.setattr(
-            tasks_module.shutil,
-            "which",
-            lambda _name: "/fake/tmux",
-        )
-        with pytest.raises(RuntimeError, match="after stderr"):
-            service.start(task_id, actor="principal")
-
-    assert crashed
-    selected = runtime / log_name
-    selected_metadata = selected.lstat()
-    selected_identity = (selected_metadata.st_dev, selected_metadata.st_ino)
-    displaced = runtime / f"{log_name}.{replacement_stage}.original"
-    original_fsync = tasks_module.os.fsync
-    selected_synced = False
-    replaced = False
-
-    def replace_selected() -> None:
-        nonlocal replaced
-        selected.rename(displaced)
-        descriptor = os.open(
-            selected,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
-        os.close(descriptor)
-        replaced = True
-
-    def sync_and_maybe_replace(descriptor: int) -> None:
-        nonlocal selected_synced
-        original_fsync(descriptor)
-        metadata = os.fstat(descriptor)
-        if (metadata.st_dev, metadata.st_ino) != selected_identity:
-            return
-        selected_synced = True
-        if replacement_stage == "file_sync" and not replaced:
-            replace_selected()
-
-    def sync_parent_and_maybe_replace(path: Path) -> None:
-        original_fsync_directory(path)
-        if (
-            replacement_stage == "parent_sync"
-            and path == runtime
-            and selected_synced
-            and not replaced
-        ):
-            replace_selected()
-
-    monkeypatch.setattr(tasks_module.os, "fsync", sync_and_maybe_replace)
-    monkeypatch.setattr(
-        tasks_module,
-        "_fsync_directory",
-        sync_parent_and_maybe_replace,
-    )
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-
-    with pytest.raises(TaskError, match="log|identity|changed|restrictive"):
-        TaskService(tmp_path).start(task_id, actor="principal")
-
-    assert replaced
-    assert displaced.is_file()
-    assert not (runtime / "launch.json").exists()
-    assert carrier_calls == []
-
-
-def test_concurrent_starts_share_one_preparation_and_launch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service, _brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key="concurrent-preparation",
-    )
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        starts = list(
-            pool.map(
-                lambda _number: service.start(task_id, actor="principal"),
-                range(4),
-            )
-        )
-
-    preparation_path = runtime / "preparation.json"
-    launch_path = runtime / "launch.json"
-    preparation = json.loads(preparation_path.read_text(encoding="utf-8"))
-    launch = json.loads(launch_path.read_text(encoding="utf-8"))
-    assert all(start["state"] == "lost" for start in starts)
-    assert all(start["launch_sha256"] == launch["launch_sha256"] for start in starts)
-    assert preparation_path.lstat().st_nlink == 1
-    assert preparation["preparation_sha256"] == json_sha256(
-        {
-            key: value
-            for key, value in preparation.items()
-            if key != "preparation_sha256"
-        }
-    )
-    assert len(list(runtime.glob("preparation.json"))) == 1
-    assert len(list(runtime.glob("launch.json"))) == 1
-    assert len(carrier_calls) == 1
-
-
-def test_different_task_carrier_launches_do_not_hold_global_publication_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service, _first, first_id, _runtime = _create_committed_task(
-        tmp_path,
-        key="parallel-carrier-one",
-    )
-    second = _create(service, key="parallel-carrier-two", objective="second task")
-    second_id = str(second["task_id"])
-    _commit_brief(tmp_path, second)
-    both_entered = Event()
-    release_carriers = Event()
-    carrier_calls: list[list[str]] = []
-    original_run = tasks_module.subprocess.run
-    def pause_carriers(
-        _service: TaskService,
-        _lock_descriptor: int,
-        command: list[str],
-        _environment: dict[str, str],
-    ) -> subprocess.CompletedProcess[str]:
-        carrier_calls.append(command)
-        if len(carrier_calls) == 2:
-            both_entered.set()
-        assert release_carriers.wait(timeout=5)
-        return subprocess.CompletedProcess(command, 0, "", "")
-
-    def absent_carrier(
-        command: list[str],
-        *args: object,
-        **kwargs: object,
-    ) -> object:
-        if "has-session" in command:
-            return subprocess.CompletedProcess(command, 1, "", "")
-        return original_run(command, *args, **kwargs)
-
-    monkeypatch.setattr(tasks_module.shutil, "which", lambda _name: "/fake/tmux")
-    monkeypatch.setattr(tasks_module, "_LAUNCH_GRACE_SECONDS", 0.0)
-    monkeypatch.setattr(TaskService, "_run_carrier_guardian", pause_carriers)
-    monkeypatch.setattr(tasks_module.subprocess, "run", absent_carrier)
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            starts = [
-                pool.submit(service.start, task_id, actor="principal")
-                for task_id in (first_id, second_id)
-            ]
-            assert both_entered.wait(timeout=5)
-            release_carriers.set()
-            statuses = [start.result(timeout=10) for start in starts]
-    finally:
-        release_carriers.set()
-
-    assert [status["state"] for status in statuses] == ["lost", "lost"]
-    assert len(carrier_calls) == 2
-
-
-def test_launch_evidence_prevents_automatic_carrier_retry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service, _brief, task_id, runtime = _create_committed_task(
-        tmp_path,
-        key="preparation-no-relaunch",
-    )
-    carrier_calls = _fake_tmux_carrier(monkeypatch)
-
-    first = service.start(task_id, actor="principal")
-    preparation_path = runtime / "preparation.json"
-    preparation_identity = (
-        preparation_path.lstat().st_dev,
-        preparation_path.lstat().st_ino,
-    )
-    second = TaskService(tmp_path).start(task_id, actor="principal")
-
-    assert first["state"] == second["state"] == "lost"
-    assert first["launch_sha256"] == second["launch_sha256"]
-    assert len(carrier_calls) == 1
-    assert (
-        preparation_path.lstat().st_dev,
-        preparation_path.lstat().st_ino,
-    ) == preparation_identity
 
 
 @pytest.mark.parametrize("dirty_kind", ("unstaged", "staged", "untracked"))
@@ -1736,7 +943,10 @@ def test_task_collect_returns_direct_commit_request(
     record, paths, message = service.collect_with_commit(task_id)
 
     assert record["collected_sha256"]
-    assert paths == (f"tasks/{task_id}/collected.json",)
+    assert paths == (
+        record["run_final_ref"],
+        f"tasks/{task_id}/collected.json",
+    )
     assert message == f"Record task {task_id} collection"
 
 
@@ -1747,8 +957,8 @@ def test_task_no_return_collection_has_no_commit_request(tmp_path: Path) -> None
     record, paths, message = service.collect_with_commit(task_id)
 
     assert record["state"] == "completed_no_return"
-    assert paths is None
-    assert message is None
+    assert paths == (record["run_final_ref"],)
+    assert message == f"Record run {record['run_id']} final"
 
 
 @pytest.mark.parametrize("status_state", ("missing", "prepared"))
@@ -3976,7 +3186,11 @@ def test_collect_records_the_reviewed_b_c_r_protocol_without_assimilation(
         "child_commit",
         "return_commit",
         "final_state",
-        "final_sha256",
+        "run_id",
+        "run_manifest_ref",
+        "run_manifest_sha256",
+        "run_final_ref",
+        "run_final_sha256",
         "return",
         "collected_at",
         "collected_sha256",
@@ -3990,7 +3204,9 @@ def test_collect_records_the_reviewed_b_c_r_protocol_without_assimilation(
     assert collected["child_commit"] == child_commit
     assert collected["return_commit"] == return_commit
     assert collected["final_state"] == "completed"
-    assert collected["final_sha256"] == final["final_sha256"]
+    assert collected["run_id"] == final["run_id"]
+    assert collected["run_manifest_sha256"] == final["manifest_sha256"]
+    assert collected["run_final_sha256"] == json_sha256(final)
     assert collected["return"] == returned
     assert collected["collected_sha256"] == json_sha256(
         {key: value for key, value in collected.items() if key != "collected_sha256"}
@@ -4083,7 +3299,11 @@ def test_collect_returns_deterministic_completed_no_return_without_inventing_one
         "base_commit": brief["base_commit"],
         "head_commit": head_commit,
         "final_state": "completed",
-        "final_sha256": final["final_sha256"],
+        "run_id": final["run_id"],
+        "run_manifest_ref": f"runs/{final['run_id']}/manifest.json",
+        "run_manifest_sha256": final["manifest_sha256"],
+        "run_final_ref": f"runs/{final['run_id']}/final.json",
+        "run_final_sha256": json_sha256(final),
     }
     assert service.collect(task_id) == result
     assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
@@ -4122,7 +3342,7 @@ def test_noncompleted_terminal_task_can_collect_an_explicit_valid_return(
     collected = service.collect(task_id)
 
     assert collected["final_state"] == state
-    assert collected["final_sha256"] == final["final_sha256"]
+    assert collected["run_final_sha256"] == json_sha256(final)
 
 
 def test_read_only_task_can_return_without_an_artifact_commit(tmp_path: Path) -> None:
@@ -4146,45 +3366,27 @@ def test_read_only_task_can_return_without_an_artifact_commit(tmp_path: Path) ->
     assert collected["return_commit"] == return_commit
 
 
-def test_collect_rejects_active_and_lost_process_states(tmp_path: Path) -> None:
-    active_root = tmp_path / "active"
-    _init_workspace(active_root)
-    active_service = TaskService(active_root)
+def test_collect_rejects_active_task(tmp_path: Path) -> None:
+    _init_workspace(tmp_path)
+    active_service = TaskService(tmp_path)
     active_brief = _create(active_service)
-    _commit_brief(active_root, active_brief)
+    _commit_brief(tmp_path, active_brief)
     active_service._ensure_worktree(str(active_brief["task_id"]))
 
-    with pytest.raises(TaskError, match="not terminal"):
+    with pytest.raises(TaskError, match="terminal Task Run|not terminal"):
         active_service.collect(str(active_brief["task_id"]))
-
-    lost_root = tmp_path / "lost"
-    lost_service, lost_brief, _ownership, _final = _create_terminal_task(lost_root)
-    lost_id = str(lost_brief["task_id"])
-    runtime = lost_root / ".aros" / "tasks" / lost_id
-    (runtime / "final.json").unlink()
-    (runtime / "status.json").unlink()
-    launch_path = runtime / "launch.json"
-    launch = json.loads(launch_path.read_text(encoding="utf-8"))
-    launch["launched_at"] = "2000-01-01T00:00:00.000Z"
-    launch["launch_sha256"] = json_sha256(
-        {key: value for key, value in launch.items() if key != "launch_sha256"}
-    )
-    atomic_write_json(launch_path, launch)
-
-    with pytest.raises(TaskError, match="not terminal"):
-        lost_service.collect(lost_id)
 
 
 def test_collect_rejects_a_hardlinked_final_receipt_as_not_create_once(
     tmp_path: Path,
 ) -> None:
-    service, brief, ownership, _final = _create_terminal_task(tmp_path)
+    service, brief, ownership, final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    final_path = tmp_path / ".aros" / "tasks" / task_id / "final.json"
+    final_path = tmp_path / "runs" / str(final["run_id"]) / "final.json"
     os.link(final_path, tmp_path / "final-alias.json")
 
-    with pytest.raises(TaskError, match="final.*restrictive|create-once"):
+    with pytest.raises(TaskError, match="invalid terminal Task Run"):
         service.collect(task_id)
 
     assert not (tmp_path / "tasks" / task_id / "collected.json").exists()
@@ -4417,13 +3619,13 @@ def test_existing_valid_collection_is_idempotent_after_child_becomes_dirty(
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    collected = service.collect(task_id)
+    collected = _collect_and_commit(service, task_id)
     worktree = Path(str(ownership["worktree_path"]))
     dirty = worktree / "after-collection.txt"
     dirty.write_text("preserve after collection\n", encoding="utf-8")
 
     assert service.collect(task_id) == collected
-    with pytest.raises(TaskError, match="clean"):
+    with pytest.raises(TaskError, match="clean|modified|untracked"):
         service.prune(task_id)
     assert dirty.is_file()
 
@@ -4438,7 +3640,7 @@ def test_existing_collection_remains_readable_after_retained_branch_advances(
         brief,
         ownership,
     )
-    collected = service.collect(task_id)
+    collected = _collect_and_commit(service, task_id)
     collected_path = tmp_path / "tasks" / task_id / "collected.json"
     collected_bytes = collected_path.read_bytes()
     collected_inode = collected_path.stat().st_ino
@@ -4470,7 +3672,7 @@ def test_preserve_is_an_idempotent_validated_noop_snapshot(tmp_path: Path) -> No
         brief,
         ownership,
     )
-    service.collect(task_id)
+    _collect_and_commit(service, task_id)
     worktree = Path(str(ownership["worktree_path"]))
     parent_head = _git(tmp_path, "rev-parse", "HEAD")
     refs_before = _git(tmp_path, "show-ref")
@@ -4541,7 +3743,7 @@ def test_prune_removes_only_the_clean_collected_worktree_and_keeps_git_history(
         brief,
         ownership,
     )
-    collected = service.collect(task_id)
+    collected = _collect_and_commit(service, task_id)
     worktree = Path(str(ownership["worktree_path"]))
     original_git = service._safe_git_result
     mutation_calls: list[tuple[str, ...]] = []
@@ -4565,7 +3767,6 @@ def test_prune_removes_only_the_clean_collected_worktree_and_keeps_git_history(
         "branch_ref",
         "return_commit",
         "final_state",
-        "final_sha256",
         "worktree_path",
         "removed_at",
         "prune_sha256",
@@ -4580,7 +3781,6 @@ def test_prune_removes_only_the_clean_collected_worktree_and_keeps_git_history(
     assert pruned["branch_ref"] == f"refs/heads/{ownership['branch']}"
     assert pruned["return_commit"] == return_commit
     assert pruned["final_state"] == final["state"]
-    assert pruned["final_sha256"] == final["final_sha256"]
     assert pruned["worktree_path"] == str(worktree)
     assert pruned["pruned_sha256"] == json_sha256(
         {key: value for key, value in pruned.items() if key != "pruned_sha256"}
@@ -4611,7 +3811,7 @@ def test_prune_accepts_mode_normalized_intent_and_receipt(
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    service.collect(task_id)
+    _collect_and_commit(service, task_id)
     original_create = tasks_module.create_json
 
     def create_with_normalized_mode(path: Path, value: object) -> bool:
@@ -4642,7 +3842,7 @@ def test_prune_rejects_mode_drift_when_permissions_are_enforced(
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    service.collect(task_id)
+    _collect_and_commit(service, task_id)
 
     def fail_remove(_target: Path) -> None:
         raise TaskError("injected remove failure")
@@ -4664,7 +3864,7 @@ def test_prune_is_idempotent_after_success_without_removing_again(
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    service.collect(task_id)
+    _collect_and_commit(service, task_id)
     first = service.prune(task_id)
     receipt_path = tmp_path / ".aros" / "tasks" / task_id / "pruned.json"
     receipt_inode = receipt_path.stat().st_ino
@@ -4693,7 +3893,7 @@ def test_existing_collection_remains_idempotently_readable_after_prune(
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    collected = service.collect(task_id)
+    collected = _collect_and_commit(service, task_id)
     service.prune(task_id)
 
     assert TaskService(tmp_path).collect(task_id) == collected
@@ -4706,7 +3906,7 @@ def test_prune_recovers_a_crash_after_git_removed_the_worktree(
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    service.collect(task_id)
+    _collect_and_commit(service, task_id)
     worktree = Path(str(ownership["worktree_path"]))
     original_create = tasks_module.create_json
 
@@ -4742,7 +3942,7 @@ def test_prune_recovers_a_crash_before_git_removed_the_exact_registration(
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    collected = service.collect(task_id)
+    collected = _collect_and_commit(service, task_id)
     worktree = Path(str(ownership["worktree_path"]))
 
     class InjectedCrash(RuntimeError):
@@ -4827,7 +4027,7 @@ def test_prune_recovery_rejects_and_preserves_an_unrelated_prunable_registration
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    service.collect(task_id)
+    _collect_and_commit(service, task_id)
     worktree = Path(str(ownership["worktree_path"]))
     unrelated = tmp_path / ".worktree" / "unrelated-prunable"
     unrelated_branch = "unrelated-prunable"
@@ -4891,7 +4091,7 @@ def test_status_rejects_a_tampered_persisted_prune_intent(
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    service.collect(task_id)
+    _collect_and_commit(service, task_id)
 
     def fail_remove(_target: Path) -> None:
         raise TaskError("injected remove failure")
@@ -4916,7 +4116,7 @@ def test_prune_rejects_and_preserves_every_kind_of_dirty_material(
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    service.collect(task_id)
+    _collect_and_commit(service, task_id)
     worktree = Path(str(ownership["worktree_path"]))
     if material in {"modified", "staged"}:
         path = worktree / "alpha.txt"
@@ -4931,7 +4131,7 @@ def test_prune_rejects_and_preserves_every_kind_of_dirty_material(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("ignored before prune\n", encoding="utf-8")
 
-    with pytest.raises(TaskError, match="clean"):
+    with pytest.raises(TaskError, match="clean|modified|untracked"):
         service.prune(task_id)
 
     assert path.exists()
@@ -4956,7 +4156,7 @@ def test_prune_requires_collection_and_an_unchanged_return_head(
     service, brief, ownership, _final = _create_terminal_task(moved_root)
     task_id = str(brief["task_id"])
     _commit_child_return(moved_root, brief, ownership)
-    service.collect(task_id)
+    _collect_and_commit(service, task_id)
     worktree = Path(str(ownership["worktree_path"]))
     (worktree / "advanced.txt").write_text("advance branch\n", encoding="utf-8")
     _git(worktree, "add", "advanced.txt")
@@ -4975,7 +4175,7 @@ def test_prune_rejects_half_missing_moved_or_symlinked_ownership(
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
     _commit_child_return(tmp_path, brief, ownership)
-    service.collect(task_id)
+    _collect_and_commit(service, task_id)
     worktree = Path(str(ownership["worktree_path"]))
     if problem == "half_missing":
         _git(tmp_path, "worktree", "remove", str(worktree))

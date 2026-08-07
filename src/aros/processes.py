@@ -8,6 +8,7 @@ import ctypes as _ctypes
 import os as _os
 import signal as _signal
 import subprocess as _subprocess
+import sys as _sys
 from collections.abc import Callable as _Callable
 from collections.abc import Mapping as _Mapping
 from collections.abc import Sequence as _Sequence
@@ -19,14 +20,20 @@ __all__ = [
     "ProcessIdentity",
     "ProcessHandle",
     "ParentDeathSetup",
+    "ProcessObservationError",
+    "enable_child_subreaper",
     "spawn_process",
     "identity_is_live",
+    "leader_identity_is_dead",
+    "process_group_is_live",
+    "process_tree_is_live",
+    "signal_process_tree",
     "signal_process_group",
     "reap_leader",
-    "terminate_and_reap",
 ]
 
 _PR_SET_PDEATHSIG = 1
+_PR_SET_CHILD_SUBREAPER = 36
 _REAP_TIMEOUT_SECONDS = 2.0
 
 
@@ -48,6 +55,26 @@ class ParentDeathSetup:
     expected_parent_pid: int
     before_install: _Callable[[], None]
     after_install: _Callable[[], None]
+
+
+class ProcessObservationError(RuntimeError):
+    """Raised when Linux process truth cannot be observed safely."""
+
+
+def enable_child_subreaper() -> None:
+    if not _sys.platform.startswith("linux"):
+        raise OSError("Run child subreaper requires Linux")
+    try:
+        libc = _ctypes.CDLL(None, use_errno=True)
+        result = libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+    except (AttributeError, OSError, TypeError) as error:
+        raise OSError("unable to enable Run child subreaper") from error
+    if result != 0:
+        error_number = _ctypes.get_errno()
+        raise OSError(
+            error_number,
+            f"unable to enable Run child subreaper: {_os.strerror(error_number)}",
+        )
 
 
 def _set_parent_death_signal() -> None:
@@ -97,8 +124,53 @@ def _read_process_stat(pid: int) -> tuple[str, int, str] | None:
             int(fields_after_name[2]),
             f"linux-proc-start:{fields_after_name[19]}",
         )
-    except (OSError, IndexError, ValueError):
+    except FileNotFoundError:
         return None
+    except (OSError, IndexError, ValueError) as error:
+        raise ProcessObservationError(f"unable to observe process: {pid}") from error
+
+
+def _direct_child_pids(runner_pid: int) -> tuple[int, ...]:
+    try:
+        raw = _Path(
+            f"/proc/{runner_pid}/task/{runner_pid}/children"
+        ).read_text(encoding="utf-8")
+        children = tuple(int(value) for value in raw.split())
+    except (OSError, ValueError) as error:
+        raise ProcessObservationError(
+            f"unable to observe Run descendants: {runner_pid}"
+        ) from error
+    if any(pid <= 1 for pid in children):
+        raise ProcessObservationError(f"invalid Run descendant: {runner_pid}")
+    return children
+
+
+def _adopted_identities(
+    runner_pid: int,
+    leader_pid: int,
+) -> tuple[ProcessIdentity, ...]:
+    adopted: list[ProcessIdentity] = []
+    for pid in _direct_child_pids(runner_pid):
+        if pid == leader_pid:
+            continue
+        observed = _read_process_stat(pid)
+        if observed is not None and observed[0] not in {"Z", "X", "x"}:
+            adopted.append(ProcessIdentity(pid, observed[1], observed[2]))
+    return tuple(adopted)
+
+
+def _reap_adopted_children(runner_pid: int, leader_pid: int) -> None:
+    for pid in _direct_child_pids(runner_pid):
+        if pid == leader_pid:
+            continue
+        try:
+            _os.waitpid(pid, _os.WNOHANG)
+        except ChildProcessError:
+            continue
+        except OSError as error:
+            raise ProcessObservationError(
+                f"unable to reap Run descendant: {pid}"
+            ) from error
 
 
 def _capture_identity(process: _subprocess.Popen[bytes]) -> ProcessIdentity:
@@ -179,11 +251,72 @@ def identity_is_live(identity: ProcessIdentity) -> bool:
     )
 
 
+def leader_identity_is_dead(identity: ProcessIdentity) -> bool:
+    observed = _read_process_stat(identity.pid)
+    return observed is None or (
+        observed[0] in {"Z", "X", "x"}
+        and observed[1:] == (identity.pgid, identity.start_token)
+    )
+
+
+def process_group_is_live(identity: ProcessIdentity) -> bool:
+    observed = _read_process_stat(identity.pid)
+    if observed is not None:
+        if observed[1:] != (identity.pgid, identity.start_token):
+            return False
+        if observed[0] not in {"Z", "X", "x"}:
+            return identity_is_live(identity)
+    try:
+        entries = _os.scandir("/proc")
+    except OSError as error:
+        raise ProcessObservationError("unable to observe Run process group") from error
+    with entries:
+        live = any(
+            (process := _read_process_stat(int(entry.name))) is not None
+            and process[0] not in {"Z", "X", "x"}
+            and process[1] == identity.pgid
+            for entry in entries
+            if entry.name.isdecimal()
+        )
+    confirmed = _read_process_stat(identity.pid)
+    return live and (
+        confirmed is None
+        or confirmed[1:] == (identity.pgid, identity.start_token)
+    )
+
+
+def process_tree_is_live(handle: ProcessHandle, runner_pid: int) -> bool:
+    _reap_adopted_children(runner_pid, handle.identity.pid)
+    if process_group_is_live(handle.identity):
+        return True
+    if _adopted_identities(runner_pid, handle.identity.pid):
+        return True
+    _reap_adopted_children(runner_pid, handle.identity.pid)
+    return bool(_adopted_identities(runner_pid, handle.identity.pid))
+
+
+def signal_process_tree(
+    handle: ProcessHandle,
+    runner_pid: int,
+    signal_number: int,
+) -> bool:
+    delivered = signal_process_group(handle.identity, signal_number)
+    for identity in _adopted_identities(runner_pid, handle.identity.pid):
+        if identity.pgid == handle.identity.pgid or not identity_is_live(identity):
+            continue
+        try:
+            _os.kill(identity.pid, signal_number)
+        except ProcessLookupError:
+            continue
+        delivered = True
+    return delivered
+
+
 def signal_process_group(
     identity: ProcessIdentity,
     signal_number: int,
 ) -> bool:
-    if not identity_is_live(identity):
+    if not process_group_is_live(identity):
         return False
     try:
         _os.killpg(identity.pgid, signal_number)
@@ -202,30 +335,3 @@ def reap_leader(
         raise TimeoutError(
             f"unable to reap process leader: {handle.identity.pid}"
         ) from error
-
-
-def terminate_and_reap(
-    handle: ProcessHandle,
-    *,
-    grace_seconds: float = 1.0,
-) -> tuple[int, tuple[str, ...]]:
-    if handle.process.poll() is not None:
-        return reap_leader(handle), ()
-    sequence: list[str] = []
-    if signal_process_group(handle.identity, _signal.SIGTERM):
-        sequence.append("TERM")
-    try:
-        exit_code = reap_leader(handle, grace_seconds)
-    except TimeoutError:
-        try:
-            group_killed = signal_process_group(
-                handle.identity,
-                _signal.SIGKILL,
-            )
-        except PermissionError:
-            group_killed = False
-        if not group_killed:
-            handle.process.kill()
-        sequence.append("KILL")
-        exit_code = reap_leader(handle, _REAP_TIMEOUT_SECONDS)
-    return exit_code, tuple(sequence)

@@ -15,9 +15,8 @@ from unittest.mock import Mock
 
 import arbor.aros.runner as runner_module
 import arbor.aros.runs as runs_module
-import arbor.aros.task_runner as task_runner_module
-import arbor.aros.tasks as tasks_module
 import pytest
+from arbor.aros.checkpoint import GitCheckpoint
 from arbor.aros.receipts import content_receipt, digest_chunks, record_sha256
 from arbor.aros.runs import RunService
 from arbor.aros.store import FINAL_IDENTITY_FIELDS, json_sha256
@@ -214,23 +213,15 @@ def test_completed_run_persists_compatible_receipts(
         )
 
 
-def test_completed_task_persists_compatible_receipts_and_self_hash(
+def test_completed_task_reads_and_verifies_its_bound_run_receipts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_tmux()
     observed_record_sha256 = Mock(wraps=record_sha256)
-    observed_digest_chunks = Mock(wraps=digest_chunks)
-    observed_content_receipt = Mock(wraps=content_receipt)
 
     monkeypatch.setattr(
-        tasks_module, "record_sha256", observed_record_sha256, raising=False
-    )
-    monkeypatch.setattr(
-        tasks_module, "digest_chunks", observed_digest_chunks, raising=False
-    )
-    monkeypatch.setattr(
-        tasks_module, "content_receipt", observed_content_receipt, raising=False
+        runs_module, "record_sha256", observed_record_sha256, raising=False
     )
     root = tmp_path / "workspace"
     _init_repo(root, task_workspace=True)
@@ -253,47 +244,40 @@ def test_completed_task_persists_compatible_receipts_and_self_hash(
     task_id = str(brief["task_id"])
     _git(root, "add", f"tasks/{task_id}/brief.json")
     _git(root, "commit", "-qm", f"record {task_id}")
-    socket_name = tasks_module._tmux_socket_name(root, task_id)
+    run_id: str | None = None
 
     try:
-        service.start(task_id)
+        service.start(
+            task_id,
+            actor="principal",
+            commit_paths=GitCheckpoint(root).commit_paths,
+        )
         terminal = _wait_for_terminal(
             lambda: service.status(task_id),
             {"completed", "failed_process", "timed_out", "cancelled", "lost"},
         )
-        runtime = root / ".aros" / "tasks" / task_id
-        final = json.loads((runtime / "final.json").read_text(encoding="utf-8"))
+        run_id = str(terminal["run_id"])
+        runs = RunService(root)
+        final = runs.read_validated_final(run_id)
         expected_outputs = {
             "stdout": b"task stdout\n",
             "stderr": b"task stderr\n",
         }
 
         assert terminal["state"] == "completed"
-        assert set(final) == task_runner_module._FINAL_FIELDS
         assert final["state"] == "completed"
         assert final["exit_code"] == 0
-        assert final["brief_sha256"] == brief["brief_sha256"]
+        assert final["run_id"] == run_id
+        assert final["manifest_sha256"] == terminal["run_manifest_sha256"]
         for stream, content in expected_outputs.items():
-            relative = f".aros/tasks/{task_id}/{stream}.log"
+            relative = f".aros/runs/{run_id}/{stream}.log"
             expected = content_receipt(
                 relative,
                 *digest_chunks([content]),
             )
             assert final[stream] == expected
-            assert tasks_module._file_receipt(
-                runtime / f"{stream}.log",
-                relative,
-                permissions_enforced=bool(
-                    final["filesystem_permissions_enforced"]
-                ),
-            ) == expected
-        assert final["final_sha256"] == record_sha256(final, "final_sha256")
-        assert tasks_module._record_sha256(final, "final_sha256") == final[
-            "final_sha256"
-        ]
+            runs.verify_output(run_id, stream)
         assert observed_record_sha256.call_count >= 1
-        assert observed_digest_chunks.call_count >= 2
-        assert observed_content_receipt.call_count >= 2
     finally:
         with suppress(Exception):
             status = service.status(task_id)
@@ -303,8 +287,9 @@ def test_completed_task_persists_compatible_receipts_and_self_hash(
                     actor="principal",
                     reason="receipt compatibility cleanup",
                 )
-        subprocess.run(
-            ["tmux", "-L", socket_name, "kill-server"],
-            capture_output=True,
-            check=False,
-        )
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", f"=aros-{run_id.lower()}"],
+                capture_output=True,
+                check=False,
+            )

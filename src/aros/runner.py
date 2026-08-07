@@ -311,6 +311,7 @@ def run(workspace: str, run_id: str) -> int:
         ) as stderr:
             if bundle_binding is not None:
                 validate_execution_bundle(*bundle_binding)
+            processes.enable_child_subreaper()
             handle = processes.spawn_process(
                 list(manifest["argv"]),
                 cwd=cwd,
@@ -366,9 +367,19 @@ def run(workspace: str, run_id: str) -> int:
     stop_escalated = False
     stop_signal_sequence: list[str] = []
     stop_started_monotonic: float | None = None
+    timeout_escalated = False
+    timeout_started_monotonic: float | None = None
+    drain_deadline: float | None = None
     last_heartbeat = time.monotonic()
+    runner_pid = os.getpid()
 
-    while handle.process.poll() is None:
+    while True:
+        polled = handle.process.poll()
+        if polled is not None and exit_code is None:
+            exit_code = polled
+        tree_is_live = processes.process_tree_is_live(handle, runner_pid)
+        if exit_code is not None and not tree_is_live:
+            break
         stop_request = _read_stop_request(runtime)
         if stop_request is not None and not stop_attempted:
             requested_name = str(stop_request.get("signal", "TERM"))
@@ -377,8 +388,9 @@ def run(workspace: str, run_id: str) -> int:
                 "KILL": signal.SIGKILL,
                 "INT": signal.SIGINT,
             }.get(requested_name, signal.SIGTERM)
-            delivered_stop = processes.signal_process_group(
-                handle.identity,
+            delivered_stop = processes.signal_process_tree(
+                handle,
+                runner_pid,
                 requested_signal,
             )
             if delivered_stop:
@@ -386,6 +398,8 @@ def run(workspace: str, run_id: str) -> int:
             stop_started_monotonic = time.monotonic()
             stop_attempted = True
             stop_escalated = requested_name == "KILL"
+            if stop_escalated and delivered_stop:
+                drain_deadline = time.monotonic() + 2
             if not delivered_stop:
                 _write_stop_receipt(
                     root,
@@ -401,16 +415,31 @@ def run(workspace: str, run_id: str) -> int:
             and stop_started_monotonic is not None
             and time.monotonic() - stop_started_monotonic >= 1
         ):
-            if processes.signal_process_group(handle.identity, signal.SIGKILL):
+            if processes.signal_process_tree(handle, runner_pid, signal.SIGKILL):
                 stop_signal_sequence.append("KILL")
             stop_escalated = True
-        if not delivered_stop and time.monotonic() - started_monotonic >= timeout_seconds:
-            timeout_hit = True
-            exit_code, timeout_signals = processes.terminate_and_reap(
-                handle,
-                grace_seconds=1,
-            )
-            timeout_signal_sequence = list(timeout_signals)
+            drain_deadline = time.monotonic() + 2
+        if (
+            not delivered_stop
+            and not timeout_hit
+            and time.monotonic() - started_monotonic >= timeout_seconds
+        ):
+            if processes.signal_process_tree(handle, runner_pid, signal.SIGTERM):
+                timeout_hit = True
+                timeout_signal_sequence.append("TERM")
+                timeout_started_monotonic = time.monotonic()
+        elif (
+            timeout_hit
+            and not timeout_escalated
+            and timeout_started_monotonic is not None
+            and time.monotonic() - timeout_started_monotonic >= 1
+        ):
+            if processes.signal_process_tree(handle, runner_pid, signal.SIGKILL):
+                timeout_signal_sequence.append("KILL")
+            timeout_escalated = True
+            drain_deadline = time.monotonic() + 2
+        if drain_deadline is not None and tree_is_live and time.monotonic() >= drain_deadline:
+            raise processes.ProcessObservationError("Run descendants did not drain")
         now = time.monotonic()
         if now - last_heartbeat >= 0.2:
             heartbeat_at = _utc_now()
@@ -418,7 +447,7 @@ def run(workspace: str, run_id: str) -> int:
             running_status["updated_at"] = heartbeat_at
             atomic_write_json(runtime / "status.json", running_status)
             last_heartbeat = now
-        if handle.process.poll() is None:
+        if exit_code is None or tree_is_live:
             time.sleep(0.02)
 
     if exit_code is None:

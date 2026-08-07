@@ -1342,8 +1342,40 @@ class RunService:
             pgid=pgid,
             start_token=expected_start_token,
         )
-        if not processes.identity_is_live(identity):
-            raise RunError(f"run process identity changed; refusing stop: {run_id}")
+        leader_is_live = (
+            processes.identity_is_live(identity)
+            or processes.process_group_is_live(identity)
+        )
+        if not leader_is_live:
+            if not processes.leader_identity_is_dead(identity):
+                raise RunError(f"run process identity changed; refusing stop: {run_id}")
+            manifest = self._load_manifest(run_id)
+            prelaunch = _read_strict_object(
+                self._receipts_path() / f"{run_id}-prelaunch.json",
+                "prelaunch receipt",
+            )
+            session = f"aros-{run_id.lower()}"
+            _validate_prelaunch_receipt(
+                prelaunch,
+                manifest,
+                expected_session=session,
+                expected_invocation=_runner_invocation(self.root, run_id),
+                expected_host=socket.gethostname(),
+            )
+            runner_pid = status.get("runner_pid")
+            if (
+                status.get("state") != "running"
+                or status.get("actor") != prelaunch.get("actor")
+                or status.get("carrier") != "tmux"
+                or status.get("tmux_session") != session
+                or status.get("host") != prelaunch.get("host")
+                or status.get("launch_receipt_sha256")
+                != prelaunch.get("receipt_sha256")
+                or type(runner_pid) is not int
+                or runner_pid <= 1
+                or not _tmux_session_exists(session)
+            ):
+                raise RunError(f"run process identity changed; refusing stop: {run_id}")
 
         requested_at = _utc_now()
         request = {
@@ -1481,11 +1513,12 @@ class RunService:
             isinstance(pid, int)
             and isinstance(pgid, int)
             and isinstance(token, str)
-            and processes.identity_is_live(
-                processes.ProcessIdentity(
-                    pid=pid,
-                    pgid=pgid,
-                    start_token=token,
+            and (
+                processes.identity_is_live(
+                    processes.ProcessIdentity(pid, pgid, token)
+                )
+                or processes.process_group_is_live(
+                    processes.ProcessIdentity(pid, pgid, token)
                 )
             )
         ):
@@ -1493,6 +1526,8 @@ class RunService:
         session_name = status.get("tmux_session")
         if isinstance(session_name, str) and _tmux_session_exists(session_name):
             return status
+        if self._final_path(run_id).is_file():
+            return self._reconcile_locked(run_id)
 
         lost_at = _utc_now()
         lost = {

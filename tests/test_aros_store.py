@@ -16,7 +16,6 @@ from typing import BinaryIO, Callable
 
 import pytest
 
-import arbor.aros.task_runner as task_runner_module
 import arbor.aros.store as store_module
 from arbor.aros.store import (
     FINAL_IDENTITY_FIELDS,
@@ -773,48 +772,6 @@ def test_anchored_workspace_reader_preserves_body_and_revalidation_errors(
 
     assert isinstance(caught.value.original_error, BodyError)
     assert isinstance(caught.value.revalidation_error, store_module.AnchoredReadError)
-
-
-def test_task_execution_claim_read_recovers_crashed_store_alias(
-    tmp_path: Path,
-) -> None:
-    task_id = "TASK-20260803-recovered-execution"
-    target = tmp_path / "execution.json"
-    brief = {"task_id": task_id, "brief_sha256": "a" * 64}
-    ownership = {"ownership_sha256": "b" * 64}
-    launch = {"launch_sha256": "c" * 64, "host": "test-host"}
-    claim: dict[str, object] = {
-        "schema_version": 1,
-        "task_id": task_id,
-        "brief_sha256": brief["brief_sha256"],
-        "ownership_sha256": ownership["ownership_sha256"],
-        "launch_sha256": launch["launch_sha256"],
-        "host": launch["host"],
-        "runner_pid": 123,
-        "runner_pgid": 123,
-        "runner_start_token": "linux-proc-start:1",
-        "claimed_at": "2026-08-03T00:00:00.000Z",
-    }
-    claim["execution_sha256"] = task_runner_module._record_sha256(
-        claim,
-        "execution_sha256",
-    )
-
-    class Service:
-        def _execution_path(self, observed_task_id: str) -> Path:
-            assert observed_task_id == task_id
-            return target
-
-    _crash_after_link(target, claim)
-
-    assert task_runner_module.load_execution_claim(
-        Service(),  # type: ignore[arg-type]
-        brief,
-        ownership,
-        launch,
-    ) == claim
-    assert target.stat().st_nlink == 1
-    assert _temporary_paths(target) == []
 
 
 def test_create_json_existing_target_skips_temp_creation(

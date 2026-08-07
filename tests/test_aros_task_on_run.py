@@ -2540,6 +2540,8 @@ def test_lost_status_never_inspects_or_commits_a_terminal_final(
 
     assert status["state"] == "lost"
     assert status["final_ref"] is None
+    with pytest.raises(TaskError, match="not terminal"):
+        TaskService(tmp_path).collect(task_id)
 
 
 def test_stop_delegates_to_bound_run_without_task_stop_material(

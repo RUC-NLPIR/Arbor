@@ -367,6 +367,58 @@ def _require_tmux() -> None:
         pytest.skip("tmux is unavailable")
 
 
+def _linux_process_state(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return None
+
+
+def _linux_process_is_live(pid: int) -> bool:
+    state = _linux_process_state(pid)
+    return state is not None and state not in {"Z", "X", "x"}
+
+
+def _wait_for_running_status(
+    service: RunService,
+    run_id: str,
+) -> dict[str, object]:
+    deadline = time.monotonic() + 5
+    status: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        status = service.status(run_id, reconcile=False)
+        if status["state"] == "running":
+            return status
+        time.sleep(0.02)
+    pytest.fail(f"run {run_id} did not start; latest status: {status}")
+
+
+def _wait_for_process_exit(pid: int) -> None:
+    deadline = time.monotonic() + 5
+    while _linux_process_is_live(pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not _linux_process_is_live(pid)
+
+
+def _leader_with_descendant(descendant: str, *, escaped: bool = False) -> str:
+    return (
+        "import subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        f"child=subprocess.Popen([sys.executable,'-c',{descendant!r}],"
+        f"start_new_session={escaped!r})\n"
+        "Path('descendant.pid').write_text(str(child.pid),encoding='utf-8')\n"
+        "deadline=time.monotonic()+5\n"
+        "while not Path('descendant.ready').exists() and time.monotonic()<deadline:\n"
+        "    time.sleep(0.01)\n"
+        "if not Path('descendant.ready').exists():\n"
+        "    raise SystemExit(2)\n"
+        "Path('leader.ready').touch()\n"
+        "while not Path('leader.release').exists():\n"
+        "    time.sleep(0.01)\n"
+        "print('leader stdout',flush=True)\n"
+    )
+
+
 def test_prepare_freezes_a_versioned_manifest_and_runtime_status(tmp_path: Path) -> None:
     head = _init_clean_repo(tmp_path)
 
@@ -2315,6 +2367,321 @@ def test_timeout_is_a_process_state_with_automatic_final(tmp_path: Path) -> None
     assert final["state"] == "timed_out"
     assert final["timeout_seconds"] == 0.2
     assert "scientific" not in json.dumps(final).lower()
+
+
+def test_runner_waits_for_same_group_descendant_and_late_stdout(
+    tmp_path: Path,
+) -> None:
+    if not Path("/proc/self/stat").is_file():
+        pytest.skip("Linux /proc is unavailable")
+    _init_clean_repo(tmp_path)
+    descendant = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "Path('descendant.ready').touch()\n"
+        "while not Path('descendant.release').exists(): time.sleep(0.01)\n"
+        "print('late descendant stdout',flush=True)\n"
+    )
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", _leader_with_descendant(descendant)],
+        key="run-late-descendant-output",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    leader_release = tmp_path / "leader.release"
+    descendant_release = tmp_path / "descendant.release"
+    descendant_pid: int | None = None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+        try:
+            running = _wait_for_running_status(service, run_id)
+            deadline = time.monotonic() + 5
+            while not (tmp_path / "leader.ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            descendant_pid = int((tmp_path / "descendant.pid").read_text())
+            leader_release.touch()
+            _wait_for_process_exit(int(running["process_pid"]))
+            assert _linux_process_is_live(descendant_pid)
+            assert not runner.done()
+            assert not (tmp_path / "runs" / run_id / "final.json").exists()
+            descendant_release.touch()
+            assert runner.result(timeout=5) == 0
+        finally:
+            leader_release.touch(exist_ok=True)
+            descendant_release.touch(exist_ok=True)
+            if descendant_pid is not None and _linux_process_is_live(descendant_pid):
+                os.kill(descendant_pid, signal.SIGKILL)
+    final = service.read_validated_final(run_id)
+    assert final["state"] == "completed"
+    assert service.read_verified_output(run_id, "stdout") == (
+        b"leader stdout\nlate descendant stdout\n"
+    )
+
+
+def test_timeout_after_leader_exit_drains_same_group_descendant(
+    tmp_path: Path,
+) -> None:
+    if not Path("/proc/self/stat").is_file():
+        pytest.skip("Linux /proc is unavailable")
+    _init_clean_repo(tmp_path)
+    descendant = (
+        "import signal,time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "Path('descendant.ready').touch()\n"
+        "time.sleep(30)\n"
+    )
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", _leader_with_descendant(descendant)],
+        timeout=0.3,
+        key="run-timeout-after-leader-exit",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    descendant_pid: int | None = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+            running = _wait_for_running_status(service, run_id)
+            deadline = time.monotonic() + 5
+            while not (tmp_path / "leader.ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            descendant_pid = int((tmp_path / "descendant.pid").read_text())
+            (tmp_path / "leader.release").touch()
+            _wait_for_process_exit(int(running["process_pid"]))
+            assert runner.result(timeout=5) == 0
+        final = service.read_validated_final(run_id)
+        assert final["state"] == "timed_out"
+        assert final["signal_sequence"] == ["TERM", "KILL"]
+        _wait_for_process_exit(descendant_pid)
+    finally:
+        (tmp_path / "leader.release").touch(exist_ok=True)
+        if descendant_pid is not None and _linux_process_is_live(descendant_pid):
+            os.kill(descendant_pid, signal.SIGKILL)
+
+
+def test_stop_after_leader_exit_drains_same_group_descendant(
+    tmp_path: Path,
+) -> None:
+    if not Path("/proc/self/stat").is_file():
+        pytest.skip("Linux /proc is unavailable")
+    _init_clean_repo(tmp_path)
+    descendant = (
+        "import signal,time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "Path('descendant.ready').touch()\n"
+        "time.sleep(30)\n"
+    )
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[sys.executable, "-c", _leader_with_descendant(descendant)],
+        key="run-stop-after-leader-exit",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    descendant_pid: int | None = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+            running = _wait_for_running_status(service, run_id)
+            deadline = time.monotonic() + 5
+            while not (tmp_path / "leader.ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            descendant_pid = int((tmp_path / "descendant.pid").read_text())
+            (tmp_path / "leader.release").touch()
+            _wait_for_process_exit(int(running["process_pid"]))
+            receipt = service.stop(run_id, actor="owner", reason="stop remaining group")
+            assert runner.result(timeout=5) == 0
+        final = service.read_validated_final(run_id)
+        assert receipt["delivered"] is True
+        assert final["state"] == "cancelled"
+        assert final["signal_sequence"] == ["TERM", "KILL"]
+        _wait_for_process_exit(descendant_pid)
+    finally:
+        (tmp_path / "leader.release").touch(exist_ok=True)
+        if descendant_pid is not None and _linux_process_is_live(descendant_pid):
+            os.kill(descendant_pid, signal.SIGKILL)
+
+
+def test_public_stop_after_leader_exit_drains_adopted_descendant(
+    tmp_path: Path,
+) -> None:
+    _require_tmux()
+    _init_clean_repo(tmp_path)
+    descendant = (
+        "import signal,time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "Path('descendant.ready').touch()\n"
+        "time.sleep(30)\n"
+    )
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            _leader_with_descendant(descendant, escaped=True),
+        ],
+        timeout=30,
+        key="run-stop-adopted-descendant",
+    )
+    run_id = str(manifest["run_id"])
+    descendant_pid: int | None = None
+    try:
+        service.start(run_id)
+        running = _wait_for_running_status(service, run_id)
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "leader.ready").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        descendant_pid = int((tmp_path / "descendant.pid").read_text())
+        (tmp_path / "leader.release").touch()
+        _wait_for_process_exit(int(running["process_pid"]))
+        assert service.status(run_id)["state"] == "running"
+        assert _linux_process_is_live(descendant_pid)
+
+        receipt = service.stop(run_id, actor="owner", reason="stop adopted child")
+        final = service.read_validated_final(run_id)
+
+        assert receipt["delivered"] is True
+        assert final["state"] == "cancelled"
+        assert final["signal_sequence"] == ["TERM", "KILL"]
+        _wait_for_process_exit(descendant_pid)
+    finally:
+        (tmp_path / "leader.release").touch(exist_ok=True)
+        if descendant_pid is not None and _linux_process_is_live(descendant_pid):
+            os.killpg(descendant_pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    ("dead-session", "host", "session", "runner-pid"),
+)
+def test_dead_leader_stop_fallback_rejects_unbound_carrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forgery: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key=f"dead-leader-{forgery}")
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    runtime = tmp_path / ".aros" / "runs" / run_id
+    status = json.loads((runtime / "status.json").read_text())
+    status.update(
+        {
+            "state": "running",
+            "runner_pid": 12345,
+            "process_pid": 12346,
+            "process_pgid": 12346,
+            "process_start_token": "linux-proc-start:1",
+            "started_at": status["launched_at"],
+            "heartbeat_at": status["launched_at"],
+        }
+    )
+    if forgery == "host":
+        status["host"] = "forged-host"
+    elif forgery == "session":
+        status["tmux_session"] = "forged-session"
+    elif forgery == "runner-pid":
+        status["runner_pid"] = 0
+    atomic_write_json(runtime / "status.json", status)
+    monkeypatch.setattr(processes_module, "identity_is_live", lambda _identity: False)
+    monkeypatch.setattr(processes_module, "process_group_is_live", lambda _identity: False)
+    monkeypatch.setattr(
+        runs_module,
+        "_tmux_session_exists",
+        lambda _session: forgery != "dead-session",
+    )
+
+    with pytest.raises(RunError):
+        service.stop(run_id, actor="owner", reason="must fail closed")
+
+    assert not (runtime / "stop-request.json").exists()
+
+
+def test_timeout_drains_adopted_new_session_descendant_without_early_completion(
+    tmp_path: Path,
+) -> None:
+    if not Path("/proc/self/stat").is_file():
+        pytest.skip("Linux /proc is unavailable")
+    _init_clean_repo(tmp_path)
+    descendant = (
+        "import signal,time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "Path('descendant.ready').touch()\n"
+        "time.sleep(30)\n"
+    )
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            _leader_with_descendant(descendant, escaped=True),
+        ],
+        timeout=0.3,
+        key="run-timeout-adopted-descendant",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    descendant_pid: int | None = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+            running = _wait_for_running_status(service, run_id)
+            deadline = time.monotonic() + 5
+            while not (tmp_path / "leader.ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            descendant_pid = int((tmp_path / "descendant.pid").read_text())
+            (tmp_path / "leader.release").touch()
+            _wait_for_process_exit(int(running["process_pid"]))
+            assert not runner.done()
+            assert not (tmp_path / "runs" / run_id / "final.json").exists()
+            assert runner.result(timeout=5) == 0
+        final = service.read_validated_final(run_id)
+        assert final["state"] == "timed_out"
+        assert final["signal_sequence"] == ["TERM", "KILL"]
+        _wait_for_process_exit(descendant_pid)
+    finally:
+        (tmp_path / "leader.release").touch(exist_ok=True)
+        if descendant_pid is not None and _linux_process_is_live(descendant_pid):
+            os.killpg(descendant_pid, signal.SIGKILL)
+
+
+def test_process_group_observation_failure_is_not_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_scan(_path: str) -> None:
+        raise PermissionError("injected /proc observation failure")
+
+    monkeypatch.setattr(processes_module._os, "scandir", fail_scan)
+
+    with pytest.raises(processes_module.ProcessObservationError):
+        processes_module.process_group_is_live(
+            processes_module.ProcessIdentity(999_999, 999_999, "absent-token")
+        )
+
+
+def test_runner_fails_closed_before_spawn_when_subreaper_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(tmp_path, key="run-subreaper-unavailable")
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    monkeypatch.setattr(
+        processes_module,
+        "enable_child_subreaper",
+        lambda: (_ for _ in ()).throw(OSError("subreaper unavailable")),
+    )
+    monkeypatch.setattr(
+        processes_module,
+        "spawn_process",
+        lambda *_args, **_kwargs: pytest.fail("process must not spawn"),
+    )
+
+    assert runner_module.run(str(tmp_path), run_id) == 1
+    final = service.read_validated_final(run_id)
+    assert final["state"] == "failed_process"
+    assert "subreaper unavailable" in str(final["error"])
 
 
 def test_nonzero_exit_is_failed_process_not_scientific_negative(tmp_path: Path) -> None:

@@ -300,3 +300,146 @@ def test_task_runtime_contains_no_duplicate_process_authority(
             for key in _json_keys(record)
             if any(fragment in key for fragment in forbidden)
         }, path
+
+
+def test_task_adapter_execs_frozen_argv_in_owned_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbor.aros.task_adapter as adapter
+
+    worktree = tmp_path / "child"
+    worktree.mkdir()
+    context = {
+        "argv": ["worker", "--exact"],
+        "worktree": str(worktree),
+        "environment": {
+            "PATH": "/controlled/bin",
+            "AROS_TASK_ID": "TASK-20260807-test",
+        },
+    }
+    loaded: list[tuple[Path, str]] = []
+
+    def fake_load_adapter_context(workspace: Path, task_id: str) -> dict[str, object]:
+        loaded.append((workspace, task_id))
+        return context
+
+    monkeypatch.setattr(adapter, "load_adapter_context", fake_load_adapter_context)
+    changed: list[Path] = []
+    executed: list[tuple[str, list[str], dict[str, str]]] = []
+    monkeypatch.setattr(adapter.os, "chdir", lambda path: changed.append(Path(path)))
+    monkeypatch.setattr(
+        adapter.os,
+        "execvpe",
+        lambda executable, argv, env: executed.append((executable, argv, env)),
+    )
+
+    assert adapter.main(
+        ["--workspace", str(tmp_path), "--task-id", "TASK-20260807-test"]
+    ) == 0
+    assert loaded == [(tmp_path, "TASK-20260807-test")]
+    assert changed == [worktree]
+    assert executed == [("worker", ["worker", "--exact"], context["environment"])]
+
+
+def test_task_adapter_environment_is_explicitly_allowlisted(tmp_path: Path) -> None:
+    from arbor.aros.task_adapter import build_adapter_environment
+
+    runtime = tmp_path / "runtime"
+    brief_path = tmp_path / "tasks/TASK-20260807-test/brief.json"
+    worktree = tmp_path / ".worktree/tasks/TASK-20260807-test"
+    environment = build_adapter_environment(
+        runtime,
+        task_id="TASK-20260807-test",
+        brief_path=brief_path,
+        worktree=worktree,
+        base_commit="a" * 40,
+        brief_sha256="b" * 64,
+        source={
+            "PATH": "/controlled/bin",
+            "LANG": "C.UTF-8",
+            "SECRET_TOKEN": "must-not-pass",
+            "PYTHONPATH": "/must/not/pass",
+        },
+    )
+
+    assert environment == {
+        "PATH": "/controlled/bin",
+        "LANG": "C.UTF-8",
+        "HOME": str(runtime / "home"),
+        "TMPDIR": str(runtime / "tmp"),
+        "AROS_TASK_ID": "TASK-20260807-test",
+        "AROS_TASK_BRIEF": str(brief_path),
+        "AROS_TASK_WORKTREE": str(worktree),
+        "AROS_TASK_BASE_COMMIT": "a" * 40,
+        "AROS_TASK_BRIEF_SHA256": "b" * 64,
+    }
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        pytest.param([], id="context-not-dict"),
+        pytest.param(
+            {"argv": ("worker",), "worktree": "/owned", "environment": {}},
+            id="argv-not-list",
+        ),
+        pytest.param(
+            {"argv": [], "worktree": "/owned", "environment": {}},
+            id="argv-empty",
+        ),
+        pytest.param(
+            {"argv": ["worker", 1], "worktree": "/owned", "environment": {}},
+            id="argv-item-not-string",
+        ),
+        pytest.param(
+            {"argv": ["worker", ""], "worktree": "/owned", "environment": {}},
+            id="argv-item-empty",
+        ),
+        pytest.param(
+            {"argv": ["worker"], "worktree": 1, "environment": {}},
+            id="worktree-not-string",
+        ),
+        pytest.param(
+            {"argv": ["worker"], "worktree": "", "environment": {}},
+            id="worktree-empty",
+        ),
+        pytest.param(
+            {"argv": ["worker"], "worktree": "/owned", "environment": []},
+            id="environment-not-dict",
+        ),
+        pytest.param(
+            {"argv": ["worker"], "worktree": "/owned", "environment": {1: "x"}},
+            id="environment-key-not-string",
+        ),
+        pytest.param(
+            {
+                "argv": ["worker"],
+                "worktree": "/owned",
+                "environment": {"PATH": 1},
+            },
+            id="environment-value-not-string",
+        ),
+    ],
+)
+def test_task_adapter_rejects_invalid_context_before_side_effects(
+    context: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbor.aros.task_adapter as adapter
+
+    monkeypatch.setattr(adapter, "load_adapter_context", lambda *_args: context)
+    changed: list[str] = []
+    executed: list[tuple[str, list[str], dict[str, str]]] = []
+    monkeypatch.setattr(adapter.os, "chdir", lambda path: changed.append(path))
+    monkeypatch.setattr(
+        adapter.os,
+        "execvpe",
+        lambda executable, argv, env: executed.append((executable, argv, env)),
+    )
+
+    with pytest.raises(ValueError, match="Task adapter context is invalid"):
+        adapter.main(["--workspace", "/workspace", "--task-id", "TASK-test"])
+
+    assert changed == []
+    assert executed == []

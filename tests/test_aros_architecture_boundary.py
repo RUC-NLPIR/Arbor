@@ -2632,3 +2632,18 @@ def test_legacy_freeze_fails_closed_for_option_shaped_base(
 
     assert result.returncode == 2
     assert "--quiet" in result.stdout + result.stderr
+
+
+def test_phase0a_removes_duplicate_task_carrier() -> None:
+    root = Path(__file__).resolve().parents[1]
+    assert not (root / "src/aros/task_runner.py").exists()
+    assert (root / "src/aros/task_adapter.py").is_file()
+    source = (root / "src/aros/tasks.py").read_text(encoding="utf-8")
+    assert "task_runner" not in source
+    assert "_run_carrier_guardian" not in source
+
+
+def test_phase0a_aros_source_budget() -> None:
+    root = Path(__file__).resolve().parents[1] / "src/aros"
+    lines = sum(len(path.read_bytes().splitlines()) for path in root.rglob("*.py"))
+    assert lines <= 16_000

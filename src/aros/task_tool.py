@@ -7,7 +7,6 @@ from collections.abc import Callable
 from typing import Any
 
 from ..core.tools.base import Tool
-from .operational import OperationalIntent
 from .tasks import TaskError, TaskService
 
 
@@ -85,29 +84,32 @@ class TaskTool(Tool):
     def __init__(
         self,
         *,
-        operational_admission: Callable[[OperationalIntent], dict[str, object]]
+        commit_paths: Callable[[tuple[str, ...], str], dict[str, object]]
         | None = None,
+        record_observation: Callable[[str], None] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        if operational_admission is not None and not callable(operational_admission):
-            raise TypeError("operational_admission must be callable or None")
-        self.operational_admission = operational_admission
+        if commit_paths is not None and not callable(commit_paths):
+            raise TypeError("commit_paths must be callable or None")
+        if record_observation is not None and not callable(record_observation):
+            raise TypeError("record_observation must be callable or None")
+        self.commit_paths = commit_paths
+        self.record_observation = record_observation
 
-    def _operational_result(
+    def _committed_result(
         self,
         record: dict[str, object],
-        intent: OperationalIntent | None,
+        paths: tuple[str, ...] | None,
+        message: str | None,
+        *,
+        observation: str | None = None,
     ) -> dict[str, object]:
-        if intent is None:
-            return record
-        result = {
-            **record,
-            "admission_required": self.operational_admission is None,
-            "operational_intent": intent.to_json(),
-        }
-        if self.operational_admission is not None:
-            result["operational_checkpoint"] = self.operational_admission(intent)
+        result = dict(record)
+        if paths is not None and message is not None and self.commit_paths is not None:
+            result["checkpoint"] = self.commit_paths(paths, message)
+        if observation is not None and self.record_observation is not None:
+            self.record_observation(observation)
         return result
 
     async def execute(self, **kwargs: Any) -> str:
@@ -135,7 +137,7 @@ class TaskTool(Tool):
 
         service = TaskService(self.cwd)
         if action == "create":
-            record, intent = service.create_with_operational_intent(
+            record, paths, message = service.create_with_commit(
                 kwargs["objective"],
                 actor="principal",
                 mode=kwargs["mode"],
@@ -149,7 +151,7 @@ class TaskTool(Tool):
                 timeout_seconds=kwargs.get("timeout_seconds", 3600),
                 idempotency_key=kwargs["idempotency_key"],
             )
-            result = self._operational_result(record, intent)
+            result = self._committed_result(record, paths, message)
         elif action == "start":
             result = service.start(kwargs["task_id"], actor="principal")
         elif action == "status":
@@ -169,10 +171,16 @@ class TaskTool(Tool):
                 reason=kwargs["reason"],
             )
         elif action == "collect":
-            record, intent = service.collect_with_operational_intent(
+            record, paths, message = service.collect_with_commit(
                 kwargs["task_id"]
             )
-            result = self._operational_result(record, intent)
+            observation = paths[0] if paths is not None else None
+            result = self._committed_result(
+                record,
+                paths,
+                message,
+                observation=observation,
+            )
         elif action == "preserve":
             result = service.preserve(kwargs["task_id"])
         else:

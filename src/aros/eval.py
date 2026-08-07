@@ -24,7 +24,6 @@ from .eval_records import (
     parse_visible_manifest,
     validate_measurement_receipt,
 )
-from .operational import OperationalIntent, build_operational_intent
 from .receipts import record_sha256
 from .runs import RunService
 from .store import (
@@ -575,7 +574,7 @@ class EvalService:
                 runs,
             )
 
-    def run_with_operational_intent(
+    def run_with_commit(
         self,
         evaluator_id: str,
         version: str,
@@ -583,8 +582,12 @@ class EvalService:
         *,
         actor: str,
         idempotency_key: str,
-    ) -> tuple[dict[str, object] | ExistingEvaluation, OperationalIntent | None]:
-        """Return the unchanged result plus a receipt intent when one exists."""
+    ) -> tuple[
+        dict[str, object] | ExistingEvaluation,
+        tuple[str, ...] | None,
+        str | None,
+    ]:
+        """Return the result and its direct receipt commit request when present."""
         result = self.run(
             evaluator_id,
             version,
@@ -596,12 +599,12 @@ class EvalService:
         eval_id = projection.get("eval_id")
         receipt_sha256 = projection.get("receipt_sha256")
         if not isinstance(eval_id, str) or not isinstance(receipt_sha256, str):
-            return result, None
-        intent = build_operational_intent(
+            return result, None, None
+        return (
+            result,
             (f"eval/evaluations/{eval_id}/receipt.json",),
-            receipt_sha256,
+            f"Record evaluation {eval_id} receipt",
         )
-        return result, intent
 
     def status(self, eval_id: str) -> dict[str, object]:
         """Return the factual public projection for one visible evaluation."""

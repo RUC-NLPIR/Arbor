@@ -1,5 +1,3 @@
-"""Bounded, read-only attention over canonical meaning and candidate reality."""
-
 from __future__ import annotations
 
 import hashlib
@@ -17,9 +15,9 @@ from .attention_fit import (
     freeze_json,
     packet_json,
 )
-from .checkpoint import CheckpointError, read_checkpoint_projection_state
 from .eval import EvalError, read_eval_inventory
 from .observations import ObservationCatalog, ObservationError, ObservationRecord
+from .observed import ObservedRefError, validate_observed_ref
 from .research_files import (
     ResearchFileError,
     SemanticDocument,
@@ -27,7 +25,6 @@ from .research_files import (
 )
 from .runs import RunError, read_run_inventory
 from .store import AnchoredReadError, AnchoredWorkspaceReader
-from .transition_index import TransitionIndex
 from .worktrees import (
     RepositoryBinding,
     WorktreeError,
@@ -50,7 +47,7 @@ _TOP_LEVEL_KEYS = {
     "recent_evidence_delta",
     "hypotheses",
     "pending_measurements",
-    "unassimilated_returns",
+    "unread_returns",
     "current_obligations",
     "remaining_budget",
     "blocked_reasons",
@@ -60,7 +57,7 @@ _TOP_LEVEL_KEYS = {
 }
 _QUESTION_ID = re.compile(r"^Q-[A-Za-z0-9][A-Za-z0-9-]*$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
-_ACTIVE_QUESTION_HEADINGS = (
+_QUESTION_HEADINGS = (
     "Question",
     "Current best answer",
     "Current uncertainty",
@@ -68,11 +65,10 @@ _ACTIVE_QUESTION_HEADINGS = (
     "Stop / pivot criterion",
     "Expected information gain",
 )
-_RUN_TERMINAL_STATES = {
-    "completed",
-    "failed_process",
-    "timed_out",
-    "cancelled",
+_TERMINAL_RUN_STATES = {"completed", "failed_process", "timed_out", "cancelled"}
+_AUTHORITY_STATES = {"available", "unavailable", "blocked", "denied", "expired"}
+_BUDGET_STATES = {
+    "available", "unavailable", "not_configured", "exhausted", "blocked", "denied"
 }
 _MAX_EXCERPT_CHARS = 768
 _MAX_DIRTY_PATHS = 48
@@ -80,28 +76,10 @@ _MAX_WORKTREES = 16
 _MAX_RIVALS = 16
 _MAX_PENDING = 32
 _MAX_RETURNS = 32
-_OPERATIONAL_SNAPSHOT_ATTEMPTS = 3
-_AUTHORITY_CONTEXT_STATES = {
-    "available",
-    "unavailable",
-    "blocked",
-    "denied",
-    "expired",
-}
-_BUDGET_CONTEXT_STATES = {
-    "available",
-    "unavailable",
-    "not_configured",
-    "exhausted",
-    "blocked",
-    "denied",
-}
 
 
 @dataclass(frozen=True)
 class AttentionAuthorityContext:
-    """Host-supplied authority facts with immutable defensive outer views."""
-
     authority: Mapping[str, object]
     remaining_budget: Mapping[str, object]
     institutional_obligations: tuple[Mapping[str, object], ...]
@@ -109,38 +87,24 @@ class AttentionAuthorityContext:
     def __post_init__(self) -> None:
         authority = freeze_json(self.authority, "authority")
         budget = freeze_json(self.remaining_budget, "remaining_budget")
-        if not isinstance(authority, Mapping):
-            raise TypeError("authority must be a mapping")
-        if not isinstance(budget, Mapping):
-            raise TypeError("remaining_budget must be a mapping")
-        _validate_context_state(
-            authority,
-            "authority",
-            _AUTHORITY_CONTEXT_STATES,
-        )
-        _validate_context_state(
-            budget,
-            "remaining_budget",
-            _BUDGET_CONTEXT_STATES,
-        )
+        if not isinstance(authority, Mapping) or not isinstance(budget, Mapping):
+            raise TypeError("authority and remaining_budget must be mappings")
+        _require_context_state(authority, "authority", _AUTHORITY_STATES)
+        _require_context_state(budget, "remaining_budget", _BUDGET_STATES)
         if not isinstance(self.institutional_obligations, tuple) or any(
             not isinstance(item, Mapping) for item in self.institutional_obligations
         ):
             raise TypeError("institutional_obligations must be a tuple of mappings")
-        institutional = tuple(
+        obligations = tuple(
             freeze_json(item, "institutional_obligations")
             for item in self.institutional_obligations
         )
         object.__setattr__(self, "authority", authority)
         object.__setattr__(self, "remaining_budget", budget)
-        object.__setattr__(
-            self,
-            "institutional_obligations",
-            institutional,
-        )
+        object.__setattr__(self, "institutional_obligations", obligations)
 
 
-def _validate_context_state(
+def _require_context_state(
     value: Mapping[str, object],
     field: str,
     allowed: set[str],
@@ -149,11 +113,11 @@ def _validate_context_state(
     if not isinstance(state, str):
         raise TypeError(f"{field}.state must be a string")
     if state not in allowed:
-        raise ValueError(f"{field}.state is unknown or unbounded: {state!r}")
+        raise ValueError(f"{field}.state is unknown: {state!r}")
 
 
 @dataclass(frozen=True)
-class _CanonicalSemanticDocument:
+class _Document:
     semantic: SemanticDocument
     content_sha256: str
     blob_oid: str
@@ -171,28 +135,19 @@ class _CanonicalSemanticDocument:
         return self.semantic.sections
 
 
-@dataclass(frozen=True)
-class _GitEntry:
-    path: str
-    blob_oid: str
-
-
 class ResearchAttentionService:
-    """Observe one candidate against one canonical Git repository."""
-
     def __init__(
         self,
         candidate_root: str | Path,
         *,
         canonical_repository: RepositoryBinding | None = None,
-    ):
+    ) -> None:
         try:
             self.candidate_repository = bind_repository(candidate_root)
         except WorktreeError as error:
-            workspace = Path(candidate_root).expanduser().resolve()
+            root = Path(candidate_root).expanduser().resolve()
             raise ValueError(
-                "workspace is not initialized; run `aros start` at the Git root: "
-                f"{workspace}"
+                f"workspace is not initialized; run `aros start` at the Git root: {root}"
             ) from error
         if canonical_repository is None:
             self.canonical_repository = self.candidate_repository
@@ -207,49 +162,23 @@ class ResearchAttentionService:
         max_chars: int = DEFAULT_ATTENTION_MAX_CHARS,
         context: AttentionAuthorityContext | None = None,
     ) -> dict[str, object]:
-        """Build one deterministic packet without persisting or reconciling state."""
         _validate_max_chars(max_chars)
         if context is not None and not isinstance(context, AttentionAuthorityContext):
             raise TypeError("context must be an AttentionAuthorityContext or None")
-        _require_initialized_candidate(self.candidate_repository)
+        _require_workspace(self.candidate_repository)
 
         warnings: list[str] = []
         omitted: dict[str, int] = {}
-        canonical_facts = _repository_facts(self.canonical_repository)
-        candidate_facts = _repository_facts(self.candidate_repository)
-        candidate_state = _candidate_state(
-            self.candidate_repository,
-            warnings,
-            omitted,
-        )
-        projection_state = _projection_state(
-            self.candidate_repository,
-            self.canonical_repository,
-            candidate_facts["head"],
-            canonical_facts["head"],
-            canonical_facts["ref"],
-        )
-        if projection_state == "projection_pending":
-            _warn(warnings, "projection_pending")
-        snapshot = {
-            "canonical": canonical_facts["head"],
-            "canonical_ref": canonical_facts["ref"],
-            "canonical_branch": canonical_facts["branch"],
-            "canonical_repository": canonical_facts["repository"],
-            "projection_state": projection_state,
-            "candidate": {**candidate_facts, **candidate_state},
-        }
-        canonical_head = canonical_facts["head"]
-        if not isinstance(canonical_head, str):
-            _warn(warnings, "canonical_head_unavailable")
+        canonical = read_repository_snapshot(self.canonical_repository)
+        candidate = read_repository_snapshot(self.candidate_repository)
+        head = canonical.get("head")
+        documents: dict[str, _Document | None] = {}
 
-        documents: dict[str, _CanonicalSemanticDocument | None] = {}
-
-        def document(path: str) -> _CanonicalSemanticDocument | None:
+        def document(path: str) -> _Document | None:
             if path not in documents:
-                documents[path] = _load_semantic_document(
+                documents[path] = _load_document(
                     self.canonical_repository,
-                    canonical_head,
+                    head,
                     path,
                     warnings,
                 )
@@ -258,149 +187,85 @@ class ResearchAttentionService:
         frontier = document("questions/FRONTIER.md")
         active_question, question = _active_question(
             self.canonical_repository,
-            canonical_head,
+            head,
             frontier,
             warnings,
             omitted,
         )
-        if question is not None:
-            documents[question.path] = question
-
         now = document("memory/NOW.md")
-        current_model = document("model/CURRENT.md")
-        current_uncertainty = _current_uncertainty(
-            question,
-            now,
-            current_model,
+        model = document("model/CURRENT.md")
+        terminal = _terminal_observations(self.candidate_repository.root, warnings)
+        runs = _runs(self.candidate_repository.root, warnings)
+        evals = _evals(self.candidate_repository.root, warnings)
+        observed, recent = _observed_git_history(
+            self.canonical_repository,
             warnings,
+        )
+        unread = bound_items(
+            [_observation_item(item) for item in terminal if item.ref not in observed],
+            _MAX_RETURNS,
+            "terminal observations",
             omitted,
         )
-        scientific_obligations = _matching_sections(
-            now,
-            "obligation",
-            omitted,
-        )
+        pending = _pending_measurements(runs, evals, terminal, omitted)
+        authority, budget, institutional = _authority_views(context, omitted)
         semantic_blockers = _matching_sections(now, "blocker", omitted)
 
-        hypotheses = _hypotheses(
-            self.canonical_repository,
-            canonical_head,
-            current_model,
-            warnings,
-            omitted,
-        )
-        terminal, run_inventory, eval_inventory, availability = (
-            _operational_snapshot(
-            self.candidate_repository.root,
-            warnings,
-            )
-        )
-        candidate_snapshot = snapshot["candidate"]
-        assert isinstance(candidate_snapshot, dict)
-        candidate_snapshot["availability"] = availability
-        transition_index = TransitionIndex(
-            self.candidate_repository,
-            self.canonical_repository,
-        ).read()
-        if transition_index.state == "complete":
-            assimilated = set(transition_index.assimilations)
-            recent_evidence_delta = _recent_evidence_delta(
-                transition_index.latest_evidence_transition
-            )
-        else:
-            assimilated = set()
-            recent_evidence_delta = []
-            _warn(warnings, "index_incomplete")
-        visible_terminal = (
-            _visible_terminal_observations(terminal, eval_inventory)
-            if terminal is not None
-            else ()
-        )
-        visible_terminal = tuple(
-            record for record in visible_terminal if record.ref not in assimilated
-        )
-        unassimilated = (
-            bound_items(
-                [_observation_item(record) for record in visible_terminal],
-                _MAX_RETURNS,
-                "terminal observations",
-                omitted,
-            )
-            if terminal is not None
-            else []
-        )
-        pending = (
-            _pending_measurements(
-                run_inventory,
-                eval_inventory,
-                terminal,
-                omitted,
-            )
-            if terminal is not None
-            else []
-        )
-
-        authority, remaining_budget, institutional = _authority_views(
-            context,
-            omitted,
-        )
-        blocked = _blocked_reasons(
-            semantic_blockers,
-            pending,
-            authority,
-            remaining_budget,
-            availability,
-            candidate_state,
-        )
         packet: dict[str, object] = {
             "schema_version": 1,
-            "snapshot": snapshot,
+            "snapshot": {
+                "canonical": head,
+                "canonical_ref": canonical.get("ref"),
+                "canonical_branch": canonical.get("branch"),
+                "candidate": {
+                    "head": candidate.get("head"),
+                    "branch": candidate.get("branch"),
+                    **_candidate_state(self.candidate_repository, warnings, omitted),
+                },
+            },
             "active_question": active_question,
-            "current_uncertainty": current_uncertainty,
-            "recent_evidence_delta": recent_evidence_delta,
-            "hypotheses": hypotheses,
+            "current_uncertainty": _uncertainty(
+                question,
+                now,
+                model,
+                warnings=warnings,
+                omitted=omitted,
+            ),
+            "recent_evidence_delta": recent,
+            "hypotheses": _hypotheses(
+                self.canonical_repository,
+                head,
+                model,
+                warnings,
+                omitted,
+            ),
             "pending_measurements": pending,
-            "unassimilated_returns": unassimilated,
+            "unread_returns": unread,
             "current_obligations": {
-                "scientific": scientific_obligations,
+                "scientific": _matching_sections(now, "obligation", omitted),
                 "institutional": institutional,
             },
-            "remaining_budget": remaining_budget,
-            "blocked_reasons": blocked,
+            "remaining_budget": budget,
+            "blocked_reasons": _blocked_reasons(
+                semantic_blockers,
+                pending,
+                authority,
+                budget,
+            ),
             "authority": authority,
             "warnings": warnings,
             "omitted": omitted,
         }
-        if recent_evidence_delta and len(packet_json(packet)) > max_chars:
-            latest = recent_evidence_delta[0]
-            transition_id = latest["transition_id"]
-            detail_count = len(latest["assimilations"]) + len(
-                latest["evidence_links"]
-            )
-            add_omission(
-                omitted,
-                f"transition:{transition_id}:detail",
-                max(1, detail_count),
-            )
-            packet["recent_evidence_delta"] = [
-                {
-                    "transition_id": transition_id,
-                    "commit": latest["commit"],
-                }
-            ]
-        if omitted:
-            _warn(warnings, "truncated")
-        _fit_with_recent_evidence_priority(packet, max_chars)
+        _fit(packet, max_chars)
         if (
-            _repository_facts(self.canonical_repository) != canonical_facts
-            or _repository_facts(self.candidate_repository) != candidate_facts
+            read_repository_snapshot(self.canonical_repository) != canonical
+            or read_repository_snapshot(self.candidate_repository) != candidate
         ):
             raise ValueError("repository snapshot changed while building attention")
         return packet
 
     @staticmethod
     def render_text(packet: dict[str, object]) -> str:
-        """Render the supplied packet itself, with no independent summary path."""
         if not isinstance(packet, dict) or set(packet) != _TOP_LEVEL_KEYS:
             raise ValueError("packet must have the exact ResearchAttentionPacket shape")
         return packet_json(packet)
@@ -413,12 +278,11 @@ def _validate_max_chars(max_chars: int) -> None:
         or not MIN_ATTENTION_MAX_CHARS <= max_chars <= MAX_ATTENTION_MAX_CHARS
     ):
         raise ValueError(
-            "max_chars must be an integer from "
-            f"{MIN_ATTENTION_MAX_CHARS} through {MAX_ATTENTION_MAX_CHARS}"
+            f"max_chars must be {MIN_ATTENTION_MAX_CHARS} through {MAX_ATTENTION_MAX_CHARS}"
         )
 
 
-def _require_initialized_candidate(repository: RepositoryBinding) -> None:
+def _require_workspace(repository: RepositoryBinding) -> None:
     try:
         with AnchoredWorkspaceReader(repository.root) as reader:
             reader.require_repository(
@@ -430,52 +294,8 @@ def _require_initialized_candidate(repository: RepositoryBinding) -> None:
             reader.require_file("memory/NOW.md")
     except (AnchoredReadError, OSError) as error:
         raise ValueError(
-            "workspace is not initialized; run `aros start` at the Git root: "
-            f"{repository.root}"
+            f"workspace is not initialized; run `aros start` at the Git root: {repository.root}"
         ) from error
-
-
-def _repository_facts(repository: RepositoryBinding) -> dict[str, object]:
-    return read_repository_snapshot(repository)
-
-
-def _projection_state(
-    candidate: RepositoryBinding,
-    canonical: RepositoryBinding,
-    candidate_head: object,
-    canonical_head: object,
-    canonical_ref: object,
-) -> str:
-    if (
-        not isinstance(candidate_head, str)
-        or not isinstance(canonical_head, str)
-        or not isinstance(canonical_ref, str)
-    ):
-        return "unavailable"
-    try:
-        runtime = read_checkpoint_projection_state(
-            candidate,
-            canonical_commit=canonical_head,
-            canonical_ref=canonical_ref,
-        )
-    except (CheckpointError, OSError, ValueError):
-        return "unavailable"
-    if runtime.state == "projection_pending":
-        return "projection_pending"
-    if candidate.common_dir == canonical.common_dir:
-        return "current"
-    if candidate_head == canonical_head:
-        return "current"
-    result = _worktrees._git_result(
-        canonical,
-        "merge-base",
-        "--is-ancestor",
-        candidate_head,
-        canonical_head,
-    )
-    if result.returncode == 0:
-        return "projection_pending"
-    return "conflict" if result.returncode == 1 else "unavailable"
 
 
 def _candidate_state(
@@ -483,130 +303,46 @@ def _candidate_state(
     warnings: list[str],
     omitted: dict[str, int],
 ) -> dict[str, object]:
-    git_status = _dirty_paths(repository, warnings, omitted)
-    worktrees = _worktrees_view(repository, warnings, omitted)
-    dirty = git_status.get("dirty_paths", [])
-    assert isinstance(dirty, list)
-    pending_refs = [
-        {
-            "path": str(item["path"]),
-            "state_sha256": item["state_sha256"],
-        }
-        for item in dirty
-        if str(item["path"]).startswith("transitions/")
-        and str(item["path"]).endswith("/proposal.json")
-    ]
-    pending_bounded = bound_items(
-        pending_refs,
-        _MAX_DIRTY_PATHS,
-        "transitions",
-        omitted,
-    )
-    return {
-        "git_status": git_status,
-        "worktrees": worktrees,
-        "pending_transition_refs": pending_bounded,
-    }
-
-
-def _dirty_paths(
-    repository: RepositoryBinding,
-    warnings: list[str],
-    omitted: dict[str, int],
-) -> dict[str, object]:
     try:
         status = read_candidate_status(repository)
-    except (OSError, RuntimeError, WorktreeError, ValueError):
-        _warn(warnings, "operational_read_failed:candidate_status")
-        return {"state": "unavailable", "error": "read_failed"}
-    dirty_paths = status["dirty_paths"]
-    assert isinstance(dirty_paths, list)
-    status["dirty_paths"] = bound_items(
-        dirty_paths,
-        _MAX_DIRTY_PATHS,
-        "git status",
-        omitted,
-    )
-    return status
-
-
-def _worktrees_view(
-    repository: RepositoryBinding,
-    warnings: list[str],
-    omitted: dict[str, int],
-) -> dict[str, object]:
+        dirty = status.get("dirty_paths")
+        if isinstance(dirty, list):
+            status["dirty_paths"] = bound_items(
+                dirty,
+                _MAX_DIRTY_PATHS,
+                "git status",
+                omitted,
+            )
+    except (OSError, RuntimeError, ValueError, WorktreeError):
+        _warn(warnings, "candidate_status_unavailable")
+        status = {"state": "unavailable"}
     try:
-        inventory = [dict(item) for item in read_worktree_inventory(repository)]
-    except (OSError, RuntimeError, WorktreeError, ValueError):
-        _warn(warnings, "operational_read_failed:worktrees")
-        return {"state": "unavailable", "error": "read_failed"}
-    return {
-        "state": "available",
-        "items": bound_items(inventory, _MAX_WORKTREES, "worktrees", omitted),
-    }
+        worktrees = {
+            "state": "available",
+            "items": bound_items(
+                [dict(item) for item in read_worktree_inventory(repository)],
+                _MAX_WORKTREES,
+                "worktrees",
+                omitted,
+            ),
+        }
+    except (OSError, RuntimeError, ValueError, WorktreeError):
+        _warn(warnings, "worktree_inventory_unavailable")
+        worktrees = {"state": "unavailable", "items": []}
+    return {"git_status": status, "worktrees": worktrees}
 
 
-def _load_semantic_document(
+def _load_document(
     repository: RepositoryBinding,
     head: object,
     path: str,
     warnings: list[str],
-) -> _CanonicalSemanticDocument | None:
+) -> _Document | None:
     if not isinstance(head, str):
         _warn(warnings, f"semantic_view_unavailable:{path}")
         return None
     try:
-        entry = _regular_git_entry(repository, head, path)
-        raw = _worktrees._git_bytes(repository, "cat-file", "blob", entry.blob_oid)
-        semantic = parse_semantic_document_bytes(path, raw)
-    except (ResearchFileError, ValueError, WorktreeError):
-        if _git_path_exists(repository, head, path):
-            _warn(warnings, f"malformed_semantic_view:{path}")
-        else:
-            _warn(warnings, f"missing_semantic_view:{path}")
-        return None
-    return _CanonicalSemanticDocument(
-        semantic=semantic,
-        content_sha256=hashlib.sha256(raw).hexdigest(),
-        blob_oid=entry.blob_oid,
-    )
-
-
-def _regular_git_entry(
-    repository: RepositoryBinding,
-    head: str,
-    path: str,
-) -> _GitEntry:
-    raw = _worktrees._git_bytes(
-        repository,
-        "--literal-pathspecs",
-        "ls-tree",
-        "-z",
-        "--full-tree",
-        head,
-        "--",
-        path,
-    )
-    records = [record for record in raw.split(b"\0") if record]
-    if len(records) != 1:
-        raise ValueError("path does not name exactly one Git entry")
-    header, separator, raw_path = records[0].partition(b"\t")
-    fields = header.split(b" ")
-    if (
-        separator != b"\t"
-        or raw_path != path.encode("utf-8")
-        or len(fields) != 3
-        or fields[0] not in {b"100644", b"100755"}
-        or fields[1] != b"blob"
-        or re.fullmatch(rb"[0-9a-f]{40}", fields[2]) is None
-    ):
-        raise ValueError("path does not name a regular Git blob")
-    return _GitEntry(path=path, blob_oid=fields[2].decode("ascii"))
-
-
-def _git_path_exists(repository: RepositoryBinding, head: str, path: str) -> bool:
-    try:
-        raw = _worktrees._git_bytes(
+        raw_entry = _worktrees._git_bytes(
             repository,
             "--literal-pathspecs",
             "ls-tree",
@@ -616,100 +352,105 @@ def _git_path_exists(repository: RepositoryBinding, head: str, path: str) -> boo
             "--",
             path,
         )
-    except WorktreeError:
-        return False
-    return bool(raw)
+        records = [item for item in raw_entry.split(b"\0") if item]
+        if len(records) != 1:
+            raise ValueError("missing semantic path")
+        header, separator, raw_path = records[0].partition(b"\t")
+        fields = header.split(b" ")
+        if (
+            separator != b"\t"
+            or raw_path != path.encode()
+            or len(fields) != 3
+            or fields[0] not in {b"100644", b"100755"}
+            or fields[1] != b"blob"
+        ):
+            raise ValueError("semantic path is not a regular blob")
+        blob_oid = fields[2].decode("ascii")
+        raw = _worktrees._git_bytes(repository, "cat-file", "blob", blob_oid)
+        semantic = parse_semantic_document_bytes(path, raw)
+    except (ResearchFileError, UnicodeError, ValueError, WorktreeError):
+        _warn(warnings, f"semantic_view_unavailable:{path}")
+        return None
+    return _Document(semantic, hashlib.sha256(raw).hexdigest(), blob_oid)
 
 
 def _active_question(
     repository: RepositoryBinding,
     head: object,
-    frontier: _CanonicalSemanticDocument | None,
+    frontier: _Document | None,
     warnings: list[str],
     omitted: dict[str, int],
-) -> tuple[dict[str, object] | None, _CanonicalSemanticDocument | None]:
+) -> tuple[dict[str, object] | None, _Document | None]:
     if frontier is None:
         return None, None
     focus = frontier.frontmatter.get("focus_question")
-    if focus is None or focus == "":
+    if focus in {None, ""}:
         return None, None
     if not isinstance(focus, str) or _QUESTION_ID.fullmatch(focus) is None:
         _warn(warnings, "malformed_focus_question")
         return None, None
     path = f"questions/{focus}/question.md"
-    question = _load_semantic_document(repository, head, path, warnings)
-    if question is None:
-        return {
-            "id": focus,
-            "path": path,
-            "content_sha256": None,
-            "sections": [],
-        }, None
-    section_refs: list[dict[str, object]] = []
-    for heading in _ACTIVE_QUESTION_HEADINGS:
-        if heading not in question.sections:
-            _warn(warnings, f"missing_section:{path}:{heading}")
-            continue
-        section_refs.append(_section_ref(question, heading, omitted))
+    question = _load_document(repository, head, path, warnings)
+    sections = (
+        [
+            _section(question, heading, omitted)
+            for heading in _QUESTION_HEADINGS
+            if heading in question.sections
+        ]
+        if question is not None
+        else []
+    )
     return {
         "id": focus,
         "path": path,
-        "content_sha256": question.content_sha256,
-        "sections": section_refs,
+        "content_sha256": question.content_sha256 if question else None,
+        "sections": sections,
     }, question
 
 
-def _current_uncertainty(
-    question: _CanonicalSemanticDocument | None,
-    now: _CanonicalSemanticDocument | None,
-    current_model: _CanonicalSemanticDocument | None,
+def _uncertainty(
+    *documents: _Document | None,
     warnings: list[str],
     omitted: dict[str, int],
 ) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
-    for document in (question, now, current_model):
+    for document in documents:
         if document is None:
             continue
-        headings = [
-            heading
-            for heading in document.sections
-            if "uncertaint" in heading.casefold()
-        ]
+        headings = [name for name in document.sections if "uncertaint" in name.casefold()]
         if not headings:
-            _warn(warnings, f"missing_section:{document.path}:Current uncertainty")
-            continue
-        result.extend(_section_ref(document, heading, omitted) for heading in headings)
+            _warn(warnings, f"missing_uncertainty:{document.path}")
+        result.extend(_section(document, heading, omitted) for heading in headings)
     return result
 
 
 def _matching_sections(
-    document: _CanonicalSemanticDocument | None,
+    document: _Document | None,
     fragment: str,
     omitted: dict[str, int],
 ) -> list[dict[str, object]]:
     if document is None:
         return []
     return [
-        _section_ref(document, heading, omitted)
+        _section(document, heading, omitted)
         for heading in document.sections
         if fragment in heading.casefold()
     ]
 
 
-def _section_ref(
-    document: _CanonicalSemanticDocument,
+def _section(
+    document: _Document,
     heading: str,
     omitted: dict[str, int],
 ) -> dict[str, object]:
     content = document.sections[heading]
     excerpt = content[:_MAX_EXCERPT_CHARS]
-    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    if len(excerpt) != len(content):
+    if len(excerpt) < len(content):
         add_omission(omitted, f"{document.path}#{heading}")
     return {
         "path": document.path,
         "heading": heading,
-        "content_sha256": content_hash,
+        "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
         "excerpt": excerpt,
     }
 
@@ -717,259 +458,127 @@ def _section_ref(
 def _hypotheses(
     repository: RepositoryBinding,
     head: object,
-    current_model: _CanonicalSemanticDocument | None,
+    model: _Document | None,
     warnings: list[str],
     omitted: dict[str, int],
 ) -> dict[str, list[dict[str, object]]]:
-    leading = []
-    if current_model is not None:
-        leading.append(
-            {
-                "path": current_model.path,
-                "content_sha256": current_model.content_sha256,
-                "blob_oid": current_model.blob_oid,
-            }
-        )
+    leading = (
+        [{"path": model.path, "content_sha256": model.content_sha256, "blob_oid": model.blob_oid}]
+        if model is not None
+        else []
+    )
     rivals: list[dict[str, object]] = []
     if isinstance(head, str):
         try:
-            entries = _regular_git_entries(repository, head, "model/rivals")
-        except (UnicodeDecodeError, ValueError, WorktreeError):
-            _warn(warnings, "malformed_semantic_view:model/rivals")
-            entries = []
-        rivals = [
-            {"path": entry.path, "blob_oid": entry.blob_oid}
-            for entry in entries
-            if entry.path.endswith(".md")
-        ]
+            raw = _worktrees._git_bytes(
+                repository,
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                head,
+                "--",
+                "model/rivals",
+            )
+            for record in (item for item in raw.split(b"\0") if item):
+                header, _, raw_path = record.partition(b"\t")
+                fields = header.split(b" ")
+                path = raw_path.decode("utf-8")
+                if len(fields) == 3 and fields[1] == b"blob" and path.endswith(".md"):
+                    rivals.append({"path": path, "blob_oid": fields[2].decode("ascii")})
+        except (UnicodeError, WorktreeError):
+            _warn(warnings, "rival_inventory_unavailable")
     return {
         "leading": leading,
-        "competing": bound_items(
-            rivals,
-            _MAX_RIVALS,
-            "model/rivals",
-            omitted,
-        ),
+        "competing": bound_items(sorted(rivals, key=lambda item: str(item["path"])), _MAX_RIVALS, "model/rivals", omitted),
     }
 
 
-def _regular_git_entries(
-    repository: RepositoryBinding,
-    head: str,
-    prefix: str,
-) -> list[_GitEntry]:
-    raw = _worktrees._git_bytes(
-        repository,
-        "--literal-pathspecs",
-        "ls-tree",
-        "-r",
-        "-z",
-        "--full-tree",
-        head,
-        "--",
-        prefix,
-    )
-    entries: list[_GitEntry] = []
-    for record in (item for item in raw.split(b"\0") if item):
-        header, separator, raw_path = record.partition(b"\t")
-        fields = header.split(b" ")
-        path = raw_path.decode("utf-8")
-        if (
-            separator != b"\t"
-            or len(fields) != 3
-            or fields[0] not in {b"100644", b"100755"}
-            or fields[1] != b"blob"
-            or re.fullmatch(rb"[0-9a-f]{40}", fields[2]) is None
-            or not path.startswith(f"{prefix}/")
-        ):
-            raise ValueError("rival path does not name a regular Git blob")
-        entries.append(_GitEntry(path, fields[2].decode("ascii")))
-    return sorted(entries, key=lambda entry: entry.path)
-
-
-def _terminal_observations(
-    root: Path,
-    warnings: list[str],
-) -> tuple[tuple[ObservationRecord, ...] | None, dict[str, str]]:
+def _terminal_observations(root: Path, warnings: list[str]) -> tuple[ObservationRecord, ...]:
     try:
-        return (
-            ObservationCatalog(root).enumerate_terminal(),
-            {"state": "available"},
-        )
+        return ObservationCatalog(root).enumerate_terminal()
     except (ObservationError, OSError, RuntimeError):
-        _warn(warnings, "operational_read_failed:terminal_observations")
-        return None, {"state": "unavailable", "error": "read_failed"}
+        _warn(warnings, "terminal_observations_unavailable")
+        return ()
 
 
-def _operational_snapshot(
-    root: Path,
-    warnings: list[str],
-) -> tuple[
-    tuple[ObservationRecord, ...] | None,
-    tuple[dict[str, object], ...] | None,
-    tuple[dict[str, object], ...] | None,
-    dict[str, dict[str, str]],
-]:
-    for _attempt in range(_OPERATIONAL_SNAPSHOT_ATTEMPTS):
-        before, before_availability = _terminal_observations(root, warnings)
-        runs, run_availability = _run_inventory(root, warnings)
-        evals, eval_availability = _eval_inventory(root, warnings)
-        after, after_availability = _terminal_observations(root, warnings)
-        terminal_availability = (
-            after_availability
-            if before is not None
-            else before_availability
-        )
-        availability = {
-            "runs": run_availability,
-            "evals": eval_availability,
-            "terminal_observations": terminal_availability,
-        }
-        if before is None or after is None:
-            return None, runs, evals, availability
-        if _terminal_identity(before) == _terminal_identity(after):
-            return after, runs, evals, availability
-    _warn(warnings, "operational_snapshot_unstable")
-    unavailable = {
-        name: {"state": "unavailable", "error": "snapshot_unstable"}
-        for name in ("runs", "evals", "terminal_observations")
-    }
-    return None, None, None, unavailable
-
-
-def _terminal_identity(
-    records: tuple[ObservationRecord, ...],
-) -> tuple[tuple[str, str, str], ...]:
-    return tuple(
-        sorted(
-            (record.kind, record.ref, record.record_sha256)
-            for record in records
-        )
-    )
-
-
-def _run_inventory(
-    root: Path,
-    warnings: list[str],
-) -> tuple[tuple[dict[str, object], ...] | None, dict[str, str]]:
+def _runs(root: Path, warnings: list[str]) -> tuple[dict[str, object], ...]:
     try:
-        return read_run_inventory(root), {"state": "available"}
+        return read_run_inventory(root)
     except (OSError, RuntimeError, RunError, ValueError):
-        _warn(warnings, "operational_read_failed:runs")
-        return None, {"state": "unavailable", "error": "read_failed"}
+        _warn(warnings, "run_inventory_unavailable")
+        return ()
 
 
-def _eval_inventory(
-    root: Path,
-    warnings: list[str],
-) -> tuple[tuple[dict[str, object], ...] | None, dict[str, str]]:
+def _evals(root: Path, warnings: list[str]) -> tuple[dict[str, object], ...]:
     try:
-        return read_eval_inventory(root), {"state": "available"}
+        return read_eval_inventory(root)
     except (OSError, RuntimeError, EvalError, ValueError):
-        _warn(warnings, "operational_read_failed:evals")
-        return None, {"state": "unavailable", "error": "read_failed"}
+        _warn(warnings, "eval_inventory_unavailable")
+        return ()
 
 
-def _visible_terminal_observations(
-    terminal: tuple[ObservationRecord, ...],
-    eval_inventory: tuple[dict[str, object], ...] | None,
-) -> tuple[ObservationRecord, ...]:
-    linked_runs = {
-        str(item["run_id"])
-        for item in (eval_inventory or ())
-        if isinstance(item.get("run_id"), str)
-    }
-    return tuple(
-        record
-        for record in terminal
-        if not (
-            record.kind == "run_final"
-            and isinstance(record.payload.get("run_id"), str)
-            and record.payload["run_id"] in linked_runs
-        )
-    )
-
-
-def _recent_evidence_delta(value: object) -> list[dict[str, object]]:
-    if value is None:
-        return []
-    assimilations = getattr(value, "assimilations")
-    evidence_links = getattr(value, "evidence_links")
-    return [
-        {
-            "transition_id": getattr(value, "transition_id"),
-            "commit": getattr(value, "commit"),
-            "assimilations": [
-                {
-                    "observation_ref": getattr(item, "observation_ref"),
-                    "affected_paths": list(getattr(item, "affected_paths")),
-                    "rationale": getattr(item, "rationale"),
-                    "record_sha256": getattr(item, "record_sha256"),
-                }
-                for item in assimilations
-            ],
-            "evidence_links": [_plain_json(item) for item in evidence_links],
-        }
-    ]
-
-
-def _fit_with_recent_evidence_priority(
-    packet: dict[str, object],
-    max_chars: int,
-) -> None:
+def _observed_git_history(
+    repository: RepositoryBinding,
+    warnings: list[str],
+) -> tuple[set[str], list[dict[str, object]]]:
     try:
-        fit_packet(packet, max_chars)
-        return
-    except ValueError:
-        recent = packet["recent_evidence_delta"]
-        if not isinstance(recent, list) or not recent:
-            raise
-    omitted = packet["omitted"]
-    assert isinstance(omitted, dict)
-    omitted_count = max(1, sum(int(count) for count in omitted.values()))
-    packet.update(
-        {
-            "snapshot": {},
-            "active_question": None,
-            "current_uncertainty": [],
-            "hypotheses": {"leading": [], "competing": []},
-            "pending_measurements": [],
-            "unassimilated_returns": [],
-            "current_obligations": {"scientific": [], "institutional": []},
-            "remaining_budget": {},
-            "blocked_reasons": [],
-            "authority": {},
-            "warnings": ["truncated"],
-            "omitted": {"aros boot": omitted_count},
-        }
-    )
-    if len(packet_json(packet)) <= max_chars:
-        return
-    packet["recent_evidence_delta"] = []
-    if len(packet_json(packet)) > max_chars:
-        raise ValueError("max_chars is too small for the attention packet shape")
-
-
-def _plain_json(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {key: _plain_json(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_plain_json(item) for item in value]
-    return value
+        raw = _worktrees._git_bytes(repository, "log", "--format=%H%x00%B%x00")
+    except WorktreeError:
+        _warn(warnings, "observed_history_unavailable")
+        return set(), []
+    fields = raw.rstrip(b"\n").split(b"\0")
+    if fields and not fields[-1]:
+        fields.pop()
+    if len(fields) % 2:
+        _warn(warnings, "observed_history_malformed")
+        return set(), []
+    observed: set[str] = set()
+    recent: list[dict[str, object]] = []
+    for raw_commit, raw_message in zip(fields[::2], fields[1::2], strict=True):
+        try:
+            commit = raw_commit.lstrip(b"\n").decode("ascii")
+            message = raw_message.decode("utf-8")
+        except UnicodeDecodeError:
+            _warn(warnings, "observed_history_malformed")
+            continue
+        if _COMMIT.fullmatch(commit) is None:
+            _warn(warnings, "observed_history_malformed")
+            continue
+        refs: list[str] = []
+        for line in message.splitlines():
+            if not line.startswith("AROS-Observed:"):
+                continue
+            try:
+                refs.append(validate_observed_ref(line.split(":", 1)[1].strip()))
+            except ObservedRefError:
+                _warn(warnings, f"invalid_observed_trailer:{commit}")
+        observed.update(refs)
+        if refs and not recent:
+            try:
+                paths = _worktrees._git_text(
+                    repository,
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    commit,
+                ).splitlines()
+            except WorktreeError:
+                paths = []
+                _warn(warnings, f"observed_delta_unavailable:{commit}")
+            recent.append(
+                {
+                    "commit": commit,
+                    "observed_refs": sorted(set(refs)),
+                    "paths": sorted(paths),
+                }
+            )
+    return observed, recent
 
 
 def _observation_item(record: ObservationRecord) -> dict[str, object]:
-    pointers: list[dict[str, object]] = [
-        {"path": path} for path in record.versioned_paths
-    ]
-    run_id = record.payload.get("run_id")
-    if isinstance(run_id, str):
-        pointers.extend(
-            (
-                {"path": f".aros/runs/{run_id}/stdout.log"},
-                {"path": f".aros/runs/{run_id}/stderr.log"},
-            )
-        )
     return {
         "kind": record.kind,
         "ref": record.ref,
@@ -977,101 +586,47 @@ def _observation_item(record: ObservationRecord) -> dict[str, object]:
         "candidate_commit": record.candidate_commit,
         "measurement_state": record.measurement_state,
         "versioned_paths": list(record.versioned_paths),
-        "retrieval_pointers": pointers,
     }
 
 
 def _pending_measurements(
-    run_inventory: tuple[dict[str, object], ...] | None,
-    eval_inventory: tuple[dict[str, object], ...] | None,
+    runs: tuple[dict[str, object], ...],
+    evals: tuple[dict[str, object], ...],
     terminal: tuple[ObservationRecord, ...],
     omitted: dict[str, int],
 ) -> list[dict[str, object]]:
-    terminal_paths = {
-        path for record in terminal for path in record.versioned_paths
-    }
-    pending_evals: list[dict[str, object]] = []
-    linked_runs: set[str] = set()
-    for status in eval_inventory or ():
-        run_id = status.get("run_id")
-        if isinstance(run_id, str):
-            linked_runs.add(run_id)
-        receipt_ref = f"eval/evaluations/{status['eval_id']}/receipt.json"
-        if receipt_ref in terminal_paths:
-            continue
-        eval_id = str(status["eval_id"])
-        terminal_missing = status.get("evaluation_state") == "completed"
-        retrieval_pointers = [
-            {"path": f".aros/evaluations/{eval_id}/request.json"},
-            {"path": receipt_ref},
-        ]
-        if isinstance(run_id, str):
-            retrieval_pointers.extend(
-                (
-                    {"path": f"runs/{run_id}/manifest.json"},
-                    {"path": f".aros/runs/{run_id}/status.json"},
-                    {"path": f"runs/{run_id}/final.json"},
-                )
+    terminal_paths = {path for item in terminal for path in item.versioned_paths}
+    linked_runs = {str(item["run_id"]) for item in evals if item.get("run_id")}
+    pending: list[dict[str, object]] = []
+    for item in evals:
+        eval_id = str(item["eval_id"])
+        receipt = f"eval/evaluations/{eval_id}/receipt.json"
+        if receipt not in terminal_paths:
+            pending.append(
+                {
+                    "kind": "eval",
+                    "ref": f".aros/evaluations/{eval_id}/request.json",
+                    "evaluation_state": item.get("evaluation_state"),
+                    "measurement_state": item.get("measurement_state"),
+                    "process_state": item.get("referenced_process_state"),
+                    "run_id": item.get("run_id"),
+                    "reason": item.get("reason"),
+                }
             )
-        pending_evals.append(
-            {
-                "kind": "eval",
-                "ref": f".aros/evaluations/{eval_id}/request.json",
-                "record_sha256": None,
-                "candidate_commit": status.get("candidate_commit"),
-                "measurement_state": (
-                    "terminal_observation_missing"
-                    if terminal_missing
-                    else status.get("measurement_state")
-                ),
-                "process_state": status.get("referenced_process_state"),
-                "evaluation_state": status.get("evaluation_state"),
-                "run_id": run_id,
-                "reason": (
-                    "terminal_observation_missing"
-                    if terminal_missing
-                    else status.get("reason")
-                ),
-                "versioned_paths": [],
-                "retrieval_pointers": retrieval_pointers,
-            }
-        )
-    pending_runs: list[dict[str, object]] = []
-    for status in run_inventory or ():
-        run_id = status.get("run_id")
-        state = status.get("state")
-        assert isinstance(run_id, str)
-        assert isinstance(state, str)
-        final_ref = f"runs/{run_id}/final.json"
-        if final_ref in terminal_paths or run_id in linked_runs:
-            continue
-        manifest_ref = f"runs/{run_id}/manifest.json"
-        terminal_missing = state in _RUN_TERMINAL_STATES
-        pending_runs.append(
-            {
-                "kind": "run",
-                "ref": manifest_ref,
-                "record_sha256": status.get("manifest_sha256"),
-                "candidate_commit": status.get("candidate_commit"),
-                "measurement_state": (
-                    "terminal_observation_missing" if terminal_missing else None
-                ),
-                "process_state": state,
-                "updated_at": status.get("updated_at"),
-                "reason": status.get("reason"),
-                "versioned_paths": [manifest_ref],
-                "retrieval_pointers": [
-                    {"path": f".aros/runs/{run_id}/status.json"},
-                    {"path": final_ref},
-                ],
-            }
-        )
-    combined = sorted(
-        [*pending_evals, *pending_runs],
-        key=lambda item: (str(item["kind"]), str(item["ref"])),
-    )
+    for item in runs:
+        run_id = str(item["run_id"])
+        final = f"runs/{run_id}/final.json"
+        if final not in terminal_paths and run_id not in linked_runs:
+            pending.append(
+                {
+                    "kind": "run",
+                    "ref": f"runs/{run_id}/manifest.json",
+                    "process_state": item.get("state"),
+                    "reason": item.get("reason"),
+                }
+            )
     return bound_items(
-        combined,
+        sorted(pending, key=lambda item: (str(item["kind"]), str(item["ref"]))),
         _MAX_PENDING,
         "pending measurements",
         omitted,
@@ -1084,16 +639,8 @@ def _authority_views(
 ) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]]]:
     if context is None:
         return (
-            {
-                "state": "unavailable",
-                "enforcement_class": "unavailable",
-                "reason": "host_context_not_supplied",
-            },
-            {
-                "state": "not_configured",
-                "enforcement_class": "unavailable",
-                "reason": "host_context_not_supplied",
-            },
+            {"state": "unavailable", "enforcement_class": "unavailable"},
+            {"state": "not_configured", "enforcement_class": "unavailable"},
             [],
         )
     return context_views(
@@ -1108,75 +655,33 @@ def _blocked_reasons(
     semantic: list[dict[str, object]],
     pending: list[dict[str, object]],
     authority: dict[str, object],
-    remaining_budget: dict[str, object],
-    availability: dict[str, dict[str, str]],
-    candidate_state: dict[str, object],
+    budget: dict[str, object],
 ) -> list[dict[str, object]]:
-    blocked: list[dict[str, object]] = [
-        {"layer": "semantic", "ref": item} for item in semantic
-    ]
+    blocked = [{"layer": "semantic", "ref": item} for item in semantic]
     for item in pending:
-        if (
-            item.get("evaluation_state") == "lost"
-            or item.get("process_state") in {"lost", "missing"}
-            or item.get("measurement_state") == "terminal_observation_missing"
-        ):
-            blocked.append(
-                {
-                    "layer": "operational",
-                    "ref": item["ref"],
-                    "reason": item.get("reason")
-                    or item.get("measurement_state"),
-                }
-            )
-    for name, status in availability.items():
-        if status.get("state") == "unavailable":
-            blocked.append(
-                {
-                    "layer": "operational",
-                    "ref": (
-                        "terminal_inventory"
-                        if name == "terminal_observations"
-                        else f"{name.removesuffix('s')}_inventory"
-                    ),
-                    "reason": status.get("error") or "unavailable",
-                }
-            )
-    for key, ref in (
-        ("git_status", "candidate_git_status"),
-        ("worktrees", "worktree_inventory"),
-    ):
-        status = candidate_state.get(key)
-        if isinstance(status, dict) and status.get("state") == "unavailable":
-            blocked.append(
-                {
-                    "layer": "operational",
-                    "ref": ref,
-                    "reason": status.get("error") or "unavailable",
-                }
-            )
-    authority_state = str(authority.get("state", "")).casefold()
-    if authority_state in {"blocked", "denied", "expired", "unavailable"}:
-        blocked.append(
-            {
-                "layer": "authority",
-                "reason": authority.get("reason") or authority_state,
-            }
-        )
-    explicit = authority.get("blocked_reasons")
-    if isinstance(explicit, list):
-        blocked.extend(
-            {"layer": "authority", "reason": reason} for reason in explicit
-        )
-    budget_state = str(remaining_budget.get("state", "")).casefold()
-    if budget_state in {"exhausted", "blocked", "denied"}:
-        blocked.append(
-            {
-                "layer": "budget",
-                "reason": remaining_budget.get("reason") or budget_state,
-            }
-        )
+        if item.get("process_state") in {"lost", "missing"}:
+            blocked.append({"layer": "operational", "ref": item["ref"], "reason": item.get("reason")})
+    if authority.get("state") in {"blocked", "denied", "expired"}:
+        blocked.append({"layer": "authority", "reason": authority.get("reason") or authority["state"]})
+    if budget.get("state") in {"exhausted", "blocked", "denied"}:
+        blocked.append({"layer": "budget", "reason": budget.get("reason") or budget["state"]})
     return blocked
+
+
+def _fit(packet: dict[str, object], max_chars: int) -> None:
+    try:
+        fit_packet(packet, max_chars)
+    except ValueError:
+        recent = packet["recent_evidence_delta"]
+        if not isinstance(recent, list) or not recent:
+            raise
+        commit = recent[0].get("commit")
+        packet["recent_evidence_delta"] = [{"commit": commit}]
+        try:
+            fit_packet(packet, max_chars)
+        except ValueError:
+            packet["recent_evidence_delta"] = []
+            fit_packet(packet, max_chars)
 
 
 def _warn(warnings: list[str], warning: str) -> None:
@@ -1186,5 +691,8 @@ def _warn(warnings: list[str], warning: str) -> None:
 
 __all__ = [
     "AttentionAuthorityContext",
+    "DEFAULT_ATTENTION_MAX_CHARS",
+    "MAX_ATTENTION_MAX_CHARS",
+    "MIN_ATTENTION_MAX_CHARS",
     "ResearchAttentionService",
 ]

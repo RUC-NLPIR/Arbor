@@ -259,7 +259,7 @@ def test_start_initializes_before_context_and_runs_native_principal(
             "What mechanism matters?",
             "--material",
             str(paper),
-            "--cooperative-human-direct",
+            "--allow-checkpoint",
         ],
     )
 

@@ -7,7 +7,6 @@ from collections.abc import Callable
 from typing import Any
 
 from ..core.tools.base import Tool
-from .operational import OperationalIntent
 from .runs import RunError, RunService
 
 
@@ -95,27 +94,32 @@ class RunTool(Tool):
     def __init__(
         self,
         *,
-        operational_admission: Callable[[OperationalIntent], dict[str, object]]
+        commit_paths: Callable[[tuple[str, ...], str], dict[str, object]]
         | None = None,
+        record_observation: Callable[[str], None] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        if operational_admission is not None and not callable(operational_admission):
-            raise TypeError("operational_admission must be callable or None")
-        self.operational_admission = operational_admission
+        if commit_paths is not None and not callable(commit_paths):
+            raise TypeError("commit_paths must be callable or None")
+        if record_observation is not None and not callable(record_observation):
+            raise TypeError("record_observation must be callable or None")
+        self.commit_paths = commit_paths
+        self.record_observation = record_observation
 
-    def _operational_result(
+    def _committed_result(
         self,
         record: dict[str, object],
-        intent: OperationalIntent,
+        paths: tuple[str, ...],
+        message: str,
+        *,
+        observation: str | None = None,
     ) -> dict[str, object]:
-        result = {
-            **record,
-            "admission_required": self.operational_admission is None,
-            "operational_intent": intent.to_json(),
-        }
-        if self.operational_admission is not None:
-            result["operational_checkpoint"] = self.operational_admission(intent)
+        result = dict(record)
+        if self.commit_paths is not None:
+            result["checkpoint"] = self.commit_paths(paths, message)
+        if observation is not None and self.record_observation is not None:
+            self.record_observation(observation)
         return result
 
     async def execute(self, **kwargs: Any) -> str:
@@ -125,7 +129,7 @@ class RunTool(Tool):
 
         service = RunService(self.cwd)
         if action == "start":
-            manifest, intent = service.prepare_with_operational_intent(
+            manifest, paths, message = service.prepare_with_commit(
                 kwargs.get("argv"),
                 cwd=kwargs.get("cwd", "."),
                 timeout_seconds=kwargs.get("timeout_seconds", 3600),
@@ -138,22 +142,34 @@ class RunTool(Tool):
                 ),
                 writable_paths=kwargs.get("writable_paths", []),
             )
+            checkpoint = (
+                self.commit_paths(paths, message)
+                if self.commit_paths is not None
+                else None
+            )
             started = service.start(str(manifest["run_id"]), actor="principal")
-            result = self._operational_result(started, intent)
+            result = dict(started)
+            if checkpoint is not None:
+                result["checkpoint"] = checkpoint
         elif action == "status":
             run_id = kwargs.get("run_id")
             status = service.status(run_id)
-            intent = (
-                service.terminal_operational_intent(run_id)
+            terminal = (
+                service.terminal_with_commit(run_id)
                 if status.get("state")
                 in {"completed", "failed_process", "timed_out", "cancelled"}
                 else None
             )
-            result = (
-                self._operational_result(status, intent)
-                if intent is not None
-                else status
-            )
+            if terminal is None:
+                result = status
+            else:
+                _final, paths, message = terminal
+                result = self._committed_result(
+                    status,
+                    paths,
+                    message,
+                    observation=paths[0],
+                )
         elif action == "list":
             result = service.list()
         elif action == "tail":

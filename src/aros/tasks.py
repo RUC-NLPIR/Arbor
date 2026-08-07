@@ -37,9 +37,6 @@ from .store import (
     read_json_strict_no_repair,
     utc_now,
 )
-from .operational import OperationalIntent, build_operational_intent
-
-
 _TASK_ID = re.compile(
     r"^TASK-[0-9]{8}-[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$"
 )
@@ -383,7 +380,7 @@ class TaskService:
                     key_digest,
                 )
 
-    def create_with_operational_intent(
+    def create_with_commit(
         self,
         objective: str,
         *,
@@ -395,8 +392,8 @@ class TaskService:
         acceptance: list[str],
         timeout_seconds: float,
         idempotency_key: str,
-    ) -> tuple[dict[str, object], OperationalIntent]:
-        """Return the unchanged brief plus a pure foreground admission intent."""
+    ) -> tuple[dict[str, object], tuple[str, ...], str]:
+        """Return the brief and its direct Git commit request."""
         brief = self.create(
             objective,
             actor=actor,
@@ -409,11 +406,11 @@ class TaskService:
             idempotency_key=idempotency_key,
         )
         task_id = str(brief["task_id"])
-        intent = build_operational_intent(
+        return (
+            brief,
             (f"tasks/{task_id}/brief.json",),
-            str(brief["brief_sha256"]),
+            f"Record task {task_id} brief",
         )
-        return brief, intent
 
     def _create_locked(
         self,
@@ -1045,20 +1042,20 @@ class TaskService:
                     raise TaskError(f"task collection differs after write: {task_id}")
                 return recorded
 
-    def collect_with_operational_intent(
+    def collect_with_commit(
         self,
         task_id: str,
-    ) -> tuple[dict[str, object], OperationalIntent | None]:
-        """Return a collection plus an intent only when a versioned record exists."""
+    ) -> tuple[dict[str, object], tuple[str, ...] | None, str | None]:
+        """Return a collection and its direct Git commit request when present."""
         record = self.collect(task_id)
         record_sha256 = record.get("collected_sha256")
         if not isinstance(record_sha256, str):
-            return record, None
-        intent = build_operational_intent(
+            return record, None, None
+        return (
+            record,
             (f"tasks/{task_id}/collected.json",),
-            record_sha256,
+            f"Record task {task_id} collection",
         )
-        return record, intent
 
     def preserve(self, task_id: str) -> dict[str, object]:
         """Return an owned-worktree snapshot without changing child material."""

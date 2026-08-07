@@ -101,10 +101,13 @@ def test_direct_aros_help_is_the_root_app() -> None:
         "status",
         "start",
         "run",
-        "transition",
-        "audit",
+        "task",
+        "eval",
+        "checkpoint",
     ):
         assert command in result.output
+    assert "transition" not in result.output
+    assert "rebuild-index" not in result.output
     registered = {command.name for command in aros_app.registered_commands}
     assert "init" not in registered
     assert "\naros " not in result.output
@@ -185,11 +188,11 @@ def test_start_has_no_checkpoint_authority_by_default(
     assert result.exit_code == 0, result.output
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
-    assert kwargs["admission_gateway"] is None
+    assert kwargs["allow_checkpoint"] is False
     assert kwargs["attention_context"] is None
 
 
-def test_start_explicit_cooperative_mode_injects_host_owned_context(
+def test_start_explicit_checkpoint_mode_injects_host_owned_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -200,7 +203,7 @@ def test_start_explicit_cooperative_mode_injects_host_owned_context(
         [
             "start",
             "inspect",
-            "--cooperative-human-direct",
+            "--allow-checkpoint",
             "--cwd",
             str(tmp_path),
         ],
@@ -209,13 +212,13 @@ def test_start_explicit_cooperative_mode_injects_host_owned_context(
     assert result.exit_code == 0, result.output
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
-    assert isinstance(kwargs["admission_gateway"], aros_cmd.HumanDirectGateway)
+    assert kwargs["allow_checkpoint"] is True
     context = kwargs["attention_context"]
     assert isinstance(context, aros_cmd.AttentionAuthorityContext)
     assert dict(context.authority) == {
         "state": "available",
         "enforcement_class": "cooperative",
-        "issuer": "human-direct",
+        "issuer": "local-host",
     }
     assert dict(context.remaining_budget) == {
         "state": "not_configured",

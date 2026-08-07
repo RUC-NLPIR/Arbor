@@ -151,51 +151,42 @@ def _create(
     return service.create(objective, **_request(key=key))  # type: ignore[arg-type]
 
 
-def test_task_create_returns_unchanged_record_with_operational_intent(
+def test_task_create_returns_record_with_direct_commit_request(
     tmp_path: Path,
 ) -> None:
     _init_workspace(tmp_path)
     service = TaskService(tmp_path)
 
-    record, intent = service.create_with_operational_intent(
+    record, paths, message = service.create_with_commit(
         "bounded objective",
-        **_request(key="create-operational-intent"),  # type: ignore[arg-type]
+        **_request(key="create-direct-commit"),  # type: ignore[arg-type]
     )
 
     task_id = str(record["task_id"])
     brief_path = tmp_path / "tasks" / task_id / "brief.json"
     assert json.loads(brief_path.read_bytes()) == record
-    assert intent.to_json() == {
-        "schema_version": 1,
-        "workspace_paths": [f"tasks/{task_id}/brief.json"],
-        "record_sha256": record["brief_sha256"],
-    }
+    assert paths == (f"tasks/{task_id}/brief.json",)
+    assert message == f"Record task {task_id} brief"
     assert not any(path.is_file() for path in (tmp_path / "transitions").rglob("*"))
-    assert "assimilations" not in intent.to_json()
     signatures = (
-        inspect.signature(TaskService.create_with_operational_intent),
-        inspect.signature(TaskService.collect_with_operational_intent),
+        inspect.signature(TaskService.create_with_commit),
+        inspect.signature(TaskService.collect_with_commit),
     )
     forbidden = {"gateway", "credential", "contract", "lease", "canonical_ref"}
     assert all(forbidden.isdisjoint(signature.parameters) for signature in signatures)
 
 
-def test_task_tool_callback_admits_brief_before_worktree_start(tmp_path: Path) -> None:
-    from arbor.aros.checkpoint import CheckpointService
+def test_task_tool_commits_brief_before_worktree_start(tmp_path: Path) -> None:
+    from arbor.aros.checkpoint import GitCheckpoint
+    from arbor.aros.observed import ObservedRefs
     from arbor.aros.task_tool import TaskTool
-    from arbor.aros.worktrees import bind_repository
-    from arbor.cli.commands.aros_cmd import HumanDirectGateway
 
     _init_workspace(tmp_path)
-    checkpoint = CheckpointService(
-        tmp_path,
-        canonical_repository=bind_repository(tmp_path),
-        canonical_ref=_git(tmp_path, "symbolic-ref", "HEAD"),
-        gateway=HumanDirectGateway(clock=lambda: 1_000),
-    )
+    checkpoint = GitCheckpoint(tmp_path)
     tool = TaskTool(
         cwd=str(tmp_path),
-        operational_admission=checkpoint.checkpoint_operational,
+        commit_paths=checkpoint.commit_paths,
+        record_observation=ObservedRefs().record,
         persist_results=False,
     )
 
@@ -203,17 +194,16 @@ def test_task_tool_callback_admits_brief_before_worktree_start(tmp_path: Path) -
         asyncio.run(
             tool.execute(
                 action="create",
-                objective="create an admitted task brief",
+                objective="create a committed task brief",
                 mode="write",
                 adapter_argv=["adapter", "--exact"],
-                idempotency_key="admitted-task-brief",
+                idempotency_key="committed-task-brief",
             )
         )
     )
 
     task_id = str(output["task_id"])
-    assert output["admission_required"] is False
-    assert output["operational_checkpoint"]["state"] == "admitted"
+    assert output["checkpoint"]["commit"] == _git(tmp_path, "rev-parse", "HEAD")
     assert _git(tmp_path, "status", "--porcelain") == ""
     assert (
         _git(tmp_path, "show", f"HEAD:tasks/{task_id}/brief.json")
@@ -1736,32 +1726,29 @@ def test_worktree_validation_tolerates_registry_head_lag_during_child_commit(
     assert _git(worktree, "rev-parse", "HEAD") != brief["base_commit"]
 
 
-def test_task_collect_intent_uses_collection_hash_and_never_assimilates(
+def test_task_collect_returns_direct_commit_request(
     tmp_path: Path,
 ) -> None:
     service, brief, ownership, _final = _create_terminal_task(tmp_path)
     _commit_child_return(tmp_path, brief, ownership)
     task_id = str(brief["task_id"])
 
-    record, intent = service.collect_with_operational_intent(task_id)
+    record, paths, message = service.collect_with_commit(task_id)
 
-    assert intent is not None
-    assert intent.to_json() == {
-        "schema_version": 1,
-        "workspace_paths": [f"tasks/{task_id}/collected.json"],
-        "record_sha256": record["collected_sha256"],
-    }
-    assert "assimilations" not in intent.to_json()
+    assert record["collected_sha256"]
+    assert paths == (f"tasks/{task_id}/collected.json",)
+    assert message == f"Record task {task_id} collection"
 
 
-def test_task_no_return_collection_has_no_operational_intent(tmp_path: Path) -> None:
+def test_task_no_return_collection_has_no_commit_request(tmp_path: Path) -> None:
     service, brief, _ownership, _final = _create_terminal_task(tmp_path)
     task_id = str(brief["task_id"])
 
-    record, intent = service.collect_with_operational_intent(task_id)
+    record, paths, message = service.collect_with_commit(task_id)
 
     assert record["state"] == "completed_no_return"
-    assert intent is None
+    assert paths is None
+    assert message is None
 
 
 @pytest.mark.parametrize("status_state", ("missing", "prepared"))

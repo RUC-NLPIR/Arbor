@@ -184,17 +184,17 @@ def _prepare(
     return service, manifest
 
 
-def test_run_prepare_returns_manifest_operational_intent_without_transition_dirt(
+def test_run_prepare_returns_manifest_with_direct_commit_request(
     tmp_path: Path,
 ) -> None:
     _init_clean_repo(tmp_path)
     service = RunService(tmp_path)
 
-    manifest, intent = service.prepare_with_operational_intent(
+    manifest, paths, message = service.prepare_with_commit(
         [sys.executable, "-c", "print('run')"],
         cwd=".",
         timeout_seconds=10,
-        idempotency_key="run-operational-intent",
+        idempotency_key="run-direct-commit",
         actor="principal",
         label="intent",
         security_profile="trusted-local",
@@ -202,11 +202,8 @@ def test_run_prepare_returns_manifest_operational_intent_without_transition_dirt
     )
 
     run_id = str(manifest["run_id"])
-    assert intent.to_json() == {
-        "schema_version": 1,
-        "workspace_paths": [f"runs/{run_id}/manifest.json"],
-        "record_sha256": manifest["manifest_sha256"],
-    }
+    assert paths == (f"runs/{run_id}/manifest.json",)
+    assert message == f"Record run {run_id} manifest"
     assert json.loads((tmp_path / "runs" / run_id / "manifest.json").read_bytes()) == manifest
     assert not (tmp_path / "transitions").exists()
 
@@ -659,29 +656,28 @@ def test_read_verified_output_returns_exact_terminal_log_bytes(
     assert service.read_verified_output(run_id, "stderr") == b""
 
 
-def test_run_terminal_operational_intent_is_derived_only_after_final(
+def test_run_terminal_commit_request_is_derived_only_after_final(
     tmp_path: Path,
 ) -> None:
     _init_clean_repo(tmp_path)
     service, manifest = _prepare(
         tmp_path,
         argv=[sys.executable, "-c", "print('terminal intent')"],
-        key="terminal-operational-intent",
+        key="terminal-direct-commit",
     )
     run_id = _mark_runner_launched(tmp_path, service, manifest)
 
-    assert service.terminal_operational_intent(run_id) is None
+    assert service.terminal_with_commit(run_id) is None
     assert runner_module.run(str(tmp_path), run_id) == 0
     final = service.read_validated_final(run_id)
 
-    intent = service.terminal_operational_intent(run_id)
+    request = service.terminal_with_commit(run_id)
 
-    assert intent is not None
-    assert intent.to_json() == {
-        "schema_version": 1,
-        "workspace_paths": [f"runs/{run_id}/final.json"],
-        "record_sha256": store_module.json_sha256(final),
-    }
+    assert request is not None
+    record, paths, message = request
+    assert record == final
+    assert paths == (f"runs/{run_id}/final.json",)
+    assert message == f"Record run {run_id} final"
 
 
 def test_immutable_final_readers_ignore_missing_mutable_status_and_fail_closed(

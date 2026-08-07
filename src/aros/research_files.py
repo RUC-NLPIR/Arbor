@@ -9,20 +9,14 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, Mapping, cast
+from typing import Mapping, cast
 
 import yaml
-
-from .store import _strict_json_loads, json_sha256
 
 
 _open = os.open
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-EvidenceRelation = Literal["supports", "challenges", "bounds", "context"]
-_RELATIONS = {"supports", "challenges", "bounds", "context"}
-_EVIDENCE_FIELDS = {"observation_ref", "relation", "scope"}
-_LINK_HEADINGS = {"Evidence links", "Counterevidence"}
 _QUESTION_PATH = re.compile(r"questions/(Q-[^/]+)/question\.md")
 _CLAIM_PATH = re.compile(r"knowledge/claims/(C-[^/]+)\.md")
 _IDEA_PATH = re.compile(r"ideas/(I-[^/]+)\.md")
@@ -48,7 +42,7 @@ _QUESTION_SECTIONS = (
 _CLAIM_SECTIONS = (
     "Claim",
     "Statement and scope",
-    "Evidence links",
+    "Evidence",
     "Counterevidence",
     "Assumptions",
     "Uncertainty and alternatives",
@@ -60,28 +54,8 @@ class ResearchFileError(ValueError):
     """A semantic file is unsafe or mechanically ambiguous."""
 
 
-class ResearchFileLimitError(ResearchFileError):
-    """A semantic file exceeds a caller-supplied mechanical link bound."""
-
-
 class ResearchFileStructureError(ResearchFileError):
     """Semantic frontmatter exceeds explicit structural bounds."""
-
-
-@dataclass(frozen=True)
-class EvidenceLink:
-    observation_ref: str
-    relation: EvidenceRelation
-    scope: str
-
-
-@dataclass(frozen=True)
-class EvidenceLinkOccurrence:
-    path: str
-    anchor: str
-    ordinal: int
-    link: EvidenceLink
-    canonical_sha256: str
 
 
 @dataclass(frozen=True)
@@ -90,7 +64,6 @@ class SemanticDocument:
     identifier: str | None
     frontmatter: Mapping[str, object]
     sections: Mapping[str, str]
-    evidence_links: tuple[EvidenceLinkOccurrence, ...]
     warnings: tuple[str, ...]
 
 
@@ -136,17 +109,11 @@ def read_semantic_document(root: Path, relative: str) -> SemanticDocument:
 def parse_semantic_document_bytes(
     relative_path: str,
     raw: bytes,
-    *,
-    max_evidence_links: int | None = None,
 ) -> SemanticDocument:
     """Parse one exact semantic file payload without filesystem access."""
     normalized_relative = _normalized_relative(relative_path)
     if not isinstance(raw, bytes):
         raise ResearchFileError("semantic content must be bytes")
-    if max_evidence_links is not None and (
-        type(max_evidence_links) is not int or max_evidence_links < 0
-    ):
-        raise ResearchFileError("max_evidence_links must be nonnegative or null")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -157,11 +124,6 @@ def parse_semantic_document_bytes(
     frontmatter, body = _split_frontmatter(text, normalized_relative)
     identifier = _validate_navigation_identity(normalized_relative, frontmatter)
     sections = _sections(body, normalized_relative)
-    evidence_links = _evidence_links(
-        normalized_relative,
-        sections,
-        max_evidence_links=max_evidence_links,
-    )
     warnings = tuple(
         f"missing recommended section: {heading}"
         for heading in _recommended_sections(normalized_relative)
@@ -172,7 +134,6 @@ def parse_semantic_document_bytes(
         identifier=identifier,
         frontmatter=MappingProxyType(dict(frontmatter)),
         sections=MappingProxyType(dict(sections)),
-        evidence_links=evidence_links,
         warnings=warnings,
     )
 
@@ -378,72 +339,6 @@ def _closes_fence(line: str, marker: str, minimum: int) -> bool:
     return run >= minimum and not stripped[run:].strip()
 
 
-def _evidence_links(
-    relative: str,
-    sections: Mapping[str, str],
-    *,
-    max_evidence_links: int | None,
-) -> tuple[EvidenceLinkOccurrence, ...]:
-    occurrences: list[EvidenceLinkOccurrence] = []
-    for anchor, content in sections.items():
-        if anchor not in _LINK_HEADINGS:
-            continue
-        ordinal = 0
-        for line in content.splitlines():
-            if not line.strip():
-                continue
-            try:
-                payload = _strict_json_loads(line)
-            except (TypeError, ValueError) as error:
-                raise ResearchFileError(
-                    f"invalid EvidenceLink in {relative} under {anchor}: {error}"
-                ) from error
-            if not isinstance(payload, dict) or set(payload) != _EVIDENCE_FIELDS:
-                raise ResearchFileError(
-                    f"EvidenceLink in {relative} under {anchor} must contain exactly "
-                    "observation_ref, relation, and scope"
-                )
-            if any(
-                not isinstance(payload[field], str) or not payload[field].strip()
-                for field in _EVIDENCE_FIELDS
-            ):
-                raise ResearchFileError(
-                    f"EvidenceLink fields must be non-empty strings: {relative} under {anchor}"
-                )
-            relation = payload["relation"]
-            if relation not in _RELATIONS:
-                raise ResearchFileError(
-                    f"invalid EvidenceLink relation in {relative} under {anchor}: {relation}"
-                )
-            normalized = {
-                "observation_ref": payload["observation_ref"],
-                "relation": relation,
-                "scope": payload["scope"],
-            }
-            if (
-                max_evidence_links is not None
-                and len(occurrences) >= max_evidence_links
-            ):
-                raise ResearchFileLimitError(
-                    f"EvidenceLink count exceeds {max_evidence_links}: {relative}"
-                )
-            occurrences.append(
-                EvidenceLinkOccurrence(
-                    path=relative,
-                    anchor=anchor,
-                    ordinal=ordinal,
-                    link=EvidenceLink(
-                        observation_ref=normalized["observation_ref"],
-                        relation=cast(EvidenceRelation, normalized["relation"]),
-                        scope=normalized["scope"],
-                    ),
-                    canonical_sha256=json_sha256(normalized),
-                )
-            )
-            ordinal += 1
-    return tuple(occurrences)
-
-
 def _recommended_sections(relative: str) -> tuple[str, ...]:
     if _QUESTION_PATH.fullmatch(relative):
         return _QUESTION_SECTIONS
@@ -453,12 +348,9 @@ def _recommended_sections(relative: str) -> tuple[str, ...]:
 
 
 __all__ = [
-    "EvidenceLink",
-    "EvidenceLinkOccurrence",
     "MAX_FRONTMATTER_DEPTH",
     "MAX_FRONTMATTER_NODES",
     "ResearchFileError",
-    "ResearchFileLimitError",
     "ResearchFileStructureError",
     "SemanticDocument",
     "parse_semantic_document_bytes",

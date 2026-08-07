@@ -11,7 +11,6 @@ from typing import Any
 import pytest
 
 from arbor.aros import run_tool
-from arbor.aros.operational import build_operational_intent
 from arbor.aros.run_tool import RunTool
 from arbor.aros.runs import RunError
 
@@ -55,11 +54,12 @@ class FakeRunService:
             "manifest_sha256": "a" * 64,
         }
 
-    def prepare_with_operational_intent(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+    def prepare_with_commit(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         manifest = self.prepare(*args, **kwargs)
-        return manifest, build_operational_intent(
+        return (
+            manifest,
             ("runs/RUN-test/manifest.json",),
-            "a" * 64,
+            "Record run RUN-test manifest",
         )
 
     def start(self, run_id: str, *, actor: str | None = None) -> dict[str, Any]:
@@ -73,13 +73,14 @@ class FakeRunService:
             "state": "completed" if run_id == "RUN-terminal" else "running",
         }
 
-    def terminal_operational_intent(self, run_id: str):  # type: ignore[no-untyped-def]
-        self.calls.append(("terminal_intent", run_id))
+    def terminal_with_commit(self, run_id: str):  # type: ignore[no-untyped-def]
+        self.calls.append(("terminal_with_commit", run_id))
         if run_id != "RUN-terminal":
             return None
-        return build_operational_intent(
+        return (
+            {"run_id": run_id, "state": "completed"},
             ("runs/RUN-terminal/final.json",),
-            "f" * 64,
+            "Record run RUN-terminal final",
         )
 
     def list(self) -> list[dict[str, Any]]:
@@ -169,28 +170,18 @@ def test_start_prepares_then_starts_as_principal(tmp_path: Path) -> None:
     assert json.loads(output) == {
         "run_id": "RUN-test",
         "state": "running",
-        "admission_required": True,
-        "operational_intent": {
-            "schema_version": 1,
-            "workspace_paths": ["runs/RUN-test/manifest.json"],
-            "record_sha256": "a" * 64,
-        },
     }
 
 
-def test_start_admits_manifest_only_after_run_started(tmp_path: Path) -> None:
-    calls: list[object] = []
+def test_start_commits_manifest_before_run_starts(tmp_path: Path) -> None:
+    calls: list[tuple[tuple[str, ...], str]] = []
 
-    def admit(intent: object) -> dict[str, object]:
-        assert FakeRunService.instances[0].calls[-1] == (
-            "start",
-            "RUN-test",
-            "principal",
-        )
-        calls.append(intent)
-        return {"state": "admitted", "commit": "b" * 40}
+    def commit(paths: tuple[str, ...], message: str) -> dict[str, object]:
+        assert FakeRunService.instances[0].calls[-1][0] == "prepare"
+        calls.append((paths, message))
+        return {"commit": "b" * 40}
 
-    tool = RunTool(cwd=str(tmp_path), operational_admission=admit)
+    tool = RunTool(cwd=str(tmp_path), commit_paths=commit)
 
     output = json.loads(
         _execute(
@@ -201,12 +192,10 @@ def test_start_admits_manifest_only_after_run_started(tmp_path: Path) -> None:
         )
     )
 
-    assert len(calls) == 1
-    assert output["admission_required"] is False
-    assert output["operational_checkpoint"] == {
-        "state": "admitted",
-        "commit": "b" * 40,
-    }
+    assert calls == [
+        (("runs/RUN-test/manifest.json",), "Record run RUN-test manifest")
+    ]
+    assert output["checkpoint"] == {"commit": "b" * 40}
 
 
 def test_start_explicitly_forwards_trusted_local_and_writable_paths(
@@ -248,26 +237,33 @@ def test_status_and_list_return_json(tmp_path: Path) -> None:
     assert FakeRunService.instances[1].calls == [("list",)]
 
 
-def test_terminal_status_admits_final_record_at_foreground_seam(tmp_path: Path) -> None:
-    calls: list[object] = []
+def test_terminal_status_commits_final_and_records_observation(tmp_path: Path) -> None:
+    events: list[object] = []
 
-    def admit(intent: object) -> dict[str, object]:
-        calls.append(intent)
-        return {"state": "admitted", "commit": "e" * 40}
+    def commit(paths: tuple[str, ...], message: str) -> dict[str, object]:
+        events.append((paths, message))
+        return {"commit": "e" * 40}
 
-    tool = RunTool(cwd=str(tmp_path), operational_admission=admit)
+    tool = RunTool(
+        cwd=str(tmp_path),
+        commit_paths=commit,
+        record_observation=lambda ref: events.append(ref),
+    )
 
     output = json.loads(_execute(tool, action="status", run_id="RUN-terminal"))
 
-    assert len(calls) == 1
     assert FakeRunService.instances[0].calls == [
         ("status", "RUN-terminal"),
-        ("terminal_intent", "RUN-terminal"),
+        ("terminal_with_commit", "RUN-terminal"),
     ]
     assert output["state"] == "completed"
-    assert output["admission_required"] is False
-    assert output["operational_intent"]["workspace_paths"] == [
-        "runs/RUN-terminal/final.json"
+    assert output["checkpoint"] == {"commit": "e" * 40}
+    assert events == [
+        (
+            ("runs/RUN-terminal/final.json",),
+            "Record run RUN-terminal final",
+        ),
+        "runs/RUN-terminal/final.json",
     ]
 
 

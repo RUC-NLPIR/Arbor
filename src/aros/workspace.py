@@ -90,7 +90,6 @@ def init_workspace(root: str | Path, mission: str) -> dict[str, object]:
         "knowledge/claims",
         "ideas",
         "memory/decisions",
-        "transitions",
         ".aros",
         ".worktree",
     ):

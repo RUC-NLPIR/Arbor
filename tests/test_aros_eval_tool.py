@@ -15,7 +15,6 @@ from jsonschema import Draft202012Validator
 from arbor.aros import eval_tool
 from arbor.aros.eval import EvalError, ExistingEvaluation
 from arbor.aros.eval_tool import EvalTool
-from arbor.aros.operational import build_operational_intent
 
 
 class FakeEvalService:
@@ -64,19 +63,27 @@ class FakeEvalService:
             "receipt_sha256": "b" * 64,
         }
 
-    def run_with_operational_intent(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+    def run_with_commit(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         result = self.run(*args, **kwargs)
         projection = result.status if isinstance(result, ExistingEvaluation) else result
         receipt_sha256 = projection.get("receipt_sha256")
         if not isinstance(receipt_sha256, str):
-            return result, None
-        return result, build_operational_intent(
-            (f"eval/evaluations/{projection['eval_id']}/receipt.json",),
-            receipt_sha256,
+            return result, None, None
+        eval_id = str(projection["eval_id"])
+        return (
+            result,
+            (f"eval/evaluations/{eval_id}/receipt.json",),
+            f"Record evaluation {eval_id} receipt",
         )
 
     def status(self, eval_id: str) -> dict[str, object]:
         self.calls.append(("status", eval_id))
+        if eval_id == "EVAL-terminal":
+            return {
+                "eval_id": eval_id,
+                "evaluation_state": "completed",
+                "receipt_ref": "eval/evaluations/EVAL-terminal/receipt.json",
+            }
         return {"eval_id": eval_id, "evaluation_state": "running"}
 
     def observe(self, eval_id: str, *, stream: str, max_bytes: int) -> str:
@@ -85,6 +92,14 @@ class FakeEvalService:
 
     def audit(self, eval_id: str) -> dict[str, object]:
         self.calls.append(("audit", eval_id))
+        if eval_id == "EVAL-terminal":
+            return {
+                "schema_version": 1,
+                "eval_id": eval_id,
+                "valid": True,
+                "checked_refs": ["eval/evaluations/EVAL-terminal/receipt.json"],
+                "issues": [],
+            }
         return {"schema_version": 1, "eval_id": eval_id, "valid": True}
 
 
@@ -317,26 +332,22 @@ def test_register_and_run_forward_exact_requests_as_principal(tmp_path: Path) ->
         "eval_id": "EVAL-" + "a" * 64,
         "evaluation_state": "completed",
         "receipt_sha256": "b" * 64,
-        "admission_required": True,
-        "operational_intent": {
-            "schema_version": 1,
-            "workspace_paths": [
-                "eval/evaluations/EVAL-" + "a" * 64 + "/receipt.json"
-            ],
-            "record_sha256": "b" * 64,
-        },
     }
 
 
-def test_eval_run_admits_receipt_only_after_terminal_result(tmp_path: Path) -> None:
-    calls: list[object] = []
+def test_eval_run_commits_receipt_then_records_observation(tmp_path: Path) -> None:
+    events: list[object] = []
 
-    def admit(intent: object) -> dict[str, object]:
+    def commit(paths: tuple[str, ...], message: str) -> dict[str, object]:
         assert FakeEvalService.instances[0].calls[-1][0] == "run"
-        calls.append(intent)
-        return {"state": "admitted", "commit": "c" * 40}
+        events.append((paths, message))
+        return {"commit": "c" * 40}
 
-    tool = EvalTool(cwd=str(tmp_path), operational_admission=admit)
+    tool = EvalTool(
+        cwd=str(tmp_path),
+        commit_paths=commit,
+        record_observation=lambda ref: events.append(ref),
+    )
 
     output = json.loads(
         _execute(
@@ -349,12 +360,15 @@ def test_eval_run_admits_receipt_only_after_terminal_result(tmp_path: Path) -> N
         )
     )
 
-    assert len(calls) == 1
-    assert output["admission_required"] is False
-    assert output["operational_checkpoint"] == {
-        "state": "admitted",
-        "commit": "c" * 40,
-    }
+    eval_id = "EVAL-" + "a" * 64
+    assert events == [
+        (
+            (f"eval/evaluations/{eval_id}/receipt.json",),
+            f"Record evaluation {eval_id} receipt",
+        ),
+        f"eval/evaluations/{eval_id}/receipt.json",
+    ]
+    assert output["checkpoint"] == {"commit": "c" * 40}
 
 
 def test_run_returns_existing_lost_status_without_retrying(tmp_path: Path) -> None:
@@ -425,10 +439,25 @@ def test_observe_returns_only_the_exact_bounded_visible_stream(tmp_path: Path) -
     assert bounded_output == "raw visible output\n"
     assert FakeEvalService.instances[0].calls == [
         ("observe", "EVAL-test", "stdout", 65_536),
+        ("status", "EVAL-test"),
     ]
     assert FakeEvalService.instances[1].calls == [
         ("observe", "EVAL-test", "stderr", 2048),
+        ("status", "EVAL-test"),
     ]
+
+
+@pytest.mark.parametrize("action", ["status", "observe", "audit"])
+def test_terminal_eval_reads_record_the_receipt_ref(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    observed: list[str] = []
+    tool = EvalTool(cwd=str(tmp_path), record_observation=observed.append)
+
+    _execute(tool, action=action, eval_id="EVAL-terminal")
+
+    assert observed == ["eval/evaluations/EVAL-terminal/receipt.json"]
 
 
 @pytest.mark.parametrize(

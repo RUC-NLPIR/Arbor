@@ -58,7 +58,7 @@ def test_init_workspace_creates_only_the_minimal_real_workspace(tmp_path: Path) 
     assert (tmp_path / "memory" / "decisions").is_dir()
     assert (tmp_path / "knowledge" / "claims").is_dir()
     assert (tmp_path / "ideas").is_dir()
-    assert (tmp_path / "transitions").is_dir()
+    assert not (tmp_path / "transitions").exists()
 
     frontier = (tmp_path / "questions" / "FRONTIER.md").read_text(encoding="utf-8")
     assert "focus_question:" in frontier
@@ -373,7 +373,7 @@ def test_boot_workspace_has_a_strict_size_limit_without_losing_git_reality(
         "recent_evidence_delta",
         "hypotheses",
         "pending_measurements",
-        "unassimilated_returns",
+        "unread_returns",
         "current_obligations",
         "remaining_budget",
         "blocked_reasons",

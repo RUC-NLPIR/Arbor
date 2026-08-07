@@ -9,7 +9,6 @@ from typing import Any
 
 from ..core.tools.base import PathAuthorizer, Tool
 from .eval import EvalError, EvalService, ExistingEvaluation
-from .operational import OperationalIntent
 
 
 _ACTIONS = ("register", "run", "status", "observe", "audit")
@@ -134,8 +133,9 @@ class EvalTool(Tool):
         workspace_dir: str | None = None,
         path_authorizer: PathAuthorizer | None = None,
         persist_results: bool = True,
-        operational_admission: Callable[[OperationalIntent], dict[str, object]]
+        commit_paths: Callable[[tuple[str, ...], str], dict[str, object]]
         | None = None,
+        record_observation: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(
             cwd=cwd,
@@ -143,14 +143,35 @@ class EvalTool(Tool):
             path_authorizer=path_authorizer,
             persist_results=persist_results,
         )
-        if operational_admission is not None and not callable(operational_admission):
-            raise TypeError("operational_admission must be callable or None")
-        self.operational_admission = operational_admission
+        if commit_paths is not None and not callable(commit_paths):
+            raise TypeError("commit_paths must be callable or None")
+        if record_observation is not None and not callable(record_observation):
+            raise TypeError("record_observation must be callable or None")
+        self.commit_paths = commit_paths
+        self.record_observation = record_observation
         self.input_schema = copy.deepcopy(type(self).input_schema)
 
     def to_api_schema(self) -> dict[str, Any]:
         """Return an export that cannot mutate this tool's schema."""
         return copy.deepcopy(super().to_api_schema())
+
+    def _record_terminal_ref(self, result: dict[str, object]) -> None:
+        ref = result.get("receipt_ref")
+        if not isinstance(ref, str) and result.get("valid") is True:
+            checked = result.get("checked_refs")
+            if isinstance(checked, list):
+                ref = next(
+                    (
+                        item
+                        for item in checked
+                        if isinstance(item, str)
+                        and item.startswith("eval/evaluations/")
+                        and item.endswith("/receipt.json")
+                    ),
+                    None,
+                )
+        if isinstance(ref, str) and self.record_observation is not None:
+            self.record_observation(ref)
 
     async def execute(self, **kwargs: Any) -> str:
         """Dispatch one visible evaluation operation."""
@@ -184,7 +205,7 @@ class EvalTool(Tool):
                 actor="principal",
             )
         elif action == "run":
-            result, intent = service.run_with_operational_intent(
+            result, paths, message = service.run_with_commit(
                 kwargs["evaluator_id"],
                 kwargs["version"],
                 kwargs["candidate_commit"],
@@ -193,26 +214,25 @@ class EvalTool(Tool):
             )
             if isinstance(result, ExistingEvaluation):
                 result = result.status
-            if intent is not None:
-                result = {
-                    **result,
-                    "admission_required": self.operational_admission is None,
-                    "operational_intent": intent.to_json(),
-                }
-                if self.operational_admission is not None:
-                    result["operational_checkpoint"] = self.operational_admission(
-                        intent
-                    )
+            if paths is not None and message is not None:
+                result = dict(result)
+                if self.commit_paths is not None:
+                    result["checkpoint"] = self.commit_paths(paths, message)
+                if self.record_observation is not None:
+                    self.record_observation(paths[0])
         elif action == "status":
             result = service.status(kwargs["eval_id"])
         elif action == "observe":
-            return service.observe(
+            output = service.observe(
                 kwargs["eval_id"],
                 stream=kwargs.get("stream", "stdout"),
                 max_bytes=kwargs.get("max_bytes", 65_536),
             )
+            self._record_terminal_ref(service.status(kwargs["eval_id"]))
+            return output
         else:
             result = service.audit(kwargs["eval_id"])
         if isinstance(result, ExistingEvaluation):
             result = result.status
+        self._record_terminal_ref(result)
         return json.dumps(result, ensure_ascii=False, indent=2)

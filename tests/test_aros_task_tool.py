@@ -11,7 +11,6 @@ from typing import Any
 
 import pytest
 
-from arbor.aros.operational import build_operational_intent
 from arbor.aros.tasks import TaskError
 
 
@@ -52,11 +51,12 @@ class FakeTaskService:
         )
         return {"task_id": "TASK-test", "state": "prepared"}
 
-    def create_with_operational_intent(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+    def create_with_commit(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         record = self.create(*args, **kwargs)
-        return record, build_operational_intent(
+        return (
+            record,
             ("tasks/TASK-test/brief.json",),
-            "b" * 64,
+            "Record task TASK-test brief",
         )
 
     def start(self, task_id: str, *, actor: str | None = None) -> dict[str, Any]:
@@ -94,11 +94,12 @@ class FakeTaskService:
             "collected_sha256": "c" * 64,
         }
 
-    def collect_with_operational_intent(self, task_id: str):  # type: ignore[no-untyped-def]
+    def collect_with_commit(self, task_id: str):  # type: ignore[no-untyped-def]
         record = self.collect(task_id)
-        return record, build_operational_intent(
+        return (
+            record,
             (f"tasks/{task_id}/collected.json",),
-            "c" * 64,
+            f"Record task {task_id} collection",
         )
 
     def preserve(self, task_id: str) -> dict[str, Any]:
@@ -234,24 +235,18 @@ def test_create_freezes_default_brief_without_starting(tmp_path: Path) -> None:
     assert json.loads(output) == {
         "task_id": "TASK-test",
         "state": "prepared",
-        "admission_required": True,
-        "operational_intent": {
-            "schema_version": 1,
-            "workspace_paths": ["tasks/TASK-test/brief.json"],
-            "record_sha256": "b" * 64,
-        },
     }
     assert not any(tmp_path.rglob("proposal.json"))
 
 
-def test_create_callback_admits_operational_intent_once(tmp_path: Path) -> None:
-    calls: list[object] = []
+def test_create_callback_commits_paths_once(tmp_path: Path) -> None:
+    calls: list[tuple[tuple[str, ...], str]] = []
 
-    def admit(intent: object) -> dict[str, object]:
-        calls.append(intent)
-        return {"state": "admitted", "commit": "d" * 40}
+    def commit(paths: tuple[str, ...], message: str) -> dict[str, object]:
+        calls.append((paths, message))
+        return {"commit": "d" * 40}
 
-    tool = _task_tool()(cwd=str(tmp_path), operational_admission=admit)
+    tool = _task_tool()(cwd=str(tmp_path), commit_paths=commit)
 
     output = _execute(
         tool,
@@ -262,19 +257,39 @@ def test_create_callback_admits_operational_intent_once(tmp_path: Path) -> None:
         idempotency_key="seed-callback",
     )
 
-    assert len(calls) == 1
-    assert getattr(calls[0], "record_sha256") == "b" * 64
+    assert calls == [
+        (("tasks/TASK-test/brief.json",), "Record task TASK-test brief")
+    ]
     assert json.loads(output) == {
         "task_id": "TASK-test",
         "state": "prepared",
-        "admission_required": False,
-        "operational_intent": {
-            "schema_version": 1,
-            "workspace_paths": ["tasks/TASK-test/brief.json"],
-            "record_sha256": "b" * 64,
-        },
-        "operational_checkpoint": {"state": "admitted", "commit": "d" * 40},
+        "checkpoint": {"commit": "d" * 40},
     }
+
+
+def test_collect_records_terminal_ref_after_commit(tmp_path: Path) -> None:
+    events: list[object] = []
+
+    def commit(paths: tuple[str, ...], message: str) -> dict[str, object]:
+        events.append((paths, message))
+        return {"commit": "e" * 40}
+
+    tool = _task_tool()(
+        cwd=str(tmp_path),
+        commit_paths=commit,
+        record_observation=lambda ref: events.append(ref),
+    )
+
+    output = json.loads(_execute(tool, action="collect", task_id="TASK-test"))
+
+    assert events == [
+        (
+            ("tasks/TASK-test/collected.json",),
+            "Record task TASK-test collection",
+        ),
+        "tasks/TASK-test/collected.json",
+    ]
+    assert output["checkpoint"] == {"commit": "e" * 40}
 
 
 def test_create_forwards_explicit_bounded_brief_fields(tmp_path: Path) -> None:
@@ -352,12 +367,6 @@ def test_start_message_and_stop_use_principal_actor(tmp_path: Path) -> None:
                 "task_id": "TASK-test",
                 "state": "collected",
                 "collected_sha256": "c" * 64,
-                "admission_required": True,
-                "operational_intent": {
-                    "schema_version": 1,
-                    "workspace_paths": ["tasks/TASK-test/collected.json"],
-                    "record_sha256": "c" * 64,
-                },
             },
         ),
         (

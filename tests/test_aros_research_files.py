@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -13,9 +14,6 @@ from arbor.aros.research_files import (
     ResearchFileError,
     read_semantic_document,
 )
-from arbor.aros.store import json_sha256
-
-
 def _write(root: Path, relative: str, content: str) -> str:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -31,7 +29,7 @@ def _write_claim(root: Path, line: str) -> str:
         "id: C-0001\n"
         "---\n"
         "# Claim\n\n"
-        "## Evidence links\n"
+        "## Evidence\n"
         f"{line}\n",
     )
 
@@ -96,21 +94,6 @@ def test_frontmatter_structure_is_explicitly_bounded(
         read_semantic_document(tmp_path, relative)
 
 
-def test_evidence_link_json_recursion_is_normalized(tmp_path: Path) -> None:
-    nested = "[" * 2_000 + "0" + "]" * 2_000
-    relative = _write_claim(
-        tmp_path,
-        "{"
-        '"observation_ref":"runs/RUN-deep/final.json",'
-        '"relation":"context",'
-        f'"scope":{nested}'
-        "}",
-    )
-
-    with pytest.raises(ResearchFileError, match="EvidenceLink|depth|recursive|recursion"):
-        read_semantic_document(tmp_path, relative)
-
-
 def test_semantic_bytes_parser_matches_filesystem_owner_validation(
     tmp_path: Path,
 ) -> None:
@@ -132,70 +115,20 @@ def test_semantic_bytes_parser_matches_filesystem_owner_validation(
         )
 
 
-def test_evidence_link_accepts_exact_three_field_json_line(tmp_path: Path) -> None:
-    first = {
-        "observation_ref": f"eval/evaluations/EVAL-{'a' * 64}/receipt.json",
-        "relation": "supports",
-        "scope": "seed 7",
-    }
-    second = {
-        "observation_ref": "runs/RUN-a/final.json",
-        "relation": "bounds",
-        "scope": "single accelerator",
-    }
+def test_evidence_is_ordinary_markdown_not_an_os_schema(tmp_path: Path) -> None:
     claim = _write_claim(
         tmp_path,
-        "{"
-        f'"scope":"{first["scope"]}",'
-        f'"relation":"{first["relation"]}",'
-        f'"observation_ref":"{first["observation_ref"]}"'
-        "}\n"
-        "{"
-        f'"observation_ref":"{second["observation_ref"]}",'
-        f'"relation":"{second["relation"]}",'
-        f'"scope":"{second["scope"]}"'
-        "}\n\n"
-        "## Notes\n"
-        '{"observation_ref":"prose","relation":"proves","scope":"ignored"}',
+        "- `runs/RUN-a/final.json` — supports this scope.\n"
+        "- malformed JSON is still prose: {not-json}",
     )
 
     document = read_semantic_document(tmp_path, claim)
 
-    assert document.path == claim
-    assert document.identifier == "C-0001"
-    assert [occurrence.anchor for occurrence in document.evidence_links] == [
-        "Evidence links",
-        "Evidence links",
-    ]
-    assert [occurrence.ordinal for occurrence in document.evidence_links] == [0, 1]
-    assert document.evidence_links[0].link.relation == "supports"
-    assert document.evidence_links[0].canonical_sha256 == json_sha256(first)
-    assert document.evidence_links[1].canonical_sha256 == json_sha256(second)
-
-
-@pytest.mark.parametrize(
-    "line",
-    [
-        '{"observation_ref":"runs/RUN-a/final.json","relation":"supports",'
-        '"scope":"x","extra":1}',
-        '{"observation_ref":"runs/RUN-a/final.json","relation":"proves",'
-        '"scope":"x"}',
-        '{"observation_ref":"runs/RUN-a/final.json",'
-        '"observation_ref":"x","relation":"supports","scope":"x"}',
-        '{"observation_ref":"runs/RUN-a/final.json","relation":null,'
-        '"scope":"x"}',
-        '{"observation_ref":"runs/RUN-a/final.json","relation":"supports",'
-        '"scope":"   "}',
-    ],
-)
-def test_evidence_link_rejects_duplicate_unknown_or_invalid_relation(
-    tmp_path: Path,
-    line: str,
-) -> None:
-    claim = _write_claim(tmp_path, line)
-
-    with pytest.raises(ResearchFileError):
-        read_semantic_document(tmp_path, claim)
+    assert "runs/RUN-a/final.json" in document.sections["Evidence"]
+    assert not hasattr(document, "evidence_links")
+    assert "max_evidence_links" not in inspect.signature(
+        research_files_module.parse_semantic_document_bytes
+    ).parameters
 
 
 def test_duplicate_markdown_heading_is_mechanically_ambiguous(tmp_path: Path) -> None:
@@ -204,16 +137,16 @@ def test_duplicate_markdown_heading_is_mechanically_ambiguous(tmp_path: Path) ->
         "knowledge/claims/C-0001.md",
         "---\nid: C-0001\n---\n"
         "# Claim\n\n"
-        "## Evidence links\n"
+        "## Evidence\n"
         "not-json\n\n"
-        "## Evidence links ##\n"
+        "## Evidence ##\n"
         '{"observation_ref":"runs/RUN-a/final.json","relation":"supports",'
         '"scope":"x"}\n',
     )
 
     with pytest.raises(
         ResearchFileError,
-        match=r"knowledge/claims/C-0001\.md.*Evidence links",
+        match=r"knowledge/claims/C-0001\.md.*Evidence",
     ):
         read_semantic_document(tmp_path, claim)
 
@@ -355,16 +288,13 @@ def test_frontier_focus_is_optional_and_does_not_hide_other_questions(
 def test_semantic_records_are_immutable(tmp_path: Path) -> None:
     claim = _write_claim(
         tmp_path,
-        '{"observation_ref":"runs/RUN-a/final.json","relation":"context",'
-        '"scope":"diagnostic only"}',
+        "- `runs/RUN-a/final.json` — diagnostic context only.",
     )
     document = read_semantic_document(tmp_path, claim)
 
     with pytest.raises(FrozenInstanceError):
         document.path = "other.md"  # type: ignore[misc]
-    with pytest.raises(FrozenInstanceError):
-        document.evidence_links[0].link.scope = "changed"  # type: ignore[misc]
     with pytest.raises(TypeError):
         document.frontmatter["id"] = "C-9999"  # type: ignore[index]
     with pytest.raises(TypeError):
-        document.sections["Evidence links"] = "changed"  # type: ignore[index]
+        document.sections["Evidence"] = "changed"  # type: ignore[index]

@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import sys
-import time
-from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +12,7 @@ import typer
 from typer.core import TyperCommand
 
 from ...aros.attention import AttentionAuthorityContext
-from ...aros.checkpoint import (
-    CheckpointService,
-    _decode_human_direct_admission_receipt,
-)
+from ...aros.checkpoint import GitCheckpoint
 from ...aros.eval import EvalService, ExistingEvaluation
 from ...aros.intake import initialize_knowledge_bank
 from ...aros.principal import (
@@ -29,15 +23,7 @@ from ...aros.principal import (
     run_principal,
 )
 from ...aros.runs import RunService
-from ...aros.store import canonical_json_bytes
 from ...aros.tasks import TaskService
-from ...aros.transition_index import TransitionIndex, transition_index_state_json
-from ...aros.transitions import TransitionAuditService
-from ...aros.worktrees import (
-    RepositoryBinding,
-    bind_repository,
-    read_repository_snapshot,
-)
 from ...aros.workspace import (
     DEFAULT_BOOT_MAX_CHARS,
     boot_packet,
@@ -84,31 +70,13 @@ eval_app = typer.Typer(
     help=_EVAL_MEASUREMENT_BOUNDARY,
     no_args_is_help=True,
 )
-transition_app = typer.Typer(
-    name="transition",
-    help="Audit explicit research transition proposals.",
-    no_args_is_help=True,
-)
 aros_app.add_typer(run_app, name="run")
 aros_app.add_typer(task_app, name="task")
 aros_app.add_typer(eval_app, name="eval")
-aros_app.add_typer(transition_app, name="transition")
 
 
 def _root(cwd: Path) -> Path:
     return cwd.expanduser().resolve()
-
-
-def _attached_repository(root: Path) -> tuple[RepositoryBinding, str]:
-    repository = bind_repository(root)
-    snapshot = read_repository_snapshot(repository)
-    canonical_ref = snapshot.get("ref")
-    if not isinstance(snapshot.get("head"), str) or not isinstance(
-        canonical_ref,
-        str,
-    ):
-        raise ValueError("operation requires an attached canonical Git branch")
-    return repository, canonical_ref
 
 
 def _print_json(value: Any) -> None:
@@ -118,49 +86,6 @@ def _print_json(value: Any) -> None:
 def _fail(exc: Exception) -> None:
     typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
     raise typer.Exit(code=2) from exc
-
-
-class HumanDirectGateway:
-    """Issue only explicit cooperative human-direct checkpoint receipts."""
-
-    def __init__(self, *, clock: Callable[[], int] | None = None):
-        selected_clock = clock or (lambda: time.time_ns() // 1_000_000)
-        if not callable(selected_clock):
-            raise TypeError("human-direct clock must be callable")
-        self._clock = selected_clock
-
-    def admit_transition(
-        self,
-        *,
-        candidate_subject_sha256: str,
-        audit_payload_sha256: str,
-        audit_testimony: Mapping[str, object],
-    ) -> bytes:
-        del audit_testimony
-        payload: dict[str, object] = {
-            "schema_version": 1,
-            "receipt_kind": "human_direct",
-            "decision": "allow",
-            "candidate_subject_sha256": candidate_subject_sha256,
-            "audit_payload_sha256": audit_payload_sha256,
-            "enforcement_class": "cooperative",
-            "issuer": "human-direct",
-            "issued_at": self._clock(),
-        }
-        receipt = canonical_json_bytes(
-            {
-                **payload,
-                "receipt_sha256": hashlib.sha256(
-                    canonical_json_bytes(payload)
-                ).hexdigest(),
-            }
-        )
-        _decode_human_direct_admission_receipt(receipt)
-        return receipt
-
-    def revalidate_transition(self, receipt: bytes) -> bytes:
-        _decode_human_direct_admission_receipt(receipt)
-        return receipt
 
 
 class _RequireCommandSeparator(TyperCommand):
@@ -224,97 +149,30 @@ def status_command(
 
 @aros_app.command("checkpoint")
 def checkpoint_command(
-    proposal_ref: str = typer.Option(
-        ...,
-        "--proposal",
-        help="Tracked transitions/T-*/proposal.json to checkpoint.",
-    ),
     message: str = typer.Option(
         ...,
         "--message",
         help="Exact Git commit message.",
     ),
-    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
-    cooperative_human_direct: bool = typer.Option(
-        False,
-        "--cooperative-human-direct",
-        help=(
-            "Explicitly use cooperative human-direct admission for same-UID "
-            "writable Git."
-        ),
+    paths: list[str] = typer.Option(
+        ...,
+        "--path",
+        help="Workspace-relative file to commit; repeat for multiple paths.",
     ),
+    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
 ) -> None:
-    """Create one explicitly cooperative human-direct checkpoint."""
-    if not cooperative_human_direct:
-        _fail(
-            ValueError(
-                "checkpoint requires explicit --cooperative-human-direct; "
-                "same-UID writable Git is cooperative"
-            )
-        )
+    """Create a cooperative human selected-path Git checkpoint."""
     try:
-        root = _root(cwd)
-        repository = bind_repository(root)
-        canonical_ref = read_repository_snapshot(repository).get("ref")
-        if not isinstance(canonical_ref, str):
-            raise ValueError("checkpoint requires an attached canonical Git branch")
-        result = CheckpointService(
-            root,
-            canonical_repository=repository,
-            canonical_ref=canonical_ref,
-            gateway=HumanDirectGateway(),
-        ).checkpoint(proposal_ref, message)
+        result = GitCheckpoint(_root(cwd)).commit(paths=paths, message=message)
     except (OSError, RuntimeError, ValueError) as exc:
         _fail(exc)
     _print_json(
         {
             **result,
-            "checkpoint_authority": "human-direct",
+            "checkpoint_authority": "human",
             "enforcement_class": "cooperative",
         }
     )
-
-
-@transition_app.command("audit")
-def transition_audit_command(
-    proposal_ref: str = typer.Argument(
-        ...,
-        metavar="PROPOSAL",
-        help="Tracked transitions/T-*/proposal.json to audit.",
-    ),
-    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
-) -> None:
-    """Emit deterministic read-only testimony for one transition proposal."""
-    try:
-        root = _root(cwd)
-        _repository, canonical_ref = _attached_repository(root)
-        result = TransitionAuditService(
-            root,
-            canonical_ref=canonical_ref,
-        ).audit(proposal_ref)
-    except (OSError, RuntimeError, ValueError) as exc:
-        _fail(exc)
-    _print_json(result)
-
-
-@aros_app.command("audit")
-def audit_command(
-    rebuild_index: bool = typer.Option(
-        False,
-        "--rebuild-index",
-        help="Explicitly rebuild the full disposable transition index.",
-    ),
-    cwd: Path = typer.Option(Path("."), "--cwd", help="AROS workspace root."),
-) -> None:
-    """Run an explicitly selected repository audit operation."""
-    if not rebuild_index:
-        _fail(ValueError("audit requires explicit --rebuild-index"))
-    try:
-        repository, _canonical_ref = _attached_repository(_root(cwd))
-        state = TransitionIndex(repository, repository).rebuild()
-    except (OSError, RuntimeError, ValueError) as exc:
-        _fail(exc)
-    _print_json(transition_index_state_json(state))
 
 
 @run_app.command("start", cls=_RequireCommandSeparator)
@@ -772,12 +630,12 @@ def start_command(
         "--allow-shell",
         help="Enable bounded foreground shell commands for this trusted-local session.",
     ),
-    cooperative_human_direct: bool = typer.Option(
+    allow_checkpoint: bool = typer.Option(
         False,
-        "--cooperative-human-direct",
+        "--allow-checkpoint",
         help=(
-            "Allow explicitly cooperative same-UID checkpoints for this local "
-            "Principal session; this is not protected authority."
+            "Expose cooperative same-UID Git checkpoints to this Principal session; "
+            "this is not protected authority."
         ),
     ),
 ) -> None:
@@ -796,13 +654,12 @@ def start_command(
         config_values["reasoning_effort"] = reasoning_effort
 
     try:
-        gateway = HumanDirectGateway() if cooperative_human_direct else None
         attention_context = (
             AttentionAuthorityContext(
                 authority={
                     "state": "available",
                     "enforcement_class": "cooperative",
-                    "issuer": "human-direct",
+                    "issuer": "local-host",
                 },
                 remaining_budget={
                     "state": "not_configured",
@@ -810,7 +667,7 @@ def start_command(
                 },
                 institutional_obligations=(),
             )
-            if cooperative_human_direct
+            if allow_checkpoint
             else None
         )
         status = status_workspace(requested_root)
@@ -842,7 +699,7 @@ def start_command(
                 render_start_transition(
                     intake,
                     authority_class=(
-                        "cooperative" if cooperative_human_direct else "unavailable"
+                        "cooperative" if allow_checkpoint else "unavailable"
                     ),
                     max_turns=max_turns,
                     allow_shell=allow_shell,
@@ -864,7 +721,7 @@ def start_command(
             boot_context,
             max_turns=max_turns,
             allow_shell=allow_shell,
-            admission_gateway=gateway,
+            allow_checkpoint=allow_checkpoint,
             attention_context=attention_context,
         )
         asyncio.run(run_principal(agent, request))

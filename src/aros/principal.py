@@ -22,12 +22,14 @@ from ..core.tools.file_write import FileWriteTool
 from ..core.tools.glob_tool import GlobTool
 from ..core.tools.grep import GrepTool
 from .attention import AttentionAuthorityContext
-from .checkpoint import AdmissionGateway
+from .attention_tool import AttentionTool
+from .checkpoint import GitCheckpoint
+from .checkpoint_tool import CheckpointTool
 from .eval_tool import EvalTool
-from .research_tool import ResearchTool
+from .observed import ObservedRefs
 from .run_tool import RunTool
 from .task_tool import TaskTool
-from .worktrees import RepositoryBinding, bind_repository, read_repository_snapshot
+from .worktrees import RepositoryBinding, bind_repository
 
 
 AROS_DEFAULT_PROVIDER = "openai-responses"
@@ -46,7 +48,7 @@ analyses, and project-local skills.
 
 The workspace, not this chat transcript or provider session, is durable project
 memory. Re-observe it whenever state may have changed and write material
-decisions, evidence links, uncertainties, and obligations back before ending a
+decisions, evidence, uncertainties, and obligations back before ending a
 material turn. The OS does not prescribe a universal research cycle, idea
 quota, belief ladder, or scheduler.
 
@@ -54,8 +56,8 @@ Reality has final veto. Treat command output, tests, evaluators, instruments,
 datasets, external sources, and human observations as observations; never
 manufacture measurements from your own prose. Inspect current state before
 acting. Preserve pre-existing dirty work and do not claim completion without
-checking the resulting files or observations. Automatic Git commits are
-disabled so that only coherent, intentional workspace snapshots are made.
+checking the resulting files or observations. Use Checkpoint only for coherent,
+intentional semantic snapshots; Task, Run, and Eval commit their own records.
 
 Task adapters are trusted-local and application-scoped, not a security sandbox.
 Network and shell capability flags are audit declarations and are not enforced.
@@ -123,9 +125,8 @@ def build_principal_agent(
     *,
     max_turns: int = 100,
     allow_shell: bool = False,
+    allow_checkpoint: bool = False,
     canonical_repository: RepositoryBinding | None = None,
-    canonical_ref: str | None = None,
-    admission_gateway: AdmissionGateway | None = None,
     attention_context: AttentionAuthorityContext | None = None,
 ) -> Agent:
     """Build the native single-Principal Agent for *root*.
@@ -136,14 +137,6 @@ def build_principal_agent(
     """
     workspace_root = Path(root).expanduser().resolve()
     research_repository = canonical_repository or bind_repository(workspace_root)
-    research_ref = canonical_ref
-    if research_ref is None:
-        observed_ref = read_repository_snapshot(research_repository).get("ref")
-        if not isinstance(observed_ref, str):
-            raise ValueError(
-                "Principal Research requires an attached canonical Git branch"
-            )
-        research_ref = observed_ref
     runtime_dir = workspace_root / ".aros" / "agent"
     authorizer = _workspace_authorizer(workspace_root)
     tool_kwargs = {
@@ -151,19 +144,13 @@ def build_principal_agent(
         "path_authorizer": authorizer,
         "persist_results": False,
     }
-    research_tool = ResearchTool(
-        cwd=str(workspace_root),
-        canonical_repository=research_repository,
-        canonical_ref=research_ref,
-        admission_gateway=admission_gateway,
-        attention_context=attention_context,
-        persist_results=False,
-    )
-    operational_admission = (
-        research_tool.checkpoint_service.checkpoint_operational
-        if admission_gateway is not None
-        else None
-    )
+    observed = ObservedRefs()
+    checkpoint = GitCheckpoint(workspace_root)
+    service_kwargs = {
+        "commit_paths": checkpoint.commit_paths,
+        "record_observation": observed.record,
+        "persist_results": False,
+    }
 
     tools: list[Tool] = [
         FileReadTool(**tool_kwargs),
@@ -171,23 +158,34 @@ def build_principal_agent(
         GlobTool(**tool_kwargs),
         FileEditTool(**tool_kwargs),
         FileWriteTool(**tool_kwargs),
-        research_tool,
+        AttentionTool(
+            cwd=str(workspace_root),
+            canonical_repository=research_repository,
+            context=attention_context,
+            persist_results=False,
+        ),
         EvalTool(
             cwd=str(workspace_root),
-            operational_admission=operational_admission,
-            persist_results=False,
+            **service_kwargs,
         ),
         RunTool(
             cwd=str(workspace_root),
-            operational_admission=operational_admission,
-            persist_results=False,
+            **service_kwargs,
         ),
         TaskTool(
             cwd=str(workspace_root),
-            operational_admission=operational_admission,
-            persist_results=False,
+            **service_kwargs,
         ),
     ]
+    if allow_checkpoint:
+        tools.append(
+            CheckpointTool(
+                cwd=str(workspace_root),
+                observed=observed,
+                checkpoint=checkpoint,
+                persist_results=False,
+            )
+        )
     if allow_shell:
         tools.append(
             ForegroundBashTool(

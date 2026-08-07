@@ -44,6 +44,7 @@ def build_adapter_environment(
             "AROS_TASK_WORKTREE": str(worktree),
             "AROS_TASK_BASE_COMMIT": base_commit,
             "AROS_TASK_BRIEF_SHA256": brief_sha256,
+            "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
     return environment

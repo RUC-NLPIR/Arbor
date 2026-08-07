@@ -1856,6 +1856,7 @@ def _receipt_sha256(receipt: dict[str, object]) -> str:
 def _runner_invocation(root: Path, run_id: str) -> list[str]:
     return [
         sys.executable,
+        "-B",
         "-m",
         "arbor.aros.runner",
         "--workspace",

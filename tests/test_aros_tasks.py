@@ -1447,12 +1447,13 @@ def test_start_git_commands_are_scrubbed_pinned_and_nondestructive(
     assert calls
     assert all(
         {key for key in env if key.startswith("GIT_")}
-        == {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"}
+        == {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_OPTIONAL_LOCKS"}
         for _, env in calls
     )
     assert all(
         env["GIT_CONFIG_GLOBAL"] == os.devnull
         and env["GIT_CONFIG_NOSYSTEM"] == "1"
+        and env["GIT_OPTIONAL_LOCKS"] == "0"
         for _, env in calls
     )
     assert all(not any(key.startswith("PYTHON") for key in env) for _, env in calls)

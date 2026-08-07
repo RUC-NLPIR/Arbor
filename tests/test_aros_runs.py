@@ -152,6 +152,7 @@ def _test_prelaunch_receipt(
         "runner_version": 1,
         "runner_invocation": [
             sys.executable,
+            "-B",
             "-m",
             "arbor.aros.runner",
             "--workspace",
@@ -2217,7 +2218,11 @@ def test_real_tmux_run_survives_client_and_writes_final_receipts(tmp_path: Path)
     )
     assert launch_receipt["host"]
     assert launch_receipt["runner_version"] == 1
-    assert launch_receipt["runner_invocation"][1:3] == ["-m", "arbor.aros.runner"]
+    assert launch_receipt["runner_invocation"][1:4] == [
+        "-B",
+        "-m",
+        "arbor.aros.runner",
+    ]
     assert len(launch_receipt["receipt_sha256"]) == 64
     assert final["launch_receipt_sha256"] == launch_receipt["receipt_sha256"]
     events = [

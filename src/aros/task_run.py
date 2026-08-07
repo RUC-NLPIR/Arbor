@@ -64,6 +64,7 @@ def task_run_argv(root: Path, task_id: str) -> list[str]:
     """Return the sole durable Run command for one Task adapter."""
     return [
         sys.executable,
+        "-B",
         "-m",
         "arbor.aros.task_adapter",
         "--workspace",
@@ -316,17 +317,20 @@ def _binding_sha256(binding: dict[str, object]) -> str:
         raise TaskRunError("Task Run binding must be canonical UTF-8 JSON") from error
 
 
-def _ensure_adapter_runtime(root: Path, task_id: str) -> Path:
-    """Create or validate the private physical directories used by the adapter."""
-    _require_physical_directory(root / ".aros", "AROS runtime directory")
-    _require_physical_directory(
-        root / ".aros" / "tasks",
-        "Task runtime root",
-    )
+def _ensure_adapter_runtime(root: Path, task_id: str, permissions_enforced: bool) -> Path:
+    """Create or validate controlled physical directories used by the adapter."""
+    return _adapter_runtime(root, task_id, permissions_enforced, create=True)
+
+
+def _adapter_runtime(root: Path, task_id: str, permissions_enforced: bool, *, create: bool) -> Path:
+    _validate_controlled_directory(root / ".aros", "AROS runtime directory", None)
+    _validate_controlled_directory(root / ".aros" / "tasks", "Task runtime root", None)
     runtime = root / ".aros" / "tasks" / task_id
-    _ensure_private_directory(runtime, "Task adapter runtime")
-    _ensure_private_directory(runtime / "home", "Task adapter HOME")
-    _ensure_private_directory(runtime / "tmp", "Task adapter TMPDIR")
+    mode = _permission_mode(permissions_enforced)
+    validate = _ensure_controlled_directory if create else _validate_controlled_directory
+    validate(runtime, "Task adapter runtime", mode)
+    validate(runtime / "home", "Task adapter HOME", mode)
+    validate(runtime / "tmp", "Task adapter TMPDIR", mode)
     return runtime
 
 
@@ -334,11 +338,13 @@ def load_task_run(
     root: Path,
     brief: dict[str, object],
     ownership: dict[str, object],
+    *,
+    permissions_enforced: bool = True,
 ) -> dict[str, object]:
     """Strictly load and validate one immutable Task-to-Run binding."""
     workspace = _validate_inputs(root, brief, ownership)
     task_id = str(brief["task_id"])
-    _validate_adapter_runtime(workspace, task_id)
+    _adapter_runtime(workspace, task_id, permissions_enforced, create=False)
     path = _binding_path(workspace, task_id)
     try:
         with AnchoredWorkspaceReader(workspace) as reader:
@@ -400,6 +406,7 @@ def ensure_task_run(
     *,
     actor: str,
     commit_paths: _COMMIT_PATHS,
+    permissions_enforced: bool = True,
 ) -> dict[str, object]:
     """Create once, commit, and publish one Task-to-Run binding."""
     workspace = _validate_root(root)
@@ -413,13 +420,14 @@ def ensure_task_run(
             raise TaskRunError(f"Task Run actor conflicts with ownership: {task_id}")
         if not callable(commit_paths):
             raise TaskRunError("Task Run commit_paths must be callable")
-        _ensure_adapter_runtime(workspace, task_id)
+        _ensure_adapter_runtime(workspace, task_id, permissions_enforced)
         return _ensure_task_run_locked(
             workspace,
             brief,
             ownership,
             actor=run_actor,
             commit_paths=commit_paths,
+            permissions_enforced=permissions_enforced,
         )
 
 
@@ -430,11 +438,13 @@ def _ensure_task_run_locked(
     *,
     actor: str,
     commit_paths: _COMMIT_PATHS,
+    permissions_enforced: bool,
 ) -> dict[str, object]:
     task_id = str(brief["task_id"])
     binding_path = _binding_path(workspace, task_id)
     if _path_exists(binding_path):
-        return load_task_run(workspace, brief, ownership)
+        return load_task_run(workspace, brief, ownership,
+                             permissions_enforced=permissions_enforced)
 
     idempotency_key = f"task-run-v1:{brief['brief_sha256']}"
     try:
@@ -507,7 +517,8 @@ def _ensure_task_run_locked(
         if created:
             _discard_failed_binding(binding_path)
         raise TaskRunError(f"Task Run binding parent identity changed: {task_id}")
-    return load_task_run(workspace, brief, ownership)
+    return load_task_run(workspace, brief, ownership,
+                         permissions_enforced=permissions_enforced)
 
 
 @contextmanager
@@ -918,56 +929,36 @@ def _discard_failed_binding(path: Path) -> None:
         pass
 
 
-def _validate_adapter_runtime(root: Path, task_id: str) -> Path:
-    """Purely validate the private physical directories used by the adapter."""
-    _require_physical_directory(root / ".aros", "AROS runtime directory")
-    _require_physical_directory(root / ".aros" / "tasks", "Task runtime root")
-    runtime = root / ".aros" / "tasks" / task_id
-    _validate_private_directory(runtime, "Task adapter runtime")
-    _validate_private_directory(runtime / "home", "Task adapter HOME")
-    _validate_private_directory(runtime / "tmp", "Task adapter TMPDIR")
-    return runtime
-
-
-def _require_physical_directory(path: Path, description: str) -> None:
+def _validate_controlled_directory(path: Path, description: str, expected_mode: int | None) -> None:
     try:
         metadata = path.lstat()
     except OSError as error:
         raise TaskRunError(f"{description} is unavailable: {path}") from error
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise TaskRunError(f"{description} must be a physical directory: {path}")
-    _open_directory(path, description, chmod=False, expected_mode=None)
+    _open_directory(path, description, chmod=False, expected_mode=expected_mode)
 
 
-def _validate_private_directory(path: Path, description: str) -> None:
+def _ensure_controlled_directory(path: Path, description: str, expected_mode: int | None) -> None:
     try:
-        metadata = path.lstat()
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
     except OSError as error:
-        raise TaskRunError(f"{description} is unavailable: {path}") from error
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise TaskRunError(f"{description} must be a physical directory: {path}")
-    _open_directory(path, description, chmod=False, expected_mode=0o700)
-
-
-def _ensure_private_directory(path: Path, description: str) -> None:
+        raise TaskRunError(f"unable to create {description}: {path}") from error
     try:
         metadata = path.lstat()
-    except FileNotFoundError:
-        try:
-            path.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-        except OSError as error:
-            raise TaskRunError(f"unable to create {description}: {path}") from error
-        try:
-            metadata = path.lstat()
-        except OSError as error:
-            raise TaskRunError(f"unable to inspect {description}: {path}") from error
     except OSError as error:
         raise TaskRunError(f"unable to inspect {description}: {path}") from error
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise TaskRunError(f"{description} must be a physical directory: {path}")
-    _open_directory(path, description, chmod=True, expected_mode=0o700)
+    _open_directory(path, description, chmod=True, expected_mode=expected_mode)
+
+
+def _permission_mode(enforced: bool) -> int | None:
+    if type(enforced) is not bool:
+        raise TaskRunError("invalid Task Run filesystem permission policy")
+    return 0o700 if enforced else None
 
 
 def _open_directory(
@@ -977,12 +968,8 @@ def _open_directory(
     chmod: bool,
     expected_mode: int | None,
 ) -> None:
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -992,11 +979,14 @@ def _open_directory(
         if not stat.S_ISDIR(opened.st_mode):
             raise TaskRunError(f"{description} must be a physical directory: {path}")
         if chmod:
-            os.fchmod(descriptor, 0o700)
-        if (
-            expected_mode is not None
-            and stat.S_IMODE(os.fstat(descriptor).st_mode) != expected_mode
-        ):
+            try:
+                os.fchmod(descriptor, 0o700)
+            except OSError as error:
+                from .tasks import _UNSUPPORTED_FILE_MODE_ERRNOS
+
+                if expected_mode is not None or error.errno not in _UNSUPPORTED_FILE_MODE_ERRNOS:
+                    raise
+        if expected_mode is not None and stat.S_IMODE(os.fstat(descriptor).st_mode) != expected_mode:
             raise TaskRunError(f"{description} permissions are not mode 0700: {path}")
     except OSError as error:
         raise TaskRunError(f"unable to validate {description}: {path}") from error

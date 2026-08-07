@@ -2955,6 +2955,7 @@ def test_task_adapter_environment_is_explicitly_allowlisted(tmp_path: Path) -> N
             "LANG": "C.UTF-8",
             "SECRET_TOKEN": "must-not-pass",
             "PYTHONPATH": "/must/not/pass",
+            "PYTHONDONTWRITEBYTECODE": "0",
         },
     )
 
@@ -2968,6 +2969,7 @@ def test_task_adapter_environment_is_explicitly_allowlisted(tmp_path: Path) -> N
         "AROS_TASK_WORKTREE": str(worktree),
         "AROS_TASK_BASE_COMMIT": "a" * 40,
         "AROS_TASK_BRIEF_SHA256": "b" * 64,
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
 
 

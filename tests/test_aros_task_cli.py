@@ -68,8 +68,9 @@ class FakeTaskService:
         commit_paths: Any = None,
     ) -> dict[str, Any]:
         self._raise_error()
+        assert callable(commit_paths)
         self.calls.append(("start", task_id, actor, commit_paths))
-        return {"state": "running", "task_id": task_id}
+        return {"state": "running", "task_id": task_id, "run_id": "RUN-test"}
 
     def status(
         self,
@@ -78,8 +79,9 @@ class FakeTaskService:
         commit_paths: Any = None,
     ) -> dict[str, Any]:
         self._raise_error()
+        assert commit_paths is None or callable(commit_paths)
         self.calls.append(("status", task_id, commit_paths))
-        return {"state": "running", "task_id": task_id}
+        return {"state": "running", "task_id": task_id, "run_id": "RUN-test"}
 
     def list(self) -> list[dict[str, Any]]:
         self._raise_error()
@@ -106,7 +108,19 @@ class FakeTaskService:
     def collect(self, task_id: str) -> dict[str, Any]:
         self._raise_error()
         self.calls.append(("collect", task_id))
-        return {"state": "collected", "task_id": task_id}
+        return self._collected(task_id)
+
+    @staticmethod
+    def _collected(task_id: str) -> dict[str, Any]:
+        return {
+            "state": "collected",
+            "task_id": task_id,
+            "run_id": "RUN-test",
+            "run_manifest_ref": "runs/RUN-test/manifest.json",
+            "run_manifest_sha256": "b" * 64,
+            "run_final_ref": "runs/RUN-test/final.json",
+            "run_final_sha256": "d" * 64,
+        }
 
     def collect_with_commit(self, task_id: str):  # type: ignore[no-untyped-def]
         record = self.collect(task_id)
@@ -122,10 +136,11 @@ class FakeTaskService:
         commit_paths: Any,
     ) -> tuple[dict[str, Any], dict[str, object]]:
         self._raise_error()
+        assert callable(commit_paths)
         self.calls.append(("collect_and_commit", task_id, commit_paths))
         paths = (f"tasks/{task_id}/collected.json",)
         checkpoint = commit_paths(paths, f"Record task {task_id} collection")
-        return {"state": "collected", "task_id": task_id}, checkpoint
+        return self._collected(task_id), checkpoint
 
     def preserve(self, task_id: str) -> dict[str, Any]:
         self._raise_error()
@@ -342,8 +357,14 @@ def test_task_start_is_a_separate_human_attributed_action(tmp_path: Path) -> Non
     class FakeCheckpoint:
         def __init__(self, root: Path) -> None:
             self.root = root
-            self.commit_paths = object()
             checkpoints.append(self)
+
+        def commit_paths(
+            self,
+            _paths: tuple[str, ...],
+            _message: str,
+        ) -> dict[str, object]:
+            raise AssertionError("start fake owns the operational callback")
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(aros_cmd, "GitCheckpoint", FakeCheckpoint)
@@ -360,6 +381,7 @@ def test_task_start_is_a_separate_human_attributed_action(tmp_path: Path) -> Non
         ("start", "TASK-test", "human", checkpoints[0].commit_paths),
     ]
     assert json.loads(result.output) == {
+        "run_id": "RUN-test",
         "state": "running",
         "task_id": "TASK-test",
     }
@@ -371,8 +393,14 @@ def test_task_status_and_list_emit_unwrapped_json(tmp_path: Path) -> None:
     class FakeCheckpoint:
         def __init__(self, root: Path) -> None:
             self.root = root
-            self.commit_paths = object()
             checkpoints.append(self)
+
+        def commit_paths(
+            self,
+            _paths: tuple[str, ...],
+            _message: str,
+        ) -> dict[str, object]:
+            raise AssertionError("status fake owns the operational callback")
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(aros_cmd, "GitCheckpoint", FakeCheckpoint)
@@ -388,6 +416,7 @@ def test_task_status_and_list_emit_unwrapped_json(tmp_path: Path) -> None:
     assert status.exit_code == 0, status.output
     assert listed.exit_code == 0, listed.output
     assert json.loads(status.output) == {
+        "run_id": "RUN-test",
         "state": "running",
         "task_id": "TASK-test",
     }
@@ -503,6 +532,11 @@ def test_task_collect_commits_service_paths_before_printing(tmp_path: Path) -> N
         )
     ]
     assert json.loads(result.output) == {
+        "run_final_ref": "runs/RUN-test/final.json",
+        "run_final_sha256": "d" * 64,
+        "run_id": "RUN-test",
+        "run_manifest_ref": "runs/RUN-test/manifest.json",
+        "run_manifest_sha256": "b" * 64,
         "state": "collected",
         "task_id": "TASK-test",
     }
@@ -512,7 +546,7 @@ def test_task_collect_real_checkpoint_leaves_run_and_collection_at_clean_head(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tests import test_aros_task_on_run as task_run_support
+    import test_aros_task_on_run as task_run_support
 
     service, brief, _ownership, binding, _final, _child, _return = (
         task_run_support._terminal_task_run(tmp_path, monkeypatch)

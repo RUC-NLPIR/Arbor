@@ -101,6 +101,7 @@ def _install_run_final(
         "runner_version": 1,
         "runner_invocation": [
             sys.executable,
+            "-B",
             "-m",
             "arbor.aros.runner",
             "--workspace",
@@ -243,6 +244,7 @@ def _install_eval_receipt(
         "runner_version": 1,
         "runner_invocation": [
             sys.executable,
+            "-B",
             "-m",
             "arbor.aros.runner",
             "--workspace",
@@ -374,6 +376,7 @@ def _collected_task(
         "runner_version": 1,
         "runner_invocation": [
             sys.executable,
+            "-B",
             "-m",
             "arbor.aros.runner",
             "--workspace",

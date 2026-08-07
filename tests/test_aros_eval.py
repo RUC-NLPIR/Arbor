@@ -204,6 +204,7 @@ def _terminal_receipt(
         "runner_version": 1,
         "runner_invocation": [
             sys.executable,
+            "-B",
             "-m",
             "arbor.aros.runner",
             "--workspace",
@@ -346,6 +347,7 @@ def _install_terminal_run(
             "runner_version": 1,
             "runner_invocation": [
                 sys.executable,
+                "-B",
                 "-m",
                 "arbor.aros.runner",
                 "--workspace",

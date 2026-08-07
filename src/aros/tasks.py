@@ -444,6 +444,7 @@ class TaskService:
                 ownership,
                 actor=launch_actor,
                 commit_paths=commit_paths,
+                permissions_enforced=self._filesystem_permissions_enforced,
             )
             RunService(self.root).start(
                 str(binding["run_id"]),
@@ -494,7 +495,8 @@ class TaskService:
         brief = self._load_brief(task_id)
         ownership = self._load_ownership(brief)
         try:
-            load_task_run(self.root, brief, ownership)
+            load_task_run(self.root, brief, ownership,
+                          permissions_enforced=self._filesystem_permissions_enforced)
         except TaskRunError as error:
             raise TaskError(f"invalid Task Run adapter context: {task_id}") from error
         runtime = self._runtime_path(task_id)
@@ -633,7 +635,9 @@ class TaskService:
                     brief = self._load_brief(task_id)
                     self._load_bound_idempotency_index(brief)
                     ownership = self._load_ownership(brief)
-                    binding = load_task_run(self.root, brief, ownership)
+                    binding = load_task_run(
+                        self.root, brief, ownership,
+                        permissions_enforced=self._filesystem_permissions_enforced)
                     run_id = str(binding["run_id"])
             receipt = RunService(self.root).stop(
                 run_id,
@@ -1549,7 +1553,8 @@ class TaskService:
 
         task_id = str(brief["task_id"])
         try:
-            binding = load_task_run(self.root, brief, ownership)
+            binding = load_task_run(self.root, brief, ownership,
+                                    permissions_enforced=self._filesystem_permissions_enforced)
             run_id = str(binding["run_id"])
             manifest_ref = f"runs/{run_id}/manifest.json"
             final_ref = f"runs/{run_id}/final.json"
@@ -1752,8 +1757,10 @@ class TaskService:
 
         brief = self._load_brief(task_id)
         self._load_bound_idempotency_index(brief)
-        ownership = self._load_ownership(brief)
-        binding = load_task_run(self.root, brief, ownership)
+        ownership = self._load_ownership(brief, check_worktree=False)
+        self._validate_owned_worktree_identity(ownership)
+        binding = load_task_run(self.root, brief, ownership,
+                                permissions_enforced=self._filesystem_permissions_enforced)
         run_status = RunService(self.root).status(str(binding["run_id"]))
         if _path_exists(self._collected_path(task_id)):
             self._load_historical_collection(
@@ -1985,11 +1992,13 @@ class TaskService:
                 )
                 self._load_bound_idempotency_index(brief)
                 return
-        ownership = (
-            self._load_ownership(brief)
-            if _path_exists(ownership_path)
-            else None
-        )
+        bound_run = _path_exists(runtime_path / "run.json")
+        ownership: dict[str, object] | None = self._load_ownership(
+            brief,
+            check_worktree=not bound_run,
+        ) if _path_exists(ownership_path) else None
+        if ownership is not None and bound_run:
+            self._validate_owned_worktree_identity(ownership)
         if not _path_exists(status_path):
             if ownership is not None:
                 self._require_new_checkout_metadata(
@@ -2403,63 +2412,19 @@ class TaskService:
             str(ownership["base_commit"]),
         )
 
+    def _validate_owned_worktree_identity(self, ownership: dict[str, object]) -> None:
+        self._validate_worktree_identity(
+            Path(str(ownership["worktree_path"])),
+            str(ownership["branch"]),
+        )
+
     def _validate_worktree(
         self,
         target: Path,
         branch: str,
         base_commit: str,
     ) -> str:
-        self._require_git_root()
-        _require_plain_directory(target, "owned task worktree")
-        branch_ref = f"refs/heads/{branch}"
-        registrations = self._worktree_registrations()
-        path_matches = [
-            item
-            for item in registrations
-            if worktrees_module._same_path(str(item["worktree"]), target)
-        ]
-        if len(path_matches) != 1:
-            raise TaskError(f"owned task worktree is not uniquely registered: {target}")
-        registration = path_matches[0]
-        if registration.get("branch") != branch_ref:
-            raise TaskError(f"owned task worktree branch registration mismatch: {target}")
-        branch_matches = [
-            item for item in registrations if item.get("branch") == branch_ref
-        ]
-        if len(branch_matches) != 1:
-            raise TaskError(f"owned task branch is registered elsewhere: {branch}")
-
-        child_git_dir = self._worktree_git_directory(target)
-        common = Path(
-            self._safe_git_text(
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-common-dir",
-                git_dir=child_git_dir,
-                work_tree=target,
-            )
-        ).resolve(strict=True)
-        if common != self._git_common_dir:
-            raise TaskError(f"owned task worktree common Git directory mismatch: {target}")
-        top = Path(
-            self._safe_git_text(
-                "rev-parse",
-                "--show-toplevel",
-                git_dir=child_git_dir,
-                work_tree=target,
-            )
-        ).resolve(strict=True)
-        if top != target:
-            raise TaskError(f"owned task worktree root mismatch: {target}")
-        attached = self._safe_git_text(
-            "symbolic-ref",
-            "-q",
-            "HEAD",
-            git_dir=child_git_dir,
-            work_tree=target,
-        )
-        if attached != branch_ref:
-            raise TaskError(f"owned task worktree is not attached to {branch}")
+        child_git_dir, branch_ref = self._validate_worktree_identity(target, branch)
         tip = self._safe_git_text(
             "rev-parse",
             "--verify",
@@ -2483,12 +2448,54 @@ class TaskService:
             tip,
         ):
             raise TaskError(f"owned task branch no longer descends from its base: {branch}")
+        return tip
+
+    def _validate_worktree_identity(self, target: Path, branch: str) -> tuple[Path, str]:
+        self._require_git_root()
+        _require_plain_directory(target, "owned task worktree")
+        branch_ref = f"refs/heads/{branch}"
+        registrations = self._worktree_registrations()
+        path_matches = [
+            item
+            for item in registrations
+            if worktrees_module._same_path(str(item["worktree"]), target)
+        ]
+        if len(path_matches) != 1:
+            raise TaskError(f"owned task worktree is not uniquely registered: {target}")
+        registration = path_matches[0]
+        if registration.get("branch") != branch_ref:
+            raise TaskError(f"owned task worktree branch registration mismatch: {target}")
+        if sum(item.get("branch") == branch_ref for item in registrations) != 1:
+            raise TaskError(f"owned task branch is registered elsewhere: {branch}")
+
+        child_git_dir = self._worktree_git_directory(target)
+        common = Path(self._safe_git_text(
+            "rev-parse", "--path-format=absolute", "--git-common-dir",
+            git_dir=child_git_dir, work_tree=target,
+        )).resolve(strict=True)
+        if common != self._git_common_dir:
+            raise TaskError(f"owned task worktree common Git directory mismatch: {target}")
+        top = Path(self._safe_git_text(
+            "rev-parse", "--show-toplevel",
+            git_dir=child_git_dir, work_tree=target,
+        )).resolve(strict=True)
+        if top != target:
+            raise TaskError(f"owned task worktree root mismatch: {target}")
+        attached = self._safe_git_text(
+            "symbolic-ref",
+            "-q",
+            "HEAD",
+            git_dir=child_git_dir,
+            work_tree=target,
+        )
+        if attached != branch_ref:
+            raise TaskError(f"owned task worktree is not attached to {branch}")
         if self._worktree_git_directory(target) != child_git_dir:
             raise TaskError(
                 f"owned task worktree Git directory association changed: {target}"
             )
         self._require_git_root()
-        return tip
+        return child_git_dir, branch_ref
 
     def _worktree_git_directory(self, target: Path) -> Path:
         marker = target / ".git"

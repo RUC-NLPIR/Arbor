@@ -18,6 +18,11 @@ class SimpleLoopProvider:
         self.phase: str | None = None
         self.expected_tool_id: str | None = None
         self.task_id: str | None = None
+        self.run_id: str | None = None
+        self.run_manifest_ref: str | None = None
+        self.run_manifest_sha256: str | None = None
+        self.run_final_ref: str | None = None
+        self.run_final_sha256: str | None = None
         self.child_commit: str | None = None
         self.return_commit: str | None = None
         self.eval_id: str | None = None
@@ -149,9 +154,15 @@ class SimpleLoopProvider:
             self.task_id = self._string(self._object(raw), "task_id")
             return self._task("start", "task_start")
         if self.phase == "task_start":
+            result = self._object(raw)
+            if result.get("task_id") != self.task_id:
+                raise ValueError("Task start identity differs")
+            self.run_id = self._string(result, "run_id")
             return self._task("status", "task_status")
         if self.phase == "task_status":
             result = self._object(raw)
+            if result.get("task_id") != self.task_id or result.get("run_id") != self.run_id:
+                raise ValueError("Task status identity differs")
             state = result.get("state")
             if state in {"created", "starting", "running"}:
                 return self._task("status", "task_status")
@@ -160,8 +171,14 @@ class SimpleLoopProvider:
             return self._task("collect", "task_collect")
         if self.phase == "task_collect":
             result = self._object(raw)
+            if result.get("task_id") != self.task_id or result.get("run_id") != self.run_id:
+                raise ValueError("Task collection identity differs")
             self.child_commit = self._string(result, "child_commit")
             self.return_commit = self._string(result, "return_commit")
+            self.run_manifest_ref = self._string(result, "run_manifest_ref")
+            self.run_manifest_sha256 = self._string(result, "run_manifest_sha256")
+            self.run_final_ref = self._string(result, "run_final_ref")
+            self.run_final_sha256 = self._string(result, "run_final_sha256")
             self.collected_ref = f"tasks/{self.task_id}/collected.json"
             return self._tool(
                 "Eval",
@@ -187,12 +204,12 @@ class SimpleLoopProvider:
             packet = self._object(raw)
             returns = packet.get("unread_returns")
             refs = {
-                item.get("ref")
+                str(item["ref"])
                 for item in returns or []
-                if isinstance(item, dict)
+                if isinstance(item, dict) and isinstance(item.get("ref"), str)
             }
             if refs != {self.collected_ref, self.eval_ref}:
-                raise ValueError("Attention lacks exact Task and Eval returns")
+                raise ValueError(f"Attention lacks exact Task and Eval returns: {sorted(refs)!r}")
             return self._write("questions/Q-0001/question.md", self._question(), "final_question")
         writes = {
             "final_question": ("model/CURRENT.md", self._final_model(), "final_model"),
@@ -233,8 +250,14 @@ class SimpleLoopProvider:
         refs = recent[0].get("observed_refs") if isinstance(recent, list) and recent else None
         if (
             not isinstance(refs, list)
-            or len(refs) != 2
+            or refs != sorted(refs)
+            or len(refs) != 3
             or not any(str(item).startswith("tasks/TASK-") for item in refs)
+            or not any(
+                str(item).startswith("runs/RUN-")
+                and str(item).endswith("/final.json")
+                for item in refs
+            )
             or not any(str(item).startswith("eval/evaluations/EVAL-") for item in refs)
         ):
             raise ValueError("restart lacks exact observed return kinds")

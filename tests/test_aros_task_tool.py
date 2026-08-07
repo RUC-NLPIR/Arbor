@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import errno
 import importlib
 import json
+import os
+import shutil
+import stat
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +24,12 @@ class FakeTaskService:
     instances: list["FakeTaskService"] = []
     start_result: dict[str, Any] = {
         "task_id": "TASK-test",
+        "run_id": "RUN-test",
         "state": "running",
-        "final_ref": None,
     }
     status_result: dict[str, Any] = {
         "task_id": "TASK-test",
+        "run_id": "RUN-test",
         "state": "running",
         "final_ref": None,
     }
@@ -77,6 +83,7 @@ class FakeTaskService:
         actor: str | None = None,
         commit_paths: Any = None,
     ) -> dict[str, Any]:
+        assert callable(commit_paths)
         self.calls.append(("start", task_id, actor, commit_paths))
         return dict(self.start_result)
 
@@ -86,6 +93,7 @@ class FakeTaskService:
         *,
         commit_paths: Any = None,
     ) -> dict[str, Any]:
+        assert commit_paths is None or callable(commit_paths)
         self.calls.append(("status", task_id, commit_paths))
         return dict(self.status_result)
 
@@ -113,8 +121,12 @@ class FakeTaskService:
         return {
             "task_id": task_id,
             "state": "collected",
+            "run_id": "RUN-test",
+            "run_manifest_ref": "runs/RUN-test/manifest.json",
+            "run_manifest_sha256": "b" * 64,
             "collected_sha256": "c" * 64,
             "run_final_ref": "runs/RUN-test/final.json",
+            "run_final_sha256": "d" * 64,
         }
 
     def collect_with_commit(self, task_id: str):  # type: ignore[no-untyped-def]
@@ -134,8 +146,12 @@ class FakeTaskService:
         record = {
             "task_id": task_id,
             "state": "collected",
+            "run_id": "RUN-test",
+            "run_manifest_ref": "runs/RUN-test/manifest.json",
+            "run_manifest_sha256": "b" * 64,
             "collected_sha256": "c" * 64,
             "run_final_ref": "runs/RUN-test/final.json",
+            "run_final_sha256": "d" * 64,
         }
         paths = (f"tasks/{task_id}/collected.json",)
         checkpoint = commit_paths(paths, f"Record task {task_id} collection")
@@ -172,11 +188,12 @@ def fake_task_service(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeTaskService.instances.clear()
     FakeTaskService.start_result = {
         "task_id": "TASK-test",
+        "run_id": "RUN-test",
         "state": "running",
-        "final_ref": None,
     }
     FakeTaskService.status_result = {
         "task_id": "TASK-test",
+        "run_id": "RUN-test",
         "state": "running",
         "final_ref": None,
     }
@@ -428,7 +445,7 @@ def test_collect_forged_plausible_callback_records_no_observations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from arbor.aros import task_tool as task_tool_module
-    from tests import test_aros_task_on_run as task_run_support
+    import test_aros_task_on_run as task_run_support
 
     _service, brief, _ownership, _binding, _final, _child, _return = (
         task_run_support._terminal_task_run(tmp_path, monkeypatch)
@@ -464,7 +481,7 @@ def test_collect_staged_exact_records_fail_closed_without_cleanup_or_observation
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from arbor.aros import task_tool as task_tool_module
-    from tests import test_aros_task_on_run as task_run_support
+    import test_aros_task_on_run as task_run_support
 
     service, brief, _ownership, _binding, _final, _child, _return = (
         task_run_support._terminal_task_run(tmp_path, monkeypatch)
@@ -610,6 +627,294 @@ def test_status_passes_commit_callback_and_records_terminal_observation_once(
     assert observations == ["runs/RUN-test/final.json"]
 
 
+def test_real_task_start_reuses_unenforced_probe_for_adapter_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbor.aros.task_run as task_run_module
+    import test_aros_task_on_run as task_run_support
+    from arbor.aros.runs import RunService
+
+    task_run_support._workspace(tmp_path)
+    real_fchmod = os.fchmod
+
+    def normalize_mode(descriptor: int, _mode: int) -> None:
+        opened = os.fstat(descriptor)
+        real_fchmod(descriptor, 0o777 if stat.S_ISDIR(opened.st_mode) else 0o666)
+
+    monkeypatch.setattr(task_run_module.os, "fchmod", normalize_mode)
+    service = TaskService(tmp_path)
+    brief = task_run_support._brief(service)
+    task_id = str(brief["task_id"])
+    task_run_support._git(tmp_path, "add", f"tasks/{task_id}/brief.json")
+    task_run_support._git(tmp_path, "commit", "-qm", "record task brief")
+
+    def fake_start(
+        _service: RunService,
+        run_id: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, object]:
+        assert actor == "principal"
+        return task_run_support._launched_run_status(tmp_path, run_id)
+
+    monkeypatch.setattr(RunService, "start", fake_start)
+    status = service.start(
+        task_id,
+        actor="principal",
+        commit_paths=GitCheckpoint(tmp_path).commit_paths,
+    )
+
+    assert service._filesystem_permission_probe["observed_mode"] == 0o666
+    assert service._filesystem_permissions_enforced is False
+    runtime = tmp_path / ".aros/tasks" / task_id
+    assert {
+        stat.S_IMODE(path.stat().st_mode)
+        for path in (runtime, runtime / "home", runtime / "tmp")
+    } == {0o777}
+    assert status["run_id"] == service.status(task_id)["run_id"]
+
+    home = runtime / "home"
+    home.rmdir()
+    outside = tmp_path / "substituted-home"
+    outside.mkdir()
+    home.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(TaskError, match="Task Run|inspect"):
+        service.status(task_id)
+
+
+@pytest.mark.parametrize(
+    ("error_number", "permissions_enforced", "accepted"),
+    [
+        (errno.EOPNOTSUPP, False, True),
+        (errno.EOPNOTSUPP, True, False),
+        (errno.EPERM, False, False),
+    ],
+)
+def test_adapter_runtime_accepts_only_recognized_unenforced_fchmod_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+    permissions_enforced: bool,
+    accepted: bool,
+) -> None:
+    import arbor.aros.task_run as task_run_module
+
+    (tmp_path / ".aros/tasks").mkdir(parents=True)
+
+    def fail_fchmod(_descriptor: int, _mode: int) -> None:
+        raise OSError(error_number, os.strerror(error_number))
+
+    monkeypatch.setattr(task_run_module.os, "fchmod", fail_fchmod)
+
+    def call() -> Path:
+        return task_run_module._ensure_adapter_runtime(
+            tmp_path,
+            "TASK-20260807-permission-test",
+            permissions_enforced=permissions_enforced,
+        )
+
+    if accepted:
+        assert call().is_dir()
+    else:
+        with pytest.raises(task_run_module.TaskRunError, match="validate"):
+            call()
+
+
+def test_task_run_argv_forces_no_bytecode_internal_adapter(tmp_path: Path) -> None:
+    from arbor.aros.task_run import task_run_argv
+
+    assert task_run_argv(tmp_path, "TASK-20260807-test") == [
+        sys.executable,
+        "-B",
+        "-m",
+        "arbor.aros.task_adapter",
+        "--workspace",
+        str(tmp_path),
+        "--task-id",
+        "TASK-20260807-test",
+    ]
+
+
+def test_run_backed_status_ignores_only_moving_owned_branch_tip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import test_aros_task_on_run as task_run_support
+    from arbor.aros.runs import RunService
+    from arbor.aros.task_run import ensure_task_run
+
+    service, brief, ownership = task_run_support._prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=GitCheckpoint(tmp_path).commit_paths,
+    )
+    monkeypatch.setattr(
+        RunService,
+        "status",
+        lambda _service, _run_id: task_run_support._running_run_status(
+            tmp_path,
+            str(binding["run_id"]),
+        ),
+    )
+
+    def moving_branch(_ownership: dict[str, object]) -> None:
+        raise TaskError("owned task branch tip mismatch during child commit")
+
+    monkeypatch.setattr(service, "_validate_owned_worktree", moving_branch)
+
+    assert service.status(task_id)["state"] == "running"
+    with pytest.raises(TaskError, match="branch tip mismatch"):
+        service.preserve(task_id)
+
+
+def test_run_backed_status_checks_identity_during_legitimate_child_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import test_aros_task_on_run as task_run_support
+    from arbor.aros.runs import RunService
+    from arbor.aros.task_run import ensure_task_run
+
+    service, brief, ownership = task_run_support._prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=GitCheckpoint(tmp_path).commit_paths,
+    )
+    monkeypatch.setattr(
+        RunService,
+        "status",
+        lambda _service, _run_id: task_run_support._running_run_status(
+            tmp_path,
+            str(binding["run_id"]),
+        ),
+    )
+    assert hasattr(service, "_validate_owned_worktree_identity")
+    validate_identity = service._validate_owned_worktree_identity
+    worktree = Path(str(ownership["worktree_path"]))
+    committed = False
+
+    def validate_while_committing(value: dict[str, object]) -> None:
+        nonlocal committed
+        validate_identity(value)
+        if committed:
+            return
+        (worktree / "concurrent.txt").write_text("committed concurrently\n")
+        task_run_support._git(worktree, "add", "concurrent.txt")
+        task_run_support._git(worktree, "commit", "-qm", "concurrent child commit")
+        committed = True
+
+    monkeypatch.setattr(
+        service,
+        "_validate_owned_worktree_identity",
+        validate_while_committing,
+    )
+
+    assert service.status(task_id)["state"] == "running"
+    assert committed is True
+    assert service.preserve(task_id)["clean"] is True
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing", "symlink", "detached", "wrong_branch", "wrong_registration"],
+)
+def test_run_backed_status_rejects_owned_worktree_identity_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    import test_aros_task_on_run as task_run_support
+    from arbor.aros.runs import RunService
+    from arbor.aros.task_run import ensure_task_run
+
+    service, brief, ownership = task_run_support._prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=GitCheckpoint(tmp_path).commit_paths,
+    )
+    monkeypatch.setattr(
+        RunService,
+        "status",
+        lambda _service, _run_id: task_run_support._running_run_status(
+            tmp_path,
+            str(binding["run_id"]),
+        ),
+    )
+    worktree = Path(str(ownership["worktree_path"]))
+    moved = worktree.with_name(worktree.name + "-moved")
+    if corruption == "missing":
+        worktree.rename(moved)
+    elif corruption == "symlink":
+        worktree.rename(moved)
+        worktree.symlink_to(moved, target_is_directory=True)
+    elif corruption == "detached":
+        task_run_support._git(worktree, "checkout", "-q", "--detach")
+    elif corruption == "wrong_branch":
+        task_run_support._git(worktree, "checkout", "-qb", "foreign-task-branch")
+    else:
+        task_run_support._git(tmp_path, "worktree", "move", str(worktree), str(moved))
+        shutil.copytree(moved, worktree)
+
+    with pytest.raises(TaskError, match="worktree|branch|registered|inspect"):
+        service.status(task_id)
+
+
+@pytest.mark.parametrize("mutation", ["hash", "path"])
+def test_run_backed_status_still_rejects_tampered_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    import arbor.aros.tasks as tasks_module
+    import test_aros_task_on_run as task_run_support
+    from arbor.aros.runs import RunService
+    from arbor.aros.task_run import ensure_task_run
+
+    service, brief, ownership = task_run_support._prepared_task(tmp_path)
+    task_id = str(brief["task_id"])
+    binding = ensure_task_run(
+        tmp_path,
+        brief,
+        ownership,
+        actor="principal",
+        commit_paths=GitCheckpoint(tmp_path).commit_paths,
+    )
+    monkeypatch.setattr(
+        RunService,
+        "status",
+        lambda _service, _run_id: task_run_support._running_run_status(
+            tmp_path,
+            str(binding["run_id"]),
+        ),
+    )
+    tampered = dict(ownership)
+    if mutation == "hash":
+        tampered["ownership_sha256"] = "0" * 64
+    else:
+        tampered["worktree_path"] = str(tmp_path / "substituted-worktree")
+        tampered["ownership_sha256"] = tasks_module._ownership_sha256(tampered)
+    task_run_support._write_json(
+        tmp_path / ".aros/tasks" / task_id / "ownership.json",
+        tampered,
+    )
+
+    with pytest.raises(TaskError, match="ownership|worktree"):
+        service.status(task_id)
+
+
 def test_message_and_stop_use_principal_actor(tmp_path: Path) -> None:
     tool = _task_tool()(cwd=str(tmp_path))
 
@@ -642,6 +947,7 @@ def test_message_and_stop_use_principal_actor(tmp_path: Path) -> None:
             ("status", "TASK-test", None),
             {
                 "task_id": "TASK-test",
+                "run_id": "RUN-test",
                 "state": "running",
                 "final_ref": None,
             },

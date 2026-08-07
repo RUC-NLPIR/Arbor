@@ -1441,6 +1441,7 @@ def _git_environment() -> dict[str, str]:
     }
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
     return environment
 
 

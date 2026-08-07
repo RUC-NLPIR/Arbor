@@ -420,6 +420,30 @@ def _leader_with_descendant(descendant: str, *, escaped: bool = False) -> str:
     )
 
 
+def _nested_adopted_descendant() -> str:
+    grandchild = (
+        "import signal,time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "Path('grandchild.ready').touch()\n"
+        "time.sleep(30)\n"
+    )
+    return (
+        "import signal,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        f"child=subprocess.Popen([sys.executable,'-c',{grandchild!r}],"
+        "start_new_session=True)\n"
+        "Path('grandchild.pid').write_text(str(child.pid),encoding='utf-8')\n"
+        "deadline=time.monotonic()+5\n"
+        "while not Path('grandchild.ready').exists() and time.monotonic()<deadline:\n"
+        "    time.sleep(0.01)\n"
+        "if not Path('grandchild.ready').exists(): raise SystemExit(2)\n"
+        "Path('descendant.ready').touch()\n"
+        "time.sleep(30)\n"
+    )
+
+
 def test_prepare_freezes_a_versioned_manifest_and_runtime_status(tmp_path: Path) -> None:
     head = _init_clean_repo(tmp_path)
 
@@ -2555,6 +2579,109 @@ def test_public_stop_after_leader_exit_drains_adopted_descendant(
         (tmp_path / "leader.release").touch(exist_ok=True)
         if descendant_pid is not None and _linux_process_is_live(descendant_pid):
             os.killpg(descendant_pid, signal.SIGKILL)
+
+
+def test_stop_repeated_kill_drains_nested_adopted_descendant(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            _leader_with_descendant(_nested_adopted_descendant(), escaped=True),
+        ],
+        timeout=30,
+        key="run-stop-nested-adopted-descendant",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    descendants: list[int] = []
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+            running = _wait_for_running_status(service, run_id)
+            deadline = time.monotonic() + 5
+            while not (tmp_path / "leader.ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            descendants = [
+                int((tmp_path / "descendant.pid").read_text()),
+                int((tmp_path / "grandchild.pid").read_text()),
+            ]
+            (tmp_path / "leader.release").touch()
+            _wait_for_process_exit(int(running["process_pid"]))
+            assert all(_linux_process_is_live(pid) for pid in descendants)
+            atomic_write_json(
+                tmp_path / ".aros/runs" / run_id / "stop-request.json",
+                {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "kind": "run_stop_request",
+                    "actor": "owner",
+                    "reason": "stop nested tree",
+                    "signal": "TERM",
+                    "signal_sequence": ["TERM"],
+                    "process_pid": running["process_pid"],
+                    "process_start_token": running["process_start_token"],
+                    "requested_at": runs_module._utc_now(),
+                },
+            )
+            assert runner.result(timeout=5) == 0
+        receipt = json.loads(
+            (tmp_path / ".aros/receipts" / f"{run_id}-stop.json").read_text()
+        )
+        final = service.read_validated_final(run_id)
+
+        assert receipt["signal_sequence"] == ["TERM", "KILL"]
+        assert final["state"] == "cancelled"
+        assert final["signal_sequence"] == ["TERM", "KILL"]
+        for pid in descendants:
+            _wait_for_process_exit(pid)
+    finally:
+        (tmp_path / "leader.release").touch(exist_ok=True)
+        for pid in descendants:
+            if _linux_process_is_live(pid):
+                os.killpg(pid, signal.SIGKILL)
+
+
+def test_timeout_repeated_kill_drains_nested_adopted_descendant(
+    tmp_path: Path,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            _leader_with_descendant(_nested_adopted_descendant(), escaped=True),
+        ],
+        timeout=0.5,
+        key="run-timeout-nested-adopted-descendant",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    descendants: list[int] = []
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+            deadline = time.monotonic() + 5
+            while not (tmp_path / "leader.ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            descendants = [
+                int((tmp_path / "descendant.pid").read_text()),
+                int((tmp_path / "grandchild.pid").read_text()),
+            ]
+            assert runner.result(timeout=5) == 0
+        final = service.read_validated_final(run_id)
+
+        assert final["state"] == "timed_out"
+        assert final["signal_sequence"] == ["TERM", "KILL"]
+        for pid in descendants:
+            _wait_for_process_exit(pid)
+    finally:
+        (tmp_path / "leader.release").touch(exist_ok=True)
+        for pid in descendants:
+            if _linux_process_is_live(pid):
+                os.killpg(pid, signal.SIGKILL)
 
 
 @pytest.mark.parametrize(

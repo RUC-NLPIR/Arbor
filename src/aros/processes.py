@@ -124,7 +124,7 @@ def _read_process_stat(pid: int) -> tuple[str, int, str] | None:
             int(fields_after_name[2]),
             f"linux-proc-start:{fields_after_name[19]}",
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     except (OSError, IndexError, ValueError) as error:
         raise ProcessObservationError(f"unable to observe process: {pid}") from error

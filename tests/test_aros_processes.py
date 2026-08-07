@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import inspect
 import os
 import select
@@ -473,6 +474,62 @@ def test_identity_liveness_rejects_actual_pgid_drift_and_zombie(
     assert processes.signal_process_group(identity, signal.SIGTERM) is False
     assert reads >= 2
     assert delivered == []
+
+
+def test_process_tree_treats_process_lookup_during_child_stat_as_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        start_new_session=True,
+    )
+    leader.wait(timeout=5)
+    handle = processes.ProcessHandle(
+        process=leader,
+        identity=processes.ProcessIdentity(
+            leader.pid,
+            leader.pid,
+            "linux-proc-start:1",
+        ),
+    )
+    children_path = Path("/proc/9000/task/9000/children")
+    vanished_path = Path("/proc/7777/stat")
+
+    def disappearing_stat(path: Path, **_kwargs: object) -> str:
+        if path == children_path:
+            return "7777"
+        if path == vanished_path:
+            raise ProcessLookupError(errno.ESRCH, "process vanished")
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(Path, "read_text", disappearing_stat)
+    monkeypatch.setattr(processes._os, "waitpid", lambda *_args: (0, 0))
+    monkeypatch.setattr(processes, "process_group_is_live", lambda _identity: False)
+    monkeypatch.setattr(processes, "signal_process_group", lambda *_args: False)
+
+    assert processes.process_tree_is_live(handle, 9000) is False
+    assert processes.signal_process_tree(handle, 9000, signal.SIGKILL) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    (PermissionError(errno.EACCES, "denied"), OSError(errno.EIO, "I/O failure")),
+)
+def test_process_stat_non_disappearance_errors_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    error: OSError,
+) -> None:
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(processes.ProcessObservationError):
+        processes.identity_is_live(
+            processes.ProcessIdentity(7777, 7777, "linux-proc-start:1")
+        )
 
 
 def test_signal_process_group_refuses_reused_pid_or_start_token(

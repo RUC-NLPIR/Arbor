@@ -74,6 +74,14 @@
       "agent_visibility": "on_demand"
     },
     {
+      "id": "aros-arbor-simple-kernel-design",
+      "title": "AROS Arbor-Simple Kernel Design",
+      "path": "docs/superpowers/specs/2026-08-07-aros-arbor-simple-kernel-design.md",
+      "status": "proposed",
+      "authority": "implementation_baseline",
+      "agent_visibility": "default"
+    },
+    {
       "id": "aros-public-guide",
       "title": "AROS Public Guide",
       "path": "docs/aros/README.md",

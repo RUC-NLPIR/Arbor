@@ -79,6 +79,7 @@ def _git_bytes(
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["GIT_NO_LAZY_FETCH"] = "1"
     result = subprocess.run(
         ["git", *_GIT_CONFIG_OVERRIDES, *argv],
         cwd=checkout,
@@ -256,14 +257,10 @@ def _raw_source_audit(
 
     commit = _git(checkout, "rev-parse", "HEAD")
     if commit != expected_commit:
-        raise SourceError(
-            f"source HEAD mismatch after diagnostic: expected {expected_commit}, observed {commit}"
-        )
+        raise SourceError(f"source HEAD mismatch: expected {expected_commit}, observed {commit}")
     tree = _git(checkout, "rev-parse", "HEAD^{tree}")
     if tree != expected_tree:
-        raise SourceError(
-            f"source tree mismatch after diagnostic: expected {expected_tree}, observed {tree}"
-        )
+        raise SourceError(f"source tree mismatch: expected {expected_tree}, observed {tree}")
 
     index_entries = _git(checkout, "ls-files", "-v", "-z")
     if any(
@@ -321,12 +318,6 @@ def _validate_source(
     expected_tree = _lock_string(lock, "tree")
     expected_url = _lock_string(lock, "repository_url")
 
-    _git(
-        checkout,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-    )
     return _raw_source_audit(
         checkout,
         build_directory,

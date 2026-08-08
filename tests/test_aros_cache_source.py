@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from commissioning.cache_campaign import source as source_module
 from commissioning.cache_campaign.records import (
     ContractError,
     canonical_bytes,
@@ -219,6 +221,26 @@ def test_prepare_ignores_git_redirect_environment(
     assert receipt["commit"] == lock["commit"]
 
 
+def test_validation_git_disables_lazy_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    real_run = subprocess.run
+    observed: list[str | None] = []
+
+    def recording_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        environment = kwargs.get("env")
+        if argv and argv[0] == "git" and isinstance(environment, dict):
+            observed.append(environment.get("GIT_NO_LAZY_FETCH"))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(source_module.subprocess, "run", recording_run)
+    validate_source(checkout, lock)
+
+    assert observed
+    assert set(observed) == {"1"}
+
+
 def test_validate_source_rejects_replacement_tree(tmp_path: Path) -> None:
     checkout, lock = fake_checkout(tmp_path)
     (checkout / "CMakeLists.txt").write_text("# replacement source\n", encoding="utf-8")
@@ -297,6 +319,28 @@ def test_validate_source_rejects_clean_filter_substitution(tmp_path: Path) -> No
         validate_source(checkout, lock)
 
 
+def test_validate_source_does_not_execute_clean_filter(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    marker = tmp_path / "external-filter-marker"
+    filter_hook = checkout / ".git/hooks/identity-with-side-effect"
+    filter_hook.write_text(
+        "#!/bin/sh\n"
+        f"printf marker > {shlex.quote(str(marker))}\n"
+        "cat\n",
+        encoding="utf-8",
+    )
+    filter_hook.chmod(0o755)
+    git(checkout, "config", "filter.side-effect.clean", str(filter_hook))
+    attributes = checkout / ".git/info/attributes"
+    attributes.write_text("CMakeLists.txt filter=side-effect\n", encoding="utf-8")
+    source = checkout / "CMakeLists.txt"
+    source.write_bytes(source.read_bytes())
+
+    validate_source(checkout, lock)
+
+    assert not marker.exists()
+
+
 def test_validate_source_rejects_tracked_type_mismatch(tmp_path: Path) -> None:
     checkout, lock = fake_checkout(tmp_path)
     source = checkout / "CMakeLists.txt"
@@ -319,73 +363,6 @@ def test_validate_source_rejects_owner_execute_bit_mismatch(tmp_path: Path) -> N
     executable.chmod(0o055)
 
     with pytest.raises(SourceError, match="tracked worktree mode"):
-        validate_source(checkout, lock)
-
-
-def test_validate_source_rejects_diagnostic_filter_mutation(tmp_path: Path) -> None:
-    checkout, lock = fake_checkout(tmp_path)
-    filter_hook = checkout / ".git/hooks/mutate-during-status"
-    filter_hook.write_text(
-        "#!/bin/sh\nprintf '# altered\\n' > CMakeLists.txt\ncat\n",
-        encoding="utf-8",
-    )
-    filter_hook.chmod(0o755)
-    git(checkout, "config", "filter.mutate.clean", str(filter_hook))
-    attributes = checkout / ".git/info/attributes"
-    attributes.write_text("CMakeLists.txt filter=mutate\n", encoding="utf-8")
-
-    with pytest.raises(SourceError, match="tracked worktree"):
-        validate_source(checkout, lock)
-
-
-def test_validate_source_rebinds_head_after_diagnostic(tmp_path: Path) -> None:
-    checkout, lock = fake_checkout(tmp_path)
-    locked_commit = str(lock["commit"])
-    source = checkout / "CMakeLists.txt"
-    source.write_text("# switched\n", encoding="utf-8")
-    git(checkout, "add", "CMakeLists.txt")
-    git(checkout, "commit", "-qm", "switched source")
-    switched_commit = git(checkout, "rev-parse", "HEAD")
-    git(checkout, "update-ref", "HEAD", locked_commit)
-    git(checkout, "read-tree", locked_commit)
-    git(checkout, "checkout-index", "-a", "-f")
-
-    filter_hook = checkout / ".git/hooks/switch-during-status"
-    filter_hook.write_text(
-        "#!/bin/sh\n"
-        f"git update-ref HEAD {switched_commit}\n"
-        f"git read-tree {switched_commit}\n"
-        "git checkout-index -a -f\n"
-        "cat\n",
-        encoding="utf-8",
-    )
-    filter_hook.chmod(0o755)
-    git(checkout, "config", "filter.switch.clean", str(filter_hook))
-    attributes = checkout / ".git/info/attributes"
-    attributes.write_text("CMakeLists.txt filter=switch\n", encoding="utf-8")
-    source.write_bytes(source.read_bytes())
-
-    with pytest.raises(SourceError, match="HEAD|tree"):
-        validate_source(checkout, lock)
-
-
-def test_validate_source_rebinds_remote_after_diagnostic(tmp_path: Path) -> None:
-    checkout, lock = fake_checkout(tmp_path)
-    filter_hook = checkout / ".git/hooks/change-remote-during-status"
-    filter_hook.write_text(
-        "#!/bin/sh\n"
-        "git config --replace-all remote.origin.url https://example.invalid/switched.git\n"
-        "cat\n",
-        encoding="utf-8",
-    )
-    filter_hook.chmod(0o755)
-    git(checkout, "config", "filter.change-remote.clean", str(filter_hook))
-    attributes = checkout / ".git/info/attributes"
-    attributes.write_text("CMakeLists.txt filter=change-remote\n", encoding="utf-8")
-    source = checkout / "CMakeLists.txt"
-    source.write_bytes(source.read_bytes())
-
-    with pytest.raises(SourceError, match="fetch URL"):
         validate_source(checkout, lock)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import platform
 import subprocess
 import sys
@@ -40,15 +41,35 @@ def _lock_argv(lock: Mapping[str, object], key: str) -> list[str]:
     return argv
 
 
+def _output_bytes(value: bytes | str | None) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    return value.encode("utf-8")
+
+
+def _bounded_text(value: bytes | str | None, limit: int = 1024) -> str:
+    decoded = _output_bytes(value).decode("utf-8", errors="replace")
+    single_line = " ".join(decoded.split())
+    if len(single_line) > limit:
+        return single_line[:limit] + "..."
+    return single_line or "<empty>"
+
+
 def _git(checkout: Path, *argv: str) -> str:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
     result = subprocess.run(
         ["git", *argv],
         cwd=checkout,
         capture_output=True,
         check=False,
+        env=environment,
     )
     if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        stderr = _bounded_text(result.stderr)
         raise SourceError(f"Git command failed ({' '.join(argv)}): {stderr}")
     return result.stdout.decode("utf-8").strip()
 
@@ -84,6 +105,10 @@ def _validate_source(
     expected_commit = _lock_string(lock, "commit")
     expected_tree = _lock_string(lock, "tree")
     expected_url = _lock_string(lock, "repository_url")
+
+    top_level = Path(_git(checkout, "rev-parse", "--show-toplevel")).resolve(strict=True)
+    if top_level != checkout.resolve(strict=True):
+        raise SourceError(f"source top-level mismatch: expected {checkout}, observed {top_level}")
 
     commit = _git(checkout, "rev-parse", "HEAD")
     if commit != expected_commit:
@@ -133,24 +158,67 @@ def _locked_build_directory(configure_argv: list[str]) -> str:
     return path.as_posix()
 
 
-def _output_bytes(value: bytes | str | None) -> bytes:
-    if value is None:
-        return b""
-    if isinstance(value, bytes):
-        return value
-    return value.encode("utf-8")
+def _cmake_compilers(cache_path: Path) -> dict[str, str]:
+    entries: dict[str, list[str]] = {
+        "CMAKE_C_COMPILER": [],
+        "CMAKE_CXX_COMPILER": [],
+    }
+    for line in cache_path.read_text(encoding="utf-8").splitlines():
+        for name in entries:
+            if line.startswith(f"{name}:") and "=" in line:
+                entries[name].append(line.split("=", 1)[1])
+
+    compilers: dict[str, str] = {}
+    for name, values in entries.items():
+        if len(values) != 1 or not Path(values[0]).is_absolute():
+            raise SourceError(f"CMake cache requires one absolute {name}")
+        compilers[name] = values[0]
+    return compilers
 
 
 def _run_command(run: Run, argv: list[str], checkout: Path) -> subprocess.CompletedProcess[bytes]:
     result = run(argv, cwd=checkout, capture_output=True, check=False)
     if result.returncode != 0:
-        raise SourceError(f"command failed with exit {result.returncode}: {argv}")
+        raise SourceError(
+            f"command failed with exit {result.returncode}: {argv}; "
+            f"stderr: {_bounded_text(result.stderr)}"
+        )
     return result
 
 
 def _version(run: Run, argv: list[str], checkout: Path) -> str:
     result = _run_command(run, argv, checkout)
     return _output_bytes(result.stdout).decode("utf-8", errors="replace").strip()
+
+
+def _version_first_line(run: Run, argv: list[str], checkout: Path) -> str:
+    output = _version(run, argv, checkout)
+    return output.splitlines()[0][:512] if output else ""
+
+
+def _validated_binary(checkout: Path, build_directory: str, locked_binary: str) -> Path:
+    binary_relative = PurePosixPath(locked_binary)
+    if binary_relative.is_absolute() or ".." in binary_relative.parts:
+        raise SourceError("locked binary must be a relative path without parent traversal")
+
+    try:
+        checkout_resolved = checkout.resolve(strict=True)
+        build_resolved = (checkout / build_directory).resolve(strict=True)
+        build_resolved.relative_to(checkout_resolved)
+    except (OSError, ValueError) as error:
+        raise SourceError("locked binary build directory escapes the checkout") from error
+
+    binary = checkout.joinpath(*binary_relative.parts)
+    if binary.is_symlink():
+        raise SourceError(f"built cache simulator binary is a symlink: {binary}")
+    try:
+        binary_resolved = binary.resolve(strict=True)
+        binary_resolved.relative_to(build_resolved)
+    except (OSError, ValueError) as error:
+        raise SourceError(f"built cache simulator binary escapes the build directory: {binary}") from error
+    if not binary_resolved.is_file() or not os.access(binary_resolved, os.X_OK):
+        raise SourceError(f"built cache simulator binary is not a regular executable: {binary}")
+    return binary_resolved
 
 
 def prepare_source(
@@ -172,7 +240,8 @@ def prepare_source(
     validate_source(checkout, lock)
 
     commands: list[dict[str, object]] = []
-    for argv in locked_commands:
+    compilers: dict[str, str] | None = None
+    for index, argv in enumerate(locked_commands):
         result = _run_command(run, argv, checkout)
         commands.append(
             {
@@ -182,11 +251,18 @@ def prepare_source(
                 "stderr_sha256": hashlib.sha256(_output_bytes(result.stderr)).hexdigest(),
             }
         )
+        if index == 0:
+            compilers = _cmake_compilers(checkout / build_directory / "CMakeCache.txt")
+
+    if compilers is None:
+        raise SourceError("configure command did not select compilers")
 
     clean = _validate_source(checkout, lock, build_directory=build_directory)
-    binary = checkout / _lock_string(lock, "binary")
-    if not binary.is_file():
-        raise SourceError(f"built cache simulator is missing: {binary}")
+    binary = _validated_binary(
+        checkout,
+        build_directory,
+        _lock_string(lock, "binary"),
+    )
 
     receipt: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -198,7 +274,24 @@ def prepare_source(
         "versions": {
             "cmake": _version(run, ["cmake", "--version"], checkout),
             "ninja": _version(run, ["ninja", "--version"], checkout),
-            "compiler": _version(run, ["c++", "--version"], checkout),
+        },
+        "compilers": {
+            "c": {
+                "path": compilers["CMAKE_C_COMPILER"],
+                "version": _version_first_line(
+                    run,
+                    [compilers["CMAKE_C_COMPILER"], "--version"],
+                    checkout,
+                ),
+            },
+            "cxx": {
+                "path": compilers["CMAKE_CXX_COMPILER"],
+                "version": _version_first_line(
+                    run,
+                    [compilers["CMAKE_CXX_COMPILER"], "--version"],
+                    checkout,
+                ),
+            },
         },
         "interpreter": sys.version,
         "platform": platform.platform(),

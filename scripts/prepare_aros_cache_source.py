@@ -24,7 +24,8 @@ def main() -> int:
     try:
         prepare_source(args.checkout.resolve(strict=True), args.receipt.absolute(), LOCK)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        print(f"error: {error}", file=sys.stderr)
+        message = " ".join(str(error).split())
+        print(f"error: {message}", file=sys.stderr)
         return 2
     return 0
 

@@ -338,6 +338,37 @@ def test_validate_source_rejects_diagnostic_filter_mutation(tmp_path: Path) -> N
         validate_source(checkout, lock)
 
 
+def test_validate_source_rebinds_head_after_diagnostic(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    locked_commit = str(lock["commit"])
+    source = checkout / "CMakeLists.txt"
+    source.write_text("# switched\n", encoding="utf-8")
+    git(checkout, "add", "CMakeLists.txt")
+    git(checkout, "commit", "-qm", "switched source")
+    switched_commit = git(checkout, "rev-parse", "HEAD")
+    git(checkout, "update-ref", "HEAD", locked_commit)
+    git(checkout, "read-tree", locked_commit)
+    git(checkout, "checkout-index", "-a", "-f")
+
+    filter_hook = checkout / ".git/hooks/switch-during-status"
+    filter_hook.write_text(
+        "#!/bin/sh\n"
+        f"git update-ref HEAD {switched_commit}\n"
+        f"git read-tree {switched_commit}\n"
+        "git checkout-index -a -f\n"
+        "cat\n",
+        encoding="utf-8",
+    )
+    filter_hook.chmod(0o755)
+    git(checkout, "config", "filter.switch.clean", str(filter_hook))
+    attributes = checkout / ".git/info/attributes"
+    attributes.write_text("CMakeLists.txt filter=switch\n", encoding="utf-8")
+    source.write_bytes(source.read_bytes())
+
+    with pytest.raises(SourceError, match="HEAD|tree"):
+        validate_source(checkout, lock)
+
+
 def test_validate_source_rejects_index_different_from_head(tmp_path: Path) -> None:
     checkout, lock = fake_checkout(tmp_path)
     source = checkout / "CMakeLists.txt"

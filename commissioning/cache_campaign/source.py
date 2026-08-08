@@ -227,7 +227,20 @@ def _read_regular(path: Path) -> bytes:
 def _raw_source_audit(
     checkout: Path,
     build_directory: str | None,
+    expected_commit: str,
+    expected_tree: str,
 ) -> bool:
+    commit = _git(checkout, "rev-parse", "HEAD")
+    if commit != expected_commit:
+        raise SourceError(
+            f"source HEAD mismatch after diagnostic: expected {expected_commit}, observed {commit}"
+        )
+    tree = _git(checkout, "rev-parse", "HEAD^{tree}")
+    if tree != expected_tree:
+        raise SourceError(
+            f"source tree mismatch after diagnostic: expected {expected_tree}, observed {tree}"
+        )
+
     object_format = _git(checkout, "rev-parse", "--show-object-format")
     head = _tree_entries(checkout, object_format)
     index = _index_entries(checkout)
@@ -321,7 +334,12 @@ def _validate_source(
         "--porcelain=v1",
         "--untracked-files=all",
     )
-    return _raw_source_audit(checkout, build_directory)
+    return _raw_source_audit(
+        checkout,
+        build_directory,
+        expected_commit,
+        expected_tree,
+    )
 
 
 def validate_source(checkout: Path, lock: Mapping[str, object]) -> None:

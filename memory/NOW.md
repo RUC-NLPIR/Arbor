@@ -27,14 +27,16 @@ after equivalent public capabilities are commissioned.
   SHA-256 `b5f35280d05e24f528d337b3916f6d72a3d394beb526e7fa06febcae57c96820`,
   and final research commit `7ca93fc634d08e4598016f7b4e9ad2fd276e4c57`.
 - First post-commission fix `26fe611fc88252a4667d24b0db92b742f654712e`
-  closes the stop/final publication race. Final current product source
+  closes the stop/final publication race. Second fix
   `14d8268ae5e82a11c872e6052027f7cf064a7337` adds nested adopted-descendant
-  draining and ESRCH disappearance handling. Its exact clean-wheel full gate
-  collected 1,969 tests: 1,963 passed, 6 skipped, 0 failed, exit 0; the nested
-  stop/timeout plus ESRCH regression set passed 20/20 iterations.
+  draining and ESRCH disappearance handling. Current authoritative code source
+  `c11eed140ca99ec6ff0d5e8d60243242411fd624` preserves failed direct-KILL
+  delivery truth without retry or concealment. Its exact clean-wheel full gate
+  collected 1,970 tests: 1,964 passed, 6 skipped, 0 failed, exit 0; the
+  direct-KILL-false, nested stop/timeout, and ESRCH set passed 20/20 iterations.
 - Phase 0A is complete under the human-approved interim gate: recursive `src/aros`
-  was exactly 17,700 LOC at Task 8 evidence and is exactly 17,700 at final current
-  source; the duplicate carrier is absent. Phase 0B must still reach the original
+  was exactly 17,700 LOC at Task 8 evidence and is exactly 17,700 at current
+  `c11eed14`; the duplicate carrier is absent. Phase 0B must still reach the original
   program-wide `src/aros <= 12,000 LOC` gate before Phase A Mission Supervisor.
   Functionality remains intentionally limited.
 

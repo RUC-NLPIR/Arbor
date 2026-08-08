@@ -88,18 +88,21 @@ bytecode。最终 research commit 是
 该 retained commissioning evidence 仍严格绑定上述 `4f1eb3d` source。第一项
 post-commission fix `26fe611fc88252a4667d24b0db92b742f654712e` 修复 public
 stop/final publication race：delivered stop 只有在 matching `cancelled` final 可验证
-后才返回，delivered-false receipt 仍立即返回。最终 current product source
+后才返回，delivered-false receipt 仍立即返回。第二项 post-commission fix
 `14d8268ae5e82a11c872e6052027f7cf064a7337` 继续排空 nested adopted descendants，
 在 escalation 后重复 KILL，并把 `/proc` stat 的 ESRCH disappearance 视为进程已消失，
-其他 observation errors 仍 fail closed。其 exact clean-wheel full gate 收集 1,969
-tests：1,963 passed、6 skipped、0 failed，exit 0；nested stop、nested timeout 与 ESRCH
-三项 regression set 连续 20/20 passed。
+其他 observation errors 仍 fail closed。current authoritative code source
+`c11eed140ca99ec6ff0d5e8d60243242411fd624` 最终限制 repeated KILL 只发生于已经
+delivered 的 stop 或已经触发的 timeout；direct KILL delivery false 不会被 retry 或
+伪装，receipt/final 保留 `delivered=false` truth。其 exact clean-wheel full gate 收集
+1,970 tests：1,964 passed、6 skipped、0 failed，exit 0；direct-KILL-false、nested stop、
+nested timeout 与 ESRCH 四项 regression set 连续 20/20 passed。
 
 ## 当前限制与下一阶段
 
 - human-approved Phase 0A interim gate 已在 Task 8 recursive
-  `src/aros = 17,700 LOC` 且旧 carrier 缺席时完成；最终 `14d8268a` current count 仍
-  exactly 17,700。原 program-wide Phase 0B `src/aros <= 12,000 LOC` gate 仍必须在
+  `src/aros = 17,700 LOC` 且旧 carrier 缺席时完成；current `c11eed14` count 仍 exactly
+  17,700。原 program-wide Phase 0B `src/aros <= 12,000 LOC` gate 仍必须在
   Phase A Mission Supervisor 之前完成。当前功能有意保持受限。
 - deterministic simple-loop commissioning 不证明真实 external-model research quality、
   真实 Researcher inner loop 或 async portfolio。

@@ -482,9 +482,10 @@ Exit met: one Task executes through Run with unchanged externally meaningful
 lineage and failure truth, the old carrier is absent, retained evidence is
 verified, and the approved recursive `src/aros <= 17,700` interim gate is met.
 Task 8 evidence recorded exactly 17,700 lines. The first reviewed
-post-commission stop/final fix is `26fe611f`; final current source `14d8268a`
-adds nested descendant drain and ESRCH disappearance handling and is exactly
-17,700 lines. Neither fix begins Phase 0B or Phase A functionality.
+post-commission stop/final fix is `26fe611f`; the second fix `14d8268a` adds
+nested descendant drain and ESRCH disappearance handling. Current authoritative
+code source `c11eed14` preserves failed direct-KILL delivery truth and is exactly
+17,700 lines. None of these fixes begins Phase 0B or Phase A functionality.
 
 ### Phase 0B: Program-wide kernel consolidation (required)
 

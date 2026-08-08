@@ -73,9 +73,13 @@ lost evaluation is never retried with the same idempotency key.
   closes the stop/final publication race: a delivered stop returns only after its
   matching `cancelled` final is readable and validated; delivered-false remains
   immediate.
-- Final current source `14d8268ae5e82a11c872e6052027f7cf064a7337`
+- Second post-commission fix `14d8268ae5e82a11c872e6052027f7cf064a7337`
   repeatedly signals nested adopted descendants after escalation and treats ESRCH
   during `/proc` stat as disappearance while other observation errors fail closed.
+- Current authoritative code source
+  `c11eed140ca99ec6ff0d5e8d60243242411fd624` restricts repeated KILL to an
+  already-delivered stop or triggered timeout. A failed direct KILL is not retried
+  or hidden; receipt and final retain `delivered=false` truth.
 - mode-normalizing filesystem 上 integrity 仍启用，但 receipt 标记
   `filesystem_permissions_enforced=false`。该行为与 controlled Git optional-lock
   都是 factual enforcement，不是 protected authority。
@@ -86,7 +90,7 @@ lost evaluation is never retried with the same idempotency key.
 
 - Phase 0B program-wide `src/aros <= 12,000 LOC` gate；Phase 0A 已由 human
   approved interim gate 在 Task 8 recursive `src/aros = 17,700 LOC` 且旧 carrier
-  缺席时完成；final current `14d8268a` count 仍 exactly 17,700；
+  缺席时完成；current `c11eed14` count 仍 exactly 17,700；
 - 真实 external-model Researcher inner-loop commissioning 与 async portfolio；
 - protected evaluation registration and admission；
 - Source Gateway、Independent Reviewer、project-local Skills 和 MCP parity；

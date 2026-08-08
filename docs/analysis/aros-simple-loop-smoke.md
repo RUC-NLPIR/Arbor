@@ -75,23 +75,35 @@ The historical interim clean gate for `26fe611f` produced
 `aa32f63dad0587a7cb50b3ead01dfd092c51a705172c1ac0f2dc05849dad28f4`.
 It collected 1,964 tests: 1,958 passed, 6 skipped, 0 failed, exit 0; its
 adopted-descendant public-stop test passed 20/20 consecutive runs. This result is
-retained as history, not presented as the final current-product gate.
+retained as history, not presented as current.
 
-Final current source `14d8268ae5e82a11c872e6052027f7cf064a7337` extends that
-fix by repeatedly signaling nested adopted descendants after escalation and by
-treating ESRCH during `/proc` stat as disappearance while other observation
-errors remain fail-closed. Its clean detached checkout produced
+The historical second clean gate for
+`14d8268ae5e82a11c872e6052027f7cf064a7337` extends that fix by repeatedly
+signaling nested adopted descendants after escalation and by treating ESRCH
+during `/proc` stat as disappearance while other observation errors remain
+fail-closed. Its clean detached checkout produced
 `arbor_agent-0.1.1.dev489+g14d8268ae-py3-none-any.whl`, SHA-256
 `0647e4fef99672d71881700409d5404268c2eaf10f6f3283b8fb12d1f1dbcd7a`.
+It collected 1,969 tests: 1,963 passed, 6 skipped, 0 failed, exit 0; the nested
+stop, nested timeout, and ESRCH set passed 20/20 consecutive iterations. This
+result is also retained as history, not labeled current.
+
+Current authoritative code source
+`c11eed140ca99ec6ff0d5e8d60243242411fd624` restricts repeated KILL to an
+already-delivered stop or triggered timeout. A failed direct KILL is never retried
+or hidden; receipt and final preserve `delivered=false` truth. Its clean detached
+checkout produced `arbor_agent-0.1.1.dev491+gc11eed140-py3-none-any.whl`,
+SHA-256
+`d183d03350e228b1956d73303d9c48fb1c1933d7f126359e0b5e4b4ac148ac55`.
 The complete product package tree matched the clean source, and a new isolated
 `--no-compile` installation matched the wheel, contained no bytecode, imported
 `task_adapter`, `runner`, `processes`, and `runs` from site-packages, and passed
 `pip check`. From that exact-wheel environment:
 
-- the authoritative final full repository pytest collected 1,969 tests: 1,963
+- the current authoritative full repository pytest collected 1,970 tests: 1,964
   passed, 6 skipped, 0 failed, exit 0;
-- the nested stop, nested timeout, and ESRCH regression set passed 20/20
-  consecutive iterations, totaling 60 test invocations;
+- the direct-KILL-false, nested stop, nested timeout, and ESRCH regression set
+  passed 20/20 consecutive iterations, totaling 80 test invocations;
 - current recursive `src/aros` is exactly 17,700 physical lines, within the approved
   Phase 0A `<= 17,700` interim gate.
 

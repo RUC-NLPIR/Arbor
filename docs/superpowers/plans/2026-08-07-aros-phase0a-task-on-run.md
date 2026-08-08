@@ -186,9 +186,10 @@ def test_phase0a_aros_source_budget() -> None:
 ```
 
 The first reviewed stop/final fix at `26fe611f` measured 17,697 recursive
-physical lines. Final current source `14d8268a`, including nested descendant
-drain and ESRCH handling, measures exactly 17,700. This remains only the approved
-Phase 0A interim gate; Phase 0B still requires the original program-wide
+physical lines. The second fix `14d8268a` adds nested descendant drain and ESRCH
+handling. Current authoritative code source `c11eed14`, including failed
+direct-KILL delivery truth, measures exactly 17,700. This remains only the
+approved Phase 0A interim gate; Phase 0B still requires the original program-wide
 `src/aros <= 12,000 LOC` before Phase A Mission Supervisor.
 
 - [ ] **Step 4: Run the tests and confirm the intended failures**

@@ -74,6 +74,14 @@
       "agent_visibility": "on_demand"
     },
     {
+      "id": "aros-real-researcher-cache-campaign-design",
+      "title": "AROS Real Researcher Cache-Policy Campaign Design",
+      "path": "docs/superpowers/specs/2026-08-08-aros-real-researcher-cache-campaign-design.md",
+      "status": "current",
+      "authority": "implementation_baseline",
+      "agent_visibility": "on_demand"
+    },
+    {
       "id": "aros-phase0a-task-on-run-plan",
       "title": "AROS Phase 0A Task-on-Run Carrier Replacement Implementation Plan",
       "path": "docs/superpowers/plans/2026-08-07-aros-phase0a-task-on-run.md",

@@ -38,8 +38,10 @@ class _OwnedManifest:
 class _OwnedDirectory:
     path: Path | None
     descriptor: int | None
-    identity: tuple[int, int]
+    identity: tuple[int, int] | None
     files: dict[str, _OwnedManifest] = field(default_factory=dict)
+    parent_descriptor: int | None = None
+    entry_name: str | None = None
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -200,27 +202,36 @@ def _create_owned_child(
     if parent.path is None or parent.descriptor is None:
         raise ManifestError("owned parent directory is unavailable")
     os.mkdir(name, mode=0o700, dir_fd=parent.descriptor)
-    metadata = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
-    directory = _OwnedDirectory(
-        path=parent.path / name,
-        descriptor=None,
-        identity=_directory_identity_from_stat(metadata),
-    )
-    registry.append(directory)
     flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    descriptor = os.open(name, flags, dir_fd=parent.descriptor)
     try:
-        identity = _directory_identity_from_stat(os.fstat(descriptor))
-        if identity != directory.identity:
-            raise ManifestError(f"owned child changed before open: {directory.path}")
-    except BaseException:
-        os.close(descriptor)
+        descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+    except BaseException as error:
+        try:
+            os.rmdir(name, dir_fd=parent.descriptor)
+        except OSError as cleanup_error:
+            raise ManifestError(
+                f"child open failure with cleanup conflict: {cleanup_error}"
+            ) from error
         raise
-    directory.descriptor = descriptor
+    directory = _OwnedDirectory(
+        path=parent.path / name,
+        descriptor=descriptor,
+        identity=None,
+        parent_descriptor=parent.descriptor,
+        entry_name=name,
+    )
+    registry.append(directory)
+    path_identity = _directory_identity_from_stat(
+        os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+    )
+    descriptor_identity = _directory_identity_from_stat(os.fstat(descriptor))
+    if descriptor_identity != path_identity:
+        raise ManifestError(f"owned child changed before registration: {directory.path}")
+    directory.identity = descriptor_identity
     return directory
 
 
@@ -310,6 +321,52 @@ def _verify_owned_record(
         raise ManifestError(f"published manifest changed: {name}")
 
 
+def _verify_published_path(
+    directory: _OwnedDirectory,
+    output: Path,
+    manifest_name: str,
+    manifest: dict[str, object],
+) -> None:
+    if directory.identity is None:
+        raise ManifestError(f"published output ownership conflict: {output}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    parent_descriptor = os.open(output.parent, flags)
+    output_descriptor = -1
+    try:
+        metadata = os.stat(
+            output.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != directory.identity
+        ):
+            raise ManifestError(f"published output ownership conflict: {output}")
+        output_descriptor = os.open(
+            output.name,
+            flags,
+            dir_fd=parent_descriptor,
+        )
+        if _directory_identity_from_stat(os.fstat(output_descriptor)) != directory.identity:
+            raise ManifestError(f"published output ownership conflict: {output}")
+        bound = _OwnedDirectory(
+            path=output,
+            descriptor=output_descriptor,
+            identity=directory.identity,
+            files=dict(directory.files),
+        )
+        _verify_owned_record(bound, manifest_name, manifest)
+    finally:
+        if output_descriptor >= 0:
+            os.close(output_descriptor)
+        os.close(parent_descriptor)
+
+
 def _write_owned_record(
     directory: _OwnedDirectory,
     name: str,
@@ -376,6 +433,22 @@ def _cleanup_owned_directory(directory: _OwnedDirectory) -> str | None:
     path = directory.path
     if path is None:
         return None
+    if directory.identity is None:
+        if (
+            directory.descriptor is None
+            or directory.parent_descriptor is None
+            or directory.entry_name is None
+        ):
+            return f"cleanup conflict: provisional ownership is incomplete: {path}"
+        try:
+            entries = os.listdir(directory.descriptor)
+            if entries:
+                return f"cleanup conflict: unexpected entries in {path}: {entries}"
+            os.rmdir(directory.entry_name, dir_fd=directory.parent_descriptor)
+            directory.path = None
+            return None
+        except OSError as error:
+            return f"cleanup conflict: provisional child remains at {path}: {error}"
     state = _directory_state(path, directory.identity)
     if state == "missing":
         directory.path = None
@@ -579,6 +652,8 @@ def freeze_manifests(
             _fsync_directory(parent)
         _verify_owned_record(task_stage, "task.json", task_manifest)
         _verify_owned_record(host_stage, "r3.json", host_manifest)
+        _verify_published_path(task_stage, task, "task.json", task_manifest)
+        _verify_published_path(host_stage, host, "r3.json", host_manifest)
         completed = True
         return task_manifest, host_manifest
     except BaseException as error:

@@ -867,6 +867,104 @@ def test_freeze_revalidates_manifest_bytes_before_return(
     assert not (tmp_path / "task").exists()
 
 
+def test_final_path_binding_rejects_replaced_output_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    real_verify = manifests_module._verify_owned_record
+    host_sentinel = tmp_path / "host/caller-sentinel"
+    verifications = 0
+
+    def replace_after_retained_verification(
+        directory: object,
+        name: str,
+        value: dict[str, object],
+    ) -> None:
+        nonlocal verifications
+        real_verify(directory, name, value)
+        verifications += 1
+        if verifications == 4:
+            shutil.rmtree(tmp_path / "host")
+            (tmp_path / "host").mkdir()
+            host_sentinel.write_text("keep\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        manifests_module,
+        "_verify_owned_record",
+        replace_after_retained_verification,
+    )
+
+    with pytest.raises(ManifestError, match="ownership conflict"):
+        _freeze(candidate, tmp_path)
+
+    assert verifications == 5
+    assert host_sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert not (tmp_path / "task").exists()
+
+
+@pytest.mark.parametrize("failure", ["stat", "open", "fstat"])
+def test_child_creation_failure_cleans_registered_scan_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    real_open = manifests_module.os.open
+    real_stat = manifests_module.os.stat
+    real_fstat = manifests_module.os.fstat
+    child_calls = 0
+    child_descriptors: list[int] = []
+    failed = False
+
+    def maybe_fail_open(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal child_calls, failed
+        if path == ".oracle-scan":
+            child_calls += 1
+            if failure == "open" and child_calls == 2:
+                failed = True
+                raise OSError("simulated child open failure")
+        descriptor = real_open(path, *args, **kwargs)
+        if path == ".oracle-scan":
+            child_descriptors.append(descriptor)
+        return descriptor
+
+    def maybe_fail_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal failed
+        if failure == "stat" and path == ".oracle-scan" and not failed:
+            if list(tmp_path.glob(".host.*/.oracle-scan")):
+                failed = True
+                raise OSError("simulated child stat failure")
+        return real_stat(path, *args, **kwargs)
+
+    def maybe_fail_fstat(descriptor: int) -> os.stat_result:
+        nonlocal failed
+        if (
+            failure == "fstat"
+            and not failed
+            and len(child_descriptors) >= 2
+            and descriptor == child_descriptors[-1]
+        ):
+            failed = True
+            raise OSError("simulated child fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(manifests_module.os, "open", maybe_fail_open)
+    monkeypatch.setattr(manifests_module.os, "stat", maybe_fail_stat)
+    monkeypatch.setattr(manifests_module.os, "fstat", maybe_fail_fstat)
+
+    with pytest.raises(ManifestError, match="child"):
+        _freeze(candidate, tmp_path)
+
+    assert failed
+    for descriptor in child_descriptors:
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+    assert not list(tmp_path.glob(".task.*"))
+    assert not list(tmp_path.glob(".host.*"))
+    assert not (tmp_path / "task").exists()
+    assert not (tmp_path / "host").exists()
+
+
 def test_linked_manifest_is_cleaned_when_directory_fsync_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

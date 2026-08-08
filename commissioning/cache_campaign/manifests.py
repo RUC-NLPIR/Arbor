@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
+import json
 import os
-import shutil
+import secrets
 import stat
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import SCHEMA_VERSION
@@ -16,12 +19,26 @@ from .records import (
     TraceWindow,
     load_candidate_object,
     record_sha256,
-    write_new_record,
 )
 
 
 class ManifestError(ContractError):
     pass
+
+
+@dataclass(frozen=True)
+class _OwnedManifest:
+    name: str
+    identity: tuple[int, int]
+    sha256: str | None
+
+
+@dataclass
+class _OwnedDirectory:
+    path: Path | None
+    descriptor: int
+    identity: tuple[int, int]
+    files: dict[str, _OwnedManifest] = field(default_factory=dict)
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -134,11 +151,47 @@ def _publish_directory(staging: Path, output: Path) -> None:
     raise OSError(error_number, os.strerror(error_number), output)
 
 
-def _directory_identity(path: Path) -> tuple[int, int]:
-    metadata = path.lstat()
+def _directory_identity_from_stat(metadata: os.stat_result) -> tuple[int, int]:
     if not stat.S_ISDIR(metadata.st_mode):
-        raise ManifestError(f"staging path is not a directory: {path}")
+        raise ManifestError("owned path is not a directory")
     return metadata.st_dev, metadata.st_ino
+
+
+def _open_owned_directory(path: Path) -> _OwnedDirectory:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        identity = _directory_identity_from_stat(os.fstat(descriptor))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return _OwnedDirectory(path=path, descriptor=descriptor, identity=identity)
+
+
+def _create_owned_child(parent: _OwnedDirectory, name: str) -> _OwnedDirectory:
+    if parent.path is None:
+        raise ManifestError("owned parent directory is unavailable")
+    os.mkdir(name, mode=0o700, dir_fd=parent.descriptor)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+    try:
+        identity = _directory_identity_from_stat(os.fstat(descriptor))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return _OwnedDirectory(
+        path=parent.path / name,
+        descriptor=descriptor,
+        identity=identity,
+    )
 
 
 def _directory_state(path: Path, identity: tuple[int, int] | None) -> str:
@@ -150,6 +203,176 @@ def _directory_state(path: Path, identity: tuple[int, int] | None) -> str:
         if (metadata.st_dev, metadata.st_ino) == identity:
             return "owned"
     return "replaced"
+
+
+def _read_owned_manifest(directory: _OwnedDirectory, name: str) -> _OwnedManifest:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory.descriptor)
+    digest = hashlib.sha256()
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ManifestError(f"owned manifest is not a regular file: {name}")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return _OwnedManifest(
+        name=name,
+        identity=(metadata.st_dev, metadata.st_ino),
+        sha256=digest.hexdigest(),
+    )
+
+
+def _capture_owned_manifest(directory: _OwnedDirectory, name: str) -> None:
+    entries = os.listdir(directory.descriptor)
+    if entries != [name]:
+        raise ManifestError(f"owned staging entries mismatch: {entries}")
+    if name in directory.files:
+        _refresh_owned_file(directory, name)
+    else:
+        directory.files[name] = _read_owned_manifest(directory, name)
+
+
+def _refresh_owned_file(directory: _OwnedDirectory, name: str) -> _OwnedManifest:
+    expected = directory.files[name]
+    observed = _read_owned_manifest(directory, name)
+    if observed.identity != expected.identity:
+        raise ManifestError(f"owned apparatus file changed: {name}")
+    if expected.sha256 is not None and observed.sha256 != expected.sha256:
+        raise ManifestError(f"owned apparatus file changed: {name}")
+    directory.files[name] = observed
+    return observed
+
+
+def _write_owned_record(
+    directory: _OwnedDirectory,
+    name: str,
+    value: dict[str, object],
+    hash_field: str,
+) -> None:
+    value[hash_field] = record_sha256(value, hash_field)
+    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    temporary_name = f".{name}.{secrets.token_hex(8)}.tmp"
+    descriptor = os.open(
+        temporary_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=directory.descriptor,
+    )
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise ManifestError(f"owned temporary is not a regular file: {temporary_name}")
+    directory.files[temporary_name] = _OwnedManifest(
+        name=temporary_name,
+        identity=(metadata.st_dev, metadata.st_ino),
+        sha256=None,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_receipt = _refresh_owned_file(directory, temporary_name)
+        try:
+            os.link(
+                temporary_name,
+                name,
+                src_dir_fd=directory.descriptor,
+                dst_dir_fd=directory.descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError as error:
+            raise ManifestError(f"refusing to replace owned manifest: {name}") from error
+        directory.files[name] = _OwnedManifest(
+            name=name,
+            identity=temporary_receipt.identity,
+            sha256=temporary_receipt.sha256,
+        )
+        os.fsync(directory.descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            _refresh_owned_file(directory, temporary_name)
+            os.unlink(temporary_name, dir_fd=directory.descriptor)
+        except FileNotFoundError:
+            directory.files.pop(temporary_name, None)
+        else:
+            directory.files.pop(temporary_name, None)
+
+
+def _cleanup_owned_directory(directory: _OwnedDirectory) -> str | None:
+    path = directory.path
+    if path is None:
+        return None
+    state = _directory_state(path, directory.identity)
+    if state == "missing":
+        directory.path = None
+        return None
+    if state == "replaced":
+        return f"cleanup conflict: replaced path: {path}"
+    try:
+        entries = os.listdir(directory.descriptor)
+        if set(entries) != set(directory.files):
+            return f"cleanup conflict: unexpected entries in {path}: {entries}"
+        for name, expected in directory.files.items():
+            observed = _read_owned_manifest(directory, name)
+            if observed != expected:
+                return f"cleanup conflict: apparatus file changed in {path}: {name}"
+        for name in list(directory.files):
+            os.unlink(name, dir_fd=directory.descriptor)
+            directory.files.pop(name)
+        state = _directory_state(path, directory.identity)
+        if state == "missing":
+            directory.path = None
+            return None
+        if state == "replaced":
+            return f"cleanup conflict: replaced path: {path}"
+        os.rmdir(path)
+        directory.path = None
+        return None
+    except OSError as error:
+        return f"cleanup failure for {path}: {error}"
+
+
+def _cleanup_owned_directories(
+    directories: list[_OwnedDirectory],
+) -> list[str]:
+    issues = []
+    for directory in reversed(directories):
+        try:
+            issue = _cleanup_owned_directory(directory)
+        except BaseException as error:
+            location = directory.path or Path("<unlinked-owned-directory>")
+            issue = f"cleanup failure for {location}: {error}"
+        if issue is not None:
+            issues.append(issue)
+    return issues
+
+
+def _publish_owned_directory(directory: _OwnedDirectory, output: Path) -> None:
+    staging = directory.path
+    if staging is None:
+        raise ManifestError("owned staging directory is unavailable")
+    if _directory_state(staging, directory.identity) != "owned":
+        raise ManifestError(f"staging ownership conflict: {staging}")
+    try:
+        _publish_directory(staging, output)
+    except BaseException:
+        if _directory_state(output, directory.identity) == "owned":
+            directory.path = output
+        elif _directory_state(staging, directory.identity) == "missing":
+            directory.path = output
+        raise
+    directory.path = output
+    if _directory_state(output, directory.identity) != "owned":
+        raise ManifestError(f"published output ownership conflict: {output}")
 
 
 def _fsync_directory(path: Path) -> None:
@@ -184,31 +407,42 @@ def freeze_manifests(
     except (OSError, ValueError) as error:
         raise ManifestError(str(error)) from error
 
-    task_stage: Path | None = None
-    host_stage: Path | None = None
-    task_identity: tuple[int, int] | None = None
-    host_identity: tuple[int, int] | None = None
+    owned_directories: list[_OwnedDirectory] = []
+    cleanup_performed = False
+    completed = False
     try:
         task.parent.mkdir(parents=True, exist_ok=True)
         host.parent.mkdir(parents=True, exist_ok=True)
-        task_stage = Path(tempfile.mkdtemp(prefix=f".{task.name}.", dir=task.parent))
-        task_identity = _directory_identity(task_stage)
-        host_stage = Path(tempfile.mkdtemp(prefix=f".{host.name}.", dir=host.parent))
-        host_identity = _directory_identity(host_stage)
-        public_scan_directory = task_stage / ".oracle-scan"
-        private_scan_directory = host_stage / ".oracle-scan"
-        public_scan_directory.mkdir(mode=0o700)
-        private_scan_directory.mkdir(mode=0o700)
+        task_stage_path = Path(
+            tempfile.mkdtemp(prefix=f".{task.name}.", dir=task.parent)
+        )
+        task_stage = _open_owned_directory(task_stage_path)
+        owned_directories.append(task_stage)
+        host_stage_path = Path(
+            tempfile.mkdtemp(prefix=f".{host.name}.", dir=host.parent)
+        )
+        host_stage = _open_owned_directory(host_stage_path)
+        owned_directories.append(host_stage)
+        public_scan = _create_owned_child(task_stage, ".oracle-scan")
+        owned_directories.append(public_scan)
+        private_scan = _create_owned_child(host_stage, ".oracle-scan")
+        owned_directories.append(private_scan)
 
         frozen_traces: list[dict[str, object]] = []
         for trace in portfolio.traces:
-            scan_directory = (
-                private_scan_directory if trace.split == "r3" else public_scan_directory
+            scan = private_scan if trace.split == "r3" else public_scan
+            if scan.path is None:
+                raise ManifestError("owned scan directory is unavailable")
+            diagnostic = scan_oracle_general(
+                trace,
+                scan.path,
+                temporary_descriptor=scan.descriptor,
             )
-            diagnostic = scan_oracle_general(trace, scan_directory)
             frozen_traces.append(_trace_record(trace, diagnostic))
-        public_scan_directory.rmdir()
-        private_scan_directory.rmdir()
+        for scan in (public_scan, private_scan):
+            issue = _cleanup_owned_directory(scan)
+            if issue is not None:
+                raise ManifestError(issue)
 
         public_traces = [
             item for item in frozen_traces if item["split"] in {"dev", "visible"}
@@ -230,72 +464,41 @@ def freeze_manifests(
             "traces": public_traces,
             "r3_commitment_sha256": host_manifest["manifest_sha256"],
         }
-        write_new_record(host_stage / "r3.json", host_manifest, "manifest_sha256")
-        write_new_record(task_stage / "task.json", task_manifest, "manifest_sha256")
+        _write_owned_record(host_stage, "r3.json", host_manifest, "manifest_sha256")
+        _capture_owned_manifest(host_stage, "r3.json")
+        _write_owned_record(task_stage, "task.json", task_manifest, "manifest_sha256")
+        _capture_owned_manifest(task_stage, "task.json")
 
-        if _directory_state(task_stage, task_identity) != "owned":
-            raise ManifestError(f"staging ownership conflict: {task_stage}")
-        if _directory_state(host_stage, host_identity) != "owned":
-            raise ManifestError(f"staging ownership conflict: {host_stage}")
-        _publish_directory(task_stage, task)
-        task_stage = None
-        _publish_directory(host_stage, host)
-        host_stage = None
+        _publish_owned_directory(task_stage, task)
+        _publish_owned_directory(host_stage, host)
         for parent in {task.parent, host.parent}:
             _fsync_directory(parent)
+        completed = True
         return task_manifest, host_manifest
     except BaseException as error:
-        rollback_errors: list[OSError] = []
-        rollback_conflicts: list[Path] = []
-        for output, identity in ((host, host_identity), (task, task_identity)):
-            state = _directory_state(output, identity)
-            if state == "missing":
-                continue
-            if state == "replaced":
-                rollback_conflicts.append(output)
-                continue
-            try:
-                shutil.rmtree(output)
-            except OSError as cleanup_error:
-                rollback_errors.append(cleanup_error)
+        publication_started = any(
+            directory.path in {task, host} for directory in owned_directories
+        )
+        cleanup_issues = _cleanup_owned_directories(owned_directories)
+        cleanup_performed = True
         if isinstance(error, (OSError, ValueError)):
             message = f"manifest publication failed: {error}"
-            if rollback_errors:
-                message += "; rollback failed: " + "; ".join(
-                    str(item) for item in rollback_errors
+            if cleanup_issues:
+                label = (
+                    "rollback conflict"
+                    if publication_started
+                    else "temporary directory cleanup failed"
                 )
-            if rollback_conflicts:
-                message += "; rollback conflict: replaced path: " + ", ".join(
-                    str(item) for item in rollback_conflicts
-                )
+                message += f"; {label}: " + "; ".join(cleanup_issues)
             raise ManifestError(message) from error
         raise
     finally:
-        cleanup_errors: list[OSError] = []
-        cleanup_conflicts: list[Path] = []
-        for staging, identity in (
-            (task_stage, task_identity),
-            (host_stage, host_identity),
-        ):
-            if staging is None:
-                continue
-            state = _directory_state(staging, identity)
-            if state == "missing":
-                continue
-            if state == "replaced":
-                cleanup_conflicts.append(staging)
-                continue
-            try:
-                shutil.rmtree(staging)
-            except OSError as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        if cleanup_errors or cleanup_conflicts:
-            details = [str(item) for item in cleanup_errors]
-            details.extend(f"replaced path: {item}" for item in cleanup_conflicts)
-            message = "temporary directory cleanup failed"
-            if cleanup_conflicts:
-                message += " due to cleanup conflict"
-            error = ManifestError(f"{message}: {'; '.join(details)}")
-            if cleanup_errors:
-                raise error from cleanup_errors[0]
-            raise error
+        try:
+            if not completed and not cleanup_performed:
+                _cleanup_owned_directories(owned_directories)
+        finally:
+            for directory in reversed(owned_directories):
+                try:
+                    os.close(directory.descriptor)
+                except OSError:
+                    pass

@@ -21,13 +21,17 @@ class OracleError(ValueError):
     pass
 
 
-def _bucket_path(directory: Path, bucket: int) -> Path:
-    return directory / f"bucket-{bucket:03d}.bin"
+def _bucket_name(bucket: int) -> str:
+    return f"bucket-{bucket:03d}.bin"
 
 
-def _open_bucket(directory: Path, bucket: int) -> BinaryIO:
-    path = _bucket_path(directory, bucket)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+def _open_bucket(directory_descriptor: int, bucket: int) -> BinaryIO:
+    descriptor = os.open(
+        _bucket_name(bucket),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=directory_descriptor,
+    )
     return os.fdopen(descriptor, "wb")
 
 
@@ -35,18 +39,31 @@ def _compression_magic(prefix: bytes) -> bool:
     return any(prefix.startswith(magic) for magic in _COMPRESSED_MAGIC)
 
 
-def scan_oracle_general(trace: TraceWindow, temporary_directory: Path) -> dict[str, object]:
+def scan_oracle_general(
+    trace: TraceWindow,
+    temporary_directory: Path,
+    *,
+    temporary_descriptor: int | None = None,
+) -> dict[str, object]:
     if trace.path.suffix.lower() in _COMPRESSED_SUFFIXES:
         raise OracleError(f"compressed OracleGeneral input is unsupported: {trace.path}")
-    if not temporary_directory.is_dir():
-        raise OracleError(f"scanner temporary directory is missing: {temporary_directory}")
-    if any(temporary_directory.iterdir()):
-        raise OracleError(f"scanner temporary directory must be empty: {temporary_directory}")
     if trace.size_bytes % ORACLE_GENERAL.size:
         raise OracleError(f"misaligned OracleGeneral data: {trace.path}")
     if trace.size_bytes // ORACLE_GENERAL.size < trace.max_requests:
         raise OracleError(f"OracleGeneral window has fewer than max_requests: {trace.path}")
-
+    owns_temporary_descriptor = temporary_descriptor is None
+    if temporary_descriptor is None:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            temporary_descriptor = os.open(temporary_directory, flags)
+        except OSError as error:
+            raise OracleError(
+                f"scanner temporary directory is missing: {temporary_directory}"
+            ) from error
     bucket_streams: dict[int, BinaryIO] = {}
     reuse_counts: dict[int, int] = {}
     no_next_count = 0
@@ -56,6 +73,10 @@ def scan_oracle_general(trace: TraceWindow, temporary_directory: Path) -> dict[s
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = -1
     try:
+        if os.listdir(temporary_descriptor):
+            raise OracleError(
+                f"scanner temporary directory must be empty: {temporary_directory}"
+            )
         descriptor = os.open(trace.path, flags)
         with os.fdopen(descriptor, "rb") as stream:
             descriptor = -1
@@ -81,7 +102,7 @@ def scan_oracle_general(trace: TraceWindow, temporary_directory: Path) -> dict[s
                 bucket = object_id & (_BUCKET_COUNT - 1)
                 bucket_stream = bucket_streams.get(bucket)
                 if bucket_stream is None:
-                    bucket_stream = _open_bucket(temporary_directory, bucket)
+                    bucket_stream = _open_bucket(temporary_descriptor, bucket)
                     bucket_streams[bucket] = bucket_stream
                 bucket_stream.write(_BUCKET_RECORD.pack(object_id, object_size))
 
@@ -112,12 +133,19 @@ def scan_oracle_general(trace: TraceWindow, temporary_directory: Path) -> dict[s
         one_hit_object_count = 0
         working_set_bytes = 0
         for bucket in range(_BUCKET_COUNT):
-            path = _bucket_path(temporary_directory, bucket)
-            if not path.exists():
+            name = _bucket_name(bucket)
+            try:
+                bucket_descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=temporary_descriptor,
+                )
+            except FileNotFoundError:
                 continue
             objects: dict[int, tuple[int, int]] = {}
             try:
-                with path.open("rb") as stream:
+                with os.fdopen(bucket_descriptor, "rb") as stream:
+                    bucket_descriptor = -1
                     while True:
                         raw = stream.read(_BUCKET_RECORD.size)
                         if not raw:
@@ -131,7 +159,12 @@ def scan_oracle_general(trace: TraceWindow, temporary_directory: Path) -> dict[s
                 one_hit_object_count += sum(count == 1 for count, _ in objects.values())
                 working_set_bytes += sum(size for _, size in objects.values())
             finally:
-                path.unlink(missing_ok=True)
+                if bucket_descriptor >= 0:
+                    os.close(bucket_descriptor)
+                try:
+                    os.unlink(name, dir_fd=temporary_descriptor)
+                except FileNotFoundError:
+                    pass
 
         if working_set_bytes != trace.working_set_bytes:
             raise OracleError(
@@ -168,4 +201,9 @@ def scan_oracle_general(trace: TraceWindow, temporary_directory: Path) -> dict[s
         for stream in bucket_streams.values():
             stream.close()
         for bucket in range(_BUCKET_COUNT):
-            _bucket_path(temporary_directory, bucket).unlink(missing_ok=True)
+            try:
+                os.unlink(_bucket_name(bucket), dir_fd=temporary_descriptor)
+            except FileNotFoundError:
+                pass
+        if owns_temporary_descriptor:
+            os.close(temporary_descriptor)

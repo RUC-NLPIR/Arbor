@@ -4,6 +4,7 @@ import copy
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -253,6 +254,26 @@ def test_validate_source_rejects_filemode_hidden_change(tmp_path: Path) -> None:
     git(checkout, "config", "core.fileMode", "false")
     (checkout / "CMakeLists.txt").chmod(0o755)
     assert git(checkout, "status", "--porcelain=v1") == ""
+
+    with pytest.raises(SourceError, match="dirty"):
+        validate_source(checkout, lock)
+
+
+def test_validate_source_rejects_minimal_stat_hidden_change(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    source = checkout / "CMakeLists.txt"
+    initial = source.stat()
+    aged_mtime = initial.st_mtime_ns - 10_000_000_000
+    os.utime(source, ns=(initial.st_atime_ns, aged_mtime))
+    git(checkout, "config", "core.trustctime", "false")
+    git(checkout, "config", "core.checkStat", "minimal")
+    assert git(checkout, "status", "--porcelain=v1") == ""
+    metadata = source.stat()
+    time.sleep(1.1)
+    replacement = b"# altered\n"
+    assert len(replacement) == metadata.st_size
+    source.write_bytes(replacement)
+    os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
 
     with pytest.raises(SourceError, match="dirty"):
         validate_source(checkout, lock)

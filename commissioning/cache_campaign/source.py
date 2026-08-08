@@ -21,6 +21,10 @@ _GIT_CONFIG_OVERRIDES = [
     "core.untrackedCache=false",
     "-c",
     "core.fileMode=true",
+    "-c",
+    "core.trustctime=true",
+    "-c",
+    "core.checkStat=default",
 ]
 
 

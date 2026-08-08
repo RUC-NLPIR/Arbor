@@ -416,6 +416,159 @@ def test_direct_scanner_closes_owned_temporary_descriptor_on_early_error(
     assert set(opened) <= set(closed)
 
 
+def test_scanner_bucket_fstat_failure_closes_and_removes_registered_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    trace = TraceWindow.from_candidate(_traces(candidate)[0])
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    scratch_descriptor = os.open(
+        scratch,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    prefix = ".oracle-test-fstat-"
+    real_open = oracle_module.os.open
+    real_fstat = oracle_module.os.fstat
+    bucket_descriptors: list[int] = []
+    failed = False
+
+    def record_open(path: object, *args: object, **kwargs: object) -> int:
+        descriptor = real_open(path, *args, **kwargs)
+        if isinstance(path, str) and path.startswith(prefix):
+            bucket_descriptors.append(descriptor)
+        return descriptor
+
+    def fail_bucket_fstat_once(descriptor: int) -> os.stat_result:
+        nonlocal failed
+        if descriptor in bucket_descriptors and not failed:
+            failed = True
+            raise OSError("simulated bucket fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(oracle_module.os, "open", record_open)
+    monkeypatch.setattr(oracle_module.os, "fstat", fail_bucket_fstat_once)
+    try:
+        with pytest.raises((OSError, OracleError)):
+            scan_oracle_general(
+                trace,
+                scratch,
+                temporary_descriptor=scratch_descriptor,
+                scan_prefix=prefix,
+            )
+    finally:
+        os.close(scratch_descriptor)
+
+    assert failed
+    assert not [path for path in scratch.iterdir() if path.name.startswith(prefix)]
+    for descriptor in bucket_descriptors:
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
+def test_scanner_bucket_fdopen_failure_closes_created_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    trace = TraceWindow.from_candidate(_traces(candidate)[0])
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    scratch_descriptor = os.open(
+        scratch,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    prefix = ".oracle-test-fdopen-"
+    real_open = oracle_module.os.open
+    real_fdopen = oracle_module.os.fdopen
+    real_fstat = oracle_module.os.fstat
+    bucket_descriptors: list[int] = []
+    failed = False
+
+    def record_open(path: object, *args: object, **kwargs: object) -> int:
+        descriptor = real_open(path, *args, **kwargs)
+        if isinstance(path, str) and path.startswith(prefix):
+            bucket_descriptors.append(descriptor)
+        return descriptor
+
+    def fail_bucket_fdopen(descriptor: int, *args: object, **kwargs: object) -> object:
+        nonlocal failed
+        if descriptor in bucket_descriptors and not failed:
+            failed = True
+            raise OSError("simulated bucket fdopen failure")
+        return real_fdopen(descriptor, *args, **kwargs)
+
+    monkeypatch.setattr(oracle_module.os, "open", record_open)
+    monkeypatch.setattr(oracle_module.os, "fdopen", fail_bucket_fdopen)
+    try:
+        with pytest.raises((OSError, OracleError)):
+            scan_oracle_general(
+                trace,
+                scratch,
+                temporary_descriptor=scratch_descriptor,
+                scan_prefix=prefix,
+            )
+    finally:
+        os.close(scratch_descriptor)
+
+    assert failed
+    assert not [path for path in scratch.iterdir() if path.name.startswith(prefix)]
+    for descriptor in bucket_descriptors:
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
+def test_scanner_cleanup_error_continues_and_closes_owned_directory_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    trace_path = candidate.trace_paths[0]
+    records = [
+        list(ORACLE.unpack_from(trace_path.read_bytes(), offset))
+        for offset in range(0, ORACLE.size * 10, ORACLE.size)
+    ]
+    records[4][2] = 0
+    trace_path.write_bytes(b"".join(ORACLE.pack(*record) for record in records))
+    trace = TraceWindow.from_candidate(_traces(candidate)[0])
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    prefix = ".oracle-test-cleanup-"
+    real_open = oracle_module.os.open
+    real_stat = oracle_module.os.stat
+    real_fstat = oracle_module.os.fstat
+    scratch_descriptors: list[int] = []
+    failed = False
+
+    def record_open(path: object, *args: object, **kwargs: object) -> int:
+        descriptor = real_open(path, *args, **kwargs)
+        if path == scratch:
+            scratch_descriptors.append(descriptor)
+        return descriptor
+
+    def fail_one_cleanup_stat(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal failed
+        if isinstance(path, str) and path.startswith(prefix) and not failed:
+            failed = True
+            raise OSError("simulated cleanup stat failure")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(oracle_module.os, "open", record_open)
+    monkeypatch.setattr(oracle_module.os, "stat", fail_one_cleanup_stat)
+
+    with pytest.raises((OSError, OracleError)):
+        scan_oracle_general(trace, scratch, scan_prefix=prefix)
+
+    assert failed
+    remaining = [path for path in scratch.iterdir() if path.name.startswith(prefix)]
+    assert len(remaining) == 1
+    for descriptor in scratch_descriptors:
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
 def test_freeze_rejects_working_set_mismatch(tmp_path: Path) -> None:
     candidate = valid_candidate(tmp_path)
     _traces(candidate)[0]["working_set_bytes"] += 1
@@ -552,29 +705,69 @@ def test_second_publication_failure_rolls_back_first(
     assert not list(tmp_path.glob(".host.*"))
 
 
-def test_scanner_keeps_r3_buckets_in_host_staging(
+def test_scanner_uses_retained_stages_without_child_directories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     candidate = valid_candidate(tmp_path)
     real_scan = manifests_module.scan_oracle_general
-    observed: dict[str, Path] = {}
+    real_mkdir = manifests_module.os.mkdir
+    observed: list[tuple[str, Path, int | None, object]] = []
+    child_directories: list[str] = []
 
     def record_scan(
         trace: object,
         temporary_directory: Path,
         **kwargs: object,
     ) -> dict[str, object]:
-        split = trace.split
-        observed.setdefault(split, temporary_directory)
+        observed.append(
+            (
+                trace.split,
+                temporary_directory,
+                kwargs.get("temporary_descriptor"),
+                kwargs.get("scan_prefix"),
+            )
+        )
         return real_scan(trace, temporary_directory, **kwargs)
 
+    def record_mkdir(path: object, *args: object, **kwargs: object) -> None:
+        if path == ".oracle-scan":
+            child_directories.append(str(path))
+        real_mkdir(path, *args, **kwargs)
+
     monkeypatch.setattr(manifests_module, "scan_oracle_general", record_scan)
+    monkeypatch.setattr(manifests_module.os, "mkdir", record_mkdir)
 
     _freeze(candidate, tmp_path)
 
-    assert observed["dev"].parent.name.startswith(".task.")
-    assert observed["visible"].parent.name.startswith(".task.")
-    assert observed["r3"].parent.name.startswith(".host.")
+    assert not child_directories
+    assert len(observed) == len(_traces(candidate))
+    prefixes = []
+    for split, stage, descriptor, prefix in observed:
+        expected = ".host." if split == "r3" else ".task."
+        assert stage.name.startswith(expected)
+        assert isinstance(descriptor, int)
+        assert isinstance(prefix, str) and prefix.startswith(".oracle-")
+        prefixes.append(prefix)
+    assert len(prefixes) == len(set(prefixes))
+
+
+def test_r3_scanner_failure_leaves_no_bucket_or_manifest_staging(tmp_path: Path) -> None:
+    candidate = valid_candidate(tmp_path)
+    r3_path = candidate.trace_paths[-1]
+    records = [
+        list(ORACLE.unpack_from(r3_path.read_bytes(), offset))
+        for offset in range(0, ORACLE.size * 10, ORACLE.size)
+    ]
+    records[4][2] = 0
+    r3_path.write_bytes(b"".join(ORACLE.pack(*record) for record in records))
+
+    with pytest.raises(ManifestError, match="nonpositive"):
+        _freeze(candidate, tmp_path)
+
+    assert not (tmp_path / "task").exists()
+    assert not (tmp_path / "host").exists()
+    assert not list(tmp_path.glob(".task.*"))
+    assert not list(tmp_path.glob(".host.*"))
 
 
 def test_publish_fails_closed_without_atomic_no_replace(
@@ -633,7 +826,7 @@ def test_cleanup_preserves_replaced_staging_directory(
         **kwargs: object,
     ) -> dict[str, object]:
         nonlocal caller_sentinel
-        staging = temporary_directory.parent
+        staging = temporary_directory
         shutil.rmtree(staging)
         staging.mkdir()
         caller_sentinel = staging / "caller-sentinel"
@@ -900,69 +1093,6 @@ def test_final_path_binding_rejects_replaced_output_directory(
     assert verifications == 5
     assert host_sentinel.read_text(encoding="utf-8") == "keep\n"
     assert not (tmp_path / "task").exists()
-
-
-@pytest.mark.parametrize("failure", ["stat", "open", "fstat"])
-def test_child_creation_failure_cleans_registered_scan_directories(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str,
-) -> None:
-    candidate = valid_candidate(tmp_path)
-    real_open = manifests_module.os.open
-    real_stat = manifests_module.os.stat
-    real_fstat = manifests_module.os.fstat
-    child_calls = 0
-    child_descriptors: list[int] = []
-    failed = False
-
-    def maybe_fail_open(path: object, *args: object, **kwargs: object) -> int:
-        nonlocal child_calls, failed
-        if path == ".oracle-scan":
-            child_calls += 1
-            if failure == "open" and child_calls == 2:
-                failed = True
-                raise OSError("simulated child open failure")
-        descriptor = real_open(path, *args, **kwargs)
-        if path == ".oracle-scan":
-            child_descriptors.append(descriptor)
-        return descriptor
-
-    def maybe_fail_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
-        nonlocal failed
-        if failure == "stat" and path == ".oracle-scan" and not failed:
-            if list(tmp_path.glob(".host.*/.oracle-scan")):
-                failed = True
-                raise OSError("simulated child stat failure")
-        return real_stat(path, *args, **kwargs)
-
-    def maybe_fail_fstat(descriptor: int) -> os.stat_result:
-        nonlocal failed
-        if (
-            failure == "fstat"
-            and not failed
-            and len(child_descriptors) >= 2
-            and descriptor == child_descriptors[-1]
-        ):
-            failed = True
-            raise OSError("simulated child fstat failure")
-        return real_fstat(descriptor)
-
-    monkeypatch.setattr(manifests_module.os, "open", maybe_fail_open)
-    monkeypatch.setattr(manifests_module.os, "stat", maybe_fail_stat)
-    monkeypatch.setattr(manifests_module.os, "fstat", maybe_fail_fstat)
-
-    with pytest.raises(ManifestError, match="child"):
-        _freeze(candidate, tmp_path)
-
-    assert failed
-    for descriptor in child_descriptors:
-        with pytest.raises(OSError):
-            real_fstat(descriptor)
-    assert not list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
 
 
 def test_linked_manifest_is_cleaned_when_directory_fsync_fails(

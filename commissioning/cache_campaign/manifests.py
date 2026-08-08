@@ -38,10 +38,8 @@ class _OwnedManifest:
 class _OwnedDirectory:
     path: Path | None
     descriptor: int | None
-    identity: tuple[int, int] | None
+    identity: tuple[int, int]
     files: dict[str, _OwnedManifest] = field(default_factory=dict)
-    parent_descriptor: int | None = None
-    entry_name: str | None = None
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -191,47 +189,6 @@ def _open_owned_directory(path: Path) -> _OwnedDirectory:
     except BaseException:
         _cleanup_owned_directory(directory)
         raise
-    return directory
-
-
-def _create_owned_child(
-    parent: _OwnedDirectory,
-    name: str,
-    registry: list[_OwnedDirectory],
-) -> _OwnedDirectory:
-    if parent.path is None or parent.descriptor is None:
-        raise ManifestError("owned parent directory is unavailable")
-    os.mkdir(name, mode=0o700, dir_fd=parent.descriptor)
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        descriptor = os.open(name, flags, dir_fd=parent.descriptor)
-    except BaseException as error:
-        try:
-            os.rmdir(name, dir_fd=parent.descriptor)
-        except OSError as cleanup_error:
-            raise ManifestError(
-                f"child open failure with cleanup conflict: {cleanup_error}"
-            ) from error
-        raise
-    directory = _OwnedDirectory(
-        path=parent.path / name,
-        descriptor=descriptor,
-        identity=None,
-        parent_descriptor=parent.descriptor,
-        entry_name=name,
-    )
-    registry.append(directory)
-    path_identity = _directory_identity_from_stat(
-        os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
-    )
-    descriptor_identity = _directory_identity_from_stat(os.fstat(descriptor))
-    if descriptor_identity != path_identity:
-        raise ManifestError(f"owned child changed before registration: {directory.path}")
-    directory.identity = descriptor_identity
     return directory
 
 
@@ -433,22 +390,6 @@ def _cleanup_owned_directory(directory: _OwnedDirectory) -> str | None:
     path = directory.path
     if path is None:
         return None
-    if directory.identity is None:
-        if (
-            directory.descriptor is None
-            or directory.parent_descriptor is None
-            or directory.entry_name is None
-        ):
-            return f"cleanup conflict: provisional ownership is incomplete: {path}"
-        try:
-            entries = os.listdir(directory.descriptor)
-            if entries:
-                return f"cleanup conflict: unexpected entries in {path}: {entries}"
-            os.rmdir(directory.entry_name, dir_fd=directory.parent_descriptor)
-            directory.path = None
-            return None
-        except OSError as error:
-            return f"cleanup conflict: provisional child remains at {path}: {error}"
     state = _directory_state(path, directory.identity)
     if state == "missing":
         directory.path = None
@@ -598,28 +539,18 @@ def freeze_manifests(
         host_stage = _register_owned_directory(host_stage_path)
         owned_directories.append(host_stage)
         _attach_owned_directory(host_stage)
-        public_scan = _create_owned_child(
-            task_stage, ".oracle-scan", owned_directories
-        )
-        private_scan = _create_owned_child(
-            host_stage, ".oracle-scan", owned_directories
-        )
-
         frozen_traces: list[dict[str, object]] = []
         for trace in portfolio.traces:
-            scan = private_scan if trace.split == "r3" else public_scan
+            scan = host_stage if trace.split == "r3" else task_stage
             if scan.path is None:
-                raise ManifestError("owned scan directory is unavailable")
+                raise ManifestError("owned staging directory is unavailable")
             diagnostic = scan_oracle_general(
                 trace,
                 scan.path,
                 temporary_descriptor=_owned_directory_descriptor(scan),
+                scan_prefix=f".oracle-{secrets.token_hex(16)}-",
             )
             frozen_traces.append(_trace_record(trace, diagnostic))
-        for scan in (public_scan, private_scan):
-            issue = _cleanup_owned_directory(scan)
-            if issue is not None:
-                raise ManifestError(issue)
 
         public_traces = [
             item for item in frozen_traces if item["split"] in {"dev", "visible"}

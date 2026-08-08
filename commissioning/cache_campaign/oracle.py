@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
+import stat
 import struct
 from pathlib import Path
 from typing import BinaryIO
@@ -21,18 +23,43 @@ class OracleError(ValueError):
     pass
 
 
-def _bucket_name(bucket: int) -> str:
-    return f"bucket-{bucket:03d}.bin"
+def _bucket_name(prefix: str, bucket: int) -> str:
+    return f"{prefix}bucket-{bucket:03d}.bin"
 
 
-def _open_bucket(directory_descriptor: int, bucket: int) -> BinaryIO:
+def _open_bucket(
+    directory_descriptor: int,
+    prefix: str,
+    bucket: int,
+    receipts: dict[str, tuple[int, int] | None],
+) -> tuple[BinaryIO, tuple[int, int]]:
+    name = _bucket_name(prefix, bucket)
     descriptor = os.open(
-        _bucket_name(bucket),
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
         0o600,
         dir_fd=directory_descriptor,
     )
-    return os.fdopen(descriptor, "wb")
+    receipts[name] = None
+    try:
+        metadata = os.fstat(descriptor)
+    except BaseException:
+        try:
+            metadata = os.fstat(descriptor)
+            receipts[name] = (metadata.st_dev, metadata.st_ino)
+        finally:
+            os.close(descriptor)
+        raise
+    receipts[name] = (metadata.st_dev, metadata.st_ino)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise OracleError("scanner bucket is not a regular file")
+    try:
+        stream = os.fdopen(descriptor, "wb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return stream, (metadata.st_dev, metadata.st_ino)
 
 
 def _compression_magic(prefix: bytes) -> bool:
@@ -44,6 +71,7 @@ def scan_oracle_general(
     temporary_directory: Path,
     *,
     temporary_descriptor: int | None = None,
+    scan_prefix: str | None = None,
 ) -> dict[str, object]:
     if trace.path.suffix.lower() in _COMPRESSED_SUFFIXES:
         raise OracleError(f"compressed OracleGeneral input is unsupported: {trace.path}")
@@ -51,6 +79,14 @@ def scan_oracle_general(
         raise OracleError(f"misaligned OracleGeneral data: {trace.path}")
     if trace.size_bytes // ORACLE_GENERAL.size < trace.max_requests:
         raise OracleError(f"OracleGeneral window has fewer than max_requests: {trace.path}")
+    if scan_prefix is None:
+        scan_prefix = f".oracle-{secrets.token_hex(16)}-"
+    if (
+        not scan_prefix.startswith(".oracle-")
+        or "/" in scan_prefix
+        or "\x00" in scan_prefix
+    ):
+        raise OracleError("invalid OracleGeneral scan prefix")
     owns_temporary_descriptor = temporary_descriptor is None
     if temporary_descriptor is None:
         flags = (
@@ -65,6 +101,7 @@ def scan_oracle_general(
                 f"scanner temporary directory is missing: {temporary_directory}"
             ) from error
     bucket_streams: dict[int, BinaryIO] = {}
+    bucket_receipts: dict[str, tuple[int, int] | None] = {}
     reuse_counts: dict[int, int] = {}
     no_next_count = 0
     digest = hashlib.sha256()
@@ -102,8 +139,14 @@ def scan_oracle_general(
                 bucket = object_id & (_BUCKET_COUNT - 1)
                 bucket_stream = bucket_streams.get(bucket)
                 if bucket_stream is None:
-                    bucket_stream = _open_bucket(temporary_descriptor, bucket)
+                    bucket_stream, identity = _open_bucket(
+                        temporary_descriptor,
+                        scan_prefix,
+                        bucket,
+                        bucket_receipts,
+                    )
                     bucket_streams[bucket] = bucket_stream
+                    bucket_receipts[_bucket_name(scan_prefix, bucket)] = identity
                 bucket_stream.write(_BUCKET_RECORD.pack(object_id, object_size))
 
                 current_vtime = trace.start_request + request_index
@@ -133,7 +176,7 @@ def scan_oracle_general(
         one_hit_object_count = 0
         working_set_bytes = 0
         for bucket in range(_BUCKET_COUNT):
-            name = _bucket_name(bucket)
+            name = _bucket_name(scan_prefix, bucket)
             try:
                 bucket_descriptor = os.open(
                     name,
@@ -142,8 +185,12 @@ def scan_oracle_general(
                 )
             except FileNotFoundError:
                 continue
+            expected_identity = bucket_receipts.get(name)
             objects: dict[int, tuple[int, int]] = {}
             try:
+                metadata = os.fstat(bucket_descriptor)
+                if expected_identity != (metadata.st_dev, metadata.st_ino):
+                    raise OracleError(f"scanner bucket ownership conflict: {name}")
                 with os.fdopen(bucket_descriptor, "rb") as stream:
                     bucket_descriptor = -1
                     while True:
@@ -162,9 +209,17 @@ def scan_oracle_general(
                 if bucket_descriptor >= 0:
                     os.close(bucket_descriptor)
                 try:
+                    metadata = os.stat(
+                        name,
+                        dir_fd=temporary_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if expected_identity != (metadata.st_dev, metadata.st_ino):
+                        raise OracleError(f"scanner bucket ownership conflict: {name}")
                     os.unlink(name, dir_fd=temporary_descriptor)
+                    bucket_receipts.pop(name, None)
                 except FileNotFoundError:
-                    pass
+                    bucket_receipts.pop(name, None)
 
         if working_set_bytes != trace.working_set_bytes:
             raise OracleError(
@@ -196,14 +251,55 @@ def scan_oracle_general(
         )
         return diagnostic
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        for stream in bucket_streams.values():
-            stream.close()
-        for bucket in range(_BUCKET_COUNT):
+        cleanup_conflicts = []
+        unexpected: list[str] = []
+        try:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    cleanup_conflicts.append(f"trace descriptor: {error}")
+            for bucket, stream in list(bucket_streams.items()):
+                try:
+                    stream.close()
+                except OSError as error:
+                    cleanup_conflicts.append(f"bucket stream {bucket}: {error}")
+            for name, expected_identity in list(bucket_receipts.items()):
+                try:
+                    metadata = os.stat(
+                        name,
+                        dir_fd=temporary_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    bucket_receipts.pop(name, None)
+                    continue
+                except OSError as error:
+                    cleanup_conflicts.append(f"{name}: {error}")
+                    continue
+                if expected_identity != (metadata.st_dev, metadata.st_ino):
+                    cleanup_conflicts.append(name)
+                    continue
+                try:
+                    os.unlink(name, dir_fd=temporary_descriptor)
+                except OSError as error:
+                    cleanup_conflicts.append(f"{name}: {error}")
+                else:
+                    bucket_receipts.pop(name, None)
             try:
-                os.unlink(_bucket_name(bucket), dir_fd=temporary_descriptor)
-            except FileNotFoundError:
-                pass
-        if owns_temporary_descriptor:
-            os.close(temporary_descriptor)
+                unexpected = [
+                    name
+                    for name in os.listdir(temporary_descriptor)
+                    if name.startswith(scan_prefix)
+                ]
+            except OSError as error:
+                unexpected = [f"<unreadable-scan-directory: {error}>"]
+        finally:
+            if owns_temporary_descriptor:
+                try:
+                    os.close(temporary_descriptor)
+                except OSError as error:
+                    cleanup_conflicts.append(f"scan directory descriptor: {error}")
+        if cleanup_conflicts or unexpected:
+            details = sorted(set([*cleanup_conflicts, *unexpected]))
+            raise OracleError(f"scanner cleanup conflict: {details}")

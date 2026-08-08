@@ -14,6 +14,14 @@ from .records import ContractError, sha256_file, write_new_record
 
 Run = Callable[..., subprocess.CompletedProcess[bytes]]
 _MUTATING_GIT_OPERATIONS = {"clean", "clone", "fetch", "reset"}
+_GIT_CONFIG_OVERRIDES = [
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "core.fileMode=true",
+]
 
 
 class SourceError(ValueError):
@@ -57,19 +65,23 @@ def _bounded_text(value: bytes | str | None, limit: int = 1024) -> str:
     return single_line or "<empty>"
 
 
-def _git(checkout: Path, *argv: str) -> str:
+def _git(
+    checkout: Path,
+    *argv: str,
+    allowed_returncodes: tuple[int, ...] = (0,),
+) -> str:
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     result = subprocess.run(
-        ["git", *argv],
+        ["git", *_GIT_CONFIG_OVERRIDES, *argv],
         cwd=checkout,
         capture_output=True,
         check=False,
         env=environment,
     )
-    if result.returncode != 0:
+    if result.returncode not in allowed_returncodes:
         stderr = _bounded_text(result.stderr)
         raise SourceError(f"Git command failed ({' '.join(argv)}): {stderr}")
     return result.stdout.decode("utf-8").strip()
@@ -119,9 +131,24 @@ def _validate_source(
     if tree != expected_tree:
         raise SourceError(f"source tree mismatch: expected {expected_tree}, observed {tree}")
 
-    origin = _git(checkout, "config", "--get", "remote.origin.url")
-    if _normalized_repository_url(origin) != _normalized_repository_url(expected_url):
-        raise SourceError(f"source origin mismatch: expected {expected_url}, observed {origin}")
+    fetch_urls = _git(checkout, "remote", "get-url", "--all", "origin").splitlines()
+    if len(fetch_urls) != 1 or _normalized_repository_url(
+        fetch_urls[0]
+    ) != _normalized_repository_url(expected_url):
+        raise SourceError(
+            f"source origin fetch URLs mismatch: expected only {expected_url}, "
+            f"observed {fetch_urls}"
+        )
+
+    push_url_records = _git(
+        checkout,
+        "config",
+        "--get-regexp",
+        r"^remote\.origin\.pushurl$",
+        allowed_returncodes=(0, 1),
+    )
+    if push_url_records:
+        raise SourceError(f"source origin has unexpected push URLs: {push_url_records}")
 
     status = _git(
         checkout,
@@ -189,12 +216,10 @@ def _run_command(run: Run, argv: list[str], checkout: Path) -> subprocess.Comple
 
 def _version(run: Run, argv: list[str], checkout: Path) -> str:
     result = _run_command(run, argv, checkout)
-    return _output_bytes(result.stdout).decode("utf-8", errors="replace").strip()
-
-
-def _version_first_line(run: Run, argv: list[str], checkout: Path) -> str:
-    output = _version(run, argv, checkout)
-    return output.splitlines()[0][:512] if output else ""
+    output = _output_bytes(result.stdout).decode("utf-8", errors="replace").strip()
+    if not output:
+        raise SourceError(f"empty version output from command: {argv}")
+    return output.splitlines()[0][:512]
 
 
 def _validated_binary(checkout: Path, build_directory: str, locked_binary: str) -> Path:
@@ -279,7 +304,7 @@ def prepare_source(
         "compilers": {
             "c": {
                 "path": compilers["CMAKE_C_COMPILER"],
-                "version": _version_first_line(
+                "version": _version(
                     run,
                     [compilers["CMAKE_C_COMPILER"], "--version"],
                     checkout,
@@ -287,7 +312,7 @@ def prepare_source(
             },
             "cxx": {
                 "path": compilers["CMAKE_CXX_COMPILER"],
-                "version": _version_first_line(
+                "version": _version(
                     run,
                     [compilers["CMAKE_CXX_COMPILER"], "--version"],
                     checkout,

@@ -150,6 +150,41 @@ def test_validate_source_accepts_normalized_origin_url(tmp_path: Path) -> None:
     validate_source(checkout, lock)
 
 
+def test_validate_source_rejects_multiple_origin_fetch_urls(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    expected = str(lock["repository_url"])
+    git(checkout, "config", "--unset-all", "remote.origin.url")
+    git(checkout, "config", "--add", "remote.origin.url", "https://example.invalid/evil.git")
+    git(checkout, "config", "--add", "remote.origin.url", expected)
+    assert git(checkout, "config", "--get", "remote.origin.url") == expected
+
+    with pytest.raises(SourceError, match="fetch URL"):
+        validate_source(checkout, lock)
+
+
+def test_validate_source_rejects_origin_pushurl(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    git(
+        checkout,
+        "config",
+        "--add",
+        "remote.origin.pushurl",
+        "ssh://example.invalid/evil.git",
+    )
+
+    with pytest.raises(SourceError, match="push URL"):
+        validate_source(checkout, lock)
+
+
+def test_validate_source_rejects_empty_origin_pushurl(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    git(checkout, "config", "--add", "remote.origin.pushurl", "")
+    assert git(checkout, "config", "--get-all", "remote.origin.pushurl") == ""
+
+    with pytest.raises(SourceError, match="push URL"):
+        validate_source(checkout, lock)
+
+
 def test_validate_source_rejects_nested_checkout_path(tmp_path: Path) -> None:
     checkout, lock = fake_checkout(tmp_path)
     nested = checkout / "nested"
@@ -193,6 +228,31 @@ def test_validate_source_rejects_replacement_tree(tmp_path: Path) -> None:
     assert git(checkout, "rev-parse", "HEAD^{tree}") == lock["tree"]
     assert git(checkout, "status", "--porcelain=v1") == ""
     assert git(checkout, "show", "HEAD:CMakeLists.txt") == "# replacement source"
+
+    with pytest.raises(SourceError, match="dirty"):
+        validate_source(checkout, lock)
+
+
+def test_validate_source_rejects_fsmonitor_hidden_change(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    hook = checkout / ".git/hooks/fake-fsmonitor"
+    hook.write_text("#!/bin/sh\nprintf 'token\\0'\n", encoding="utf-8")
+    hook.chmod(0o755)
+    git(checkout, "config", "core.fsmonitor", str(hook))
+    git(checkout, "config", "core.fsmonitorHookVersion", "2")
+    assert git(checkout, "status", "--porcelain=v1") == ""
+    (checkout / "CMakeLists.txt").write_text("# hidden by fsmonitor\n", encoding="utf-8")
+    assert git(checkout, "status", "--porcelain=v1") == ""
+
+    with pytest.raises(SourceError, match="dirty"):
+        validate_source(checkout, lock)
+
+
+def test_validate_source_rejects_filemode_hidden_change(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    git(checkout, "config", "core.fileMode", "false")
+    (checkout / "CMakeLists.txt").chmod(0o755)
+    assert git(checkout, "status", "--porcelain=v1") == ""
 
     with pytest.raises(SourceError, match="dirty"):
         validate_source(checkout, lock)
@@ -404,6 +464,47 @@ def test_prepare_stops_on_failed_command_with_bounded_stderr(
     assert calls[-1] == failed_argv
     assert "\n" not in str(captured.value)
     assert len(str(captured.value)) < 2048
+    assert not receipt_path.exists()
+
+
+@pytest.mark.parametrize(
+    "empty_argv",
+    [
+        ["cmake", "--version"],
+        ["ninja", "--version"],
+        [C_COMPILER, "--version"],
+        [CXX_COMPILER, "--version"],
+    ],
+    ids=["cmake", "ninja", "c-compiler", "cxx-compiler"],
+)
+def test_prepare_rejects_empty_version_output(
+    tmp_path: Path, empty_argv: list[str]
+) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    receipt_path = tmp_path / "receipt.json"
+    calls: list[list[str]] = []
+
+    def empty_version_run(
+        argv: list[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(list(argv))
+        if argv == empty_argv:
+            return subprocess.CompletedProcess(argv, 0, stdout=b" \n", stderr=b"")
+        return fake_run(
+            argv,
+            cwd=cwd,
+            capture_output=capture_output,
+            check=check,
+        )
+
+    with pytest.raises(SourceError, match="empty version output"):
+        prepare_source(checkout, receipt_path, lock, run=empty_version_run)
+
+    assert calls[-1] == empty_argv
     assert not receipt_path.exists()
 
 

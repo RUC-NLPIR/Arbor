@@ -5,7 +5,7 @@ import platform
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import SCHEMA_VERSION
 from .records import ContractError, sha256_file, write_new_record
@@ -60,7 +60,27 @@ def _normalized_repository_url(value: str) -> str:
     return normalized.rstrip("/")
 
 
-def validate_source(checkout: Path, lock: Mapping[str, object]) -> None:
+def _status_allows_only_build_output(status: str, build_directory: str | None) -> bool:
+    if not status:
+        return True
+    if build_directory is None:
+        return False
+    prefix = f"{build_directory}/"
+    for entry in status.splitlines():
+        relative = entry[3:].rstrip("/")
+        if entry[:3] not in {"?? ", "!! "} or not (
+            relative == build_directory or relative.startswith(prefix)
+        ):
+            return False
+    return True
+
+
+def _validate_source(
+    checkout: Path,
+    lock: Mapping[str, object],
+    *,
+    build_directory: str | None,
+) -> bool:
     expected_commit = _lock_string(lock, "commit")
     expected_tree = _lock_string(lock, "tree")
     expected_url = _lock_string(lock, "repository_url")
@@ -77,8 +97,15 @@ def validate_source(checkout: Path, lock: Mapping[str, object]) -> None:
     if _normalized_repository_url(origin) != _normalized_repository_url(expected_url):
         raise SourceError(f"source origin mismatch: expected {expected_url}, observed {origin}")
 
-    status = _git(checkout, "status", "--porcelain=v1", "--untracked-files=all")
-    if status:
+    status = _git(
+        checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+    )
+    clean = _status_allows_only_build_output(status, build_directory)
+    if not clean:
         raise SourceError("source checkout is dirty")
 
     index_entries = _git(checkout, "ls-files", "-v", "-z")
@@ -88,6 +115,22 @@ def validate_source(checkout: Path, lock: Mapping[str, object]) -> None:
         if entry
     ):
         raise SourceError("source checkout has ambiguous index flags")
+    return clean
+
+
+def validate_source(checkout: Path, lock: Mapping[str, object]) -> None:
+    _validate_source(checkout, lock, build_directory=None)
+
+
+def _locked_build_directory(configure_argv: list[str]) -> str:
+    try:
+        raw = configure_argv[configure_argv.index("-B") + 1]
+    except (IndexError, ValueError) as error:
+        raise SourceError("configure argv requires a -B build directory") from error
+    path = PurePosixPath(raw)
+    if path.is_absolute() or path.as_posix() == "." or ".." in path.parts:
+        raise SourceError("configure build directory must be a relative child path")
+    return path.as_posix()
 
 
 def _output_bytes(value: bytes | str | None) -> bytes:
@@ -125,6 +168,7 @@ def prepare_source(
         _lock_argv(lock, "build_argv"),
         _lock_argv(lock, "test_argv"),
     ]
+    build_directory = _locked_build_directory(locked_commands[0])
     validate_source(checkout, lock)
 
     commands: list[dict[str, object]] = []
@@ -139,6 +183,7 @@ def prepare_source(
             }
         )
 
+    clean = _validate_source(checkout, lock, build_directory=build_directory)
     binary = checkout / _lock_string(lock, "binary")
     if not binary.is_file():
         raise SourceError(f"built cache simulator is missing: {binary}")
@@ -148,7 +193,7 @@ def prepare_source(
         "repository_url": _lock_string(lock, "repository_url"),
         "commit": _lock_string(lock, "commit"),
         "tree": _lock_string(lock, "tree"),
-        "clean": True,
+        "clean": clean,
         "commands": commands,
         "versions": {
             "cmake": _version(run, ["cmake", "--version"], checkout),

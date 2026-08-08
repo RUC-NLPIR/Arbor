@@ -11,6 +11,7 @@ from commissioning.cache_campaign.records import (
     load_object,
     record_sha256,
     sha256_file,
+    write_new_record,
 )
 from commissioning.cache_campaign.source import SourceError, prepare_source, validate_source
 
@@ -58,12 +59,9 @@ def fake_checkout(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     git(checkout, "config", "user.email", "cache-test@example.invalid")
     git(checkout, "remote", "add", "origin", "https://example.invalid/libCacheSim.git")
 
-    binary = checkout / "_build/bin/cachesim"
-    binary.parent.mkdir(parents=True)
-    binary.write_bytes(b"unbuilt cache simulator\n")
-    binary.chmod(0o755)
     (checkout / "CMakeLists.txt").write_text("# fixture\n", encoding="utf-8")
-    git(checkout, "add", "CMakeLists.txt", "_build/bin/cachesim")
+    (checkout / ".gitignore").write_text("*_build*\n*.log\n", encoding="utf-8")
+    git(checkout, "add", ".gitignore", "CMakeLists.txt")
     git(checkout, "commit", "-qm", "fixture")
 
     lock = copy.deepcopy(LOCK)
@@ -102,8 +100,9 @@ def fake_run(
     command = list(argv)
 
     if command == LOCK["configure_argv"]:
-        assert binary.read_bytes() == b"unbuilt cache simulator\n"
+        assert not binary.exists()
     elif command == LOCK["build_argv"]:
+        binary.parent.mkdir(parents=True)
         binary.write_bytes(b"built cache simulator\n")
         binary.chmod(0o755)
     elif command == LOCK["test_argv"]:
@@ -137,6 +136,19 @@ def test_validate_source_accepts_normalized_origin_url(tmp_path: Path) -> None:
     validate_source(checkout, lock)
 
 
+@pytest.mark.parametrize("relative_path", ["_build/bin/cachesim", "outside.log"])
+def test_validate_source_rejects_ignored_untracked_input(
+    tmp_path: Path, relative_path: str
+) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    ignored = checkout / relative_path
+    ignored.parent.mkdir(parents=True, exist_ok=True)
+    ignored.write_text("ignored input\n", encoding="utf-8")
+
+    with pytest.raises(SourceError, match="dirty"):
+        validate_source(checkout, lock)
+
+
 @pytest.mark.parametrize("index_flag", ["--assume-unchanged", "--skip-worktree"])
 def test_validate_source_rejects_ambiguous_index_flags(
     tmp_path: Path, index_flag: str
@@ -154,6 +166,7 @@ def test_prepare_records_commands_versions_and_binary_hash(tmp_path: Path) -> No
     checkout, lock = fake_checkout(tmp_path)
     receipt_path = tmp_path / "source-receipt.json"
     assert not receipt_path.exists()
+    assert not (checkout / str(lock["binary"])).exists()
 
     receipt = prepare_source(checkout, receipt_path, lock, run=fake_run)
 
@@ -178,6 +191,61 @@ def test_prepare_records_commands_versions_and_binary_hash(tmp_path: Path) -> No
     assert isinstance(receipt["platform"], str)
     assert receipt["receipt_sha256"] == record_sha256(receipt, "receipt_sha256")
     assert load_object(receipt_path) == receipt
+
+
+@pytest.mark.parametrize("mutation_command", ["build_argv", "test_argv"])
+def test_prepare_rejects_tracked_mutation_during_commands(
+    tmp_path: Path, mutation_command: str
+) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    receipt_path = tmp_path / "source-receipt.json"
+
+    def mutating_run(
+        argv: list[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        result = fake_run(
+            argv,
+            cwd=cwd,
+            capture_output=capture_output,
+            check=check,
+        )
+        if argv == lock[mutation_command]:
+            (checkout / "CMakeLists.txt").write_text("# mutated\n", encoding="utf-8")
+        return result
+
+    with pytest.raises(SourceError, match="dirty"):
+        prepare_source(checkout, receipt_path, lock, run=mutating_run)
+    assert not receipt_path.exists()
+
+
+def test_prepare_rejects_ignored_output_outside_build_directory(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    receipt_path = tmp_path / "source-receipt.json"
+
+    def mutating_run(
+        argv: list[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        result = fake_run(
+            argv,
+            cwd=cwd,
+            capture_output=capture_output,
+            check=check,
+        )
+        if argv == lock["test_argv"]:
+            (checkout / "outside.log").write_text("ignored output\n", encoding="utf-8")
+        return result
+
+    with pytest.raises(SourceError, match="dirty"):
+        prepare_source(checkout, receipt_path, lock, run=mutating_run)
+    assert not receipt_path.exists()
 
 
 def test_prepare_refuses_existing_receipt(tmp_path: Path) -> None:
@@ -205,3 +273,20 @@ def test_load_object_rejects_duplicate_keys(tmp_path: Path) -> None:
 
     with pytest.raises(ContractError, match="duplicate JSON key: key"):
         load_object(path)
+
+
+def test_write_new_record_exclusively_creates_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "record.json"
+    path.write_text("raced-in record\n", encoding="utf-8")
+    original_exists = Path.exists
+    monkeypatch.setattr(
+        Path,
+        "exists",
+        lambda candidate: False if candidate == path else original_exists(candidate),
+    )
+
+    with pytest.raises(ContractError, match="refusing to replace immutable record"):
+        write_new_record(path, {"schema_version": 1}, "record_sha256")
+    assert path.read_text(encoding="utf-8") == "raced-in record\n"

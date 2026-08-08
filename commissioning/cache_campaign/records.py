@@ -54,11 +54,11 @@ def load_object(path: Path) -> dict[str, object]:
 
 
 def write_new_record(path: Path, value: dict[str, object], hash_field: str) -> None:
-    if path.exists():
-        raise ContractError(f"refusing to replace immutable record: {path}")
     value[hash_field] = record_sha256(value, hash_field)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    try:
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(serialized)
+    except FileExistsError as error:
+        raise ContractError(f"refusing to replace immutable record: {path}") from error

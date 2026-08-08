@@ -97,9 +97,10 @@ def scan_oracle_general(trace: TraceWindow, temporary_directory: Path) -> dict[s
                     bin_index = distance.bit_length() - 1
                     reuse_counts[bin_index] = reuse_counts.get(bin_index, 0) + 1
 
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-                observed_size += len(block)
+            if stream.read(1):
+                raise OracleError(
+                    f"OracleGeneral window has records beyond max_requests: {trace.path}"
+                )
         if observed_size != trace.size_bytes or digest.hexdigest() != trace.sha256:
             raise OracleError(f"trace file changed after candidate validation: {trace.path}")
 

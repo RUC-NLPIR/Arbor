@@ -173,9 +173,9 @@ class Portfolio:
         raw_fractions = candidate["cache_fractions"]
         if not isinstance(raw_fractions, list) or len(raw_fractions) != 3:
             raise ContractError("cache_fractions must contain exactly three numbers")
-        if any(type(item) not in {int, float} for item in raw_fractions):
+        if any(type(item) is not Decimal for item in raw_fractions):
             raise ContractError("cache_fractions must contain JSON numbers")
-        exact = tuple(Decimal(str(item)) for item in raw_fractions)
+        exact = tuple(raw_fractions)
         if exact != (Decimal("0.01"), Decimal("0.05"), Decimal("0.10")):
             raise ContractError("cache_fractions must be exactly [0.01, 0.05, 0.10]")
         raw_traces = candidate["traces"]
@@ -213,6 +213,13 @@ def _finite_float(value: str) -> float:
     return parsed
 
 
+def _finite_decimal(value: str) -> Decimal:
+    parsed = Decimal(value)
+    if not parsed.is_finite():
+        raise ContractError(f"non-finite JSON number is forbidden: {value}")
+    return parsed
+
+
 def canonical_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -243,6 +250,18 @@ def load_object(path: Path) -> dict[str, object]:
         object_pairs_hook=_unique_object,
         parse_constant=_invalid_constant,
         parse_float=_finite_float,
+    )
+    if not isinstance(value, dict):
+        raise ContractError(f"JSON object required: {path}")
+    return value
+
+
+def load_candidate_object(path: Path) -> dict[str, object]:
+    value = json.loads(
+        path.read_bytes(),
+        object_pairs_hook=_unique_object,
+        parse_constant=_invalid_constant,
+        parse_float=_finite_decimal,
     )
     if not isinstance(value, dict):
         raise ContractError(f"JSON object required: {path}")

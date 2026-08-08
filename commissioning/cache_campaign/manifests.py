@@ -14,7 +14,7 @@ from .records import (
     ContractError,
     Portfolio,
     TraceWindow,
-    load_object,
+    load_candidate_object,
     record_sha256,
     write_new_record,
 )
@@ -47,9 +47,7 @@ def _intervals_disjoint(left: TraceWindow, right: TraceWindow) -> bool:
 
 def _differs_from_every_dev_window(item: TraceWindow, dev: list[TraceWindow]) -> bool:
     for dev_item in dev:
-        source = (item.organization, item.application)
-        dev_source = (dev_item.organization, dev_item.application)
-        if source != dev_source:
+        if item.application != dev_item.application:
             continue
         if item.origin_sha256 != dev_item.origin_sha256:
             return False
@@ -143,14 +141,15 @@ def _directory_identity(path: Path) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
 
 
-def _same_directory(path: Path, identity: tuple[int, int] | None) -> bool:
-    if identity is None:
-        return False
+def _directory_state(path: Path, identity: tuple[int, int] | None) -> str:
     try:
         metadata = path.lstat()
     except FileNotFoundError:
-        return False
-    return stat.S_ISDIR(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == identity
+        return "missing"
+    if identity is not None and stat.S_ISDIR(metadata.st_mode):
+        if (metadata.st_dev, metadata.st_ino) == identity:
+            return "owned"
+    return "replaced"
 
 
 def _fsync_directory(path: Path) -> None:
@@ -174,7 +173,7 @@ def freeze_manifests(
             raise ManifestError("task and host outputs must not overlap")
         if _paths_overlap(candidate, task) or _paths_overlap(candidate, host):
             raise ManifestError("candidate and outputs must not overlap")
-        raw_candidate = load_object(candidate)
+        raw_candidate = load_candidate_object(candidate)
         portfolio = Portfolio.from_candidate(raw_candidate)
         for trace in portfolio.traces:
             if _paths_overlap(trace.path, task) or _paths_overlap(trace.path, host):
@@ -193,7 +192,9 @@ def freeze_manifests(
         task.parent.mkdir(parents=True, exist_ok=True)
         host.parent.mkdir(parents=True, exist_ok=True)
         task_stage = Path(tempfile.mkdtemp(prefix=f".{task.name}.", dir=task.parent))
+        task_identity = _directory_identity(task_stage)
         host_stage = Path(tempfile.mkdtemp(prefix=f".{host.name}.", dir=host.parent))
+        host_identity = _directory_identity(host_stage)
         public_scan_directory = task_stage / ".oracle-scan"
         private_scan_directory = host_stage / ".oracle-scan"
         public_scan_directory.mkdir(mode=0o700)
@@ -232,17 +233,26 @@ def freeze_manifests(
         write_new_record(host_stage / "r3.json", host_manifest, "manifest_sha256")
         write_new_record(task_stage / "task.json", task_manifest, "manifest_sha256")
 
-        task_identity = _directory_identity(task_stage)
-        host_identity = _directory_identity(host_stage)
+        if _directory_state(task_stage, task_identity) != "owned":
+            raise ManifestError(f"staging ownership conflict: {task_stage}")
+        if _directory_state(host_stage, host_identity) != "owned":
+            raise ManifestError(f"staging ownership conflict: {host_stage}")
         _publish_directory(task_stage, task)
+        task_stage = None
         _publish_directory(host_stage, host)
+        host_stage = None
         for parent in {task.parent, host.parent}:
             _fsync_directory(parent)
         return task_manifest, host_manifest
     except BaseException as error:
         rollback_errors: list[OSError] = []
+        rollback_conflicts: list[Path] = []
         for output, identity in ((host, host_identity), (task, task_identity)):
-            if not _same_directory(output, identity):
+            state = _directory_state(output, identity)
+            if state == "missing":
+                continue
+            if state == "replaced":
+                rollback_conflicts.append(output)
                 continue
             try:
                 shutil.rmtree(output)
@@ -254,17 +264,38 @@ def freeze_manifests(
                 message += "; rollback failed: " + "; ".join(
                     str(item) for item in rollback_errors
                 )
+            if rollback_conflicts:
+                message += "; rollback conflict: replaced path: " + ", ".join(
+                    str(item) for item in rollback_conflicts
+                )
             raise ManifestError(message) from error
         raise
     finally:
         cleanup_errors: list[OSError] = []
-        for staging in (task_stage, host_stage):
-            if staging is None or not os.path.lexists(staging):
+        cleanup_conflicts: list[Path] = []
+        for staging, identity in (
+            (task_stage, task_identity),
+            (host_stage, host_identity),
+        ):
+            if staging is None:
+                continue
+            state = _directory_state(staging, identity)
+            if state == "missing":
+                continue
+            if state == "replaced":
+                cleanup_conflicts.append(staging)
                 continue
             try:
                 shutil.rmtree(staging)
             except OSError as cleanup_error:
                 cleanup_errors.append(cleanup_error)
-        if cleanup_errors:
-            detail = "; ".join(str(item) for item in cleanup_errors)
-            raise ManifestError(f"temporary directory cleanup failed: {detail}") from cleanup_errors[0]
+        if cleanup_errors or cleanup_conflicts:
+            details = [str(item) for item in cleanup_errors]
+            details.extend(f"replaced path: {item}" for item in cleanup_conflicts)
+            message = "temporary directory cleanup failed"
+            if cleanup_conflicts:
+                message += " due to cleanup conflict"
+            error = ManifestError(f"{message}: {'; '.join(details)}")
+            if cleanup_errors:
+                raise error from cleanup_errors[0]
+            raise error

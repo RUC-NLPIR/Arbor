@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
 import struct
 import subprocess
 from dataclasses import dataclass
@@ -107,7 +108,7 @@ def valid_candidate(tmp_path: Path) -> Candidate:
             "visible-twitter-kv-late",
             "visible",
             "Twitter",
-            "key-value",
+            "application-time",
             "2020_twitterKV",
             "2",
             10,
@@ -234,6 +235,36 @@ def test_freeze_recomputes_sizes_hashes_and_diagnostics(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "literal",
+    ["0.0100000000000000001", "0.0099999999999999999"],
+)
+def test_cache_fraction_validation_preserves_json_lexical_precision(
+    tmp_path: Path, literal: str
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    raw = candidate.path.read_text(encoding="utf-8")
+    candidate.path.write_text(
+        raw.replace("    0.01,", f"    {literal},", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestError, match="cache_fractions"):
+        _freeze(candidate, tmp_path)
+
+
+@pytest.mark.parametrize("value", [True, "0.01"])
+def test_cache_fraction_validation_rejects_bool_and_string(
+    tmp_path: Path, value: object
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    candidate.value["cache_fractions"] = [value, 0.05, 0.10]
+    candidate.write()
+
+    with pytest.raises(ManifestError, match="cache_fractions"):
+        _freeze(candidate, tmp_path)
+
+
+@pytest.mark.parametrize(
     "defect",
     [
         "duplicate_bytes",
@@ -307,7 +338,18 @@ def test_freeze_rejects_symlink_and_nonregular_trace_files(tmp_path: Path, kind:
         _freeze(candidate, tmp_path)
 
 
-@pytest.mark.parametrize("mutation", ["truncated", "fewer", "nonmonotonic", "zero_size", "backward_next"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "truncated",
+        "fewer",
+        "surplus_full",
+        "surplus_partial",
+        "nonmonotonic",
+        "zero_size",
+        "backward_next",
+    ],
+)
 def test_freeze_rejects_invalid_oracle_records(tmp_path: Path, mutation: str) -> None:
     candidate = valid_candidate(tmp_path)
     path = candidate.trace_paths[0]
@@ -316,13 +358,17 @@ def test_freeze_rejects_invalid_oracle_records(tmp_path: Path, mutation: str) ->
         path.write_bytes(path.read_bytes()[:-1])
     elif mutation == "fewer":
         path.write_bytes(path.read_bytes()[:-ORACLE.size])
+    elif mutation == "surplus_full":
+        path.write_bytes(path.read_bytes() + ORACLE.pack(999, 999, 999, NO_NEXT))
+    elif mutation == "surplus_partial":
+        path.write_bytes(path.read_bytes() + b"\x00")
     elif mutation == "nonmonotonic":
         records[5][0] = 0
     elif mutation == "zero_size":
         records[4][2] = 0
     elif mutation == "backward_next":
         records[4][3] = 1
-    if mutation not in {"truncated", "fewer"}:
+    if mutation not in {"truncated", "fewer", "surplus_full", "surplus_partial"}:
         path.write_bytes(b"".join(ORACLE.pack(*record) for record in records))
 
     with pytest.raises(ManifestError):
@@ -356,6 +402,35 @@ def test_freeze_rejects_duplicate_trace_ids(tmp_path: Path) -> None:
 
     with pytest.raises(ManifestError, match="trace ID"):
         _freeze(candidate, tmp_path)
+
+
+def test_visible_same_application_requires_same_origin_disjoint_interval(
+    tmp_path: Path,
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    visible = _traces(candidate)[3]
+    visible["organization"] = "UnseenVisibleOrg"
+    visible["application"] = "key-value"
+    visible["origin_sha256"] = "5" * 64
+    candidate.write()
+
+    with pytest.raises(ManifestError, match="visible"):
+        _freeze(candidate, tmp_path)
+
+
+def test_visible_same_application_accepts_same_origin_disjoint_interval(
+    tmp_path: Path,
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    traces = _traces(candidate)
+    traces[0]["application"] = "social"
+    traces[1]["application"] = "social"
+    traces[4]["application"] = "key-value"
+    candidate.write()
+
+    task, _ = _freeze(candidate, tmp_path)
+
+    assert any(item["trace_id"] == "visible-twitter-kv-late" for item in task["traces"])
 
 
 @pytest.mark.parametrize("existing", ["task", "host"])
@@ -499,6 +574,103 @@ def test_staging_cleanup_failure_is_reported_and_other_stage_is_cleaned(
 
     assert list(tmp_path.glob(".task.*"))
     assert not list(tmp_path.glob(".host.*"))
+
+
+def test_cleanup_preserves_replaced_staging_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    caller_sentinel: Path | None = None
+
+    def replace_staging(trace: object, temporary_directory: Path) -> dict[str, object]:
+        nonlocal caller_sentinel
+        staging = temporary_directory.parent
+        shutil.rmtree(staging)
+        staging.mkdir()
+        caller_sentinel = staging / "caller-sentinel"
+        caller_sentinel.write_text("keep\n", encoding="utf-8")
+        raise OSError("simulated scan failure after staging replacement")
+
+    monkeypatch.setattr(manifests_module, "scan_oracle_general", replace_staging)
+
+    with pytest.raises(ManifestError, match="cleanup conflict"):
+        _freeze(candidate, tmp_path)
+
+    assert caller_sentinel is not None
+    assert caller_sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert not list(tmp_path.glob(".host.*"))
+    assert not (tmp_path / "task").exists()
+    assert not (tmp_path / "host").exists()
+
+
+def test_rollback_preserves_replaced_first_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    real_publish = manifests_module._publish_directory
+    caller_sentinel = tmp_path / "task/caller-sentinel"
+    calls = 0
+
+    def replace_first_then_fail_second(staging: Path, output: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            real_publish(staging, output)
+            return
+        shutil.rmtree(tmp_path / "task")
+        (tmp_path / "task").mkdir()
+        caller_sentinel.write_text("keep\n", encoding="utf-8")
+        raise OSError("simulated host failure after task replacement")
+
+    monkeypatch.setattr(
+        manifests_module,
+        "_publish_directory",
+        replace_first_then_fail_second,
+    )
+
+    with pytest.raises(ManifestError, match="rollback conflict"):
+        _freeze(candidate, tmp_path)
+
+    assert caller_sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert not (tmp_path / "host").exists()
+    assert not list(tmp_path.glob(".task.*"))
+    assert not list(tmp_path.glob(".host.*"))
+
+
+def test_success_ignores_reused_vacated_staging_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    real_publish = manifests_module._publish_directory
+    real_fsync = manifests_module._fsync_directory
+    vacated: list[Path] = []
+    sentinels: list[Path] = []
+    recreated = False
+
+    def record_publish(staging: Path, output: Path) -> None:
+        real_publish(staging, output)
+        vacated.append(staging)
+
+    def recreate_vacated_names(path: Path) -> None:
+        nonlocal recreated
+        if not recreated:
+            recreated = True
+            for staging in vacated:
+                staging.mkdir()
+                sentinel = staging / "caller-sentinel"
+                sentinel.write_text("keep\n", encoding="utf-8")
+                sentinels.append(sentinel)
+        real_fsync(path)
+
+    monkeypatch.setattr(manifests_module, "_publish_directory", record_publish)
+    monkeypatch.setattr(manifests_module, "_fsync_directory", recreate_vacated_names)
+
+    task, host = _freeze(candidate, tmp_path)
+
+    assert load_object(tmp_path / "task/task.json") == task
+    assert load_object(tmp_path / "host/r3.json") == host
+    assert len(sentinels) == 2
+    assert all(path.read_text(encoding="utf-8") == "keep\n" for path in sentinels)
 
 
 def _run_cli(*argv: str) -> subprocess.CompletedProcess[str]:

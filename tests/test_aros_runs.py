@@ -3047,6 +3047,75 @@ def test_failed_direct_kill_delivery_is_never_retried_or_hidden(
     assert "signal_sequence" not in final
 
 
+@pytest.mark.parametrize("termination", ("stop", "timeout"))
+def test_refreshed_kill_delivery_is_recorded_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    termination: str,
+) -> None:
+    _init_clean_repo(tmp_path)
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            (
+                "import signal,time;"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                "print('ready',flush=True);time.sleep(30)"
+            ),
+        ],
+        timeout=0.5 if termination == "timeout" else 30,
+        key=f"refreshed-kill-{termination}",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    original_signal = processes_module.signal_process_tree
+    kill_calls = 0
+
+    def fail_first_kill(*args: object) -> bool:
+        nonlocal kill_calls
+        if args[2] == signal.SIGKILL:
+            kill_calls += 1
+            if kill_calls == 1:
+                return False
+        return original_signal(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(processes_module, "signal_process_tree", fail_first_kill)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+        running = _wait_for_running_status(service, run_id)
+        deadline = time.monotonic() + 5
+        while "ready" not in service.tail(run_id) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if termination == "stop":
+            atomic_write_json(
+                tmp_path / ".aros/runs" / run_id / "stop-request.json",
+                {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "kind": "run_stop_request",
+                    "actor": "owner",
+                    "reason": "record refreshed kill",
+                    "signal": "TERM",
+                    "signal_sequence": ["TERM"],
+                    "process_pid": running["process_pid"],
+                    "process_start_token": running["process_start_token"],
+                    "requested_at": runs_module._utc_now(),
+                },
+            )
+        assert runner.result(timeout=5) == 0
+
+    final = service.read_validated_final(run_id)
+    assert kill_calls == 2
+    assert final["state"] == ("cancelled" if termination == "stop" else "timed_out")
+    assert final["signal_sequence"] == ["TERM", "KILL"]
+    if termination == "stop":
+        receipt = json.loads(
+            (tmp_path / ".aros/receipts" / f"{run_id}-stop.json").read_text()
+        )
+        assert receipt["signal_sequence"] == ["TERM", "KILL"]
+
+
 def test_delivered_stop_waits_for_final_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -415,8 +415,6 @@ def run(workspace: str, run_id: str) -> int:
             and stop_started_monotonic is not None
             and time.monotonic() - stop_started_monotonic >= 1
         ):
-            if processes.signal_process_tree(handle, runner_pid, signal.SIGKILL):
-                stop_signal_sequence.append("KILL")
             stop_escalated = True
             drain_deadline = time.monotonic() + 2
         if (
@@ -434,12 +432,13 @@ def run(workspace: str, run_id: str) -> int:
             and timeout_started_monotonic is not None
             and time.monotonic() - timeout_started_monotonic >= 1
         ):
-            if processes.signal_process_tree(handle, runner_pid, signal.SIGKILL):
-                timeout_signal_sequence.append("KILL")
             timeout_escalated = True
             drain_deadline = time.monotonic() + 2
         if tree_is_live and ((delivered_stop and stop_escalated) or (timeout_hit and timeout_escalated)):
-            processes.signal_process_tree(handle, runner_pid, signal.SIGKILL)
+            if processes.signal_process_tree(handle, runner_pid, signal.SIGKILL):
+                sequence = stop_signal_sequence if delivered_stop else timeout_signal_sequence
+                if sequence[-1:] != ["KILL"]:
+                    sequence.append("KILL")
             tree_is_live = processes.process_tree_is_live(handle, runner_pid)
         if drain_deadline is not None and tree_is_live and time.monotonic() >= drain_deadline:
             raise processes.ProcessObservationError("Run descendants did not drain")

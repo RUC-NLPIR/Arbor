@@ -229,7 +229,31 @@ def _raw_source_audit(
     build_directory: str | None,
     expected_commit: str,
     expected_tree: str,
+    expected_url: str,
 ) -> bool:
+    top_level = Path(_git(checkout, "rev-parse", "--show-toplevel")).resolve(strict=True)
+    if top_level != checkout.resolve(strict=True):
+        raise SourceError(f"source top-level mismatch: expected {checkout}, observed {top_level}")
+
+    fetch_urls = _git(checkout, "remote", "get-url", "--all", "origin").splitlines()
+    if len(fetch_urls) != 1 or _normalized_repository_url(
+        fetch_urls[0]
+    ) != _normalized_repository_url(expected_url):
+        raise SourceError(
+            f"source origin fetch URLs mismatch: expected only {expected_url}, "
+            f"observed {fetch_urls}"
+        )
+
+    push_url_records = _git(
+        checkout,
+        "config",
+        "--get-regexp",
+        r"^remote\.origin\.pushurl$",
+        allowed_returncodes=(0, 1),
+    )
+    if push_url_records:
+        raise SourceError(f"source origin has unexpected push URLs: {push_url_records}")
+
     commit = _git(checkout, "rev-parse", "HEAD")
     if commit != expected_commit:
         raise SourceError(
@@ -240,6 +264,14 @@ def _raw_source_audit(
         raise SourceError(
             f"source tree mismatch after diagnostic: expected {expected_tree}, observed {tree}"
         )
+
+    index_entries = _git(checkout, "ls-files", "-v", "-z")
+    if any(
+        entry[:1] == "S" or entry[:1].islower()
+        for entry in index_entries.split("\0")
+        if entry
+    ):
+        raise SourceError("source checkout has ambiguous index flags")
 
     object_format = _git(checkout, "rev-parse", "--show-object-format")
     head = _tree_entries(checkout, object_format)
@@ -289,45 +321,6 @@ def _validate_source(
     expected_tree = _lock_string(lock, "tree")
     expected_url = _lock_string(lock, "repository_url")
 
-    top_level = Path(_git(checkout, "rev-parse", "--show-toplevel")).resolve(strict=True)
-    if top_level != checkout.resolve(strict=True):
-        raise SourceError(f"source top-level mismatch: expected {checkout}, observed {top_level}")
-
-    commit = _git(checkout, "rev-parse", "HEAD")
-    if commit != expected_commit:
-        raise SourceError(f"source HEAD mismatch: expected {expected_commit}, observed {commit}")
-
-    tree = _git(checkout, "rev-parse", "HEAD^{tree}")
-    if tree != expected_tree:
-        raise SourceError(f"source tree mismatch: expected {expected_tree}, observed {tree}")
-
-    fetch_urls = _git(checkout, "remote", "get-url", "--all", "origin").splitlines()
-    if len(fetch_urls) != 1 or _normalized_repository_url(
-        fetch_urls[0]
-    ) != _normalized_repository_url(expected_url):
-        raise SourceError(
-            f"source origin fetch URLs mismatch: expected only {expected_url}, "
-            f"observed {fetch_urls}"
-        )
-
-    push_url_records = _git(
-        checkout,
-        "config",
-        "--get-regexp",
-        r"^remote\.origin\.pushurl$",
-        allowed_returncodes=(0, 1),
-    )
-    if push_url_records:
-        raise SourceError(f"source origin has unexpected push URLs: {push_url_records}")
-
-    index_entries = _git(checkout, "ls-files", "-v", "-z")
-    if any(
-        entry[:1] == "S" or entry[:1].islower()
-        for entry in index_entries.split("\0")
-        if entry
-    ):
-        raise SourceError("source checkout has ambiguous index flags")
-
     _git(
         checkout,
         "status",
@@ -339,6 +332,7 @@ def _validate_source(
         build_directory,
         expected_commit,
         expected_tree,
+        expected_url,
     )
 
 

@@ -369,6 +369,26 @@ def test_validate_source_rebinds_head_after_diagnostic(tmp_path: Path) -> None:
         validate_source(checkout, lock)
 
 
+def test_validate_source_rebinds_remote_after_diagnostic(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    filter_hook = checkout / ".git/hooks/change-remote-during-status"
+    filter_hook.write_text(
+        "#!/bin/sh\n"
+        "git config --replace-all remote.origin.url https://example.invalid/switched.git\n"
+        "cat\n",
+        encoding="utf-8",
+    )
+    filter_hook.chmod(0o755)
+    git(checkout, "config", "filter.change-remote.clean", str(filter_hook))
+    attributes = checkout / ".git/info/attributes"
+    attributes.write_text("CMakeLists.txt filter=change-remote\n", encoding="utf-8")
+    source = checkout / "CMakeLists.txt"
+    source.write_bytes(source.read_bytes())
+
+    with pytest.raises(SourceError, match="fetch URL"):
+        validate_source(checkout, lock)
+
+
 def test_validate_source_rejects_index_different_from_head(tmp_path: Path) -> None:
     checkout, lock = fake_checkout(tmp_path)
     source = checkout / "CMakeLists.txt"

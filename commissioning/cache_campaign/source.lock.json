@@ -1,0 +1,43 @@
+{
+  "baseline_policies": [
+    "Sieve",
+    "S3FIFO"
+  ],
+  "binary": "_build/bin/cachesim",
+  "build_argv": [
+    "cmake",
+    "--build",
+    "_build",
+    "-j",
+    "8"
+  ],
+  "commit": "da022c2945146e9577d91375a48d53850d7041a3",
+  "comparison_policies": [
+    "LRU",
+    "ARC",
+    "WTinyLFU",
+    "Sieve",
+    "S3FIFO",
+    "BeladySize"
+  ],
+  "configure_argv": [
+    "cmake",
+    "-S",
+    ".",
+    "-B",
+    "_build",
+    "-G",
+    "Ninja",
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DENABLE_TESTS=ON"
+  ],
+  "repository_url": "https://github.com/1a1a11a/libCacheSim.git",
+  "schema_version": 1,
+  "test_argv": [
+    "ctest",
+    "--test-dir",
+    "_build",
+    "--output-on-failure"
+  ],
+  "tree": "d59c0319fff072788ab5d5a5c1f204f758082c80"
+}

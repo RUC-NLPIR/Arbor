@@ -61,6 +61,7 @@ def _git(checkout: Path, *argv: str) -> str:
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     result = subprocess.run(
         ["git", *argv],
         cwd=checkout,

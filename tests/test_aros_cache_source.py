@@ -183,6 +183,21 @@ def test_prepare_ignores_git_redirect_environment(
     assert receipt["commit"] == lock["commit"]
 
 
+def test_validate_source_rejects_replacement_tree(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    (checkout / "CMakeLists.txt").write_text("# replacement source\n", encoding="utf-8")
+    git(checkout, "add", "CMakeLists.txt")
+    replacement_tree = git(checkout, "write-tree")
+    git(checkout, "replace", str(lock["tree"]), replacement_tree)
+
+    assert git(checkout, "rev-parse", "HEAD^{tree}") == lock["tree"]
+    assert git(checkout, "status", "--porcelain=v1") == ""
+    assert git(checkout, "show", "HEAD:CMakeLists.txt") == "# replacement source"
+
+    with pytest.raises(SourceError, match="dirty"):
+        validate_source(checkout, lock)
+
+
 @pytest.mark.parametrize("relative_path", ["_build/bin/cachesim", "outside.log"])
 def test_validate_source_rejects_ignored_untracked_input(
     tmp_path: Path, relative_path: str

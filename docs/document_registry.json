@@ -90,6 +90,14 @@
       "agent_visibility": "on_demand"
     },
     {
+      "id": "aros-cache-campaign-substrate-plan",
+      "title": "AROS Cache Campaign Substrate Implementation Plan",
+      "path": "docs/superpowers/plans/2026-08-08-aros-cache-campaign-substrate.md",
+      "status": "current",
+      "authority": "informative",
+      "agent_visibility": "on_demand"
+    },
+    {
       "id": "aros-public-guide",
       "title": "AROS Public Guide",
       "path": "docs/aros/README.md",

@@ -29,14 +29,16 @@ after equivalent public capabilities are commissioned.
 - First post-commission fix `26fe611fc88252a4667d24b0db92b742f654712e`
   closes the stop/final publication race. Second fix
   `14d8268ae5e82a11c872e6052027f7cf064a7337` adds nested adopted-descendant
-  draining and ESRCH disappearance handling. Current authoritative code source
+  draining and ESRCH disappearance handling. Third fix
   `c11eed140ca99ec6ff0d5e8d60243242411fd624` preserves failed direct-KILL
-  delivery truth without retry or concealment. Its exact clean-wheel full gate
-  collected 1,970 tests: 1,964 passed, 6 skipped, 0 failed, exit 0; the
-  direct-KILL-false, nested stop/timeout, and ESRCH set passed 20/20 iterations.
+  delivery truth without retry or concealment. Current authoritative code source
+  `a07f50fce557ea1b89c0e6d87836b407dce44922` attributes refreshed KILL only
+  after successful delivery. Its exact clean-wheel full gate collected 1,972
+  tests: 1,966 passed, 6 skipped, 0 failed, exit 0; the six-test refreshed-KILL
+  and prior process-truth set passed 20/20 iterations.
 - Phase 0A is complete under the human-approved interim gate: recursive `src/aros`
-  was exactly 17,700 LOC at Task 8 evidence and is exactly 17,700 at current
-  `c11eed14`; the duplicate carrier is absent. Phase 0B must still reach the original
+  was exactly 17,700 LOC at Task 8 evidence and is 17,699 at current `a07f50fc`;
+  the duplicate carrier is absent. Phase 0B must still reach the original
   program-wide `src/aros <= 12,000 LOC` gate before Phase A Mission Supervisor.
   Functionality remains intentionally limited.
 

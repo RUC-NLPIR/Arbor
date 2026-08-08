@@ -88,23 +88,34 @@ It collected 1,969 tests: 1,963 passed, 6 skipped, 0 failed, exit 0; the nested
 stop, nested timeout, and ESRCH set passed 20/20 consecutive iterations. This
 result is also retained as history, not labeled current.
 
-Current authoritative code source
+The historical third clean gate for
 `c11eed140ca99ec6ff0d5e8d60243242411fd624` restricts repeated KILL to an
 already-delivered stop or triggered timeout. A failed direct KILL is never retried
 or hidden; receipt and final preserve `delivered=false` truth. Its clean detached
 checkout produced `arbor_agent-0.1.1.dev491+gc11eed140-py3-none-any.whl`,
 SHA-256
 `d183d03350e228b1956d73303d9c48fb1c1933d7f126359e0b5e4b4ac148ac55`.
+It collected 1,970 tests: 1,964 passed, 6 skipped, 0 failed, exit 0; its four-test
+process-truth set passed 20/20 consecutive iterations. This result is retained as
+history, not labeled current.
+
+Current authoritative code source
+`a07f50fce557ea1b89c0e6d87836b407dce44922` records `KILL` only after a
+successful refreshed delivery and at most once in each stop/timeout signal
+sequence. Its clean detached checkout produced
+`arbor_agent-0.1.1.dev493+ga07f50fce-py3-none-any.whl`, SHA-256
+`e0b4d92c2015ff0a21dee20e3b6fc520880e403d09443bf7ad3b37cf5bbd29f1`.
 The complete product package tree matched the clean source, and a new isolated
 `--no-compile` installation matched the wheel, contained no bytecode, imported
 `task_adapter`, `runner`, `processes`, and `runs` from site-packages, and passed
 `pip check`. From that exact-wheel environment:
 
-- the current authoritative full repository pytest collected 1,970 tests: 1,964
+- the current authoritative full repository pytest collected 1,972 tests: 1,966
   passed, 6 skipped, 0 failed, exit 0;
-- the direct-KILL-false, nested stop, nested timeout, and ESRCH regression set
-  passed 20/20 consecutive iterations, totaling 80 test invocations;
-- current recursive `src/aros` is exactly 17,700 physical lines, within the approved
+- the refreshed-KILL stop/timeout, direct-KILL-false, nested stop/timeout, and
+  ESRCH regression set passed 20/20 consecutive iterations, totaling 120 test
+  invocations;
+- current recursive `src/aros` is exactly 17,699 physical lines, within the approved
   Phase 0A `<= 17,700` interim gate.
 
 ## Exact research and Task-owned Run lineage

@@ -405,6 +405,14 @@ def test_validate_source_rejects_ignored_untracked_input(
         validate_source(checkout, lock)
 
 
+def test_validate_source_rejects_empty_untracked_directory(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    (checkout / "empty-untracked").mkdir()
+
+    with pytest.raises(SourceError, match="untracked worktree directory"):
+        validate_source(checkout, lock)
+
+
 @pytest.mark.parametrize("index_flag", ["--assume-unchanged", "--skip-worktree"])
 def test_validate_source_rejects_ambiguous_index_flags(
     tmp_path: Path, index_flag: str
@@ -720,6 +728,32 @@ def test_prepare_rejects_ignored_output_outside_build_directory(tmp_path: Path) 
         return result
 
     with pytest.raises(SourceError, match="dirty"):
+        prepare_source(checkout, receipt_path, lock, run=mutating_run)
+    assert not receipt_path.exists()
+
+
+def test_prepare_rejects_empty_directory_outside_build_directory(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    receipt_path = tmp_path / "source-receipt.json"
+
+    def mutating_run(
+        argv: list[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        result = fake_run(
+            argv,
+            cwd=cwd,
+            capture_output=capture_output,
+            check=check,
+        )
+        if argv == lock["test_argv"]:
+            (checkout / "empty-outside-build").mkdir()
+        return result
+
+    with pytest.raises(SourceError, match="untracked worktree directory"):
         prepare_source(checkout, receipt_path, lock, run=mutating_run)
     assert not receipt_path.exists()
 

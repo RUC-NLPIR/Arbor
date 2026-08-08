@@ -178,6 +178,7 @@ def _build_root(checkout: Path, build_directory: str) -> Path:
 def _filesystem_entries(
     checkout: Path,
     build_directory: str | None,
+    tracked_directories: set[str],
 ) -> dict[str, tuple[Path, os.stat_result]]:
     build_root = _build_root(checkout, build_directory) if build_directory is not None else None
     files: dict[str, tuple[Path, os.stat_result]] = {}
@@ -194,6 +195,10 @@ def _filesystem_entries(
                 if build_root is not None and path == build_root:
                     continue
                 if stat.S_ISDIR(metadata.st_mode):
+                    if relative not in tracked_directories:
+                        raise SourceError(
+                            f"source checkout is dirty: untracked worktree directory: {relative}"
+                        )
                     directories.append((path, relative))
                 else:
                     files[relative] = (path, metadata)
@@ -229,7 +234,14 @@ def _raw_source_audit(
     if index != head:
         raise SourceError("source checkout is dirty: index does not exactly match HEAD")
 
-    filesystem = _filesystem_entries(checkout, build_directory)
+    tracked_directories: set[str] = set()
+    for path in head:
+        parent = PurePosixPath(path).parent
+        while parent.as_posix() != ".":
+            tracked_directories.add(parent.as_posix())
+            parent = parent.parent
+
+    filesystem = _filesystem_entries(checkout, build_directory, tracked_directories)
     untracked = sorted(set(filesystem) - set(head))
     if untracked:
         raise SourceError(f"source checkout is dirty: untracked worktree entry: {untracked[0]}")

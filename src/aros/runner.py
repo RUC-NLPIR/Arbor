@@ -438,7 +438,7 @@ def run(workspace: str, run_id: str) -> int:
                 timeout_signal_sequence.append("KILL")
             timeout_escalated = True
             drain_deadline = time.monotonic() + 2
-        if tree_is_live and (stop_escalated or timeout_escalated):
+        if tree_is_live and ((delivered_stop and stop_escalated) or (timeout_hit and timeout_escalated)):
             processes.signal_process_tree(handle, runner_pid, signal.SIGKILL)
             tree_is_live = processes.process_tree_is_live(handle, runner_pid)
         if drain_deadline is not None and tree_is_live and time.monotonic() >= drain_deadline:

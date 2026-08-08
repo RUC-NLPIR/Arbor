@@ -2977,6 +2977,76 @@ def test_stop_signal_false_ack_does_not_cancel_successful_process(
     assert "signal_sequence" not in final
 
 
+def test_failed_direct_kill_delivery_is_never_retried_or_hidden(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_clean_repo(tmp_path)
+    release = tmp_path / "release-payload"
+    service, manifest = _prepare(
+        tmp_path,
+        argv=[
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,time;"
+                "release=pathlib.Path('release-payload');"
+                "exec('while not release.exists(): time.sleep(0.01)')"
+            ),
+        ],
+        key="failed-direct-kill-truth",
+    )
+    run_id = _mark_runner_launched(tmp_path, service, manifest)
+    original_signal = processes_module.signal_process_tree
+    signal_calls = 0
+
+    def refuse_once_then_signal(*args: object) -> bool:
+        nonlocal signal_calls
+        signal_calls += 1
+        if signal_calls == 1:
+            return False
+        return original_signal(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(processes_module, "signal_process_tree", refuse_once_then_signal)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        runner = pool.submit(runner_module.run, str(tmp_path), run_id)
+        running = _wait_for_running_status(service, run_id)
+        request = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "run_stop_request",
+            "actor": "owner",
+            "reason": "refused direct kill",
+            "signal": "KILL",
+            "signal_sequence": ["KILL"],
+            "process_pid": running["process_pid"],
+            "process_start_token": running["process_start_token"],
+            "requested_at": runs_module._utc_now(),
+        }
+        atomic_write_json(
+            tmp_path / ".aros/runs" / run_id / "stop-request.json",
+            request,
+        )
+        receipt_path = tmp_path / ".aros/receipts" / f"{run_id}-stop.json"
+        deadline = time.monotonic() + 5
+        while not receipt_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert receipt_path.is_file()
+        assert signal_calls == 1
+        assert not runner.done()
+        assert _linux_process_is_live(int(running["process_pid"]))
+        release.touch()
+        assert runner.result(timeout=5) == 0
+
+    receipt = json.loads(receipt_path.read_text())
+    final = service.read_validated_final(run_id)
+    assert receipt["delivered"] is False
+    assert receipt["signal_sequence"] == []
+    assert final["state"] == "completed"
+    assert final["exit_code"] == 0
+    assert "signal_sequence" not in final
+
+
 def test_delivered_stop_waits_for_final_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

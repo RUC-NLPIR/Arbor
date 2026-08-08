@@ -63,6 +63,18 @@ def test_parse_rejects_pinned_stderr_logger_text(logger: str) -> None:
         parse_cachesim_output(logger + LINE)
 
 
+@pytest.mark.parametrize("level", ["INFO", "DEBUG", "WARN", "ERROR"])
+def test_parse_rejects_logger_wrapped_complete_result(level: str) -> None:
+    wrapped = f"[{level}]  08-08-2026 12:34:56 sim.c:213: " + LINE
+    with pytest.raises(CacheSimOutputError):
+        parse_cachesim_output(wrapped)
+
+
+def test_parse_rejects_relative_trace_path_result() -> None:
+    with pytest.raises(CacheSimOutputError):
+        parse_cachesim_output(LINE.removeprefix("/"))
+
+
 @pytest.mark.parametrize("character", ["\t", "\r", "\v", "\f", "\0", "\xa0"])
 def test_parse_rejects_non_ascii_space_and_control_characters(
     character: str,

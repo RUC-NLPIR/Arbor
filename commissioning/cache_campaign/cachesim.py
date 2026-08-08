@@ -19,7 +19,9 @@ from .records import quarantine_unlink, sha256_file
 
 
 RESULT = re.compile(
-    r"^[^,]{1,2048} cache size {1,16}[^, ]{1,64}, {1,32}"
+    r"^/[^,\x00-\x1f\x7f]{1,1792} "
+    r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,255} cache size {1,16}"
+    r"[^, ]{1,64}, {1,32}"
     r"(?P<requests>[0-9]{1,20}) req, miss ratio "
     r"(?P<object>[0-9]{1,3}\.[0-9]{1,12}), byte miss ratio "
     r"(?P<byte>[0-9]{1,3}\.[0-9]{1,12}), throughput "

@@ -4,6 +4,7 @@ import hashlib
 import os
 import signal
 import sys
+import time
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,16 +27,18 @@ LINE = (
     "          900000 req, miss ratio 0.1234, byte miss ratio 0.2345, "
     "throughput 20.25 MQPS\n"
 )
-CONFIG_LOG = (
+COLORLESS_PINNED_INFO = (
     "[INFO]  08-08-2026 12:34:56 cli_parser.c:802  (tid=1234): "
     "trace path: /trace/dev-a.oracleGeneral.bin, trace_type oracleGeneral, "
     "ofilepath result/dev-a.cachesim, 1 threads, warmup 0 sec, "
     "total 1 algo x 1 size = 1 caches, S3FIFO, consider object metadata\n"
 )
-PROGRESS_LOG = (
-    "[INFO]  08-08-2026 12:34:56    sim.c:171  (tid=1234): "
-    "dev-a.oracleGeneral.bin S3FIFO-0.1000-2 1.00 hour: 900000 requests, "
-    "miss ratio 0.1234, interval miss ratio 0.2345\n"
+ANSI_PINNED_INFO = (
+    "\x1b[32m[INFO]  08-08-2026 12:34:56 cli_parser.c:802  (tid=1234): "
+    "trace path: /trace/dev-a.oracleGeneral.bin, trace_type oracleGeneral, "
+    "ofilepath result/dev-a.cachesim, 1 threads, warmup 0 sec, "
+    "total 1 algo x 1 size = 1 caches, S3FIFO, consider object metadata\n"
+    "\x1b[0m"
 )
 
 
@@ -49,9 +52,15 @@ def test_parse_single_result_line() -> None:
     )
 
 
-def test_parse_accepts_no_final_newline_and_pinned_logger_lines() -> None:
-    output = CONFIG_LOG + PROGRESS_LOG + "\n" + LINE.rstrip("\n")
+def test_parse_accepts_no_final_newline_and_blank_stdout_lines() -> None:
+    output = "\n" + LINE.rstrip("\n") + "\n\n"
     assert parse_cachesim_output(output).request_count == 900_000
+
+
+@pytest.mark.parametrize("logger", [COLORLESS_PINNED_INFO, ANSI_PINNED_INFO])
+def test_parse_rejects_pinned_stderr_logger_text(logger: str) -> None:
+    with pytest.raises(CacheSimOutputError):
+        parse_cachesim_output(logger + LINE)
 
 
 @pytest.mark.parametrize("character", ["\t", "\r", "\v", "\f", "\0", "\xa0"])
@@ -295,6 +304,13 @@ def test_run_child_uses_wait4_cpu_rounding_and_popen_contract(
     )
     times = iter([1000, 2500])
     monkeypatch.setattr(cachesim_module.time, "monotonic_ns", lambda: next(times))
+    group_checks: list[tuple[int, int]] = []
+
+    def empty_process_group(pgid: int, sig: int) -> None:
+        group_checks.append((pgid, sig))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(cachesim_module.os, "killpg", empty_process_group)
 
     result = run_child(["program", "argument"], tmp_path / "run")
 
@@ -307,6 +323,7 @@ def test_run_child_uses_wait4_cpu_rounding_and_popen_contract(
     assert result.wall_ns == 1500
     assert result.cpu_ns == 3
     assert observed["process"].returncode == 7  # type: ignore[union-attr]
+    assert group_checks == [(4321, 0)]
 
 
 def test_run_child_requires_wait4_before_creating_output(
@@ -374,6 +391,90 @@ def test_run_child_cleans_up_if_a_raw_stream_cannot_be_opened(
     assert not output.exists()
 
 
+def test_stage_fstat_precedes_path_stat_and_failure_cleans_owned_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_fstat = cachesim_module.os.fstat
+    real_stat = cachesim_module.os.stat
+    stage_fstat_attempted = False
+    failed = False
+
+    def fail_stage_fstat(descriptor: int) -> os.stat_result:
+        nonlocal stage_fstat_attempted, failed
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+        if ".cachesim-stage-" in target and not failed:
+            stage_fstat_attempted = True
+            failed = True
+            raise OSError("stage fstat failed")
+        return real_fstat(descriptor)
+
+    def forbid_early_stage_stat(
+        path: object, *args: object, **kwargs: object
+    ) -> os.stat_result:
+        if (
+            isinstance(path, str)
+            and path.startswith(".cachesim-stage-")
+            and not stage_fstat_attempted
+        ):
+            raise AssertionError("stage path stat preceded retained fstat")
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cachesim_module.os, "fstat", fail_stage_fstat)
+    monkeypatch.setattr(cachesim_module.os, "stat", forbid_early_stage_stat)
+    with pytest.raises(ChildRunError, match="stage fstat failed"):
+        run_child(["program"], tmp_path / "run")
+    assert not any(
+        path.name.startswith(".cachesim-stage-") for path in tmp_path.iterdir()
+    )
+
+
+def test_stage_path_stat_failure_after_fstat_cleans_owned_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_stat = cachesim_module.os.stat
+    failed = False
+
+    def fail_stage_stat(
+        path: object, *args: object, **kwargs: object
+    ) -> os.stat_result:
+        nonlocal failed
+        if isinstance(path, str) and path.startswith(".cachesim-stage-") and not failed:
+            failed = True
+            raise OSError("stage stat failed")
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cachesim_module.os, "stat", fail_stage_stat)
+    with pytest.raises(ChildRunError, match="stage stat failed"):
+        run_child(["program"], tmp_path / "run")
+    assert failed
+    assert not any(
+        path.name.startswith(".cachesim-stage-") for path in tmp_path.iterdir()
+    )
+
+
+def test_raw_fstat_failure_registers_owned_file_for_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_fstat = cachesim_module.os.fstat
+    failed = False
+
+    def fail_stdout_fstat(descriptor: int) -> os.stat_result:
+        nonlocal failed
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+        if target.endswith("/stdout.raw") and not failed:
+            failed = True
+            raise OSError("raw fstat failed")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(cachesim_module.os, "fstat", fail_stdout_fstat)
+    with pytest.raises(ChildRunError, match="raw fstat failed"):
+        run_child(["program"], tmp_path / "run")
+    assert failed
+    assert not any(
+        path.name.startswith(".cachesim-stage-") for path in tmp_path.iterdir()
+    )
+
+
 def test_run_child_wait4_failure_kills_and_reaps_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -393,6 +494,12 @@ def test_run_child_wait4_failure_kills_and_reaps_once(
             return 0
 
     monkeypatch.setattr(cachesim_module.subprocess, "Popen", FakeProcess)
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        cachesim_module.os,
+        "killpg",
+        lambda pgid, sig: signals.append((pgid, sig)),
+    )
 
     def fail_wait4(pid: int, options: int) -> object:
         raise OSError("wait4 failed")
@@ -404,6 +511,7 @@ def test_run_child_wait4_failure_kills_and_reaps_once(
     assert observed["stdout"].closed  # type: ignore[union-attr]
     assert observed["stderr"].closed  # type: ignore[union-attr]
     assert observed["process"].wait_calls == 1  # type: ignore[union-attr]
+    assert signals == [(4321, signal.SIGKILL)]
     assert not output.exists()
 
 
@@ -448,6 +556,55 @@ def test_run_child_wait4_failure_leaves_no_live_or_zombie_child(
                 except ProcessLookupError:
                     pass
                 process.wait()  # type: ignore[union-attr]
+
+
+def test_run_child_rejects_and_kills_descendant_after_leader_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_path = tmp_path / "descendant.pid"
+    output = tmp_path / "run"
+    real_popen = cachesim_module.subprocess.Popen
+    leaders: list[object] = []
+
+    def capture_leader(*args: object, **kwargs: object) -> object:
+        process = real_popen(*args, **kwargs)
+        leaders.append(process)
+        return process
+
+    monkeypatch.setattr(cachesim_module.subprocess, "Popen", capture_leader)
+    descendant_code = (
+        "import os, time; time.sleep(60); "
+        "os.write(1, b'late stdout'); os.write(2, b'late stderr')"
+    )
+    leader_code = (
+        "import pathlib, subprocess, sys; "
+        f"child = subprocess.Popen([sys.executable, '-c', {descendant_code!r}]); "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(child.pid))"
+    )
+    try:
+        with pytest.raises(ChildRunError, match="descendant"):
+            run_child([sys.executable, "-c", leader_code], output)
+        descendant_pid = int(pid_path.read_text())
+        leader_pid = leaders[0].pid  # type: ignore[union-attr]
+        with pytest.raises(ProcessLookupError):
+            os.kill(descendant_pid, 0)
+        with pytest.raises(ProcessLookupError):
+            os.killpg(leader_pid, 0)
+        assert not output.exists()
+    finally:
+        if leaders:
+            try:
+                os.killpg(leaders[0].pid, signal.SIGKILL)  # type: ignore[union-attr]
+            except ProcessLookupError:
+                pass
+        if pid_path.exists():
+            descendant_pid = int(pid_path.read_text())
+            for _ in range(100):
+                try:
+                    os.kill(descendant_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
 
 
 def test_run_child_cleanup_preserves_a_replacement_file(

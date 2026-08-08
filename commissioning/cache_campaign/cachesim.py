@@ -25,32 +25,6 @@ RESULT = re.compile(
     r"(?P<byte>[0-9]{1,3}\.[0-9]{1,12}), throughput "
     r"(?P<throughput>[0-9]{1,12}\.[0-9]{1,12}) MQPS$"
 )
-_LOGGER_HEADER = (
-    r"^\[INFO\] {2}[0-9]{2}-[0-9]{2}-[0-9]{4} "
-    r"[0-9]{2}:[0-9]{2}:[0-9]{2} {0,7}[A-Za-z0-9_-]{1,60}\.c:"
-    r"[0-9]{1,6} {2,5}\(tid=[0-9]{1,20}\): "
-)
-_CONFIG_LOG = re.compile(
-    _LOGGER_HEADER
-    + r"trace path: [^,]{1,2048}, trace_type [A-Za-z0-9_-]{1,32}, "
-    + r"ofilepath [^,]{1,2048}, [0-9]{1,3} threads, warmup [0-9]{1,10} sec, "
-    + r"total [0-9]{1,3} algo x [0-9]{1,3} size = [0-9]{1,5} caches"
-    + r"(?:, [A-Za-z][A-Za-z0-9_-]{0,63}){1,64}"
-    + r"(?:, trace-type-params: [^,]{1,256})?"
-    + r"(?:, admission: [^,]{1,128})?"
-    + r"(?:, admission-params: [^,]{1,256})?"
-    + r"(?:, prefetch: [^,]{1,128})?"
-    + r"(?:, prefetch-params: [^,]{1,256})?"
-    + r"(?:, eviction-params: [^,]{1,256})?"
-    + r"(?:, use ttl)?(?:, ignore object size)?(?:, consider object metadata)?$"
-)
-_PROGRESS_LOG = re.compile(
-    _LOGGER_HEADER
-    + r"[^ ,]{1,255} [A-Za-z0-9_.:+-]{1,128} [0-9]{1,12}\.[0-9]{2} hour: "
-    + r"[0-9]{1,20} requests, miss ratio [0-9]{1,3}\.[0-9]{1,12}, "
-    + r"interval miss ratio [0-9]{1,3}\.[0-9]{1,12}$"
-)
-_DISABLE_METADATA_LOG = re.compile(_LOGGER_HEADER + r"disable object metadata$")
 
 
 class CacheSimOutputError(ValueError):
@@ -96,14 +70,8 @@ def _excerpt(line: str) -> str:
     return value + ("..." if len(line) > 120 else "")
 
 
-def _known_log_line(line: str) -> bool:
-    return any(
-        expression.fullmatch(line) is not None
-        for expression in (_CONFIG_LOG, _PROGRESS_LOG, _DISABLE_METADATA_LOG)
-    )
-
-
 def parse_cachesim_output(output: str) -> ParsedResult:
+    """Parse libCacheSim stdout; stderr logger text is never accepted here."""
     if type(output) is not str:
         raise CacheSimOutputError("libCacheSim output must be text")
     if any(
@@ -119,8 +87,6 @@ def parse_cachesim_output(output: str) -> ParsedResult:
         match = RESULT.fullmatch(line)
         if match is not None:
             matches.append(match)
-            continue
-        if _known_log_line(line):
             continue
         if line == "":
             continue
@@ -218,7 +184,13 @@ def _create_raw_file(
         dir_fd=directory_descriptor,
     )
     try:
-        metadata = os.fstat(descriptor)
+        try:
+            metadata = os.fstat(descriptor)
+        except BaseException:
+            retained = os.stat(f"/proc/self/fd/{descriptor}")
+            if stat.S_ISREG(retained.st_mode):
+                files[name] = _raw_file_receipt(retained)
+            raise
         files[name] = _raw_file_receipt(metadata)
         if not stat.S_ISREG(metadata.st_mode):
             raise ChildRunError(f"raw output is not a regular file: {name}")
@@ -380,14 +352,6 @@ def _create_stage_directory(
     descriptor = -1
     identity: tuple[int, int] | None = None
     try:
-        metadata = os.stat(
-            stage_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise ChildRunError("private output stage changed after creation")
-        identity = _identity(metadata)
         descriptor = os.open(
             stage_name,
             os.O_RDONLY
@@ -395,10 +359,36 @@ def _create_stage_directory(
             | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_descriptor,
         )
-        if _identity(os.fstat(descriptor)) != identity or os.listdir(descriptor):
+        metadata = os.fstat(descriptor)
+        identity = _identity(metadata)
+        observed = os.stat(
+            stage_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or not stat.S_ISDIR(observed.st_mode)
+            or _identity(observed) != identity
+            or os.listdir(descriptor)
+        ):
             raise ChildRunError("private output stage changed before adoption")
         return stage_name, descriptor, identity
     except BaseException:
+        if identity is None:
+            try:
+                if descriptor >= 0:
+                    retained = os.stat(f"/proc/self/fd/{descriptor}")
+                else:
+                    retained = os.stat(
+                        stage_name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                if stat.S_ISDIR(retained.st_mode):
+                    identity = _identity(retained)
+            except OSError:
+                pass
         if descriptor >= 0:
             os.close(descriptor)
         if identity is not None:
@@ -540,6 +530,48 @@ def _kill_process_group_and_reap(process: subprocess.Popen[bytes]) -> None:
     process.returncode = returncode
 
 
+def _reject_surviving_process_group(process_group: int) -> None:
+    # Linux can reuse a PGID after its leader is reaped, so this check must stay
+    # immediately after wait4 and before any hashing or other fallible work.
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return
+    except PermissionError as error:
+        raise ChildRunError(
+            "permission denied while checking child process group"
+        ) from error
+    except OSError as error:
+        raise ChildRunError("cannot check child process group") from error
+
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError as error:
+        raise ChildRunError("child run retained a descendant process") from error
+    except PermissionError as error:
+        raise ChildRunError(
+            "permission denied while killing child process group"
+        ) from error
+    except OSError as error:
+        raise ChildRunError("cannot kill child process group") from error
+
+    deadline = time.monotonic_ns() + 1_000_000_000
+    while True:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError as error:
+            raise ChildRunError("child run retained a descendant process") from error
+        except PermissionError as error:
+            raise ChildRunError(
+                "permission denied while polling child process group"
+            ) from error
+        except OSError as error:
+            raise ChildRunError("cannot poll child process group") from error
+        if time.monotonic_ns() >= deadline:
+            raise ChildRunError("descendant process group survived SIGKILL")
+        time.sleep(0.01)
+
+
 def run_child(
     argv: Sequence[str],
     output_dir: Path,
@@ -596,13 +628,14 @@ def run_child(
         except BaseException:
             _kill_process_group_and_reap(process)
             raise
-        wall_ns = max(0, time.monotonic_ns() - start)
         if pid != process.pid:
             raise ChildRunError(
                 f"os.wait4 returned unexpected pid: expected {process.pid}, observed {pid}"
             )
         returncode = os.waitstatus_to_exitcode(status)
         process.returncode = returncode
+        _reject_surviving_process_group(process.pid)
+        wall_ns = max(0, time.monotonic_ns() - start)
         cpu_ns = max(
             0,
             round((usage.ru_utime + usage.ru_stime) * 1_000_000_000),

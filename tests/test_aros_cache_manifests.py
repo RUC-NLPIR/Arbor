@@ -213,6 +213,12 @@ def test_freeze_writes_visible_splits_and_only_r3_commitment(tmp_path: Path) -> 
     assert "r3_count" not in task
     assert load_object(tmp_path / "task/task.json") == task
     assert load_object(tmp_path / "host/r3.json") == host
+    assert (tmp_path / "task/task.json").read_bytes() == (
+        json.dumps(task, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    assert (tmp_path / "host/r3.json").read_bytes() == (
+        json.dumps(host, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
     assert record_sha256(task, "manifest_sha256") == task["manifest_sha256"]
     assert record_sha256(host, "manifest_sha256") == host["manifest_sha256"]
 
@@ -811,6 +817,56 @@ def test_publish_then_raise_tracks_output_when_vacated_stage_is_reused(
     assert not list(tmp_path.glob(".host.*"))
 
 
+def test_publish_revalidates_manifest_bytes_after_each_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    real_publish = manifests_module._publish_directory
+    mutated = tmp_path / "task/task.json"
+    calls = 0
+
+    def mutate_after_publish(staging: Path, output: Path) -> None:
+        nonlocal calls
+        calls += 1
+        real_publish(staging, output)
+        if calls == 1:
+            mutated.write_bytes(b"caller-mutated-task\n")
+
+    monkeypatch.setattr(manifests_module, "_publish_directory", mutate_after_publish)
+
+    with pytest.raises(ManifestError, match="changed"):
+        _freeze(candidate, tmp_path)
+
+    assert calls == 1
+    assert mutated.read_bytes() == b"caller-mutated-task\n"
+    assert not (tmp_path / "host").exists()
+
+
+def test_freeze_revalidates_manifest_bytes_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    real_fsync = manifests_module._fsync_directory
+    mutated = tmp_path / "host/r3.json"
+    changed = False
+
+    def mutate_after_parent_fsync(path: Path) -> None:
+        nonlocal changed
+        real_fsync(path)
+        if not changed:
+            changed = True
+            mutated.write_bytes(b"caller-mutated-r3\n")
+
+    monkeypatch.setattr(manifests_module, "_fsync_directory", mutate_after_parent_fsync)
+
+    with pytest.raises(ManifestError, match="changed"):
+        _freeze(candidate, tmp_path)
+
+    assert changed
+    assert mutated.read_bytes() == b"caller-mutated-r3\n"
+    assert not (tmp_path / "task").exists()
+
+
 def test_linked_manifest_is_cleaned_when_directory_fsync_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -949,6 +1005,71 @@ def test_final_capture_rejects_same_inode_hash_mutation(
     assert not (tmp_path / "host").exists()
 
 
+def test_cleanup_removes_owned_r3_manifest_but_preserves_foreign_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    real_capture = manifests_module._capture_owned_manifest
+    host_stage: Path | None = None
+
+    def add_foreign_entry_then_fail(directory: object, name: str) -> None:
+        nonlocal host_stage
+        real_capture(directory, name)
+        if name == "r3.json":
+            assert directory.path is not None
+            host_stage = directory.path
+            (host_stage / "caller-sentinel").write_text("keep\n", encoding="utf-8")
+            raise OSError("simulated failure with mixed entries")
+
+    monkeypatch.setattr(
+        manifests_module,
+        "_capture_owned_manifest",
+        add_foreign_entry_then_fail,
+    )
+
+    with pytest.raises(ManifestError, match="cleanup conflict"):
+        _freeze(candidate, tmp_path)
+
+    assert host_stage is not None
+    assert (host_stage / "caller-sentinel").read_text(encoding="utf-8") == "keep\n"
+    assert not (host_stage / "r3.json").exists()
+    assert not (tmp_path / "task").exists()
+    assert not (tmp_path / "host").exists()
+
+
+@pytest.mark.parametrize("stage_name", ["task", "host"])
+def test_stage_open_failure_cleans_all_registered_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage_name: str,
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    real_open = manifests_module.os.open
+    failed = False
+
+    def fail_stage_open(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal failed
+        if (
+            not failed
+            and isinstance(path, Path)
+            and path.name.startswith(f".{stage_name}.")
+        ):
+            failed = True
+            raise OSError(f"simulated {stage_name} stage open failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(manifests_module.os, "open", fail_stage_open)
+
+    with pytest.raises(ManifestError, match="open failure"):
+        _freeze(candidate, tmp_path)
+
+    assert failed
+    assert not list(tmp_path.glob(".task.*"))
+    assert not list(tmp_path.glob(".host.*"))
+    assert not (tmp_path / "task").exists()
+    assert not (tmp_path / "host").exists()
+
+
 def test_r3_manifest_write_does_not_follow_replaced_host_stage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -994,15 +1115,15 @@ def test_cleanup_exception_closes_all_retained_directory_fds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     candidate = valid_candidate(tmp_path)
-    real_open_owned = manifests_module._open_owned_directory
+    real_attach_owned = manifests_module._attach_owned_directory
     real_publish = manifests_module._publish_directory
     retained_fds: list[int] = []
     calls = 0
 
-    def record_owned(path: Path) -> object:
-        owned = real_open_owned(path)
+    def record_owned(owned: object) -> None:
+        real_attach_owned(owned)
+        assert owned.descriptor is not None
         retained_fds.append(owned.descriptor)
-        return owned
 
     def replace_manifest_then_fail(staging: Path, output: Path) -> None:
         nonlocal calls
@@ -1016,7 +1137,7 @@ def test_cleanup_exception_closes_all_retained_directory_fds(
         (manifest / "caller-sentinel").write_text("keep\n", encoding="utf-8")
         raise OSError("simulated host publication failure")
 
-    monkeypatch.setattr(manifests_module, "_open_owned_directory", record_owned)
+    monkeypatch.setattr(manifests_module, "_attach_owned_directory", record_owned)
     monkeypatch.setattr(manifests_module, "_publish_directory", replace_manifest_then_fail)
 
     with pytest.raises(ManifestError):

@@ -31,12 +31,13 @@ class _OwnedManifest:
     name: str
     identity: tuple[int, int]
     sha256: str | None
+    raw: bytes | None
 
 
 @dataclass
 class _OwnedDirectory:
     path: Path | None
-    descriptor: int
+    descriptor: int | None
     identity: tuple[int, int]
     files: dict[str, _OwnedManifest] = field(default_factory=dict)
 
@@ -157,25 +158,55 @@ def _directory_identity_from_stat(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
 
 
-def _open_owned_directory(path: Path) -> _OwnedDirectory:
+def _register_owned_directory(path: Path) -> _OwnedDirectory:
+    identity = _directory_identity_from_stat(path.lstat())
+    return _OwnedDirectory(path=path, descriptor=None, identity=identity)
+
+
+def _attach_owned_directory(directory: _OwnedDirectory) -> None:
+    if directory.path is None:
+        raise ManifestError("owned directory path is unavailable")
     flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    descriptor = os.open(path, flags)
+    descriptor = os.open(directory.path, flags)
     try:
         identity = _directory_identity_from_stat(os.fstat(descriptor))
+        if identity != directory.identity:
+            raise ManifestError(f"owned directory changed before open: {directory.path}")
     except BaseException:
         os.close(descriptor)
         raise
-    return _OwnedDirectory(path=path, descriptor=descriptor, identity=identity)
+    directory.descriptor = descriptor
 
 
-def _create_owned_child(parent: _OwnedDirectory, name: str) -> _OwnedDirectory:
-    if parent.path is None:
+def _open_owned_directory(path: Path) -> _OwnedDirectory:
+    directory = _register_owned_directory(path)
+    try:
+        _attach_owned_directory(directory)
+    except BaseException:
+        _cleanup_owned_directory(directory)
+        raise
+    return directory
+
+
+def _create_owned_child(
+    parent: _OwnedDirectory,
+    name: str,
+    registry: list[_OwnedDirectory],
+) -> _OwnedDirectory:
+    if parent.path is None or parent.descriptor is None:
         raise ManifestError("owned parent directory is unavailable")
     os.mkdir(name, mode=0o700, dir_fd=parent.descriptor)
+    metadata = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+    directory = _OwnedDirectory(
+        path=parent.path / name,
+        descriptor=None,
+        identity=_directory_identity_from_stat(metadata),
+    )
+    registry.append(directory)
     flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
@@ -184,14 +215,13 @@ def _create_owned_child(parent: _OwnedDirectory, name: str) -> _OwnedDirectory:
     descriptor = os.open(name, flags, dir_fd=parent.descriptor)
     try:
         identity = _directory_identity_from_stat(os.fstat(descriptor))
+        if identity != directory.identity:
+            raise ManifestError(f"owned child changed before open: {directory.path}")
     except BaseException:
         os.close(descriptor)
         raise
-    return _OwnedDirectory(
-        path=parent.path / name,
-        descriptor=descriptor,
-        identity=identity,
-    )
+    directory.descriptor = descriptor
+    return directory
 
 
 def _directory_state(path: Path, identity: tuple[int, int] | None) -> str:
@@ -205,10 +235,18 @@ def _directory_state(path: Path, identity: tuple[int, int] | None) -> str:
     return "replaced"
 
 
+def _owned_directory_descriptor(directory: _OwnedDirectory) -> int:
+    if directory.descriptor is None:
+        raise ManifestError("owned directory descriptor is unavailable")
+    return directory.descriptor
+
+
 def _read_owned_manifest(directory: _OwnedDirectory, name: str) -> _OwnedManifest:
+    directory_descriptor = _owned_directory_descriptor(directory)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(name, flags, dir_fd=directory.descriptor)
+    descriptor = os.open(name, flags, dir_fd=directory_descriptor)
     digest = hashlib.sha256()
+    raw = bytearray()
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -217,6 +255,7 @@ def _read_owned_manifest(directory: _OwnedDirectory, name: str) -> _OwnedManifes
             descriptor = -1
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(block)
+                raw.extend(block)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -224,11 +263,12 @@ def _read_owned_manifest(directory: _OwnedDirectory, name: str) -> _OwnedManifes
         name=name,
         identity=(metadata.st_dev, metadata.st_ino),
         sha256=digest.hexdigest(),
+        raw=bytes(raw),
     )
 
 
 def _capture_owned_manifest(directory: _OwnedDirectory, name: str) -> None:
-    entries = os.listdir(directory.descriptor)
+    entries = os.listdir(_owned_directory_descriptor(directory))
     if entries != [name]:
         raise ManifestError(f"owned staging entries mismatch: {entries}")
     if name in directory.files:
@@ -244,8 +284,30 @@ def _refresh_owned_file(directory: _OwnedDirectory, name: str) -> _OwnedManifest
         raise ManifestError(f"owned apparatus file changed: {name}")
     if expected.sha256 is not None and observed.sha256 != expected.sha256:
         raise ManifestError(f"owned apparatus file changed: {name}")
+    if expected.raw is not None and observed.raw != expected.raw:
+        raise ManifestError(f"owned apparatus file changed: {name}")
     directory.files[name] = observed
     return observed
+
+
+def _serialized_record(value: dict[str, object]) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+
+
+def _verify_owned_record(
+    directory: _OwnedDirectory,
+    name: str,
+    value: dict[str, object],
+) -> None:
+    expected = directory.files.get(name)
+    directory_descriptor = _owned_directory_descriptor(directory)
+    if expected is None or set(os.listdir(directory_descriptor)) != set(directory.files):
+        raise ManifestError(f"published manifest changed: {name}")
+    observed = _read_owned_manifest(directory, name)
+    if observed != expected or observed.raw != _serialized_record(value):
+        raise ManifestError(f"published manifest changed: {name}")
 
 
 def _write_owned_record(
@@ -254,14 +316,15 @@ def _write_owned_record(
     value: dict[str, object],
     hash_field: str,
 ) -> None:
+    directory_descriptor = _owned_directory_descriptor(directory)
     value[hash_field] = record_sha256(value, hash_field)
-    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    serialized = _serialized_record(value)
     temporary_name = f".{name}.{secrets.token_hex(8)}.tmp"
     descriptor = os.open(
         temporary_name,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL,
         0o600,
-        dir_fd=directory.descriptor,
+        dir_fd=directory_descriptor,
     )
     metadata = os.fstat(descriptor)
     if not stat.S_ISREG(metadata.st_mode):
@@ -271,9 +334,10 @@ def _write_owned_record(
         name=temporary_name,
         identity=(metadata.st_dev, metadata.st_ino),
         sha256=None,
+        raw=None,
     )
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
             stream.write(serialized)
             stream.flush()
@@ -283,8 +347,8 @@ def _write_owned_record(
             os.link(
                 temporary_name,
                 name,
-                src_dir_fd=directory.descriptor,
-                dst_dir_fd=directory.descriptor,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
                 follow_symlinks=False,
             )
         except FileExistsError as error:
@@ -293,14 +357,15 @@ def _write_owned_record(
             name=name,
             identity=temporary_receipt.identity,
             sha256=temporary_receipt.sha256,
+            raw=temporary_receipt.raw,
         )
-        os.fsync(directory.descriptor)
+        os.fsync(directory_descriptor)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         try:
             _refresh_owned_file(directory, temporary_name)
-            os.unlink(temporary_name, dir_fd=directory.descriptor)
+            os.unlink(temporary_name, dir_fd=directory_descriptor)
         except FileNotFoundError:
             directory.files.pop(temporary_name, None)
         else:
@@ -317,17 +382,46 @@ def _cleanup_owned_directory(directory: _OwnedDirectory) -> str | None:
         return None
     if state == "replaced":
         return f"cleanup conflict: replaced path: {path}"
+    if directory.descriptor is None:
+        try:
+            if _directory_state(path, directory.identity) != "owned":
+                return f"cleanup conflict: replaced path: {path}"
+            os.rmdir(path)
+            directory.path = None
+            return None
+        except OSError as error:
+            return f"cleanup conflict: unopened owned directory remains at {path}: {error}"
+    directory_descriptor = directory.descriptor
     try:
-        entries = os.listdir(directory.descriptor)
-        if set(entries) != set(directory.files):
-            return f"cleanup conflict: unexpected entries in {path}: {entries}"
+        conflicts = []
+        entries = set(os.listdir(directory_descriptor))
+        verified = []
         for name, expected in directory.files.items():
-            observed = _read_owned_manifest(directory, name)
+            if name not in entries:
+                conflicts.append(f"missing apparatus file: {name}")
+                continue
+            try:
+                observed = _read_owned_manifest(directory, name)
+            except (OSError, ValueError) as error:
+                conflicts.append(f"unreadable apparatus file {name}: {error}")
+                continue
             if observed != expected:
-                return f"cleanup conflict: apparatus file changed in {path}: {name}"
-        for name in list(directory.files):
-            os.unlink(name, dir_fd=directory.descriptor)
+                conflicts.append(f"changed apparatus file: {name}")
+                continue
+            verified.append(name)
+        for name in verified:
+            try:
+                os.unlink(name, dir_fd=directory_descriptor)
+            except OSError as error:
+                conflicts.append(f"failed to remove apparatus file {name}: {error}")
+                continue
             directory.files.pop(name)
+        remaining = set(os.listdir(directory_descriptor))
+        unknown = sorted(remaining - set(directory.files))
+        if unknown:
+            conflicts.append(f"unexpected entries: {unknown}")
+        if conflicts:
+            return f"cleanup conflict in {path}: {'; '.join(conflicts)}"
         state = _directory_state(path, directory.identity)
         if state == "missing":
             directory.path = None
@@ -356,7 +450,12 @@ def _cleanup_owned_directories(
     return issues
 
 
-def _publish_owned_directory(directory: _OwnedDirectory, output: Path) -> None:
+def _publish_owned_directory(
+    directory: _OwnedDirectory,
+    output: Path,
+    manifest_name: str,
+    manifest: dict[str, object],
+) -> None:
     staging = directory.path
     if staging is None:
         raise ManifestError("owned staging directory is unavailable")
@@ -373,6 +472,7 @@ def _publish_owned_directory(directory: _OwnedDirectory, output: Path) -> None:
     directory.path = output
     if _directory_state(output, directory.identity) != "owned":
         raise ManifestError(f"published output ownership conflict: {output}")
+    _verify_owned_record(directory, manifest_name, manifest)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -416,17 +516,21 @@ def freeze_manifests(
         task_stage_path = Path(
             tempfile.mkdtemp(prefix=f".{task.name}.", dir=task.parent)
         )
-        task_stage = _open_owned_directory(task_stage_path)
+        task_stage = _register_owned_directory(task_stage_path)
         owned_directories.append(task_stage)
+        _attach_owned_directory(task_stage)
         host_stage_path = Path(
             tempfile.mkdtemp(prefix=f".{host.name}.", dir=host.parent)
         )
-        host_stage = _open_owned_directory(host_stage_path)
+        host_stage = _register_owned_directory(host_stage_path)
         owned_directories.append(host_stage)
-        public_scan = _create_owned_child(task_stage, ".oracle-scan")
-        owned_directories.append(public_scan)
-        private_scan = _create_owned_child(host_stage, ".oracle-scan")
-        owned_directories.append(private_scan)
+        _attach_owned_directory(host_stage)
+        public_scan = _create_owned_child(
+            task_stage, ".oracle-scan", owned_directories
+        )
+        private_scan = _create_owned_child(
+            host_stage, ".oracle-scan", owned_directories
+        )
 
         frozen_traces: list[dict[str, object]] = []
         for trace in portfolio.traces:
@@ -436,7 +540,7 @@ def freeze_manifests(
             diagnostic = scan_oracle_general(
                 trace,
                 scan.path,
-                temporary_descriptor=scan.descriptor,
+                temporary_descriptor=_owned_directory_descriptor(scan),
             )
             frozen_traces.append(_trace_record(trace, diagnostic))
         for scan in (public_scan, private_scan):
@@ -469,10 +573,12 @@ def freeze_manifests(
         _write_owned_record(task_stage, "task.json", task_manifest, "manifest_sha256")
         _capture_owned_manifest(task_stage, "task.json")
 
-        _publish_owned_directory(task_stage, task)
-        _publish_owned_directory(host_stage, host)
+        _publish_owned_directory(task_stage, task, "task.json", task_manifest)
+        _publish_owned_directory(host_stage, host, "r3.json", host_manifest)
         for parent in {task.parent, host.parent}:
             _fsync_directory(parent)
+        _verify_owned_record(task_stage, "task.json", task_manifest)
+        _verify_owned_record(host_stage, "r3.json", host_manifest)
         completed = True
         return task_manifest, host_manifest
     except BaseException as error:
@@ -498,7 +604,8 @@ def freeze_manifests(
                 _cleanup_owned_directories(owned_directories)
         finally:
             for directory in reversed(owned_directories):
-                try:
-                    os.close(directory.descriptor)
-                except OSError:
-                    pass
+                if directory.descriptor is not None:
+                    try:
+                        os.close(directory.descriptor)
+                    except OSError:
+                        pass

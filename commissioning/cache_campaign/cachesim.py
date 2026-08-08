@@ -271,13 +271,6 @@ def _revalidate_raw_hash(
         raise ChildRunError(f"raw output changed: {name}")
 
 
-def _path_identity(path: Path) -> tuple[int, int] | None:
-    try:
-        return _identity(path.lstat())
-    except FileNotFoundError:
-        return None
-
-
 def _rename_noreplace(
     directory_descriptor: int, source: str, target: str
 ) -> None:
@@ -310,20 +303,169 @@ def _rename_noreplace(
     raise OSError(error_number, os.strerror(error_number), source)
 
 
-def _remove_owned_directory(
-    output: Path, directory_identity: tuple[int, int]
-) -> str | None:
-    parent_descriptor = -1
-    quarantine = f".cachesim-quarantine-{secrets.token_hex(16)}"
+def _open_output_parent(
+    output_dir: Path,
+) -> tuple[Path, Path, int, tuple[int, int]]:
     try:
-        parent_descriptor = os.open(
-            output.parent,
+        requested = Path(output_dir).absolute()
+    except (TypeError, ValueError) as error:
+        raise ChildRunError(f"invalid output directory: {_bounded_error(error)}") from error
+    if not requested.name or requested.name in {".", ".."}:
+        raise ChildRunError("output directory must have a final name")
+    supplied_parent = requested.parent
+    try:
+        metadata = supplied_parent.lstat()
+        resolved_parent = supplied_parent.resolve(strict=True)
+    except OSError as error:
+        raise ChildRunError(
+            f"output parent must be an existing real directory: {_bounded_error(error)}"
+        ) from error
+    if (
+        supplied_parent.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or resolved_parent != supplied_parent
+    ):
+        raise ChildRunError("output parent must be an existing real directory")
+
+    descriptor = os.open(
+        supplied_parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        identity = _identity(os.fstat(descriptor))
+        if identity != _identity(metadata):
+            raise ChildRunError("output parent changed before open")
+        try:
+            os.stat(requested.name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ChildRunError("output directory must not exist")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return resolved_parent / requested.name, resolved_parent, descriptor, identity
+
+
+def _parent_path_is_bound(parent: Path, identity: tuple[int, int]) -> bool:
+    try:
+        metadata = parent.lstat()
+        return (
+            stat.S_ISDIR(metadata.st_mode)
+            and not parent.is_symlink()
+            and _identity(metadata) == identity
+            and parent.resolve(strict=True) == parent
+        )
+    except OSError:
+        return False
+
+
+def _create_stage_directory(
+    parent_descriptor: int,
+) -> tuple[str, int, tuple[int, int]]:
+    stage_name = ""
+    for _ in range(8):
+        candidate = f".cachesim-stage-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(candidate, 0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            continue
+        stage_name = candidate
+        break
+    if not stage_name:
+        raise ChildRunError("cannot allocate private output stage")
+
+    descriptor = -1
+    identity: tuple[int, int] | None = None
+    try:
+        metadata = os.stat(
+            stage_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ChildRunError("private output stage changed after creation")
+        identity = _identity(metadata)
+        descriptor = os.open(
+            stage_name,
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
             | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
         )
+        if _identity(os.fstat(descriptor)) != identity or os.listdir(descriptor):
+            raise ChildRunError("private output stage changed before adoption")
+        return stage_name, descriptor, identity
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if identity is not None:
+            _remove_owned_directory(parent_descriptor, stage_name, identity)
+        raise
+
+
+def _descriptor_file_path(directory_descriptor: int, name: str) -> Path:
+    return Path(f"/proc/self/fd/{directory_descriptor}") / name
+
+
+def _revalidate_published_output(
+    output: Path,
+    parent: Path,
+    parent_descriptor: int,
+    parent_identity: tuple[int, int],
+    directory_identity: tuple[int, int],
+    files: dict[str, _RawFileReceipt],
+    hashes: dict[str, str],
+) -> None:
+    if not _parent_path_is_bound(parent, parent_identity):
+        raise ChildRunError("output parent changed before result publication")
+    final_descriptor = os.open(
+        output.name,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_descriptor,
+    )
+    try:
+        if _identity(os.fstat(final_descriptor)) != directory_identity:
+            raise ChildRunError("published output directory changed")
+        if set(os.listdir(final_descriptor)) != set(files):
+            raise ChildRunError("published output entries changed")
+        for name, receipt in files.items():
+            _revalidate_raw_hash(
+                _descriptor_file_path(final_descriptor, name),
+                receipt,
+                hashes[name],
+                name,
+            )
+        observed = os.stat(
+            output.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        canonical = output.lstat()
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or _identity(observed) != directory_identity
+            or _identity(canonical) != directory_identity
+            or not _parent_path_is_bound(parent, parent_identity)
+        ):
+            raise ChildRunError("published output directory changed")
+    finally:
+        os.close(final_descriptor)
+
+
+def _remove_owned_directory(
+    parent_descriptor: int,
+    name: str,
+    directory_identity: tuple[int, int],
+) -> str | None:
+    quarantine = f".cachesim-quarantine-{secrets.token_hex(16)}"
+    try:
         try:
-            _rename_noreplace(parent_descriptor, output.name, quarantine)
+            _rename_noreplace(parent_descriptor, name, quarantine)
         except FileNotFoundError:
             return None
         quarantine_descriptor = os.open(
@@ -344,21 +486,19 @@ def _remove_owned_directory(
             os.close(quarantine_descriptor)
         if not owned:
             try:
-                _rename_noreplace(parent_descriptor, quarantine, output.name)
+                _rename_noreplace(parent_descriptor, quarantine, name)
             except OSError:
                 pass
             return "replacement or nonempty output directory preserved"
         os.rmdir(quarantine, dir_fd=parent_descriptor)
     except (OSError, ChildRunError) as error:
         return f"cannot remove output directory: {_bounded_error(error)}"
-    finally:
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
     return None
 
 
 def _cleanup_outputs(
-    output: Path,
+    parent_descriptor: int,
+    directory_name: str,
     directory_descriptor: int,
     directory_identity: tuple[int, int],
     files: dict[str, _RawFileReceipt],
@@ -376,7 +516,11 @@ def _cleanup_outputs(
             continue
         except (OSError, ValueError) as error:
             issues.append(f"replacement preserved for {name}: {_bounded_error(error)}")
-    directory_issue = _remove_owned_directory(output, directory_identity)
+    directory_issue = _remove_owned_directory(
+        parent_descriptor,
+        directory_name,
+        directory_identity,
+    )
     if directory_issue is not None:
         issues.append(directory_issue)
     return "; ".join(issues) or None
@@ -408,35 +552,29 @@ def run_child(
         raise ChildRunError("os.wait4 is required for child CPU accounting")
     argv_tuple = _validated_argv(argv)
     child_cwd = _validated_cwd(cwd)
-    try:
-        output = Path(output_dir).absolute()
-    except (TypeError, ValueError) as error:
-        raise ChildRunError(f"invalid output directory: {_bounded_error(error)}") from error
 
+    output: Path | None = None
+    parent: Path | None = None
+    parent_descriptor = -1
+    parent_identity: tuple[int, int] | None = None
     directory_descriptor = -1
     directory_identity: tuple[int, int] | None = None
+    directory_name: str | None = None
     files: dict[str, _RawFileReceipt] = {}
     stdout_stream: BinaryIO | None = None
     stderr_stream: BinaryIO | None = None
     try:
-        try:
-            output.mkdir(mode=0o700)
-        except FileExistsError as error:
-            raise ChildRunError("output directory must not exist") from error
-        metadata = output.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or output.is_symlink():
-            raise ChildRunError("created output is not a real directory")
-        directory_identity = _identity(metadata)
-        directory_descriptor = os.open(
+        (
             output,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        if _identity(os.fstat(directory_descriptor)) != directory_identity:
-            raise ChildRunError("output directory changed before open")
-        if os.listdir(directory_descriptor):
-            raise ChildRunError("created output changed before adoption")
+            parent,
+            parent_descriptor,
+            parent_identity,
+        ) = _open_output_parent(output_dir)
+        (
+            directory_name,
+            directory_descriptor,
+            directory_identity,
+        ) = _create_stage_directory(parent_descriptor)
 
         stdout_stream = _create_raw_file(
             directory_descriptor, "stdout.raw", files
@@ -474,32 +612,53 @@ def run_child(
         stdout_stream = None
         _close_stream(stderr_stream)
         stderr_stream = None
-        stdout_path = output / "stdout.raw"
-        stderr_path = output / "stderr.raw"
+        stage_stdout_path = _descriptor_file_path(
+            directory_descriptor, "stdout.raw"
+        )
+        stage_stderr_path = _descriptor_file_path(
+            directory_descriptor, "stderr.raw"
+        )
         stdout_sha256, files["stdout.raw"] = _seal_and_hash_raw_file(
-            stdout_path,
+            stage_stdout_path,
             files["stdout.raw"],
             "stdout.raw",
         )
         stderr_sha256, files["stderr.raw"] = _seal_and_hash_raw_file(
-            stderr_path,
+            stage_stderr_path,
             files["stderr.raw"],
             "stderr.raw",
         )
         _revalidate_raw_hash(
-            stdout_path,
+            stage_stdout_path,
             files["stdout.raw"],
             stdout_sha256,
             "stdout.raw",
         )
         _revalidate_raw_hash(
-            stderr_path,
+            stage_stderr_path,
             files["stderr.raw"],
             stderr_sha256,
             "stderr.raw",
         )
-        if _path_identity(output) != directory_identity:
-            raise ChildRunError("output directory changed before result publication")
+        if not _parent_path_is_bound(parent, parent_identity):
+            raise ChildRunError("output parent changed before publication")
+        _rename_noreplace(parent_descriptor, directory_name, output.name)
+        directory_name = output.name
+        hashes = {
+            "stdout.raw": stdout_sha256,
+            "stderr.raw": stderr_sha256,
+        }
+        _revalidate_published_output(
+            output,
+            parent,
+            parent_descriptor,
+            parent_identity,
+            directory_identity,
+            files,
+            hashes,
+        )
+        stdout_path = output / "stdout.raw"
+        stderr_path = output / "stderr.raw"
         return ChildResult(
             argv=argv_tuple,
             returncode=returncode,
@@ -516,15 +675,29 @@ def run_child(
         _close_stream(stdout_stream)
         _close_stream(stderr_stream)
         cleanup_issue = None
-        if directory_descriptor >= 0 and directory_identity is not None:
+        if (
+            parent_descriptor >= 0
+            and directory_name is not None
+            and directory_descriptor >= 0
+            and directory_identity is not None
+        ):
             cleanup_issue = _cleanup_outputs(
-                output,
+                parent_descriptor,
+                directory_name,
                 directory_descriptor,
                 directory_identity,
                 files,
             )
-        elif directory_identity is not None:
-            cleanup_issue = _remove_owned_directory(output, directory_identity)
+        elif (
+            parent_descriptor >= 0
+            and directory_name is not None
+            and directory_identity is not None
+        ):
+            cleanup_issue = _remove_owned_directory(
+                parent_descriptor,
+                directory_name,
+                directory_identity,
+            )
         if isinstance(error, (OSError, ValueError, ChildRunError)):
             message = _bounded_error(error)
             if cleanup_issue is not None:
@@ -537,3 +710,5 @@ def run_child(
     finally:
         if directory_descriptor >= 0:
             os.close(directory_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)

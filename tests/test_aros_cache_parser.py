@@ -344,7 +344,7 @@ def test_run_child_cleans_up_if_the_new_directory_cannot_be_opened(
     real_open = cachesim_module.os.open
 
     def fail_directory_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
-        if path == output:
+        if isinstance(path, str) and path.startswith(".cachesim-stage-"):
             raise OSError("directory open failed")
         return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -454,10 +454,14 @@ def test_run_child_cleanup_preserves_a_replacement_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output = tmp_path / "run"
+    replaced: dict[str, Path] = {}
 
     def replace_stdout_then_fail(argv: tuple[str, ...], **kwargs: object) -> object:
-        (output / "stdout.raw").unlink()
-        (output / "stdout.raw").write_bytes(b"foreign")
+        stdout = kwargs["stdout"]
+        path = Path(os.readlink(f"/proc/self/fd/{stdout.fileno()}"))  # type: ignore[union-attr]
+        path.unlink()
+        path.write_bytes(b"foreign")
+        replaced["path"] = path
         raise OSError("spawn failed")
 
     monkeypatch.setattr(
@@ -465,8 +469,8 @@ def test_run_child_cleanup_preserves_a_replacement_file(
     )
     with pytest.raises(ChildRunError, match="spawn failed"):
         run_child(["program"], output)
-    assert (output / "stdout.raw").read_bytes() == b"foreign"
-    assert not (output / "stderr.raw").exists()
+    assert replaced["path"].read_bytes() == b"foreign"
+    assert not (replaced["path"].parent / "stderr.raw").exists()
 
 
 def test_run_child_cleanup_preserves_a_replacement_directory(
@@ -474,11 +478,16 @@ def test_run_child_cleanup_preserves_a_replacement_directory(
 ) -> None:
     output = tmp_path / "run"
     moved = tmp_path / "moved-owned-run"
+    replaced: dict[str, Path] = {}
 
     def replace_directory_then_fail(argv: tuple[str, ...], **kwargs: object) -> object:
-        output.rename(moved)
-        output.mkdir()
-        (output / "foreign").write_bytes(b"keep")
+        stdout = kwargs["stdout"]
+        stage = Path(os.readlink(f"/proc/self/fd/{stdout.fileno()}"))  # type: ignore[union-attr]
+        stage = stage.parent
+        stage.rename(moved)
+        stage.mkdir()
+        (stage / "foreign").write_bytes(b"keep")
+        replaced["stage"] = stage
         raise OSError("spawn failed")
 
     monkeypatch.setattr(
@@ -486,7 +495,7 @@ def test_run_child_cleanup_preserves_a_replacement_directory(
     )
     with pytest.raises(ChildRunError, match="spawn failed"):
         run_child(["program"], output)
-    assert (output / "foreign").read_bytes() == b"keep"
+    assert (replaced["stage"] / "foreign").read_bytes() == b"keep"
     assert moved.exists()
 
 
@@ -545,17 +554,27 @@ def test_cleanup_quarantine_preserves_swap_before_directory_removal(
 ) -> None:
     output = tmp_path / "run"
     moved = tmp_path / "moved-owned"
-    swapped: dict[str, tuple[int, int]] = {}
+    swapped: dict[str, object] = {}
     real_rename = cachesim_module._rename_noreplace
 
     def swap_then_rename(
         directory_descriptor: int, source: str, target: str
     ) -> None:
-        if source == output.name and not swapped:
-            output.rename(moved)
-            output.mkdir()
-            metadata = output.lstat()
+        if source.startswith(".cachesim-stage-") and not swapped:
+            os.rename(
+                source,
+                moved.name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+            os.mkdir(source, 0o700, dir_fd=directory_descriptor)
+            metadata = os.stat(
+                source,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
             swapped["identity"] = (metadata.st_dev, metadata.st_ino)
+            swapped["name"] = source
         real_rename(directory_descriptor, source, target)
 
     monkeypatch.setattr(
@@ -571,7 +590,8 @@ def test_cleanup_quarantine_preserves_swap_before_directory_removal(
     monkeypatch.setattr(cachesim_module.subprocess, "Popen", fail_spawn)
     with pytest.raises(ChildRunError, match="spawn failed"):
         run_child(["program"], output)
-    metadata = output.lstat()
+    replacement = tmp_path / str(swapped["name"])
+    metadata = replacement.lstat()
     assert (metadata.st_dev, metadata.st_ino) == swapped["identity"]
 
 
@@ -633,11 +653,13 @@ def test_run_child_preserves_replacement_installed_after_task1_hash(
 ) -> None:
     output = tmp_path / "run"
     replaced = False
+    replacement_path: Path | None = None
 
     def replace_after_hash(path: Path) -> str:
-        nonlocal replaced
+        nonlocal replaced, replacement_path
         digest = sha256_file(path)
         if path.name == "stdout.raw" and not replaced:
+            replacement_path = Path(os.readlink(path.parent)) / path.name
             path.unlink()
             path.write_bytes(b"foreign")
             replaced = True
@@ -655,4 +677,125 @@ def test_run_child_preserves_replacement_installed_after_task1_hash(
             output,
         )
     assert replaced
+    assert replacement_path is not None
+    assert replacement_path.read_bytes() == b"foreign"
+
+
+def test_run_child_never_adopts_empty_final_created_during_stage_mkdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "run"
+    displaced = tmp_path / "displaced-owned"
+    real_mkdir = cachesim_module.os.mkdir
+    installed_identity: tuple[int, int] | None = None
+
+    def mkdir_then_install_final(
+        path: object,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal installed_identity
+        if dir_fd is None:
+            real_mkdir(path, mode)  # type: ignore[arg-type]
+        else:
+            real_mkdir(path, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+        if installed_identity is not None:
+            return
+        if dir_fd is None and Path(path) == output:  # type: ignore[arg-type]
+            output.rename(displaced)
+            real_mkdir(output, 0o700)
+        elif (
+            dir_fd is not None
+            and isinstance(path, str)
+            and path.startswith(".cachesim-stage-")
+        ):
+            real_mkdir(output.name, 0o700, dir_fd=dir_fd)
+        else:
+            return
+        metadata = output.lstat()
+        installed_identity = (metadata.st_dev, metadata.st_ino)
+
+    monkeypatch.setattr(cachesim_module.os, "mkdir", mkdir_then_install_final)
+    with pytest.raises(ChildRunError):
+        run_child([sys.executable, "-c", "pass"], output)
+    metadata = output.lstat()
+    assert (metadata.st_dev, metadata.st_ino) == installed_identity
+    assert not any(path.name.startswith(".cachesim-stage-") for path in tmp_path.iterdir())
+
+
+def test_run_child_revalidates_stdout_after_atomic_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "run"
+    real_rename = cachesim_module._rename_noreplace
+    replaced = False
+
+    def publish_then_replace_stdout(
+        directory_descriptor: int, source: str, target: str
+    ) -> None:
+        nonlocal replaced
+        real_rename(directory_descriptor, source, target)
+        if source.startswith(".cachesim-stage-") and target == output.name:
+            final_descriptor = os.open(
+                target,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_descriptor,
+            )
+            try:
+                os.unlink("stdout.raw", dir_fd=final_descriptor)
+                descriptor = os.open(
+                    "stdout.raw",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=final_descriptor,
+                )
+                try:
+                    os.write(descriptor, b"foreign")
+                finally:
+                    os.close(descriptor)
+            finally:
+                os.close(final_descriptor)
+            replaced = True
+
+    monkeypatch.setattr(cachesim_module, "_rename_noreplace", publish_then_replace_stdout)
+    with pytest.raises(ChildRunError, match="changed"):
+        run_child(
+            [sys.executable, "-c", "import os; os.write(1, b'original')"],
+            output,
+        )
+    assert replaced
     assert (output / "stdout.raw").read_bytes() == b"foreign"
+
+
+def test_run_child_spawn_failure_cleans_stage_through_retained_parent_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    foreign_parent = tmp_path / "foreign-parent"
+    foreign_parent.mkdir()
+    (foreign_parent / "sentinel").write_bytes(b"keep")
+
+    def swap_parent_then_fail(argv: tuple[str, ...], **kwargs: object) -> object:
+        parent.rename(moved_parent)
+        parent.symlink_to(foreign_parent, target_is_directory=True)
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(cachesim_module.subprocess, "Popen", swap_parent_then_fail)
+    with pytest.raises(ChildRunError, match="spawn failed"):
+        run_child(["program"], parent / "run")
+    assert parent.is_symlink()
+    assert (foreign_parent / "sentinel").read_bytes() == b"keep"
+    assert list(moved_parent.iterdir()) == []
+
+
+def test_run_child_rejects_symlinked_output_parent(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(ChildRunError, match="parent"):
+        run_child([sys.executable, "-c", "pass"], linked_parent / "run")
+    assert list(real_parent.iterdir()) == []

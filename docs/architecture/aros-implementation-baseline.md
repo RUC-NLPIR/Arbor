@@ -85,18 +85,21 @@ wheel 包含 `task_adapter.py` 与 `task_run.py`，不包含 `task_runner.py` �
 bytecode。最终 research commit 是
 `7ca93fc634d08e4598016f7b4e9ad2fd276e4c57`。
 
-该 retained commissioning evidence 仍严格绑定上述 `4f1eb3d` source。当前 product
-source `26fe611fc88252a4667d24b0db92b742f654712e` 另行修复了 commissioning 后发现的
-public stop/final publication race：delivered stop 只有在 matching `cancelled` final
-可验证后才返回，delivered-false receipt 仍立即返回。基于该 commit 的 clean wheel
-full gate 收集 1,964 tests：1,958 passed、6 skipped、0 failed，exit 0；adopted-descendant
-stop test 连续 20/20 passed。
+该 retained commissioning evidence 仍严格绑定上述 `4f1eb3d` source。第一项
+post-commission fix `26fe611fc88252a4667d24b0db92b742f654712e` 修复 public
+stop/final publication race：delivered stop 只有在 matching `cancelled` final 可验证
+后才返回，delivered-false receipt 仍立即返回。最终 current product source
+`14d8268ae5e82a11c872e6052027f7cf064a7337` 继续排空 nested adopted descendants，
+在 escalation 后重复 KILL，并把 `/proc` stat 的 ESRCH disappearance 视为进程已消失，
+其他 observation errors 仍 fail closed。其 exact clean-wheel full gate 收集 1,969
+tests：1,963 passed、6 skipped、0 failed，exit 0；nested stop、nested timeout 与 ESRCH
+三项 regression set 连续 20/20 passed。
 
 ## 当前限制与下一阶段
 
 - human-approved Phase 0A interim gate 已在 Task 8 recursive
-  `src/aros = 17,700 LOC` 且旧 carrier 缺席时完成；post-commission race fix 后当前
-  count 是 17,697。原 program-wide Phase 0B `src/aros <= 12,000 LOC` gate 仍必须在
+  `src/aros = 17,700 LOC` 且旧 carrier 缺席时完成；最终 `14d8268a` current count 仍
+  exactly 17,700。原 program-wide Phase 0B `src/aros <= 12,000 LOC` gate 仍必须在
   Phase A Mission Supervisor 之前完成。当前功能有意保持受限。
 - deterministic simple-loop commissioning 不证明真实 external-model research quality、
   真实 Researcher inner loop 或 async portfolio。

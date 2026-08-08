@@ -57,10 +57,10 @@ authority. Both its embedded run and a hostile standalone `-I -S` run returned
 ## Post-commission current-product gate
 
 The retained evidence and hashes above remain bound to Task 8 source `4f1eb3d`;
-they are not rewritten by later product maintenance. Current source
-`26fe611fc88252a4667d24b0db92b742f654712e` separately fixes the stop/final
-publication race found by the post-full stress gate: a delivered stop waits for its
-validated matching `cancelled` final, while delivered-false remains immediate.
+they are not rewritten by later product maintenance. The first post-commission
+fix `26fe611fc88252a4667d24b0db92b742f654712e` separately fixes the stop/final
+publication race found by the post-full stress gate: a delivered stop waits for
+its validated matching `cancelled` final, while delivered-false remains immediate.
 
 The first `/workspace/Arbor/.venv/bin/python -m pytest -q` run was
 **non-authoritative**: that shared venv's editable finder targeted the
@@ -70,18 +70,29 @@ collected 1,961 tests and reported 1,903 passed, 6 skipped, and 52 failed; more
 than 50 failures were cascading stale-module failures. This was environment
 contamination, not a product result.
 
-A clean detached checkout of `26fe611f` produced
+The historical interim clean gate for `26fe611f` produced
 `arbor_agent-0.1.1.dev487+g26fe611fc-py3-none-any.whl`, SHA-256
 `aa32f63dad0587a7cb50b3ead01dfd092c51a705172c1ac0f2dc05849dad28f4`.
-Its complete product package tree matched the clean source, and a new isolated
+It collected 1,964 tests: 1,958 passed, 6 skipped, 0 failed, exit 0; its
+adopted-descendant public-stop test passed 20/20 consecutive runs. This result is
+retained as history, not presented as the final current-product gate.
+
+Final current source `14d8268ae5e82a11c872e6052027f7cf064a7337` extends that
+fix by repeatedly signaling nested adopted descendants after escalation and by
+treating ESRCH during `/proc` stat as disappearance while other observation
+errors remain fail-closed. Its clean detached checkout produced
+`arbor_agent-0.1.1.dev489+g14d8268ae-py3-none-any.whl`, SHA-256
+`0647e4fef99672d71881700409d5404268c2eaf10f6f3283b8fb12d1f1dbcd7a`.
+The complete product package tree matched the clean source, and a new isolated
 `--no-compile` installation matched the wheel, contained no bytecode, imported
 `task_adapter`, `runner`, `processes`, and `runs` from site-packages, and passed
-`pip check`. From that environment:
+`pip check`. From that exact-wheel environment:
 
-- the authoritative full repository pytest collected 1,964 tests: 1,958 passed,
-  6 skipped, 0 failed, exit 0;
-- the adopted-descendant public-stop test passed 20/20 consecutive runs;
-- current recursive `src/aros` is 17,697 physical lines, within the approved
+- the authoritative final full repository pytest collected 1,969 tests: 1,963
+  passed, 6 skipped, 0 failed, exit 0;
+- the nested stop, nested timeout, and ESRCH regression set passed 20/20
+  consecutive iterations, totaling 60 test invocations;
+- current recursive `src/aros` is exactly 17,700 physical lines, within the approved
   Phase 0A `<= 17,700` interim gate.
 
 ## Exact research and Task-owned Run lineage

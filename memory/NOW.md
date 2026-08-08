@@ -22,17 +22,19 @@ after equivalent public capabilities are commissioned.
   rebuild commands, bridges, compatibility readers, and dual writes are deleted.
 - Deterministic clean-wheel E2E completed preregistration, one Task, one valid
   Eval, final Question/Model/Idea/Claim/NOW prose, primary destruction, and a
-  fresh Attention restart with `unread_returns=[]`. Exact current evidence is
+  fresh Attention restart with `unread_returns=[]`. Exact retained evidence is
   `docs/analysis/aros-simple-loop-smoke.md` at product source `4f1eb3d`, evidence
   SHA-256 `b5f35280d05e24f528d337b3916f6d72a3d394beb526e7fa06febcae57c96820`,
   and final research commit `7ca93fc634d08e4598016f7b4e9ad2fd276e4c57`.
-- Current product source `26fe611fc88252a4667d24b0db92b742f654712e`
-  separately fixes the post-commission stop/final publication race. Its clean-wheel
-  full gate collected 1,964 tests: 1,958 passed, 6 skipped, 0 failed, exit 0; the
-  adopted-descendant stop test passed 20/20 consecutive runs.
+- First post-commission fix `26fe611fc88252a4667d24b0db92b742f654712e`
+  closes the stop/final publication race. Final current product source
+  `14d8268ae5e82a11c872e6052027f7cf064a7337` adds nested adopted-descendant
+  draining and ESRCH disappearance handling. Its exact clean-wheel full gate
+  collected 1,969 tests: 1,963 passed, 6 skipped, 0 failed, exit 0; the nested
+  stop/timeout plus ESRCH regression set passed 20/20 iterations.
 - Phase 0A is complete under the human-approved interim gate: recursive `src/aros`
-  was exactly 17,700 LOC at Task 8 evidence and is currently 17,697 after the
-  race fix; the duplicate carrier is absent. Phase 0B must still reach the original
+  was exactly 17,700 LOC at Task 8 evidence and is exactly 17,700 at final current
+  source; the duplicate carrier is absent. Phase 0B must still reach the original
   program-wide `src/aros <= 12,000 LOC` gate before Phase A Mission Supervisor.
   Functionality remains intentionally limited.
 

@@ -69,10 +69,13 @@ lost evaluation is never retried with the same idempotency key.
   live. A new-session process that outlives runner death is not claimed contained
   and cannot justify a clean final receipt or prune. Delegated per-task cgroups
   belong to the shared Operations process core, not the Wave 2 security claim.
-- Current source `26fe611fc88252a4667d24b0db92b742f654712e` closes the
-  post-commission stop/final publication race: a delivered stop returns only after
-  its matching `cancelled` final is readable and validated; delivered-false remains
+- First post-commission fix `26fe611fc88252a4667d24b0db92b742f654712e`
+  closes the stop/final publication race: a delivered stop returns only after its
+  matching `cancelled` final is readable and validated; delivered-false remains
   immediate.
+- Final current source `14d8268ae5e82a11c872e6052027f7cf064a7337`
+  repeatedly signals nested adopted descendants after escalation and treats ESRCH
+  during `/proc` stat as disappearance while other observation errors fail closed.
 - mode-normalizing filesystem 上 integrity 仍启用，但 receipt 标记
   `filesystem_permissions_enforced=false`。该行为与 controlled Git optional-lock
   都是 factual enforcement，不是 protected authority。
@@ -83,7 +86,7 @@ lost evaluation is never retried with the same idempotency key.
 
 - Phase 0B program-wide `src/aros <= 12,000 LOC` gate；Phase 0A 已由 human
   approved interim gate 在 Task 8 recursive `src/aros = 17,700 LOC` 且旧 carrier
-  缺席时完成；post-commission race fix 后当前 count 是 17,697；
+  缺席时完成；final current `14d8268a` count 仍 exactly 17,700；
 - 真实 external-model Researcher inner-loop commissioning 与 async portfolio；
 - protected evaluation registration and admission；
 - Source Gateway、Independent Reviewer、project-local Skills 和 MCP parity；

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import stat
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
@@ -69,11 +70,11 @@ def _bounded_text(value: bytes | str | None, limit: int = 1024) -> str:
     return single_line or "<empty>"
 
 
-def _git(
+def _git_bytes(
     checkout: Path,
     *argv: str,
     allowed_returncodes: tuple[int, ...] = (0,),
-) -> str:
+) -> bytes:
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
@@ -88,7 +89,19 @@ def _git(
     if result.returncode not in allowed_returncodes:
         stderr = _bounded_text(result.stderr)
         raise SourceError(f"Git command failed ({' '.join(argv)}): {stderr}")
-    return result.stdout.decode("utf-8").strip()
+    return result.stdout
+
+
+def _git(
+    checkout: Path,
+    *argv: str,
+    allowed_returncodes: tuple[int, ...] = (0,),
+) -> str:
+    return _git_bytes(
+        checkout,
+        *argv,
+        allowed_returncodes=allowed_returncodes,
+    ).decode("utf-8").strip()
 
 
 def _normalized_repository_url(value: str) -> str:
@@ -98,18 +111,146 @@ def _normalized_repository_url(value: str) -> str:
     return normalized.rstrip("/")
 
 
-def _status_allows_only_build_output(status: str, build_directory: str | None) -> bool:
-    if not status:
-        return True
-    if build_directory is None:
-        return False
-    prefix = f"{build_directory}/"
-    for entry in status.splitlines():
-        relative = entry[3:].rstrip("/")
-        if entry[:3] not in {"?? ", "!! "} or not (
-            relative == build_directory or relative.startswith(prefix)
-        ):
-            return False
+def _tree_entries(checkout: Path, object_format: str) -> dict[str, tuple[str, str]]:
+    oid_length = {"sha1": 40, "sha256": 64}.get(object_format)
+    if oid_length is None:
+        raise SourceError(f"unsupported Git object format: {object_format}")
+
+    entries: dict[str, tuple[str, str]] = {}
+    raw = _git_bytes(checkout, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            raw_mode, raw_type, raw_oid = metadata.split(b" ", 2)
+            mode = raw_mode.decode("ascii")
+            entry_type = raw_type.decode("ascii")
+            oid = raw_oid.decode("ascii")
+        except (UnicodeError, ValueError) as error:
+            raise SourceError("invalid raw HEAD tree entry") from error
+        if mode not in {"100644", "100755", "120000"} or entry_type != "blob":
+            raise SourceError(f"unsupported tracked HEAD entry: {record!r}")
+        if len(oid) != oid_length or any(character not in "0123456789abcdef" for character in oid):
+            raise SourceError(f"invalid tracked HEAD object ID: {oid}")
+        path = os.fsdecode(raw_path)
+        relative = PurePosixPath(path)
+        if relative.is_absolute() or ".." in relative.parts or path in entries:
+            raise SourceError(f"invalid or duplicate tracked HEAD path: {path!r}")
+        entries[path] = (mode, oid)
+    return entries
+
+
+def _index_entries(checkout: Path) -> dict[str, tuple[str, str]]:
+    entries: dict[str, tuple[str, str]] = {}
+    raw = _git_bytes(checkout, "ls-files", "--stage", "-z")
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            raw_mode, raw_oid, raw_stage = metadata.split(b" ", 2)
+            mode = raw_mode.decode("ascii")
+            oid = raw_oid.decode("ascii")
+            stage = raw_stage.decode("ascii")
+        except (UnicodeError, ValueError) as error:
+            raise SourceError("invalid raw index entry") from error
+        path = os.fsdecode(raw_path)
+        if stage != "0" or path in entries:
+            raise SourceError("source checkout is dirty: index contains conflict stages")
+        entries[path] = (mode, oid)
+    return entries
+
+
+def _build_root(checkout: Path, build_directory: str) -> Path:
+    root = checkout.joinpath(*PurePosixPath(build_directory).parts)
+    try:
+        metadata = root.lstat()
+        resolved = root.resolve(strict=True)
+        resolved.relative_to(checkout.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise SourceError("source checkout is dirty: build root escapes the checkout") from error
+    if not stat.S_ISDIR(metadata.st_mode) or root.is_symlink():
+        raise SourceError("source checkout is dirty: build root is not a real directory")
+    return root
+
+
+def _filesystem_entries(
+    checkout: Path,
+    build_directory: str | None,
+) -> dict[str, tuple[Path, os.stat_result]]:
+    build_root = _build_root(checkout, build_directory) if build_directory is not None else None
+    files: dict[str, tuple[Path, os.stat_result]] = {}
+    directories: list[tuple[Path, str]] = [(checkout, "")]
+    while directories:
+        directory, prefix = directories.pop()
+        with os.scandir(directory) as scanner:
+            for entry in scanner:
+                if not prefix and entry.name == ".git":
+                    continue
+                relative = f"{prefix}/{entry.name}" if prefix else entry.name
+                path = Path(entry.path)
+                metadata = entry.stat(follow_symlinks=False)
+                if build_root is not None and path == build_root:
+                    continue
+                if stat.S_ISDIR(metadata.st_mode):
+                    directories.append((path, relative))
+                else:
+                    files[relative] = (path, metadata)
+    return files
+
+
+def _blob_oid(raw: bytes, object_format: str) -> str:
+    constructor = {"sha1": hashlib.sha1, "sha256": hashlib.sha256}.get(object_format)
+    if constructor is None:
+        raise SourceError(f"unsupported Git object format: {object_format}")
+    header = f"blob {len(raw)}\0".encode("ascii")
+    return constructor(header + raw).hexdigest()
+
+
+def _read_regular(path: Path) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            return stream.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _raw_source_audit(
+    checkout: Path,
+    build_directory: str | None,
+) -> bool:
+    object_format = _git(checkout, "rev-parse", "--show-object-format")
+    head = _tree_entries(checkout, object_format)
+    index = _index_entries(checkout)
+    if index != head:
+        raise SourceError("source checkout is dirty: index does not exactly match HEAD")
+
+    filesystem = _filesystem_entries(checkout, build_directory)
+    untracked = sorted(set(filesystem) - set(head))
+    if untracked:
+        raise SourceError(f"source checkout is dirty: untracked worktree entry: {untracked[0]}")
+
+    for path, (mode, expected_oid) in head.items():
+        observed = filesystem.get(path)
+        if observed is None:
+            raise SourceError(f"source checkout is dirty: tracked worktree entry is missing: {path}")
+        local_path, metadata = observed
+        if mode in {"100644", "100755"}:
+            expected_executable = mode == "100755"
+            observed_executable = bool(metadata.st_mode & stat.S_IXUSR)
+            if not stat.S_ISREG(metadata.st_mode) or observed_executable != expected_executable:
+                raise SourceError(f"source checkout is dirty: tracked worktree mode mismatch: {path}")
+            raw = _read_regular(local_path)
+        else:
+            if not stat.S_ISLNK(metadata.st_mode):
+                raise SourceError(f"source checkout is dirty: tracked worktree type mismatch: {path}")
+            raw = os.fsencode(os.readlink(local_path))
+        if _blob_oid(raw, object_format) != expected_oid:
+            raise SourceError(f"source checkout is dirty: tracked worktree bytes mismatch: {path}")
     return True
 
 
@@ -154,17 +295,6 @@ def _validate_source(
     if push_url_records:
         raise SourceError(f"source origin has unexpected push URLs: {push_url_records}")
 
-    status = _git(
-        checkout,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        "--ignored=matching",
-    )
-    clean = _status_allows_only_build_output(status, build_directory)
-    if not clean:
-        raise SourceError("source checkout is dirty")
-
     index_entries = _git(checkout, "ls-files", "-v", "-z")
     if any(
         entry[:1] == "S" or entry[:1].islower()
@@ -172,7 +302,14 @@ def _validate_source(
         if entry
     ):
         raise SourceError("source checkout has ambiguous index flags")
-    return clean
+
+    _git(
+        checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    return _raw_source_audit(checkout, build_directory)
 
 
 def validate_source(checkout: Path, lock: Mapping[str, object]) -> None:

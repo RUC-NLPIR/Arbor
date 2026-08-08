@@ -279,6 +279,119 @@ def test_validate_source_rejects_minimal_stat_hidden_change(tmp_path: Path) -> N
         validate_source(checkout, lock)
 
 
+def test_validate_source_rejects_clean_filter_substitution(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    filter_hook = checkout / ".git/hooks/hide-source-change"
+    filter_hook.write_text("#!/bin/sh\nsed 's/# altered/# fixture/'\n", encoding="utf-8")
+    filter_hook.chmod(0o755)
+    git(checkout, "config", "filter.hide-source.clean", str(filter_hook))
+    attributes = checkout / ".git/info/attributes"
+    attributes.write_text("CMakeLists.txt filter=hide-source\n", encoding="utf-8")
+    source = checkout / "CMakeLists.txt"
+    replacement = "# altered\n"
+    assert len(replacement.encode("utf-8")) == source.stat().st_size
+    source.write_text(replacement, encoding="utf-8")
+    assert git(checkout, "status", "--porcelain=v1") == ""
+
+    with pytest.raises(SourceError, match="tracked worktree"):
+        validate_source(checkout, lock)
+
+
+def test_validate_source_rejects_tracked_type_mismatch(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    source = checkout / "CMakeLists.txt"
+    source.unlink()
+    source.symlink_to("unexpected-target")
+
+    with pytest.raises(SourceError, match="tracked worktree"):
+        validate_source(checkout, lock)
+
+
+def test_validate_source_rejects_owner_execute_bit_mismatch(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    executable = checkout / "tracked-executable"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    git(checkout, "add", "tracked-executable")
+    git(checkout, "commit", "-qm", "add executable")
+    lock["commit"] = git(checkout, "rev-parse", "HEAD")
+    lock["tree"] = git(checkout, "rev-parse", "HEAD^{tree}")
+    executable.chmod(0o055)
+
+    with pytest.raises(SourceError, match="tracked worktree mode"):
+        validate_source(checkout, lock)
+
+
+def test_validate_source_rejects_diagnostic_filter_mutation(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    filter_hook = checkout / ".git/hooks/mutate-during-status"
+    filter_hook.write_text(
+        "#!/bin/sh\nprintf '# altered\\n' > CMakeLists.txt\ncat\n",
+        encoding="utf-8",
+    )
+    filter_hook.chmod(0o755)
+    git(checkout, "config", "filter.mutate.clean", str(filter_hook))
+    attributes = checkout / ".git/info/attributes"
+    attributes.write_text("CMakeLists.txt filter=mutate\n", encoding="utf-8")
+
+    with pytest.raises(SourceError, match="tracked worktree"):
+        validate_source(checkout, lock)
+
+
+def test_validate_source_rejects_index_different_from_head(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    source = checkout / "CMakeLists.txt"
+    original = source.read_bytes()
+    source.write_bytes(b"# altered\n")
+    git(checkout, "add", "CMakeLists.txt")
+    source.write_bytes(original)
+
+    with pytest.raises(SourceError, match="index"):
+        validate_source(checkout, lock)
+
+
+def test_validate_source_rejects_changed_symlink_target(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    link = checkout / "tracked-link"
+    link.symlink_to("first-target")
+    git(checkout, "add", "tracked-link")
+    git(checkout, "commit", "-qm", "add symlink")
+    lock["commit"] = git(checkout, "rev-parse", "HEAD")
+    lock["tree"] = git(checkout, "rev-parse", "HEAD^{tree}")
+    link.unlink()
+    link.symlink_to("other-target")
+
+    with pytest.raises(SourceError, match="tracked worktree"):
+        validate_source(checkout, lock)
+
+
+def test_prepare_rejects_symlinked_build_root(tmp_path: Path) -> None:
+    checkout, lock = fake_checkout(tmp_path)
+    receipt_path = tmp_path / "receipt.json"
+
+    def escaped_build_run(
+        argv: list[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if argv == lock["configure_argv"]:
+            outside = tmp_path / "outside-build"
+            outside.mkdir()
+            (checkout / "_build").symlink_to(outside, target_is_directory=True)
+        return fake_run(
+            argv,
+            cwd=cwd,
+            capture_output=capture_output,
+            check=check,
+        )
+
+    with pytest.raises(SourceError, match="build root"):
+        prepare_source(checkout, receipt_path, lock, run=escaped_build_run)
+    assert not receipt_path.exists()
+
+
 @pytest.mark.parametrize("relative_path", ["_build/bin/cachesim", "outside.log"])
 def test_validate_source_rejects_ignored_untracked_input(
     tmp_path: Path, relative_path: str

@@ -18,6 +18,7 @@ from .records import (
     Portfolio,
     TraceWindow,
     load_candidate_object,
+    quarantine_unlink,
     record_sha256,
 )
 
@@ -378,8 +379,14 @@ def _write_owned_record(
         if descriptor >= 0:
             os.close(descriptor)
         try:
-            _refresh_owned_file(directory, temporary_name)
-            os.unlink(temporary_name, dir_fd=directory_descriptor)
+            receipt = _refresh_owned_file(directory, temporary_name)
+            quarantine_unlink(
+                directory_descriptor,
+                temporary_name,
+                receipt.identity,
+                sha256=receipt.sha256,
+                raw=receipt.raw,
+            )
         except FileNotFoundError:
             directory.files.pop(temporary_name, None)
         else:
@@ -425,8 +432,15 @@ def _cleanup_owned_directory(directory: _OwnedDirectory) -> str | None:
             verified.append(name)
         for name in verified:
             try:
-                os.unlink(name, dir_fd=directory_descriptor)
-            except OSError as error:
+                receipt = directory.files[name]
+                quarantine_unlink(
+                    directory_descriptor,
+                    name,
+                    receipt.identity,
+                    sha256=receipt.sha256,
+                    raw=receipt.raw,
+                )
+            except (OSError, ValueError) as error:
                 conflicts.append(f"failed to remove apparatus file {name}: {error}")
                 continue
             directory.files.pop(name)
@@ -506,8 +520,13 @@ def freeze_manifests(
         candidate = Path(candidate_path).resolve(strict=True)
         task = _output_path(Path(task_output))
         host = _output_path(Path(host_output))
+        task_root = task.parent
         if _paths_overlap(task, host):
             raise ManifestError("task and host outputs must not overlap")
+        if _paths_overlap(host, task_root) or _paths_overlap(host.parent, task_root):
+            raise ManifestError("host output and staging parent must be outside task root")
+        if _paths_overlap(candidate, task_root):
+            raise ManifestError("candidate manifest must be outside task root")
         if _paths_overlap(candidate, task) or _paths_overlap(candidate, host):
             raise ManifestError("candidate and outputs must not overlap")
         raw_candidate = load_candidate_object(candidate)
@@ -515,6 +534,8 @@ def freeze_manifests(
         for trace in portfolio.traces:
             if _paths_overlap(trace.path, task) or _paths_overlap(trace.path, host):
                 raise ManifestError("trace input and outputs must not overlap")
+            if trace.split == "r3" and _paths_overlap(trace.path, task_root):
+                raise ManifestError("R3 trace path must be outside task root")
         _validate_splits(portfolio)
     except ManifestError:
         raise

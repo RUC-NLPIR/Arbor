@@ -8,7 +8,7 @@ import struct
 from pathlib import Path
 from typing import BinaryIO
 
-from .records import TraceWindow, record_sha256
+from .records import TraceWindow, quarantine_unlink, record_sha256
 
 
 ORACLE_GENERAL = struct.Struct("<IQIq")
@@ -149,7 +149,7 @@ def scan_oracle_general(
                     bucket_receipts[_bucket_name(scan_prefix, bucket)] = identity
                 bucket_stream.write(_BUCKET_RECORD.pack(object_id, object_size))
 
-                current_vtime = trace.start_request + request_index
+                current_vtime = trace.start_request + request_index + 1
                 if next_access_vtime in {-1, _MAX_VTIME}:
                     no_next_count += 1
                 else:
@@ -216,7 +216,13 @@ def scan_oracle_general(
                     )
                     if expected_identity != (metadata.st_dev, metadata.st_ino):
                         raise OracleError(f"scanner bucket ownership conflict: {name}")
-                    os.unlink(name, dir_fd=temporary_descriptor)
+                    if expected_identity is None:
+                        raise OracleError(f"scanner bucket ownership conflict: {name}")
+                    quarantine_unlink(
+                        temporary_descriptor,
+                        name,
+                        expected_identity,
+                    )
                     bucket_receipts.pop(name, None)
                 except FileNotFoundError:
                     bucket_receipts.pop(name, None)
@@ -241,7 +247,10 @@ def scan_oracle_general(
                 "denominator": trace.max_requests,
             },
             "reuse_distance": {
-                "bin_convention": "bin k counts d where 2^k <= d < 2^(k+1)",
+                "bin_convention": (
+                    "1-based next_access_vtime distance d; "
+                    "bin k counts 2^k <= d < 2^(k+1)"
+                ),
                 "counts": {str(key): reuse_counts[key] for key in sorted(reuse_counts)},
                 "no_next_count": no_next_count,
             },
@@ -274,15 +283,22 @@ def scan_oracle_general(
                 except FileNotFoundError:
                     bucket_receipts.pop(name, None)
                     continue
-                except OSError as error:
+                except (OSError, ValueError) as error:
                     cleanup_conflicts.append(f"{name}: {error}")
                     continue
                 if expected_identity != (metadata.st_dev, metadata.st_ino):
                     cleanup_conflicts.append(name)
                     continue
                 try:
-                    os.unlink(name, dir_fd=temporary_descriptor)
-                except OSError as error:
+                    if expected_identity is None:
+                        cleanup_conflicts.append(name)
+                        continue
+                    quarantine_unlink(
+                        temporary_descriptor,
+                        name,
+                        expected_identity,
+                    )
+                except (OSError, ValueError) as error:
                     cleanup_conflicts.append(f"{name}: {error}")
                 else:
                     bucket_receipts.pop(name, None)

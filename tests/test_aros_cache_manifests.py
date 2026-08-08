@@ -16,6 +16,7 @@ import pytest
 
 from commissioning.cache_campaign import manifests as manifests_module
 from commissioning.cache_campaign import oracle as oracle_module
+from commissioning.cache_campaign import records as records_module
 from commissioning.cache_campaign.manifests import ManifestError, freeze_manifests
 from commissioning.cache_campaign.oracle import OracleError, scan_oracle_general
 from commissioning.cache_campaign.records import TraceWindow, load_object, record_sha256
@@ -50,7 +51,7 @@ def _window(path: Path, seed: int, start_request: int) -> int:
     for index, item in enumerate(object_ids):
         next_access = next_indexes.get(index, NO_NEXT)
         if next_access != NO_NEXT:
-            next_access += start_request
+            next_access += start_request + 1
         records.append(
             ORACLE.pack(
                 seed * 100 + index // 2,
@@ -152,6 +153,22 @@ def _traces(candidate: Candidate) -> list[dict[str, object]]:
     return traces
 
 
+def task_root(tmp_path: Path) -> Path:
+    return tmp_path / "task-root"
+
+
+def task_output(tmp_path: Path) -> Path:
+    return task_root(tmp_path) / "task"
+
+
+def host_root(tmp_path: Path) -> Path:
+    return tmp_path / "host-root"
+
+
+def host_output(tmp_path: Path) -> Path:
+    return host_root(tmp_path) / "host"
+
+
 def inject(candidate: Candidate, defect: str) -> None:
     traces = _traces(candidate)
     if defect == "duplicate_bytes":
@@ -180,7 +197,7 @@ def inject(candidate: Candidate, defect: str) -> None:
 
 
 def _freeze(candidate: Candidate, tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
-    return freeze_manifests(candidate.path, tmp_path / "task", tmp_path / "host")
+    return freeze_manifests(candidate.path, task_output(tmp_path), host_output(tmp_path))
 
 
 def test_freeze_writes_visible_splits_and_only_r3_commitment(tmp_path: Path) -> None:
@@ -188,7 +205,7 @@ def test_freeze_writes_visible_splits_and_only_r3_commitment(tmp_path: Path) -> 
     task, host = _freeze(candidate, tmp_path)
     task_bytes = b"".join(
         path.read_bytes()
-        for path in sorted((tmp_path / "task").rglob("*"))
+        for path in sorted(task_root(tmp_path).rglob("*"))
         if path.is_file()
     )
     r3 = _traces(candidate)[-1]
@@ -211,16 +228,49 @@ def test_freeze_writes_visible_splits_and_only_r3_commitment(tmp_path: Path) -> 
     assert task["r3_commitment_sha256"] == host["manifest_sha256"]
     assert {item["split"] for item in task["traces"]} == {"dev", "visible"}
     assert "r3_count" not in task
-    assert load_object(tmp_path / "task/task.json") == task
-    assert load_object(tmp_path / "host/r3.json") == host
-    assert (tmp_path / "task/task.json").read_bytes() == (
+    assert load_object(task_output(tmp_path) / "task.json") == task
+    assert load_object(host_output(tmp_path) / "r3.json") == host
+    assert (task_output(tmp_path) / "task.json").read_bytes() == (
         json.dumps(task, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
-    assert (tmp_path / "host/r3.json").read_bytes() == (
+    assert (host_output(tmp_path) / "r3.json").read_bytes() == (
         json.dumps(host, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
     assert record_sha256(task, "manifest_sha256") == task["manifest_sha256"]
     assert record_sha256(host, "manifest_sha256") == host["manifest_sha256"]
+
+
+@pytest.mark.parametrize(
+    "placement",
+    ["candidate", "host_output", "host_parent", "r3_trace"],
+)
+def test_freeze_rejects_r3_material_inside_task_root(
+    tmp_path: Path,
+    placement: str,
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    root = task_root(tmp_path)
+    root.mkdir()
+    candidate_path = candidate.path
+    private_output = host_output(tmp_path)
+    if placement == "candidate":
+        candidate_path = root / "candidate.json"
+        candidate_path.write_bytes(candidate.path.read_bytes())
+    elif placement == "host_output":
+        private_output = root / "host"
+    elif placement == "host_parent":
+        private_output = root / "private" / "host"
+    elif placement == "r3_trace":
+        exposed = root / candidate.trace_paths[-1].name
+        exposed.write_bytes(candidate.trace_paths[-1].read_bytes())
+        _traces(candidate)[-1]["path"] = str(exposed)
+        candidate.write()
+
+    with pytest.raises(ManifestError, match="task root"):
+        freeze_manifests(candidate_path, task_output(tmp_path), private_output)
+
+    assert not task_output(tmp_path).exists()
+    assert not private_output.exists()
 
 
 def test_freeze_recomputes_sizes_hashes_and_diagnostics(tmp_path: Path) -> None:
@@ -297,8 +347,8 @@ def test_freeze_rejects_contaminated_or_incomplete_portfolio(
     with pytest.raises(ManifestError):
         _freeze(candidate, tmp_path)
 
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
 
 
 @pytest.mark.parametrize(
@@ -357,6 +407,7 @@ def test_freeze_rejects_symlink_and_nonregular_trace_files(tmp_path: Path, kind:
         "nonmonotonic",
         "zero_size",
         "backward_next",
+        "self_next",
     ],
 )
 def test_freeze_rejects_invalid_oracle_records(tmp_path: Path, mutation: str) -> None:
@@ -377,11 +428,29 @@ def test_freeze_rejects_invalid_oracle_records(tmp_path: Path, mutation: str) ->
         records[4][2] = 0
     elif mutation == "backward_next":
         records[4][3] = 1
+    elif mutation == "self_next":
+        records[4][3] = 5
     if mutation not in {"truncated", "fewer", "surplus_full", "surplus_partial"}:
         path.write_bytes(b"".join(ORACLE.pack(*record) for record in records))
 
     with pytest.raises(ManifestError):
         _freeze(candidate, tmp_path)
+
+
+def test_oracle_immediate_reuse_is_base2_bin_zero(tmp_path: Path) -> None:
+    candidate = valid_candidate(tmp_path)
+    path = candidate.trace_paths[0]
+    records = [
+        list(ORACLE.unpack_from(path.read_bytes(), offset))
+        for offset in range(0, ORACLE.size * 10, ORACLE.size)
+    ]
+    records[0][3] = 2
+    path.write_bytes(b"".join(ORACLE.pack(*record) for record in records))
+
+    task, _ = _freeze(candidate, tmp_path)
+
+    trace = next(item for item in task["traces"] if item["trace_id"] == "dev-meta-kv-a")
+    assert trace["diagnostics"]["reuse_distance"]["counts"]["0"] == 1
 
 
 def test_direct_scanner_closes_owned_temporary_descriptor_on_early_error(
@@ -630,7 +699,8 @@ def test_visible_same_application_accepts_same_origin_disjoint_interval(
 @pytest.mark.parametrize("existing", ["task", "host"])
 def test_freeze_refuses_preexisting_outputs(tmp_path: Path, existing: str) -> None:
     candidate = valid_candidate(tmp_path)
-    protected = tmp_path / existing
+    protected = task_output(tmp_path) if existing == "task" else host_output(tmp_path)
+    protected.parent.mkdir(parents=True)
     protected.mkdir()
     marker = protected / "caller-data"
     marker.write_text("keep\n", encoding="utf-8")
@@ -639,15 +709,15 @@ def test_freeze_refuses_preexisting_outputs(tmp_path: Path, existing: str) -> No
         _freeze(candidate, tmp_path)
 
     assert marker.read_text(encoding="utf-8") == "keep\n"
-    other = tmp_path / ("host" if existing == "task" else "task")
+    other = host_output(tmp_path) if existing == "task" else task_output(tmp_path)
     assert not other.exists()
 
 
 @pytest.mark.parametrize("alias", ["same_outputs", "nested_outputs", "input_output"])
 def test_freeze_rejects_aliasing_input_and_output_paths(tmp_path: Path, alias: str) -> None:
     candidate = valid_candidate(tmp_path)
-    task = tmp_path / "task"
-    host = tmp_path / "host"
+    task = task_output(tmp_path)
+    host = host_output(tmp_path)
     if alias == "same_outputs":
         host = task
     elif alias == "nested_outputs":
@@ -670,10 +740,10 @@ def test_failed_validation_cleans_staging_directories(tmp_path: Path) -> None:
     with pytest.raises(ManifestError):
         _freeze(candidate, tmp_path)
 
-    assert {path.name for path in tmp_path.iterdir()} == {
-        candidate.path.name,
-        *(path.name for path in candidate.trace_paths),
-    }
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
+    assert not list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 @pytest.mark.parametrize("failure_point", ["before_rename", "after_rename"])
@@ -699,10 +769,10 @@ def test_second_publication_failure_rolls_back_first(
         _freeze(candidate, tmp_path)
 
     assert calls == 2
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
-    assert not list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
+    assert not list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_scanner_uses_retained_stages_without_child_directories(
@@ -764,10 +834,10 @@ def test_r3_scanner_failure_leaves_no_bucket_or_manifest_staging(tmp_path: Path)
     with pytest.raises(ManifestError, match="nonpositive"):
         _freeze(candidate, tmp_path)
 
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
-    assert not list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
+    assert not list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_publish_fails_closed_without_atomic_no_replace(
@@ -810,8 +880,8 @@ def test_staging_cleanup_failure_is_reported_and_other_stage_is_cleaned(
     with pytest.raises(ManifestError, match="temporary directory cleanup failed"):
         _freeze(candidate, tmp_path)
 
-    assert list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
+    assert list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_cleanup_preserves_replaced_staging_directory(
@@ -840,9 +910,9 @@ def test_cleanup_preserves_replaced_staging_directory(
 
     assert caller_sentinel is not None
     assert caller_sentinel.read_text(encoding="utf-8") == "keep\n"
-    assert not list(tmp_path.glob(".host.*"))
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
+    assert not list(host_root(tmp_path).glob(".host.*"))
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
 
 
 def test_cleanup_preserves_stage_replaced_after_ownership_check(
@@ -870,7 +940,7 @@ def test_cleanup_preserves_stage_replaced_after_ownership_check(
 
     assert caller_sentinel is not None
     assert caller_sentinel.read_text(encoding="utf-8") == "keep\n"
-    assert not list(tmp_path.glob(".host.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_rollback_preserves_replaced_first_publication(
@@ -878,7 +948,7 @@ def test_rollback_preserves_replaced_first_publication(
 ) -> None:
     candidate = valid_candidate(tmp_path)
     real_publish = manifests_module._publish_directory
-    caller_sentinel = tmp_path / "task/caller-sentinel"
+    caller_sentinel = task_output(tmp_path) / "caller-sentinel"
     calls = 0
 
     def replace_first_then_fail_second(staging: Path, output: Path) -> None:
@@ -887,8 +957,8 @@ def test_rollback_preserves_replaced_first_publication(
         if calls == 1:
             real_publish(staging, output)
             return
-        shutil.rmtree(tmp_path / "task")
-        (tmp_path / "task").mkdir()
+        shutil.rmtree(task_output(tmp_path))
+        task_output(tmp_path).mkdir()
         caller_sentinel.write_text("keep\n", encoding="utf-8")
         raise OSError("simulated host failure after task replacement")
 
@@ -902,9 +972,9 @@ def test_rollback_preserves_replaced_first_publication(
         _freeze(candidate, tmp_path)
 
     assert caller_sentinel.read_text(encoding="utf-8") == "keep\n"
-    assert not (tmp_path / "host").exists()
-    assert not list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
+    assert not host_output(tmp_path).exists()
+    assert not list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_rollback_preserves_output_replaced_after_ownership_check(
@@ -913,7 +983,7 @@ def test_rollback_preserves_output_replaced_after_ownership_check(
     candidate = valid_candidate(tmp_path)
     real_publish = manifests_module._publish_directory
     real_state = manifests_module._directory_state
-    caller_sentinel = tmp_path / "task/caller-sentinel"
+    caller_sentinel = task_output(tmp_path) / "caller-sentinel"
     calls = 0
     task_checks = 0
     replaced = False
@@ -928,7 +998,7 @@ def test_rollback_preserves_output_replaced_after_ownership_check(
     def replace_after_check(path: Path, identity: tuple[int, int] | None) -> str:
         nonlocal replaced, task_checks
         state = real_state(path, identity)
-        if path == tmp_path / "task":
+        if path == task_output(tmp_path):
             task_checks += 1
         if task_checks >= 2 and state == "owned" and not replaced:
             replaced = True
@@ -944,9 +1014,9 @@ def test_rollback_preserves_output_replaced_after_ownership_check(
         _freeze(candidate, tmp_path)
 
     assert caller_sentinel.read_text(encoding="utf-8") == "keep\n"
-    assert not (tmp_path / "host").exists()
-    assert not list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
+    assert not host_output(tmp_path).exists()
+    assert not list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_publish_rejects_stage_replaced_immediately_before_rename(
@@ -954,7 +1024,7 @@ def test_publish_rejects_stage_replaced_immediately_before_rename(
 ) -> None:
     candidate = valid_candidate(tmp_path)
     real_publish = manifests_module._publish_directory
-    foreign_sentinel = tmp_path / "task/foreign-sentinel"
+    foreign_sentinel = task_output(tmp_path) / "foreign-sentinel"
     calls = 0
 
     def replace_before_publish(staging: Path, output: Path) -> None:
@@ -973,9 +1043,9 @@ def test_publish_rejects_stage_replaced_immediately_before_rename(
 
     assert calls == 1
     assert foreign_sentinel.read_text(encoding="utf-8") == "keep\n"
-    assert not (tmp_path / "host").exists()
-    assert not list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
+    assert not host_output(tmp_path).exists()
+    assert not list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_publish_then_raise_tracks_output_when_vacated_stage_is_reused(
@@ -1005,9 +1075,9 @@ def test_publish_then_raise_tracks_output_when_vacated_stage_is_reused(
     assert calls == 1
     assert caller_sentinel is not None
     assert caller_sentinel.read_text(encoding="utf-8") == "keep\n"
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
-    assert not list(tmp_path.glob(".host.*"))
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_publish_revalidates_manifest_bytes_after_each_rename(
@@ -1015,7 +1085,7 @@ def test_publish_revalidates_manifest_bytes_after_each_rename(
 ) -> None:
     candidate = valid_candidate(tmp_path)
     real_publish = manifests_module._publish_directory
-    mutated = tmp_path / "task/task.json"
+    mutated = task_output(tmp_path) / "task.json"
     calls = 0
 
     def mutate_after_publish(staging: Path, output: Path) -> None:
@@ -1032,7 +1102,7 @@ def test_publish_revalidates_manifest_bytes_after_each_rename(
 
     assert calls == 1
     assert mutated.read_bytes() == b"caller-mutated-task\n"
-    assert not (tmp_path / "host").exists()
+    assert not host_output(tmp_path).exists()
 
 
 def test_freeze_revalidates_manifest_bytes_before_return(
@@ -1040,7 +1110,7 @@ def test_freeze_revalidates_manifest_bytes_before_return(
 ) -> None:
     candidate = valid_candidate(tmp_path)
     real_fsync = manifests_module._fsync_directory
-    mutated = tmp_path / "host/r3.json"
+    mutated = host_output(tmp_path) / "r3.json"
     changed = False
 
     def mutate_after_parent_fsync(path: Path) -> None:
@@ -1057,7 +1127,7 @@ def test_freeze_revalidates_manifest_bytes_before_return(
 
     assert changed
     assert mutated.read_bytes() == b"caller-mutated-r3\n"
-    assert not (tmp_path / "task").exists()
+    assert not task_output(tmp_path).exists()
 
 
 def test_final_path_binding_rejects_replaced_output_directory(
@@ -1065,7 +1135,7 @@ def test_final_path_binding_rejects_replaced_output_directory(
 ) -> None:
     candidate = valid_candidate(tmp_path)
     real_verify = manifests_module._verify_owned_record
-    host_sentinel = tmp_path / "host/caller-sentinel"
+    host_sentinel = host_output(tmp_path) / "caller-sentinel"
     verifications = 0
 
     def replace_after_retained_verification(
@@ -1077,8 +1147,8 @@ def test_final_path_binding_rejects_replaced_output_directory(
         real_verify(directory, name, value)
         verifications += 1
         if verifications == 4:
-            shutil.rmtree(tmp_path / "host")
-            (tmp_path / "host").mkdir()
+            shutil.rmtree(host_output(tmp_path))
+            host_output(tmp_path).mkdir()
             host_sentinel.write_text("keep\n", encoding="utf-8")
 
     monkeypatch.setattr(
@@ -1092,7 +1162,7 @@ def test_final_path_binding_rejects_replaced_output_directory(
 
     assert verifications == 5
     assert host_sentinel.read_text(encoding="utf-8") == "keep\n"
-    assert not (tmp_path / "task").exists()
+    assert not task_output(tmp_path).exists()
 
 
 def test_linked_manifest_is_cleaned_when_directory_fsync_fails(
@@ -1115,10 +1185,10 @@ def test_linked_manifest_is_cleaned_when_directory_fsync_fails(
         _freeze(candidate, tmp_path)
 
     assert failed
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
-    assert not list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
+    assert not list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_temp_record_replacement_is_not_unlinked_after_write_failure(
@@ -1131,7 +1201,7 @@ def test_temp_record_replacement_is_not_unlinked_after_write_failure(
     def replace_temp_then_fail(descriptor: int) -> None:
         nonlocal foreign_temp
         if foreign_temp is None and stat.S_ISREG(os.fstat(descriptor).st_mode):
-            stages = list(tmp_path.glob(".host.*"))
+            stages = list(host_root(tmp_path).glob(".host.*"))
             assert len(stages) == 1
             temporary = [path for path in stages[0].iterdir() if path.name.endswith(".tmp")]
             assert len(temporary) == 1
@@ -1148,8 +1218,8 @@ def test_temp_record_replacement_is_not_unlinked_after_write_failure(
 
     assert foreign_temp is not None
     assert foreign_temp.read_text(encoding="utf-8") == "caller-temp\n"
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
 
 
 def test_final_receipt_survives_first_final_name_read_failure(
@@ -1175,10 +1245,10 @@ def test_final_receipt_survives_first_final_name_read_failure(
         _freeze(candidate, tmp_path)
 
     assert failed
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
-    assert not list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
+    assert not list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_owned_file_refresh_rejects_same_inode_hash_mutation(tmp_path: Path) -> None:
@@ -1229,8 +1299,8 @@ def test_final_capture_rejects_same_inode_hash_mutation(
 
     assert mutated_path is not None
     assert mutated_path.read_bytes() == b"caller-mutated-r3\n"
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
 
 
 def test_cleanup_removes_owned_r3_manifest_but_preserves_foreign_entry(
@@ -1261,8 +1331,136 @@ def test_cleanup_removes_owned_r3_manifest_but_preserves_foreign_entry(
     assert host_stage is not None
     assert (host_stage / "caller-sentinel").read_text(encoding="utf-8") == "keep\n"
     assert not (host_stage / "r3.json").exists()
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
+
+
+@pytest.mark.parametrize("target", ["manifest", "temp", "bucket"])
+def test_quarantine_delete_preserves_swap_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    module = oracle_module if target == "bucket" else manifests_module
+    real_quarantine = module.quarantine_unlink
+    swapped = False
+
+    def swap_then_quarantine(
+        directory_descriptor: int,
+        name: str,
+        identity: tuple[int, int],
+        **kwargs: object,
+    ) -> None:
+        nonlocal swapped
+        selected = (
+            (target == "manifest" and name == "r3.json")
+            or (target == "temp" and name.endswith(".tmp"))
+            or (target == "bucket" and "bucket-" in name)
+        )
+        if selected and not swapped:
+            swapped = True
+            os.unlink(name, dir_fd=directory_descriptor)
+            descriptor = os.open(
+                name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                dir_fd=directory_descriptor,
+            )
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(f"caller-{target}\n".encode())
+        real_quarantine(directory_descriptor, name, identity, **kwargs)
+
+    monkeypatch.setattr(module, "quarantine_unlink", swap_then_quarantine)
+    if target == "manifest":
+        real_publish = manifests_module._publish_directory
+        publish_calls = 0
+
+        def fail_second_publish(staging: Path, output: Path) -> None:
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 2:
+                raise OSError("simulated host publication failure")
+            real_publish(staging, output)
+
+        monkeypatch.setattr(
+            manifests_module,
+            "_publish_directory",
+            fail_second_publish,
+        )
+
+    with pytest.raises(ManifestError, match="conflict|changed"):
+        _freeze(candidate, tmp_path)
+
+    assert swapped
+    preserved = b"".join(
+        path.read_bytes()
+        for root in (task_root(tmp_path), host_root(tmp_path))
+        if root.exists()
+        for path in root.rglob("*")
+        if path.is_file()
+    )
+    assert f"caller-{target}\n".encode() in preserved
+
+
+def test_manifest_link_temp_unlink_directory_fsync_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    real_link = manifests_module.os.link
+    real_unlink = manifests_module.os.unlink
+    real_fsync = manifests_module.os.fsync
+    events: list[str] = []
+    linked = False
+
+    def record_link(*args: object, **kwargs: object) -> None:
+        nonlocal linked
+        real_link(*args, **kwargs)
+        linked = True
+        events.append("link")
+
+    def record_unlink(path: object, *args: object, **kwargs: object) -> None:
+        real_unlink(path, *args, **kwargs)
+        if linked and isinstance(path, str) and path.startswith(".quarantine-"):
+            events.append("unlink-temp")
+
+    def record_fsync(descriptor: int) -> None:
+        real_fsync(descriptor)
+        if linked and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            events.append("fsync-directory")
+
+    monkeypatch.setattr(manifests_module.os, "link", record_link)
+    monkeypatch.setattr(manifests_module.os, "unlink", record_unlink)
+    monkeypatch.setattr(manifests_module.os, "fsync", record_fsync)
+
+    _freeze(candidate, tmp_path)
+
+    first_link = events.index("link")
+    first_unlink = events.index("unlink-temp", first_link)
+    first_fsync = events.index("fsync-directory", first_unlink)
+    assert first_link < first_unlink < first_fsync
+
+
+def test_identity_only_quarantine_does_not_read_file_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "quarantine"
+    directory.mkdir()
+    target = directory / "bucket"
+    target.write_bytes(b"bucket-content")
+    metadata = target.stat()
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+
+    def forbid_fdopen(*args: object, **kwargs: object) -> object:
+        raise AssertionError("identity-only quarantine must not read file bytes")
+
+    monkeypatch.setattr(records_module.os, "fdopen", forbid_fdopen)
+    try:
+        records_module.quarantine_unlink(
+            descriptor,
+            target.name,
+            (metadata.st_dev, metadata.st_ino),
+        )
+    finally:
+        os.close(descriptor)
+
+    assert not target.exists()
 
 
 @pytest.mark.parametrize("stage_name", ["task", "host"])
@@ -1292,10 +1490,10 @@ def test_stage_open_failure_cleans_all_registered_directories(
         _freeze(candidate, tmp_path)
 
     assert failed
-    assert not list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
+    assert not list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
 
 
 def test_r3_manifest_write_does_not_follow_replaced_host_stage(
@@ -1315,7 +1513,7 @@ def test_r3_manifest_write_does_not_follow_replaced_host_stage(
             and value["traces"]
             and all(item.get("split") == "r3" for item in value["traces"])
         ):
-            stages = list(tmp_path.glob(".host.*"))
+            stages = list(host_root(tmp_path).glob(".host.*"))
             assert len(stages) == 1
             foreign_stage = stages[0]
             shutil.rmtree(foreign_stage)
@@ -1335,8 +1533,8 @@ def test_r3_manifest_write_does_not_follow_replaced_host_stage(
     assert b"r3-tencent-photo" not in foreign_bytes
     assert b"Tencent" not in foreign_bytes
     assert (foreign_stage / "caller-sentinel").read_text(encoding="utf-8") == "keep\n"
-    assert not (tmp_path / "task").exists()
-    assert not (tmp_path / "host").exists()
+    assert not task_output(tmp_path).exists()
+    assert not host_output(tmp_path).exists()
 
 
 def test_cleanup_exception_closes_all_retained_directory_fds(
@@ -1359,7 +1557,7 @@ def test_cleanup_exception_closes_all_retained_directory_fds(
         if calls == 1:
             real_publish(staging, output)
             return
-        manifest = tmp_path / "task/task.json"
+        manifest = task_output(tmp_path) / "task.json"
         manifest.unlink()
         manifest.mkdir()
         (manifest / "caller-sentinel").write_text("keep\n", encoding="utf-8")
@@ -1380,12 +1578,12 @@ def test_cleanup_exception_closes_all_retained_directory_fds(
         leaked.append(descriptor)
         os.close(descriptor)
     assert not leaked
-    assert (tmp_path / "task/task.json/caller-sentinel").read_text(
+    assert (task_output(tmp_path) / "task.json/caller-sentinel").read_text(
         encoding="utf-8"
     ) == "keep\n"
-    assert not (tmp_path / "host").exists()
-    assert not list(tmp_path.glob(".task.*"))
-    assert not list(tmp_path.glob(".host.*"))
+    assert not host_output(tmp_path).exists()
+    assert not list(task_root(tmp_path).glob(".task.*"))
+    assert not list(host_root(tmp_path).glob(".host.*"))
 
 
 def test_success_ignores_reused_vacated_staging_names(
@@ -1418,8 +1616,8 @@ def test_success_ignores_reused_vacated_staging_names(
 
     task, host = _freeze(candidate, tmp_path)
 
-    assert load_object(tmp_path / "task/task.json") == task
-    assert load_object(tmp_path / "host/r3.json") == host
+    assert load_object(task_output(tmp_path) / "task.json") == task
+    assert load_object(host_output(tmp_path) / "r3.json") == host
     assert len(sentinels) == 2
     assert all(path.read_text(encoding="utf-8") == "keep\n" for path in sentinels)
 
@@ -1436,25 +1634,25 @@ def _run_cli(*argv: str) -> subprocess.CompletedProcess[str]:
 
 def test_freeze_cli_success_prints_only_public_commitment(tmp_path: Path) -> None:
     candidate = valid_candidate(tmp_path)
-    task_output = tmp_path / "task"
-    host_output = tmp_path / "private-host"
+    cli_task_output = task_output(tmp_path)
+    cli_host_output = host_output(tmp_path)
 
     result = _run_cli(
         "--input",
         str(candidate.path),
         "--task-output",
-        str(task_output),
+        str(cli_task_output),
         "--host-output",
-        str(host_output),
+        str(cli_host_output),
     )
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     printed = json.loads(result.stdout)
-    task = load_object(task_output / "task.json")
+    task = load_object(cli_task_output / "task.json")
     assert printed == {
         "r3_commitment_sha256": task["r3_commitment_sha256"],
-        "task_manifest": str((task_output / "task.json").absolute()),
+        "task_manifest": str((cli_task_output / "task.json").absolute()),
     }
     assert "private-host" not in result.stdout
     assert "Tencent" not in result.stdout
@@ -1480,9 +1678,9 @@ def test_freeze_cli_validation_error_prints_one_error_line(tmp_path: Path) -> No
         "--input",
         str(candidate.path),
         "--task-output",
-        str(tmp_path / "task"),
+        str(task_output(tmp_path)),
         "--host-output",
-        str(tmp_path / "host"),
+        str(host_output(tmp_path)),
     )
 
     assert result.returncode == 2

@@ -5,6 +5,8 @@ import json
 import math
 import os
 import re
+import ctypes
+import secrets
 import stat
 import tempfile
 from collections.abc import Mapping
@@ -37,6 +39,82 @@ _PORTFOLIO_KEYS = {"schema_version", "source_commit", "cache_fractions", "traces
 
 class ContractError(ValueError):
     pass
+
+
+def quarantine_unlink(
+    directory_descriptor: int,
+    name: str,
+    identity: tuple[int, int],
+    *,
+    sha256: str | None = None,
+    raw: bytes | None = None,
+) -> None:
+    quarantine = f".quarantine-{secrets.token_hex(16)}"
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise ContractError("atomic quarantine rename is unavailable") from error
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+
+    def rename(source: str, target: str) -> None:
+        result = renameat2(
+            directory_descriptor,
+            os.fsencode(source),
+            directory_descriptor,
+            os.fsencode(target),
+            1,
+        )
+        if result != 0:
+            number = ctypes.get_errno()
+            raise OSError(number, os.strerror(number), source)
+
+    rename(name, quarantine)
+    verified = False
+    try:
+        descriptor = os.open(
+            quarantine,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
+        digest_value: str | None = None
+        observed_value: bytes | None = None
+        try:
+            metadata = os.fstat(descriptor)
+            if sha256 is not None or raw is not None:
+                digest = hashlib.sha256()
+                observed = bytearray() if raw is not None else None
+                with os.fdopen(descriptor, "rb") as stream:
+                    descriptor = -1
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        if sha256 is not None:
+                            digest.update(block)
+                        if observed is not None:
+                            observed.extend(block)
+                digest_value = digest.hexdigest() if sha256 is not None else None
+                observed_value = bytes(observed) if observed is not None else None
+            else:
+                os.close(descriptor)
+                descriptor = -1
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        verified = (
+            (metadata.st_dev, metadata.st_ino) == identity
+            and (sha256 is None or digest_value == sha256)
+            and (raw is None or observed_value == raw)
+        )
+        if not verified:
+            raise ContractError(f"owned file changed before quarantine unlink: {name}")
+        os.unlink(quarantine, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
+    except BaseException:
+        if not verified:
+            try:
+                rename(quarantine, name)
+            except OSError:
+                pass
+        raise
 
 
 def _exact_keys(value: Mapping[str, object], expected: set[str], label: str) -> None:

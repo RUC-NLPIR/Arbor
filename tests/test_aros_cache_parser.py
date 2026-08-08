@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import signal
 import sys
 from decimal import Decimal
@@ -17,13 +18,24 @@ from commissioning.cache_campaign.cachesim import (
     parse_cachesim_output,
     run_child,
 )
-from commissioning.cache_campaign.records import sha256_file
+from commissioning.cache_campaign.records import quarantine_unlink, sha256_file
 
 
 LINE = (
     "/trace/dev-a.oracleGeneral.bin S3FIFO-0.1000-2 cache size  10.00MiB, "
     "          900000 req, miss ratio 0.1234, byte miss ratio 0.2345, "
     "throughput 20.25 MQPS\n"
+)
+CONFIG_LOG = (
+    "[INFO]  08-08-2026 12:34:56 cli_parser.c:802  (tid=1234): "
+    "trace path: /trace/dev-a.oracleGeneral.bin, trace_type oracleGeneral, "
+    "ofilepath result/dev-a.cachesim, 1 threads, warmup 0 sec, "
+    "total 1 algo x 1 size = 1 caches, S3FIFO, consider object metadata\n"
+)
+PROGRESS_LOG = (
+    "[INFO]  08-08-2026 12:34:56    sim.c:171  (tid=1234): "
+    "dev-a.oracleGeneral.bin S3FIFO-0.1000-2 1.00 hour: 900000 requests, "
+    "miss ratio 0.1234, interval miss ratio 0.2345\n"
 )
 
 
@@ -37,13 +49,18 @@ def test_parse_single_result_line() -> None:
     )
 
 
-def test_parse_accepts_no_final_newline_and_known_logger_lines() -> None:
-    output = (
-        "[INFO]  trace path: /trace/dev-a.oracleGeneral.bin, trace_type oracleGeneral\n"
-        "\n"
-        + LINE.rstrip("\n")
-    )
+def test_parse_accepts_no_final_newline_and_pinned_logger_lines() -> None:
+    output = CONFIG_LOG + PROGRESS_LOG + "\n" + LINE.rstrip("\n")
     assert parse_cachesim_output(output).request_count == 900_000
+
+
+@pytest.mark.parametrize("character", ["\t", "\r", "\v", "\f", "\0", "\xa0"])
+def test_parse_rejects_non_ascii_space_and_control_characters(
+    character: str,
+) -> None:
+    invalid = LINE.replace("cache size  ", f"cache size{character} ")
+    with pytest.raises(CacheSimOutputError):
+        parse_cachesim_output(invalid)
 
 
 @pytest.mark.parametrize(
@@ -87,6 +104,7 @@ def test_parse_rejects_multi_cache_output_without_throughput() -> None:
     [
         "arbitrary text\n",
         "[NOTICE] plausible-looking but unknown logger\n",
+        "[INFO] hacked\n",
         "[INFO] /trace/other Sieve cache size 1MiB, 1 req, miss ratio 0.1\n",
     ],
 )
@@ -98,6 +116,26 @@ def test_parse_rejects_extra_non_result_output(extra: str) -> None:
 def test_parse_rejects_bytes_including_invalid_utf8() -> None:
     with pytest.raises(CacheSimOutputError, match="text"):
         parse_cachesim_output(b"\xff")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        LINE.replace("900000", "9" * 5000),
+        LINE.replace("0.1234", "1." + "9" * 5000),
+        LINE.replace("20.25", "9" * 5000 + ".25"),
+    ],
+)
+def test_parse_rejects_oversized_numbers_with_bounded_errors(invalid: str) -> None:
+    with pytest.raises(CacheSimOutputError) as caught:
+        parse_cachesim_output(invalid)
+    assert len(str(caught.value)) <= 512
+
+
+def test_parse_arbitrary_line_error_is_bounded() -> None:
+    with pytest.raises(CacheSimOutputError) as caught:
+        parse_cachesim_output("x" * 10_000 + "\n" + LINE)
+    assert len(str(caught.value)) <= 512
 
 
 def test_run_child_records_exact_output_exit_and_resource_cost(tmp_path: Path) -> None:
@@ -140,6 +178,18 @@ def test_run_child_creates_a_new_directory_without_replacement(tmp_path: Path) -
         run_child([sys.executable, "-c", "pass"], output)
 
     assert marker.read_bytes() == b"keep"
+
+
+def test_run_child_existing_output_error_is_bounded(tmp_path: Path) -> None:
+    parent = tmp_path
+    for index in range(30):
+        parent = parent / (f"segment-{index:02d}-" + "x" * 35)
+        parent.mkdir()
+    output = parent / "run"
+    output.mkdir()
+    with pytest.raises(ChildRunError) as caught:
+        run_child([sys.executable, "-c", "pass"], output)
+    assert len(str(caught.value)) <= 512
 
 
 @pytest.mark.parametrize(
@@ -324,7 +374,7 @@ def test_run_child_cleans_up_if_a_raw_stream_cannot_be_opened(
     assert not output.exists()
 
 
-def test_run_child_wait4_failure_closes_outputs_without_double_reap(
+def test_run_child_wait4_failure_kills_and_reaps_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     observed: dict[str, object] = {}
@@ -353,8 +403,51 @@ def test_run_child_wait4_failure_closes_outputs_without_double_reap(
         run_child(["program"], output)
     assert observed["stdout"].closed  # type: ignore[union-attr]
     assert observed["stderr"].closed  # type: ignore[union-attr]
-    assert observed["process"].wait_calls == 0  # type: ignore[union-attr]
+    assert observed["process"].wait_calls == 1  # type: ignore[union-attr]
     assert not output.exists()
+
+
+def test_run_child_wait4_failure_leaves_no_live_or_zombie_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_popen = cachesim_module.subprocess.Popen
+    processes: list[object] = []
+
+    def capture_process(*args: object, **kwargs: object) -> object:
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(cachesim_module.subprocess, "Popen", capture_process)
+
+    def fail_wait4(pid: int, options: int) -> object:
+        raise OSError("injected wait4 failure")
+
+    monkeypatch.setattr(cachesim_module.os, "wait4", fail_wait4)
+    output = tmp_path / "run"
+    try:
+        with pytest.raises(ChildRunError, match="injected wait4 failure"):
+            run_child(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                output,
+            )
+        process = processes[0]
+        pid = process.pid  # type: ignore[union-attr]
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pid, 0)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+        assert not output.exists()
+    finally:
+        for process in processes:
+            if process.returncode is None:  # type: ignore[union-attr]
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)  # type: ignore[union-attr]
+                except ProcessLookupError:
+                    pass
+                process.wait()  # type: ignore[union-attr]
 
 
 def test_run_child_cleanup_preserves_a_replacement_file(
@@ -395,3 +488,171 @@ def test_run_child_cleanup_preserves_a_replacement_directory(
         run_child(["program"], output)
     assert (output / "foreign").read_bytes() == b"keep"
     assert moved.exists()
+
+
+def test_cleanup_quarantine_preserves_swap_immediately_before_file_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    swapped: dict[str, Path] = {}
+
+    def swap_then_quarantine(
+        directory_descriptor: int,
+        name: str,
+        identity: tuple[int, int],
+        **kwargs: object,
+    ) -> None:
+        if name == "stdout.raw" and not swapped:
+            directory = Path(
+                os.readlink(f"/proc/self/fd/{directory_descriptor}")
+            )
+            os.unlink(name, dir_fd=directory_descriptor)
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            try:
+                os.write(descriptor, b"foreign")
+            finally:
+                os.close(descriptor)
+            swapped["directory"] = directory
+        quarantine_unlink(
+            directory_descriptor,
+            name,
+            identity,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        cachesim_module,
+        "quarantine_unlink",
+        swap_then_quarantine,
+        raising=False,
+    )
+
+    def fail_spawn(argv: tuple[str, ...], **kwargs: object) -> object:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(cachesim_module.subprocess, "Popen", fail_spawn)
+    with pytest.raises(ChildRunError, match="spawn failed"):
+        run_child(["program"], tmp_path / "run")
+    assert (swapped["directory"] / "stdout.raw").read_bytes() == b"foreign"
+
+
+def test_cleanup_quarantine_preserves_swap_before_directory_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "run"
+    moved = tmp_path / "moved-owned"
+    swapped: dict[str, tuple[int, int]] = {}
+    real_rename = cachesim_module._rename_noreplace
+
+    def swap_then_rename(
+        directory_descriptor: int, source: str, target: str
+    ) -> None:
+        if source == output.name and not swapped:
+            output.rename(moved)
+            output.mkdir()
+            metadata = output.lstat()
+            swapped["identity"] = (metadata.st_dev, metadata.st_ino)
+        real_rename(directory_descriptor, source, target)
+
+    monkeypatch.setattr(
+        cachesim_module,
+        "_rename_noreplace",
+        swap_then_rename,
+        raising=False,
+    )
+
+    def fail_spawn(argv: tuple[str, ...], **kwargs: object) -> object:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(cachesim_module.subprocess, "Popen", fail_spawn)
+    with pytest.raises(ChildRunError, match="spawn failed"):
+        run_child(["program"], output)
+    metadata = output.lstat()
+    assert (metadata.st_dev, metadata.st_ino) == swapped["identity"]
+
+
+def test_run_child_rejects_post_create_directory_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "run"
+    moved = tmp_path / "moved-owned"
+    real_lstat = Path.lstat
+    swapped = False
+
+    def swap_before_receipt(path: Path) -> os.stat_result:
+        nonlocal swapped
+        if path == output and not swapped and path.is_dir():
+            path.rename(moved)
+            path.mkdir()
+            (path / "foreign").write_bytes(b"keep")
+            swapped = True
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", swap_before_receipt)
+    with pytest.raises(ChildRunError):
+        run_child([sys.executable, "-c", "pass"], output)
+    assert swapped
+    assert (output / "foreign").read_bytes() == b"keep"
+
+
+def test_run_child_detects_same_inode_mutation_after_task1_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout_calls = 0
+
+    def mutate_after_hash(path: Path) -> str:
+        nonlocal stdout_calls
+        digest = sha256_file(path)
+        if path.name == "stdout.raw":
+            stdout_calls += 1
+            if stdout_calls == 2:
+                path.write_bytes(b"other")
+        return digest
+
+    monkeypatch.setattr(
+        cachesim_module,
+        "sha256_file",
+        mutate_after_hash,
+        raising=False,
+    )
+    with pytest.raises(ChildRunError, match="changed"):
+        run_child(
+            [sys.executable, "-c", "import os; os.write(1, b'alpha')"],
+            tmp_path / "run",
+        )
+    assert stdout_calls == 2
+    assert not (tmp_path / "run").exists()
+
+
+def test_run_child_preserves_replacement_installed_after_task1_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "run"
+    replaced = False
+
+    def replace_after_hash(path: Path) -> str:
+        nonlocal replaced
+        digest = sha256_file(path)
+        if path.name == "stdout.raw" and not replaced:
+            path.unlink()
+            path.write_bytes(b"foreign")
+            replaced = True
+        return digest
+
+    monkeypatch.setattr(
+        cachesim_module,
+        "sha256_file",
+        replace_after_hash,
+        raising=False,
+    )
+    with pytest.raises(ChildRunError, match="changed"):
+        run_child(
+            [sys.executable, "-c", "import os; os.write(1, b'original')"],
+            output,
+        )
+    assert replaced
+    assert (output / "stdout.raw").read_bytes() == b"foreign"

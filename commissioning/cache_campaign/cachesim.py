@@ -1,30 +1,56 @@
 from __future__ import annotations
 
-import hashlib
+import ctypes
+import errno
 import os
 import re
+import secrets
+import signal
 import stat
 import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from pathlib import Path
 from typing import BinaryIO
 
+from .records import quarantine_unlink, sha256_file
+
 
 RESULT = re.compile(
-    r"^[^\x00-\x1f\x7f,]+ cache size\s+[^,\x00-\x1f\x7f]+,\s+"
-    r"(?P<requests>[0-9]+) req, miss ratio (?P<object>[0-9]+\.[0-9]+), "
-    r"byte miss ratio (?P<byte>[0-9]+\.[0-9]+), throughput "
-    r"(?P<throughput>[0-9]+\.[0-9]+) MQPS$"
+    r"^[^,]{1,2048} cache size {1,16}[^, ]{1,64}, {1,32}"
+    r"(?P<requests>[0-9]{1,20}) req, miss ratio "
+    r"(?P<object>[0-9]{1,3}\.[0-9]{1,12}), byte miss ratio "
+    r"(?P<byte>[0-9]{1,3}\.[0-9]{1,12}), throughput "
+    r"(?P<throughput>[0-9]{1,12}\.[0-9]{1,12}) MQPS$"
 )
-_LOGGER = re.compile(
-    r"^(?:\x1b\[[0-9;]*m)*\[(?:VERB|DEBUG|INFO|WARN)\]\s+"
-    r"[^\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]*"
-    r"(?:\x1b\[0m)?$"
+_LOGGER_HEADER = (
+    r"^\[INFO\] {2}[0-9]{2}-[0-9]{2}-[0-9]{4} "
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2} {0,7}[A-Za-z0-9_-]{1,60}\.c:"
+    r"[0-9]{1,6} {2,5}\(tid=[0-9]{1,20}\): "
 )
-_ANSI_RESET = re.compile(r"^(?:\x1b\[0m)+$")
+_CONFIG_LOG = re.compile(
+    _LOGGER_HEADER
+    + r"trace path: [^,]{1,2048}, trace_type [A-Za-z0-9_-]{1,32}, "
+    + r"ofilepath [^,]{1,2048}, [0-9]{1,3} threads, warmup [0-9]{1,10} sec, "
+    + r"total [0-9]{1,3} algo x [0-9]{1,3} size = [0-9]{1,5} caches"
+    + r"(?:, [A-Za-z][A-Za-z0-9_-]{0,63}){1,64}"
+    + r"(?:, trace-type-params: [^,]{1,256})?"
+    + r"(?:, admission: [^,]{1,128})?"
+    + r"(?:, admission-params: [^,]{1,256})?"
+    + r"(?:, prefetch: [^,]{1,128})?"
+    + r"(?:, prefetch-params: [^,]{1,256})?"
+    + r"(?:, eviction-params: [^,]{1,256})?"
+    + r"(?:, use ttl)?(?:, ignore object size)?(?:, consider object metadata)?$"
+)
+_PROGRESS_LOG = re.compile(
+    _LOGGER_HEADER
+    + r"[^ ,]{1,255} [A-Za-z0-9_.:+-]{1,128} [0-9]{1,12}\.[0-9]{2} hour: "
+    + r"[0-9]{1,20} requests, miss ratio [0-9]{1,3}\.[0-9]{1,12}, "
+    + r"interval miss ratio [0-9]{1,3}\.[0-9]{1,12}$"
+)
+_DISABLE_METADATA_LOG = re.compile(_LOGGER_HEADER + r"disable object metadata$")
 
 
 class CacheSimOutputError(ValueError):
@@ -57,16 +83,36 @@ class ChildResult:
     stderr_sha256: str
 
 
+@dataclass(frozen=True)
+class _RawFileReceipt:
+    identity: tuple[int, int]
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
 def _excerpt(line: str) -> str:
-    value = repr(line[:160])
-    return value + ("..." if len(line) > 160 else "")
+    value = repr(line[:120])
+    return value + ("..." if len(line) > 120 else "")
+
+
+def _known_log_line(line: str) -> bool:
+    return any(
+        expression.fullmatch(line) is not None
+        for expression in (_CONFIG_LOG, _PROGRESS_LOG, _DISABLE_METADATA_LOG)
+    )
 
 
 def parse_cachesim_output(output: str) -> ParsedResult:
     if type(output) is not str:
         raise CacheSimOutputError("libCacheSim output must be text")
-    if "\r" in output:
-        raise CacheSimOutputError("libCacheSim output must use LF line endings")
+    if any(
+        character != "\n" and not 0x20 <= ord(character) <= 0x7E
+        for character in output
+    ):
+        raise CacheSimOutputError(
+            "libCacheSim output must contain printable ASCII and LF only"
+        )
 
     matches: list[re.Match[str]] = []
     for line_number, line in enumerate(output.split("\n"), start=1):
@@ -74,10 +120,9 @@ def parse_cachesim_output(output: str) -> ParsedResult:
         if match is not None:
             matches.append(match)
             continue
-        logger_result = _LOGGER.fullmatch(line)
-        if logger_result is not None and " cache size " not in line:
+        if _known_log_line(line):
             continue
-        if line == "" or _ANSI_RESET.fullmatch(line) is not None:
+        if line == "":
             continue
         raise CacheSimOutputError(
             f"unrecognized libCacheSim output on line {line_number}: {_excerpt(line)}"
@@ -88,10 +133,13 @@ def parse_cachesim_output(output: str) -> ParsedResult:
             f"expected exactly one libCacheSim result line, found {len(matches)}"
         )
     fields = matches[0].groupdict()
-    request_count = int(fields["requests"])
-    object_miss_ratio = Decimal(fields["object"])
-    byte_miss_ratio = Decimal(fields["byte"])
-    throughput = Decimal(fields["throughput"])
+    try:
+        request_count = int(fields["requests"])
+        object_miss_ratio = Decimal(fields["object"])
+        byte_miss_ratio = Decimal(fields["byte"])
+        throughput = Decimal(fields["throughput"])
+    except (ValueError, DecimalException) as error:
+        raise CacheSimOutputError("invalid bounded decimal in libCacheSim result") from error
     if request_count <= 0:
         raise CacheSimOutputError("libCacheSim request count must be positive")
     if not object_miss_ratio.is_finite() or not 0 <= object_miss_ratio <= 1:
@@ -139,14 +187,29 @@ def _bounded_error(error: BaseException) -> str:
     return message[:300] + ("..." if len(message) > 300 else "")
 
 
+def _bounded_message(message: str, limit: int = 512) -> str:
+    if len(message) <= limit:
+        return message
+    return message[: limit - 3] + "..."
+
+
 def _identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
+
+
+def _raw_file_receipt(metadata: os.stat_result) -> _RawFileReceipt:
+    return _RawFileReceipt(
+        identity=_identity(metadata),
+        size=metadata.st_size,
+        mtime_ns=metadata.st_mtime_ns,
+        ctime_ns=metadata.st_ctime_ns,
+    )
 
 
 def _create_raw_file(
     directory_descriptor: int,
     name: str,
-    files: dict[str, tuple[int, int]],
+    files: dict[str, _RawFileReceipt],
 ) -> BinaryIO:
     descriptor = os.open(
         name,
@@ -156,7 +219,7 @@ def _create_raw_file(
     )
     try:
         metadata = os.fstat(descriptor)
-        files[name] = _identity(metadata)
+        files[name] = _raw_file_receipt(metadata)
         if not stat.S_ISREG(metadata.st_mode):
             raise ChildRunError(f"raw output is not a regular file: {name}")
         stream = os.fdopen(descriptor, "wb")
@@ -167,34 +230,45 @@ def _create_raw_file(
             os.close(descriptor)
 
 
-def _hash_raw_file(
-    directory_descriptor: int,
+def _regular_file_metadata(
+    path: Path, receipt: _RawFileReceipt, name: str
+) -> os.stat_result:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or _identity(metadata) != receipt.identity
+    ):
+        raise ChildRunError(f"raw output changed: {name}")
+    return metadata
+
+
+def _seal_and_hash_raw_file(
+    path: Path, opened: _RawFileReceipt, name: str
+) -> tuple[str, _RawFileReceipt]:
+    before = _regular_file_metadata(path, opened, name)
+    sealed = _raw_file_receipt(before)
+    digest = sha256_file(path)
+    after = _regular_file_metadata(path, sealed, name)
+    if _raw_file_receipt(after) != sealed:
+        raise ChildRunError(f"raw output changed: {name}")
+    return digest, sealed
+
+
+def _revalidate_raw_hash(
+    path: Path,
+    receipt: _RawFileReceipt,
+    expected_sha256: str,
     name: str,
-    expected_identity: tuple[int, int],
-) -> tuple[str, int]:
-    descriptor = os.open(
-        name,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=directory_descriptor,
-    )
-    digest = hashlib.sha256()
-    size = 0
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != expected_identity:
-            raise ChildRunError(f"raw output changed before hashing: {name}")
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-                size += len(block)
-        observed = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
-        if _identity(observed) != expected_identity or observed.st_size != size:
-            raise ChildRunError(f"raw output changed while hashing: {name}")
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    return digest.hexdigest(), size
+) -> None:
+    before = _regular_file_metadata(path, receipt, name)
+    observed_sha256 = sha256_file(path)
+    after = _regular_file_metadata(path, receipt, name)
+    if (
+        _raw_file_receipt(before) != receipt
+        or _raw_file_receipt(after) != receipt
+        or observed_sha256 != expected_sha256
+    ):
+        raise ChildRunError(f"raw output changed: {name}")
 
 
 def _path_identity(path: Path) -> tuple[int, int] | None:
@@ -204,19 +278,82 @@ def _path_identity(path: Path) -> tuple[int, int] | None:
         return None
 
 
+def _rename_noreplace(
+    directory_descriptor: int, source: str, target: str
+) -> None:
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise ChildRunError("atomic no-replace rename is unavailable") from error
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        directory_descriptor,
+        os.fsencode(source),
+        directory_descriptor,
+        os.fsencode(target),
+        1,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.ENOENT:
+        raise FileNotFoundError(error_number, os.strerror(error_number), source)
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), target)
+    raise OSError(error_number, os.strerror(error_number), source)
+
+
 def _remove_owned_directory(
     output: Path, directory_identity: tuple[int, int]
 ) -> str | None:
+    parent_descriptor = -1
+    quarantine = f".cachesim-quarantine-{secrets.token_hex(16)}"
     try:
-        observed_identity = _path_identity(output)
-    except OSError as error:
-        return f"cannot inspect output directory: {_bounded_error(error)}"
-    if observed_identity != directory_identity:
-        return "replacement output directory preserved"
-    try:
-        os.rmdir(output)
-    except OSError as error:
+        parent_descriptor = os.open(
+            output.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            _rename_noreplace(parent_descriptor, output.name, quarantine)
+        except FileNotFoundError:
+            return None
+        quarantine_descriptor = os.open(
+            quarantine,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        try:
+            metadata = os.fstat(quarantine_descriptor)
+            owned = (
+                stat.S_ISDIR(metadata.st_mode)
+                and _identity(metadata) == directory_identity
+                and not os.listdir(quarantine_descriptor)
+            )
+        finally:
+            os.close(quarantine_descriptor)
+        if not owned:
+            try:
+                _rename_noreplace(parent_descriptor, quarantine, output.name)
+            except OSError:
+                pass
+            return "replacement or nonempty output directory preserved"
+        os.rmdir(quarantine, dir_fd=parent_descriptor)
+    except (OSError, ChildRunError) as error:
         return f"cannot remove output directory: {_bounded_error(error)}"
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
     return None
 
 
@@ -224,26 +361,21 @@ def _cleanup_outputs(
     output: Path,
     directory_descriptor: int,
     directory_identity: tuple[int, int],
-    files: dict[str, tuple[int, int]],
+    files: dict[str, _RawFileReceipt],
 ) -> str | None:
     issues = []
-    for name, expected_identity in files.items():
+    for name, receipt in files.items():
         try:
-            observed = os.stat(
-                name, dir_fd=directory_descriptor, follow_symlinks=False
+            quarantine_unlink(
+                directory_descriptor,
+                name,
+                receipt.identity,
+                fsync_directory=False,
             )
         except FileNotFoundError:
             continue
-        except OSError as error:
-            issues.append(f"cannot inspect {name}: {_bounded_error(error)}")
-            continue
-        if _identity(observed) != expected_identity:
-            issues.append(f"replacement preserved: {name}")
-            continue
-        try:
-            os.unlink(name, dir_fd=directory_descriptor)
-        except OSError as error:
-            issues.append(f"cannot remove {name}: {_bounded_error(error)}")
+        except (OSError, ValueError) as error:
+            issues.append(f"replacement preserved for {name}: {_bounded_error(error)}")
     directory_issue = _remove_owned_directory(output, directory_identity)
     if directory_issue is not None:
         issues.append(directory_issue)
@@ -253,6 +385,15 @@ def _cleanup_outputs(
 def _close_stream(stream: BinaryIO | None) -> None:
     if stream is not None and not stream.closed:
         stream.close()
+
+
+def _kill_process_group_and_reap(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    returncode = process.wait()
+    process.returncode = returncode
 
 
 def run_child(
@@ -274,17 +415,17 @@ def run_child(
 
     directory_descriptor = -1
     directory_identity: tuple[int, int] | None = None
-    files: dict[str, tuple[int, int]] = {}
+    files: dict[str, _RawFileReceipt] = {}
     stdout_stream: BinaryIO | None = None
     stderr_stream: BinaryIO | None = None
     try:
         try:
             output.mkdir(mode=0o700)
         except FileExistsError as error:
-            raise ChildRunError(f"output directory must not exist: {output}") from error
+            raise ChildRunError("output directory must not exist") from error
         metadata = output.lstat()
         if not stat.S_ISDIR(metadata.st_mode) or output.is_symlink():
-            raise ChildRunError(f"created output is not a real directory: {output}")
+            raise ChildRunError("created output is not a real directory")
         directory_identity = _identity(metadata)
         directory_descriptor = os.open(
             output,
@@ -294,6 +435,8 @@ def run_child(
         )
         if _identity(os.fstat(directory_descriptor)) != directory_identity:
             raise ChildRunError("output directory changed before open")
+        if os.listdir(directory_descriptor):
+            raise ChildRunError("created output changed before adoption")
 
         stdout_stream = _create_raw_file(
             directory_descriptor, "stdout.raw", files
@@ -310,7 +453,11 @@ def run_child(
             shell=False,
             start_new_session=True,
         )
-        pid, status, usage = wait4(process.pid, 0)
+        try:
+            pid, status, usage = wait4(process.pid, 0)
+        except BaseException:
+            _kill_process_group_and_reap(process)
+            raise
         wall_ns = max(0, time.monotonic_ns() - start)
         if pid != process.pid:
             raise ChildRunError(
@@ -327,11 +474,29 @@ def run_child(
         stdout_stream = None
         _close_stream(stderr_stream)
         stderr_stream = None
-        stdout_sha256, stdout_bytes = _hash_raw_file(
-            directory_descriptor, "stdout.raw", files["stdout.raw"]
+        stdout_path = output / "stdout.raw"
+        stderr_path = output / "stderr.raw"
+        stdout_sha256, files["stdout.raw"] = _seal_and_hash_raw_file(
+            stdout_path,
+            files["stdout.raw"],
+            "stdout.raw",
         )
-        stderr_sha256, stderr_bytes = _hash_raw_file(
-            directory_descriptor, "stderr.raw", files["stderr.raw"]
+        stderr_sha256, files["stderr.raw"] = _seal_and_hash_raw_file(
+            stderr_path,
+            files["stderr.raw"],
+            "stderr.raw",
+        )
+        _revalidate_raw_hash(
+            stdout_path,
+            files["stdout.raw"],
+            stdout_sha256,
+            "stdout.raw",
+        )
+        _revalidate_raw_hash(
+            stderr_path,
+            files["stderr.raw"],
+            stderr_sha256,
+            "stderr.raw",
         )
         if _path_identity(output) != directory_identity:
             raise ChildRunError("output directory changed before result publication")
@@ -340,11 +505,11 @@ def run_child(
             returncode=returncode,
             wall_ns=wall_ns,
             cpu_ns=cpu_ns,
-            stdout_path=output / "stdout.raw",
-            stdout_bytes=stdout_bytes,
+            stdout_path=stdout_path,
+            stdout_bytes=files["stdout.raw"].size,
             stdout_sha256=stdout_sha256,
-            stderr_path=output / "stderr.raw",
-            stderr_bytes=stderr_bytes,
+            stderr_path=stderr_path,
+            stderr_bytes=files["stderr.raw"].size,
             stderr_sha256=stderr_sha256,
         )
     except BaseException as error:
@@ -364,6 +529,7 @@ def run_child(
             message = _bounded_error(error)
             if cleanup_issue is not None:
                 message += f"; cleanup: {cleanup_issue}"
+            message = _bounded_message(message)
             if isinstance(error, ChildRunError) and cleanup_issue is None:
                 raise
             raise ChildRunError(message) from error

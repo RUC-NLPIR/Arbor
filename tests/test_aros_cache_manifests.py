@@ -197,7 +197,13 @@ def inject(candidate: Candidate, defect: str) -> None:
 
 
 def _freeze(candidate: Candidate, tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
-    return freeze_manifests(candidate.path, task_output(tmp_path), host_output(tmp_path))
+    task_root(tmp_path).mkdir(exist_ok=True)
+    return freeze_manifests(
+        candidate.path,
+        task_root(tmp_path),
+        task_output(tmp_path),
+        host_output(tmp_path),
+    )
 
 
 def test_freeze_writes_visible_splits_and_only_r3_commitment(tmp_path: Path) -> None:
@@ -267,10 +273,66 @@ def test_freeze_rejects_r3_material_inside_task_root(
         candidate.write()
 
     with pytest.raises(ManifestError, match="task root"):
-        freeze_manifests(candidate_path, task_output(tmp_path), private_output)
+        freeze_manifests(
+            candidate_path,
+            root,
+            task_output(tmp_path),
+            private_output,
+        )
 
     assert not task_output(tmp_path).exists()
     assert not private_output.exists()
+
+
+def test_explicit_task_root_allows_nested_public_output(tmp_path: Path) -> None:
+    candidate = valid_candidate(tmp_path)
+    root = task_root(tmp_path)
+    root.mkdir()
+    nested = root / "artifacts/manifests"
+
+    task, host = freeze_manifests(
+        candidate.path,
+        root,
+        nested,
+        host_output(tmp_path),
+    )
+
+    assert load_object(nested / "task.json") == task
+    task_bytes = b"".join(
+        path.read_bytes() for path in root.rglob("*") if path.is_file()
+    )
+    assert host["traces"][0]["trace_id"].encode() not in task_bytes
+    assert host["traces"][0]["sha256"].encode() not in task_bytes
+
+
+def test_explicit_task_root_rejects_nested_private_output(tmp_path: Path) -> None:
+    candidate = valid_candidate(tmp_path)
+    root = task_root(tmp_path)
+    root.mkdir()
+
+    with pytest.raises(ManifestError, match="task root"):
+        freeze_manifests(
+            candidate.path,
+            root,
+            root / "artifacts/manifests",
+            root / "private/sealed",
+        )
+
+
+def test_explicit_task_root_rejects_symlink(tmp_path: Path) -> None:
+    candidate = valid_candidate(tmp_path)
+    real_root = task_root(tmp_path)
+    real_root.mkdir()
+    linked_root = tmp_path / "linked-task-root"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+
+    with pytest.raises(ManifestError, match="real directory"):
+        freeze_manifests(
+            candidate.path,
+            linked_root,
+            linked_root / "artifacts/manifests",
+            host_output(tmp_path),
+        )
 
 
 def test_freeze_recomputes_sizes_hashes_and_diagnostics(tmp_path: Path) -> None:
@@ -716,6 +778,7 @@ def test_freeze_refuses_preexisting_outputs(tmp_path: Path, existing: str) -> No
 @pytest.mark.parametrize("alias", ["same_outputs", "nested_outputs", "input_output"])
 def test_freeze_rejects_aliasing_input_and_output_paths(tmp_path: Path, alias: str) -> None:
     candidate = valid_candidate(tmp_path)
+    task_root(tmp_path).mkdir()
     task = task_output(tmp_path)
     host = host_output(tmp_path)
     if alias == "same_outputs":
@@ -726,7 +789,7 @@ def test_freeze_rejects_aliasing_input_and_output_paths(tmp_path: Path, alias: s
         task = candidate.path
 
     with pytest.raises(ManifestError):
-        freeze_manifests(candidate.path, task, host)
+        freeze_manifests(candidate.path, task_root(tmp_path), task, host)
 
     if alias != "input_output":
         assert not task.exists()
@@ -1463,6 +1526,37 @@ def test_identity_only_quarantine_does_not_read_file_content(
     assert not target.exists()
 
 
+def test_scanner_bucket_cleanup_fsyncs_parent_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = valid_candidate(tmp_path)
+    trace = TraceWindow.from_candidate(_traces(candidate)[0])
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    descriptor = os.open(scratch, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    real_fsync = oracle_module.os.fsync
+    parent_fsyncs = 0
+
+    def count_fsync(value: int) -> None:
+        nonlocal parent_fsyncs
+        if value == descriptor:
+            parent_fsyncs += 1
+        real_fsync(value)
+
+    monkeypatch.setattr(oracle_module.os, "fsync", count_fsync)
+    try:
+        scan_oracle_general(
+            trace,
+            scratch,
+            temporary_descriptor=descriptor,
+            scan_prefix=".oracle-fsync-count-",
+        )
+    finally:
+        os.close(descriptor)
+
+    assert parent_fsyncs == 1
+
+
 @pytest.mark.parametrize("stage_name", ["task", "host"])
 def test_stage_open_failure_cleans_all_registered_directories(
     tmp_path: Path,
@@ -1636,10 +1730,13 @@ def test_freeze_cli_success_prints_only_public_commitment(tmp_path: Path) -> Non
     candidate = valid_candidate(tmp_path)
     cli_task_output = task_output(tmp_path)
     cli_host_output = host_output(tmp_path)
+    task_root(tmp_path).mkdir()
 
     result = _run_cli(
         "--input",
         str(candidate.path),
+        "--task-root",
+        str(task_root(tmp_path)),
         "--task-output",
         str(cli_task_output),
         "--host-output",
@@ -1670,6 +1767,7 @@ def test_freeze_cli_missing_arguments_prints_one_error_line() -> None:
 
 def test_freeze_cli_validation_error_prints_one_error_line(tmp_path: Path) -> None:
     candidate = valid_candidate(tmp_path)
+    task_root(tmp_path).mkdir()
     candidate.value = copy.deepcopy(candidate.value)
     candidate.value["cache_fractions"] = [0.01]
     candidate.write()
@@ -1677,6 +1775,8 @@ def test_freeze_cli_validation_error_prints_one_error_line(tmp_path: Path) -> No
     result = _run_cli(
         "--input",
         str(candidate.path),
+        "--task-root",
+        str(task_root(tmp_path)),
         "--task-output",
         str(task_output(tmp_path)),
         "--host-output",

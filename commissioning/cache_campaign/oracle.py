@@ -222,6 +222,7 @@ def scan_oracle_general(
                         temporary_descriptor,
                         name,
                         expected_identity,
+                        fsync_directory=False,
                     )
                     bucket_receipts.pop(name, None)
                 except FileNotFoundError:
@@ -297,6 +298,7 @@ def scan_oracle_general(
                         temporary_descriptor,
                         name,
                         expected_identity,
+                        fsync_directory=False,
                     )
                 except (OSError, ValueError) as error:
                     cleanup_conflicts.append(f"{name}: {error}")
@@ -310,6 +312,10 @@ def scan_oracle_general(
                 ]
             except OSError as error:
                 unexpected = [f"<unreadable-scan-directory: {error}>"]
+            try:
+                os.fsync(temporary_descriptor)
+            except OSError as error:
+                cleanup_conflicts.append(f"scan directory fsync: {error}")
         finally:
             if owns_temporary_descriptor:
                 try:

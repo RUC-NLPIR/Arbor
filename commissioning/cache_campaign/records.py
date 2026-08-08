@@ -48,6 +48,7 @@ def quarantine_unlink(
     *,
     sha256: str | None = None,
     raw: bytes | None = None,
+    fsync_directory: bool = True,
 ) -> None:
     quarantine = f".quarantine-{secrets.token_hex(16)}"
     try:
@@ -107,7 +108,8 @@ def quarantine_unlink(
         if not verified:
             raise ContractError(f"owned file changed before quarantine unlink: {name}")
         os.unlink(quarantine, dir_fd=directory_descriptor)
-        os.fsync(directory_descriptor)
+        if fsync_directory:
+            os.fsync(directory_descriptor)
     except BaseException:
         if not verified:
             try:

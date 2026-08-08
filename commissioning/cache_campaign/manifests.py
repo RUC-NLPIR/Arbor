@@ -513,14 +513,21 @@ def _fsync_directory(path: Path) -> None:
 
 def freeze_manifests(
     candidate_path: Path,
+    task_root: Path,
     task_output: Path,
     host_output: Path,
 ) -> tuple[dict[str, object], dict[str, object]]:
     try:
         candidate = Path(candidate_path).resolve(strict=True)
+        raw_task_root = Path(task_root).absolute()
+        root_metadata = raw_task_root.lstat()
+        if raw_task_root.is_symlink() or not stat.S_ISDIR(root_metadata.st_mode):
+            raise ManifestError("task root must be a real directory")
+        task_root = raw_task_root.resolve(strict=True)
         task = _output_path(Path(task_output))
         host = _output_path(Path(host_output))
-        task_root = task.parent
+        if task == task_root or task_root not in task.parents:
+            raise ManifestError("task output must be strictly beneath task root")
         if _paths_overlap(task, host):
             raise ManifestError("task and host outputs must not overlap")
         if _paths_overlap(host, task_root) or _paths_overlap(host.parent, task_root):

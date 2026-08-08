@@ -28,16 +28,21 @@ def _error(message: object) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = _Parser(add_help=True)
     parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--task-root", type=Path, required=True)
     parser.add_argument("--task-output", type=Path, required=True)
     parser.add_argument("--host-output", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         candidate = args.input.resolve(strict=True)
+        raw_task_root = args.task_root.absolute()
+        if raw_task_root.is_symlink() or not raw_task_root.is_dir():
+            raise ValueError("task root must be an existing real directory")
+        task_root = raw_task_root.resolve(strict=True)
         task_output = args.task_output.absolute()
         host_output = args.host_output.absolute()
         if os.path.lexists(task_output) or os.path.lexists(host_output):
             raise ValueError("output paths must not exist")
-        task, _ = freeze_manifests(candidate, task_output, host_output)
+        task, _ = freeze_manifests(candidate, task_root, task_output, host_output)
         result = {
             "r3_commitment_sha256": task["r3_commitment_sha256"],
             "task_manifest": str(task_output / "task.json"),

@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "allowed_tools": [
+    "Source.read",
+    "Source.search",
+    "Task.create",
+    "Task.start",
+    "Task.status",
+    "Task.collect",
+    "Run.request",
+    "Run.status",
+    "Eval.run",
+    "Receipt.read",
+    "Research.observe",
+    "Research.checkpoint",
+    "Research.petition",
+    "Git.read"
+  ],
+  "artifacts": {
+    "ResearchQuestion": [
+      "question_ref",
+      "scope",
+      "decision_context"
+    ],
+    "SourcePacket": [
+      "query",
+      "sources",
+      "retrieved_at",
+      "content_refs",
+      "content_sha256s",
+      "limitations"
+    ],
+    "RivalMechanismSet": [
+      "root_question_ref",
+      "mechanisms",
+      "predictions",
+      "falsifiers",
+      "conflicts",
+      "remaining_uncertainty"
+    ],
+    "ExperimentProposal": [
+      "mechanism_refs",
+      "decision_uncertainty",
+      "prediction",
+      "falsifier",
+      "controls",
+      "run_request",
+      "expected_information_gain",
+      "cost_bound"
+    ],
+    "RunEvidence": [
+      "run_ref",
+      "eval_refs",
+      "raw_refs",
+      "process_state",
+      "budget_used"
+    ],
+    "ObservationUpdate": [
+      "evidence_refs",
+      "strengthened",
+      "weakened",
+      "eliminated",
+      "counterexamples",
+      "negative_results",
+      "remaining_uncertainty",
+      "next_action_rationale"
+    ],
+    "FrozenEvidencePacket": [
+      "task_brief_ref",
+      "preregistration_ref",
+      "commit",
+      "source_refs",
+      "raw_refs",
+      "reproduction_ref"
+    ],
+    "ReviewerReport": [
+      "reproduction_refs",
+      "alternative_explanations",
+      "leakage_findings",
+      "statistical_findings",
+      "scope_objections",
+      "fatal_objections",
+      "unresolved_objections"
+    ],
+    "AdjudicatedEvidence": [
+      "claim_draft_ref",
+      "evidence_refs",
+      "review_ref",
+      "principal_response_ref"
+    ],
+    "ClaimPackage": [
+      "claim",
+      "scope",
+      "evidence_refs",
+      "counterevidence",
+      "reproduction_commands",
+      "limitations",
+      "remaining_uncertainty",
+      "review_objections"
+    ]
+  },
+  "procedures": {
+    "aros-source-research": {
+      "input": "ResearchQuestion",
+      "output": "SourcePacket",
+      "tools": [
+        "Source.read",
+        "Source.search"
+      ]
+    },
+    "aros-rival-mechanisms": {
+      "input": "SourcePacket",
+      "output": "RivalMechanismSet",
+      "tools": [
+        "Git.read",
+        "Receipt.read",
+        "Research.observe"
+      ]
+    },
+    "aros-experiment-design": {
+      "input": "RivalMechanismSet",
+      "output": "ExperimentProposal",
+      "tools": [
+        "Receipt.read",
+        "Research.observe",
+        "Research.petition"
+      ]
+    },
+    "aros-evidence-update": {
+      "input": "RunEvidence",
+      "output": "ObservationUpdate",
+      "tools": [
+        "Run.status",
+        "Eval.run",
+        "Receipt.read",
+        "Research.observe",
+        "Research.checkpoint"
+      ]
+    },
+    "aros-independent-review": {
+      "input": "FrozenEvidencePacket",
+      "output": "ReviewerReport",
+      "tools": [
+        "Source.read",
+        "Run.request",
+        "Run.status",
+        "Eval.run",
+        "Receipt.read",
+        "Git.read"
+      ]
+    },
+    "aros-claim-package": {
+      "input": "AdjudicatedEvidence",
+      "output": "ClaimPackage",
+      "tools": [
+        "Source.read",
+        "Receipt.read",
+        "Git.read",
+        "Research.checkpoint"
+      ]
+    }
+  }
+}

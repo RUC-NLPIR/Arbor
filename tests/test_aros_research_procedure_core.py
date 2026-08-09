@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import json
+import os
 import re
 import subprocess
+from dataclasses import FrozenInstanceError
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -12,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 PROGRAM_ROOT = ROOT / "commissioning/research_program"
 SOURCES_PATH = PROGRAM_ROOT / "SOURCES.json"
+CONTRACTS_PATH = PROGRAM_ROOT / "contracts/procedure_contracts.json"
 UPSTREAM_PRODUCT_NAMES = ("claude", "gemini")
 SOURCE_RECORD_SUFFIXES = {".json", ".jsonl", ".yaml", ".yml", ".md"}
 SOURCE_RECORD_EXEMPTIONS = {
@@ -79,6 +83,146 @@ APPROVED_SOURCE_RECORD = {
             ),
         },
     ],
+}
+EXPECTED_ALLOWED_TOOLS = (
+    "Source.read",
+    "Source.search",
+    "Task.create",
+    "Task.start",
+    "Task.status",
+    "Task.collect",
+    "Run.request",
+    "Run.status",
+    "Eval.run",
+    "Receipt.read",
+    "Research.observe",
+    "Research.checkpoint",
+    "Research.petition",
+    "Git.read",
+)
+EXPECTED_ARTIFACTS = {
+    "ResearchQuestion": ("question_ref", "scope", "decision_context"),
+    "SourcePacket": (
+        "query",
+        "sources",
+        "retrieved_at",
+        "content_refs",
+        "content_sha256s",
+        "limitations",
+    ),
+    "RivalMechanismSet": (
+        "root_question_ref",
+        "mechanisms",
+        "predictions",
+        "falsifiers",
+        "conflicts",
+        "remaining_uncertainty",
+    ),
+    "ExperimentProposal": (
+        "mechanism_refs",
+        "decision_uncertainty",
+        "prediction",
+        "falsifier",
+        "controls",
+        "run_request",
+        "expected_information_gain",
+        "cost_bound",
+    ),
+    "RunEvidence": (
+        "run_ref",
+        "eval_refs",
+        "raw_refs",
+        "process_state",
+        "budget_used",
+    ),
+    "ObservationUpdate": (
+        "evidence_refs",
+        "strengthened",
+        "weakened",
+        "eliminated",
+        "counterexamples",
+        "negative_results",
+        "remaining_uncertainty",
+        "next_action_rationale",
+    ),
+    "FrozenEvidencePacket": (
+        "task_brief_ref",
+        "preregistration_ref",
+        "commit",
+        "source_refs",
+        "raw_refs",
+        "reproduction_ref",
+    ),
+    "ReviewerReport": (
+        "reproduction_refs",
+        "alternative_explanations",
+        "leakage_findings",
+        "statistical_findings",
+        "scope_objections",
+        "fatal_objections",
+        "unresolved_objections",
+    ),
+    "AdjudicatedEvidence": (
+        "claim_draft_ref",
+        "evidence_refs",
+        "review_ref",
+        "principal_response_ref",
+    ),
+    "ClaimPackage": (
+        "claim",
+        "scope",
+        "evidence_refs",
+        "counterevidence",
+        "reproduction_commands",
+        "limitations",
+        "remaining_uncertainty",
+        "review_objections",
+    ),
+}
+EXPECTED_PROCEDURES = {
+    "aros-source-research": (
+        "ResearchQuestion",
+        "SourcePacket",
+        ("Source.read", "Source.search"),
+    ),
+    "aros-rival-mechanisms": (
+        "SourcePacket",
+        "RivalMechanismSet",
+        ("Git.read", "Receipt.read", "Research.observe"),
+    ),
+    "aros-experiment-design": (
+        "RivalMechanismSet",
+        "ExperimentProposal",
+        ("Receipt.read", "Research.observe", "Research.petition"),
+    ),
+    "aros-evidence-update": (
+        "RunEvidence",
+        "ObservationUpdate",
+        (
+            "Run.status",
+            "Eval.run",
+            "Receipt.read",
+            "Research.observe",
+            "Research.checkpoint",
+        ),
+    ),
+    "aros-independent-review": (
+        "FrozenEvidencePacket",
+        "ReviewerReport",
+        (
+            "Source.read",
+            "Run.request",
+            "Run.status",
+            "Eval.run",
+            "Receipt.read",
+            "Git.read",
+        ),
+    ),
+    "aros-claim-package": (
+        "AdjudicatedEvidence",
+        "ClaimPackage",
+        ("Source.read", "Receipt.read", "Git.read", "Research.checkpoint"),
+    ),
 }
 
 
@@ -369,3 +513,309 @@ def test_source_commit_check_rejects_tree_oid() -> None:
 
     with pytest.raises(AssertionError, match="commit"):
         _assert_commit_object(ROOT, tree_oid)
+
+
+def _contract_module():
+    if not CONTRACTS_PATH.is_file():
+        pytest.skip("canonical contract file is not implemented")
+    return importlib.import_module("commissioning.research_program.validate")
+
+
+def _contract_candidate(tmp_path: Path) -> tuple[object, dict[str, object], Path]:
+    module = _contract_module()
+    value = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    path = tmp_path / "procedure_contracts.json"
+    return module, value, path
+
+
+def _write_contract_candidate(path: Path, value: object) -> None:
+    path.write_text(
+        json.dumps(value, allow_nan=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def test_contract_file_exists() -> None:
+    assert CONTRACTS_PATH.is_file()
+
+
+def test_contract_set_has_exact_canonical_values() -> None:
+    module = _contract_module()
+    contracts = module.load_contracts(CONTRACTS_PATH)
+
+    assert type(contracts.schema_version) is int
+    assert contracts.schema_version == 1
+    assert contracts.allowed_tools == EXPECTED_ALLOWED_TOOLS
+    assert dict(contracts.artifacts) == EXPECTED_ARTIFACTS
+    assert tuple(contracts.procedures) == tuple(EXPECTED_PROCEDURES)
+    for name, (input_name, output_name, tools) in EXPECTED_PROCEDURES.items():
+        procedure = contracts.procedures[name]
+        assert isinstance(procedure, module.ProcedureContract)
+        assert procedure.input == input_name
+        assert procedure.output == output_name
+        assert procedure.tools == tools
+
+
+def test_contract_json_has_exact_container_shapes() -> None:
+    _contract_module()
+    value = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
+
+    assert list(value) == ["schema_version", "allowed_tools", "artifacts", "procedures"]
+    assert isinstance(value["allowed_tools"], list)
+    assert list(value["artifacts"]) == list(EXPECTED_ARTIFACTS)
+    for name, required_fields in value["artifacts"].items():
+        assert isinstance(required_fields, list), name
+    assert list(value["procedures"]) == list(EXPECTED_PROCEDURES)
+    for procedure in value["procedures"].values():
+        assert list(procedure) == ["input", "output", "tools"]
+        assert isinstance(procedure["tools"], list)
+
+
+def test_contract_results_are_recursively_immutable() -> None:
+    module = _contract_module()
+    contracts = module.load_contracts(CONTRACTS_PATH)
+    procedure = contracts.procedures["aros-source-research"]
+
+    with pytest.raises(FrozenInstanceError):
+        contracts.schema_version = 2
+    with pytest.raises(FrozenInstanceError):
+        procedure.input = "OtherArtifact"
+    with pytest.raises(TypeError):
+        contracts.artifacts["ResearchQuestion"] = ()
+    with pytest.raises(TypeError):
+        contracts.procedures["new-procedure"] = procedure
+    with pytest.raises(TypeError):
+        contracts.artifacts["ResearchQuestion"][0] = "other"
+
+
+def test_contract_loader_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    module = _contract_module()
+    raw = CONTRACTS_PATH.read_text(encoding="utf-8")
+    duplicate = raw.replace(
+        '"schema_version": 1,',
+        '"schema_version": 1,\n  "schema_version": 1,',
+        1,
+    )
+    path = tmp_path / "duplicate.json"
+    path.write_text(duplicate, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate"):
+        module.load_contracts(path)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_contract_loader_rejects_non_finite_json(
+    tmp_path: Path, constant: str
+) -> None:
+    module = _contract_module()
+    raw = CONTRACTS_PATH.read_text(encoding="utf-8")
+    candidate = raw.replace(
+        '"schema_version": 1,',
+        f'"schema_version": 1,\n  "finite_probe": {constant},',
+        1,
+    )
+    path = tmp_path / "non-finite.json"
+    path.write_text(candidate, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="finite"):
+        module.load_contracts(path)
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        "score",
+        "ranking",
+        "pass",
+        "reward",
+        "objective",
+        "aggregate",
+        "acceptance_score",
+    ],
+)
+def test_contract_loader_recursively_rejects_forbidden_field_names(
+    tmp_path: Path, forbidden: str
+) -> None:
+    module, value, path = _contract_candidate(tmp_path)
+    procedures = value["procedures"]
+    assert isinstance(procedures, dict)
+    source_research = procedures["aros-source-research"]
+    assert isinstance(source_research, dict)
+    source_research["nested"] = {"deeper": {forbidden: 0}}
+    _write_contract_candidate(path, value)
+
+    with pytest.raises(ValueError, match=forbidden):
+        module.load_contracts(path)
+
+
+def test_contract_loader_requires_plain_schema_integer(tmp_path: Path) -> None:
+    module, value, path = _contract_candidate(tmp_path)
+    value["schema_version"] = True
+    _write_contract_candidate(path, value)
+
+    with pytest.raises(ValueError, match="schema_version"):
+        module.load_contracts(path)
+
+
+@pytest.mark.parametrize("section", ["top", "artifact", "procedure"])
+def test_contract_loader_rejects_unknown_fields(
+    tmp_path: Path, section: str
+) -> None:
+    module, value, path = _contract_candidate(tmp_path)
+    if section == "top":
+        value["unknown"] = None
+    elif section == "artifact":
+        artifacts = value["artifacts"]
+        assert isinstance(artifacts, dict)
+        artifacts["UnknownArtifact"] = ["field"]
+    else:
+        procedures = value["procedures"]
+        assert isinstance(procedures, dict)
+        procedure = procedures["aros-source-research"]
+        assert isinstance(procedure, dict)
+        procedure["unknown"] = None
+    _write_contract_candidate(path, value)
+
+    with pytest.raises(ValueError, match="unknown"):
+        module.load_contracts(path)
+
+
+@pytest.mark.parametrize("section", ["allowed_tools", "artifact", "procedure_tools"])
+def test_contract_loader_requires_exact_duplicate_free_lists(
+    tmp_path: Path, section: str
+) -> None:
+    module, value, path = _contract_candidate(tmp_path)
+    if section == "allowed_tools":
+        values = value["allowed_tools"]
+    elif section == "artifact":
+        artifacts = value["artifacts"]
+        assert isinstance(artifacts, dict)
+        values = artifacts["ResearchQuestion"]
+    else:
+        procedures = value["procedures"]
+        assert isinstance(procedures, dict)
+        procedure = procedures["aros-source-research"]
+        assert isinstance(procedure, dict)
+        values = procedure["tools"]
+    assert isinstance(values, list)
+    values.append(values[0])
+    _write_contract_candidate(path, value)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        module.load_contracts(path)
+
+
+@pytest.mark.parametrize("reference", ["input", "output", "tool"])
+def test_contract_loader_rejects_unknown_references(
+    tmp_path: Path, reference: str
+) -> None:
+    module, value, path = _contract_candidate(tmp_path)
+    procedures = value["procedures"]
+    assert isinstance(procedures, dict)
+    procedure = procedures["aros-source-research"]
+    assert isinstance(procedure, dict)
+    if reference == "input":
+        procedure["input"] = "UnknownArtifact"
+    elif reference == "output":
+        procedure["output"] = "UnknownArtifact"
+    else:
+        tools = procedure["tools"]
+        assert isinstance(tools, list)
+        tools[0] = "Unknown.tool"
+    _write_contract_candidate(path, value)
+
+    with pytest.raises(ValueError, match="unknown"):
+        module.load_contracts(path)
+
+
+@pytest.mark.parametrize("section", ["allowed_tools", "artifact", "procedure_tools"])
+def test_contract_loader_rejects_non_list_collections(
+    tmp_path: Path, section: str
+) -> None:
+    module, value, path = _contract_candidate(tmp_path)
+    if section == "allowed_tools":
+        value["allowed_tools"] = "Source.read"
+    elif section == "artifact":
+        artifacts = value["artifacts"]
+        assert isinstance(artifacts, dict)
+        artifacts["ResearchQuestion"] = "question_ref"
+    else:
+        procedures = value["procedures"]
+        assert isinstance(procedures, dict)
+        procedure = procedures["aros-source-research"]
+        assert isinstance(procedure, dict)
+        procedure["tools"] = "Source.read"
+    _write_contract_candidate(path, value)
+
+    with pytest.raises(ValueError, match="list"):
+        module.load_contracts(path)
+
+
+def test_contract_loader_rejects_symlink_non_utf8_and_oversize(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    linked = tmp_path / "linked.json"
+    linked.symlink_to(CONTRACTS_PATH)
+    invalid_utf8 = tmp_path / "invalid-utf8.json"
+    invalid_utf8.write_bytes(b"\xff")
+    oversize = tmp_path / "oversize.json"
+    oversize.write_bytes(b" " * (128 * 1024 + 1))
+
+    with pytest.raises(ValueError, match="regular file"):
+        module.load_contracts(tmp_path)
+    with pytest.raises(ValueError, match="symlink"):
+        module.load_contracts(linked)
+    with pytest.raises(ValueError, match="UTF-8"):
+        module.load_contracts(invalid_utf8)
+    with pytest.raises(ValueError, match="128 KiB"):
+        module.load_contracts(oversize)
+
+
+def test_contract_loader_binds_single_read_to_lstat_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, value, path = _contract_candidate(tmp_path)
+    _write_contract_candidate(path, value)
+    replacement = path.read_bytes()
+    real_open = os.open
+
+    def replacing_open(candidate: object, flags: int) -> int:
+        path.unlink()
+        path.write_bytes(replacement)
+        return real_open(candidate, flags)
+
+    monkeypatch.setattr(module.os, "open", replacing_open)
+
+    with pytest.raises(ValueError, match="identity"):
+        module.load_contracts(path)
+
+
+def test_contract_loader_uses_only_standard_library_imports() -> None:
+    _contract_module()
+    validate_path = PROGRAM_ROOT / "validate.py"
+    tree = ast.parse(validate_path.read_text(encoding="utf-8"))
+    imports = {
+        alias.name.split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imports.update(
+        node.module.split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    )
+
+    assert imports <= {
+        "__future__",
+        "dataclasses",
+        "json",
+        "math",
+        "os",
+        "pathlib",
+        "stat",
+        "types",
+        "typing",
+    }

@@ -57,6 +57,9 @@ RESEARCH_PROCEDURE_WAVE1_TESTS = {
     "tests/test_aros_architecture_boundary.py",
     "tests/test_aros_research_procedure_core.py",
 }
+RESEARCH_PROCEDURE_WAVE1_PLAN = (
+    "docs/superpowers/plans/2026-08-09-aros-research-procedure-core.md"
+)
 
 
 def _assert_research_procedure_wave1_changes(name_status: str) -> None:
@@ -70,9 +73,34 @@ def _assert_research_procedure_wave1_changes(name_status: str) -> None:
         assert not path.startswith("src/aros/"), (
             f"Wave 1 must not change runtime architecture: {line!r}"
         )
-        assert path.startswith("commissioning/research_program/") or path in (
-            RESEARCH_PROCEDURE_WAVE1_TESTS
+        assert (
+            path.startswith("commissioning/research_program/")
+            or path in RESEARCH_PROCEDURE_WAVE1_TESTS
+            or path == RESEARCH_PROCEDURE_WAVE1_PLAN
         ), f"path is outside the research procedure Wave 1 boundary: {line!r}"
+
+
+def _research_procedure_wave1_name_status(
+    repository: Path, baseline: str, head: str = "HEAD"
+) -> str:
+    environment = os.environ.copy()
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    completed = subprocess.run(
+        [
+            "git",
+            "--no-replace-objects",
+            "diff",
+            "--name-status",
+            "--no-renames",
+            f"{baseline}..{head}",
+        ],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        env=environment,
+        text=True,
+    )
+    return completed.stdout
 
 
 def _configured_package_path(package: str, package_dirs: dict[str, str]) -> Path:
@@ -2730,21 +2758,11 @@ def test_cache_campaign_boundary_detects_deleted_aros_source(tmp_path: Path) -> 
 
 
 def test_research_procedure_wave1_changes_stay_inside_static_boundary() -> None:
-    completed = subprocess.run(
-        [
-            "git",
-            "diff",
-            "--name-status",
-            "--no-renames",
-            f"{RESEARCH_PROCEDURE_WAVE1_BASE}..HEAD",
-        ],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
+    name_status = _research_procedure_wave1_name_status(
+        REPO_ROOT, RESEARCH_PROCEDURE_WAVE1_BASE
     )
 
-    _assert_research_procedure_wave1_changes(completed.stdout)
+    _assert_research_procedure_wave1_changes(name_status)
 
 
 @pytest.mark.parametrize("status_code", ["A", "M", "D"])
@@ -2755,3 +2773,45 @@ def test_research_procedure_wave1_boundary_has_no_status_bypass(
         _assert_research_procedure_wave1_changes(
             f"{status_code}\tsrc/aros/procedure_runtime.py\n"
         )
+
+
+def test_research_procedure_wave1_boundary_ignores_replace_objects(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "boundary@example.invalid")
+    _git(repository, "config", "user.name", "Boundary Test")
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "base")
+    baseline = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    runtime = repository / "src/aros/replaced.py"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("value = 1\n", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "runtime change")
+    head = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    _git(repository, "replace", baseline, head)
+    hidden = _git(
+        repository,
+        "diff",
+        "--name-status",
+        "--no-renames",
+        f"{baseline}..{head}",
+    ).stdout
+    assert hidden == ""
+
+    name_status = _research_procedure_wave1_name_status(
+        repository, baseline, head
+    )
+
+    with pytest.raises(AssertionError, match="runtime architecture"):
+        _assert_research_procedure_wave1_changes(name_status)
+
+
+def test_research_procedure_wave1_boundary_allows_exact_plan_correction() -> None:
+    _assert_research_procedure_wave1_changes(
+        "M\tdocs/superpowers/plans/2026-08-09-aros-research-procedure-core.md\n"
+    )

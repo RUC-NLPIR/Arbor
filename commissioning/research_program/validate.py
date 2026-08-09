@@ -717,6 +717,7 @@ def _normative_units(section: str) -> tuple[str, ...]:
 _RUNTIME_ACTION_PATTERNS = (
     r"\bshell\b",
     r"\bbash\b",
+    r"\b(?:ba|z)?sh\s+-c\b",
     r"\bsubprocess\b",
     r"\bssh\b",
     r"\bremote\b",
@@ -738,8 +739,15 @@ _RUNTIME_ACTION_PATTERNS = (
     r"\brank(?:s|ed|ing)?\b",
     r"\bpass threshold\b",
     r"\bfixed[- ]round\b",
+    r"\b(?:[0-9]+|zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+    r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|"
+    r"thousand)\s+(?:rounds?|iterations?|cycles?)\b",
     r"\bwinner\b",
-    r"\bautomatic(?:ally)? select(?:s|ed|ing)?\b",
+    r"\b(?:auto|automatic|automatically)[- ]+(?:choose|chooses|chose|chosen|"
+    r"choosing|select|selects|selected|selecting|pick|picks|picked|picking)\b",
+    r"\b(?:choose|chooses|chose|chosen|choosing|select|selects|selected|selecting|"
+    r"pick|picks|picked|picking)\b.{0,80}\b(?:auto|automatic|automatically)\b",
     r"\b(?:execute|run|launch|start|request)(?:s|ed|ing)? "
     r"(?:an? |the )?(?:experiment|evaluation)\b",
     r"```(?:sh|zsh|fish|powershell|console)\b",

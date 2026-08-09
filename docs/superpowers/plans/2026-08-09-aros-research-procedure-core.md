@@ -164,10 +164,10 @@ Artifact required fields are exactly those in Design §11. Procedure tools are:
 ```json
 {
   "aros-source-research": ["Source.read", "Source.search"],
-  "aros-rival-mechanisms": ["Git.read", "Receipt.read", "Research.observe"],
+  "aros-rival-mechanisms": ["Git.read", "Receipt.read", "Research.observe", "Research.petition"],
   "aros-experiment-design": ["Receipt.read", "Research.observe", "Research.petition"],
-  "aros-evidence-update": ["Run.status", "Eval.run", "Receipt.read", "Research.observe", "Research.checkpoint"],
-  "aros-independent-review": ["Source.read", "Run.request", "Run.status", "Eval.run", "Receipt.read", "Git.read"],
+  "aros-evidence-update": ["Run.status", "Receipt.read", "Git.read", "Research.observe", "Research.checkpoint"],
+  "aros-independent-review": ["Source.read", "Run.request", "Run.status", "Eval.run", "Receipt.read", "Git.read", "Research.petition"],
   "aros-claim-package": ["Source.read", "Receipt.read", "Git.read", "Research.checkpoint"]
 }
 ```

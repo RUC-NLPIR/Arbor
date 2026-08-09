@@ -3957,6 +3957,68 @@ def test_program_validator_rejects_runtime_authority_granted_by_method(
 @pytest.mark.parametrize(
     "grant",
     [
+        "Use sh -c to perform the experiment.",
+        "Use bash -c to perform the experiment.",
+        "Use zsh -c to perform the experiment.",
+        "Use a shell command to perform the experiment.",
+        "Use a subprocess to perform the experiment.",
+        "Use exactly ten rounds before stopping.",
+        "Use a fixed 10 rounds before stopping.",
+        "Use four iterations before stopping.",
+        "Use 3 cycles before stopping.",
+        "Use thirty rounds before stopping.",
+        "Use one hundred and ten cycles before stopping.",
+        "Choose the best pilot result automatically.",
+        "Automatically select the top result.",
+        "Automatically pick the best pilot.",
+        "Automatically choose a winner.",
+        "Auto choose the best pilot result.",
+        "Auto-pick the best pilot result.",
+        "Automatically choosing the top result is required.",
+        "The best pilot was chosen automatically.",
+    ],
+)
+def test_program_validator_rejects_shell_fixed_round_and_auto_choice_variants(
+    tmp_path: Path, grant: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-experiment-design.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(
+        text.replace("\n## Output\n", f"\n7. {grant}\n\n## Output\n", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="forbidden runtime authority"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize(
+    "prohibition",
+    [
+        "Do not use sh -c to perform the experiment.",
+        "Do not use exactly ten rounds before stopping.",
+        "Do not use thirty rounds before stopping.",
+        "Do not choose the best pilot result automatically.",
+        "Do not auto-pick the best pilot result.",
+    ],
+)
+def test_program_validator_allows_direct_new_runtime_prohibitions(
+    tmp_path: Path, prohibition: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-experiment-design.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(f"{text.rstrip()}\n- {prohibition}\n", encoding="utf-8")
+
+    assert module.validate_program(program)["state"] == "valid"
+
+
+@pytest.mark.parametrize(
+    "grant",
+    [
         "Use Bash to run the experiment.\n\n",
         "Compute a numeric score and rank the highest result first.\n\n",
     ],

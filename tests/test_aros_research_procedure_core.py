@@ -13,28 +13,68 @@ ROOT = Path(__file__).resolve().parent.parent
 PROGRAM_ROOT = ROOT / "commissioning/research_program"
 SOURCES_PATH = PROGRAM_ROOT / "SOURCES.json"
 UPSTREAM_PRODUCT_NAMES = ("claude", "gemini")
-SOURCE_KEYS = {
-    "id",
-    "repository",
-    "commit",
-    "license",
-    "selected_paths",
-    "adaptation",
-}
-EXPECTED_LICENSES = {
-    "source-1": "MIT",
-    "source-2": "Apache-2.0",
-}
-EXPECTED_ADAPTATIONS = {
-    "source-1": (
-        "Distill scientific procedures, durable recovery, cadence, and fresh review; "
-        "remove scoring, paper production, remote execution, and duplicate orchestration."
-    ),
-    "source-2": (
-        "Distill mechanism framing, deterministic tool boundaries, search, and durable "
-        "handoff; remove tree authority, scalar evaluation, merge gates, and duplicate "
-        "session state."
-    ),
+SOURCE_RECORD_SUFFIXES = {".json", ".jsonl", ".yaml", ".yml", ".md"}
+RUNTIME_SOURCE_SUFFIXES = {".json", ".md", ".py"}
+RUNTIME_ARTIFACT_PARTS = {"__pycache__", "build"}
+APPROVED_SOURCE_RECORD = {
+    "schema_version": 1,
+    "sources": [
+        {
+            "id": "source-1",
+            "repository": "/workspace/Auto-claude-code-research-in-sleep",
+            "commit": "df729a3f942e4a97646d212eb8aee1144ab5e31b",
+            "license": "MIT",
+            "selected_paths": [
+                "skills/research-lit/SKILL.md",
+                "skills/novelty-check/SKILL.md",
+                "skills/citation-audit/SKILL.md",
+                "skills/idea-creator/SKILL.md",
+                "skills/research-refine/SKILL.md",
+                "skills/experiment-plan/SKILL.md",
+                "skills/ablation-planner/SKILL.md",
+                "skills/analyze-results/SKILL.md",
+                "skills/research-wiki/SKILL.md",
+                "skills/research-review/SKILL.md",
+                "skills/experiment-audit/SKILL.md",
+                "skills/integrity-forensics/SKILL.md",
+                "skills/result-to-claim/SKILL.md",
+                "skills/claims-drafting/SKILL.md",
+                "skills/shared-references/external-cadence.md",
+                "skills/shared-references/reviewer-independence.md",
+                "mcp-servers/claude-review/server.py",
+                "mcp-servers/gemini-review/server.py",
+                "mcp-servers/manual-review/server.py",
+            ],
+            "adaptation": (
+                "Distill scientific procedures, durable recovery, cadence, and fresh "
+                "review; remove scoring, paper production, remote execution, and "
+                "duplicate orchestration."
+            ),
+        },
+        {
+            "id": "source-2",
+            "repository": (
+                "/workspace/Arbor/.worktree/aros-long-running-research-program-design"
+            ),
+            "commit": "e9c58c998767dd87bdea99a727533819850ac281",
+            "license": "Apache-2.0",
+            "selected_paths": [
+                "skills/arbor-agent-setup-intake/SKILL.md",
+                "skills/arbor-agent-ideate/SKILL.md",
+                "skills/arbor-agent-executor/SKILL.md",
+                "skills/arbor-agent-search/SKILL.md",
+                "skills/arbor-agent-resume-report/SKILL.md",
+                "skills/arbor-agent-tools/SKILL.md",
+                "src/mcp/server.py",
+                "src/mcp/session_ops.py",
+            ],
+            "adaptation": (
+                "Distill mechanism framing, deterministic tool boundaries, search, and "
+                "durable handoff; remove tree authority, scalar evaluation, merge gates, "
+                "and duplicate session state."
+            ),
+        },
+    ],
 }
 
 
@@ -56,6 +96,10 @@ def _load_source_record() -> dict[str, object]:
     return value
 
 
+def _assert_approved_source_record(record: dict[str, object]) -> None:
+    assert record == APPROVED_SOURCE_RECORD
+
+
 def _git(repository: Path, *arguments: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repository), *arguments],
@@ -65,20 +109,28 @@ def _git(repository: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
+def _assert_commit_object(repository: Path, commit: object) -> None:
+    assert isinstance(commit, str)
+    assert re.fullmatch(r"[0-9a-f]{40}", commit)
+    assert _git(repository, "rev-parse", commit) == commit
+    assert _git(repository, "cat-file", "-t", commit) == "commit", (
+        "source object must be a commit"
+    )
+
+
 def _is_source_or_provenance_record(program_root: Path, path: Path) -> bool:
     relative = path.relative_to(program_root)
-    if path.name.casefold() == "sources.json":
-        return True
-    for index, component in enumerate(relative.parts):
-        candidate = (
-            Path(component).stem if index == len(relative.parts) - 1 else component
-        )
-        tokens = [
-            token for token in re.split(r"[^a-z0-9]+", candidate.casefold()) if token
-        ]
-        if "provenance" in tokens:
+    if path.suffix.casefold() not in SOURCE_RECORD_SUFFIXES:
+        return False
+    if relative.as_posix().casefold() == "procedures/aros-source-research.md":
+        return False
+    candidates = (*relative.parts[:-1], path.stem)
+    for candidate in candidates:
+        folded = candidate.casefold()
+        tokens = [token for token in re.split(r"[^a-z0-9]+", folded) if token]
+        if folded.startswith("provenance"):
             return True
-        if any(pair == ("source", "record") for pair in zip(tokens, tokens[1:])):
+        if tokens and tokens[0] in {"source", "sources"}:
             return True
     return False
 
@@ -98,12 +150,20 @@ def _assert_sole_source_or_provenance_record(
 
 def _assert_no_upstream_product_names(program_root: Path, sources_path: Path) -> None:
     for path in program_root.rglob("*"):
-        relative_name = path.relative_to(program_root).as_posix().casefold()
+        relative = path.relative_to(program_root)
+        if not path.is_file() or path.suffix.casefold() not in RUNTIME_SOURCE_SUFFIXES:
+            continue
+        folded_parts = tuple(part.casefold() for part in relative.parts)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        if any(part in RUNTIME_ARTIFACT_PARTS for part in folded_parts):
+            continue
+        relative_name = relative.as_posix().casefold()
         for upstream_name in UPSTREAM_PRODUCT_NAMES:
             assert upstream_name not in relative_name, (
                 f"upstream product name {upstream_name!r} in path {path}"
             )
-        if path.is_file() and path != sources_path:
+        if path != sources_path:
             content = path.read_bytes().lower()
             for upstream_name in UPSTREAM_PRODUCT_NAMES:
                 assert upstream_name.encode() not in content, (
@@ -124,18 +184,14 @@ def test_source_schema_versions_are_exact_int_one() -> None:
 
 def test_source_record_binds_exact_sources_and_adaptations() -> None:
     record = _load_source_record()
+    _assert_approved_source_record(record)
     sources = record["sources"]
     assert isinstance(sources, list)
-    assert [source["id"] for source in sources] == ["source-1", "source-2"]
 
     for source in sources:
         assert isinstance(source, dict)
-        assert set(source) == SOURCE_KEYS
-        source_id = source["id"]
-        assert source["license"] == EXPECTED_LICENSES[source_id]
         adaptation = source["adaptation"]
         assert isinstance(adaptation, str)
-        assert adaptation == EXPECTED_ADAPTATIONS[source_id]
         assert adaptation == adaptation.strip()
         assert 1 <= len(adaptation) <= 256
 
@@ -158,9 +214,7 @@ def test_source_repositories_commits_and_selected_paths_are_real() -> None:
         assert git_directory.is_dir()
 
         commit = source["commit"]
-        assert isinstance(commit, str)
-        assert re.fullmatch(r"[0-9a-f]{40}", commit)
-        assert _git(repository, "rev-parse", commit) == commit
+        _assert_commit_object(repository, commit)
 
         selected_paths = source["selected_paths"]
         assert isinstance(selected_paths, list)
@@ -195,7 +249,10 @@ def test_source_record_scan_allows_runtime_source_procedure(tmp_path: Path) -> N
     procedure = program_root / "procedures/aros-source-research.md"
     procedure.parent.mkdir(parents=True)
     sources_path.write_text("{}\n", encoding="utf-8")
-    procedure.write_text("# Runtime procedure\n", encoding="utf-8")
+    procedure.write_text(
+        "# Source research\n\nScientific source and provenance analysis.\n",
+        encoding="utf-8",
+    )
 
     _assert_sole_source_or_provenance_record(program_root, sources_path)
 
@@ -208,6 +265,11 @@ def test_source_record_scan_allows_runtime_source_procedure(tmp_path: Path) -> N
         "provenance/record.json",
         "source-record/record.json",
         "duplicate/SOURCES.json",
+        "source.json",
+        "SOURCES-v2.JSONL",
+        "source/record.YAML",
+        "Provenance-notes.YML",
+        "PROVENANCE.MD",
     ],
 )
 def test_source_record_scan_rejects_second_record_location(
@@ -222,6 +284,19 @@ def test_source_record_scan_rejects_second_record_location(
 
     with pytest.raises(AssertionError, match="source or provenance record"):
         _assert_sole_source_or_provenance_record(program_root, sources_path)
+
+
+def test_source_record_scan_ignores_scientific_content(tmp_path: Path) -> None:
+    program_root = tmp_path / "research_program"
+    sources_path = program_root / "SOURCES.json"
+    notes = program_root / "procedures/resource-analysis.md"
+    notes.parent.mkdir(parents=True)
+    sources_path.write_text("{}\n", encoding="utf-8")
+    notes.write_text(
+        "Analyze scientific sources and provenance evidence.\n", encoding="utf-8"
+    )
+
+    _assert_sole_source_or_provenance_record(program_root, sources_path)
 
 
 @pytest.mark.parametrize("upstream_name", UPSTREAM_PRODUCT_NAMES)
@@ -251,3 +326,38 @@ def test_source_runtime_name_scan_allows_sources_json_bytes(tmp_path: Path) -> N
     sources_path.write_text("ClAuDe and GeMiNi\n", encoding="utf-8")
 
     _assert_no_upstream_product_names(program_root, sources_path)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["__pycache__/cache.pyc", ".hidden.py", "build/generated.py"],
+)
+def test_source_runtime_name_scan_ignores_artifacts(
+    tmp_path: Path, relative_path: str
+) -> None:
+    program_root = tmp_path / "research_program"
+    sources_path = program_root / "SOURCES.json"
+    artifact = program_root / relative_path
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    sources_path.write_text("{}\n", encoding="utf-8")
+    artifact.write_bytes(b"CLAUDE and GEMINI\n")
+
+    _assert_no_upstream_product_names(program_root, sources_path)
+
+
+def test_source_approved_record_rejects_value_drift() -> None:
+    record = _load_source_record()
+    sources = record["sources"]
+    assert isinstance(sources, list)
+    sources[0]["repository"] = "/unapproved/repository"
+
+    with pytest.raises(AssertionError):
+        _assert_approved_source_record(record)
+
+
+def test_source_commit_check_rejects_tree_oid() -> None:
+    tree_oid = _git(ROOT, "rev-parse", "HEAD^{tree}")
+    assert re.fullmatch(r"[0-9a-f]{40}", tree_oid)
+
+    with pytest.raises(AssertionError, match="commit"):
+        _assert_commit_object(ROOT, tree_oid)

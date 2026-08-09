@@ -850,7 +850,7 @@ def test_release_build_failure_leaves_dependent_facts_not_measured(
     assert receipt["measured_metadata"] is None
 
 
-def test_malformed_probe_output_is_not_a_scientific_negative(
+def test_executed_malformed_metadata_is_false_but_capacity_is_unmeasured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner = FakeRun()
@@ -858,8 +858,82 @@ def test_malformed_probe_output_is_not_a_scientific_negative(
     runner.metadata_output = b"not a metadata measurement\n"
     receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, runner)
     assert receipt["checks"]["capacity"] is None
-    assert receipt["checks"]["metadata_probe"] is None
+    assert receipt["checks"]["metadata_probe"] is False
     assert receipt["capacity_measurement"] is None
+    assert receipt["measured_metadata"] is None
+
+
+@pytest.mark.parametrize(
+    "metadata_output",
+    [
+        (
+            b"global_metadata_bytes=24\n"
+            b"sample=1000 live_bytes=23 resident_objects=1000\n"
+            b"sample=5000 live_bytes=10024 resident_objects=5000\n"
+            b"sample=10000 live_bytes=30024 resident_objects=10000\n"
+            b"status=ok\n"
+        ),
+        (
+            b"global_metadata_bytes=24\n"
+            b"sample=1000 live_bytes=1024 resident_objects=0\n"
+            b"sample=5000 live_bytes=10024 resident_objects=5000\n"
+            b"sample=10000 live_bytes=30024 resident_objects=10000\n"
+            b"status=ok\n"
+        ),
+    ],
+    ids=["negative-live-delta", "zero-resident"],
+)
+def test_executed_invalid_metadata_accounting_is_false(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_output: bytes,
+) -> None:
+    runner = FakeRun()
+    runner.metadata_output = metadata_output
+    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, runner)
+    assert receipt["checks"]["metadata_probe"] is False
+    assert receipt["measured_metadata"] is None
+
+
+def test_nonzero_probe_with_conclusive_invalid_accounting_is_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class InvalidAccountingRun(FakeRun):
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            result = super().__call__(argv, output_dir, cwd=cwd)
+            if argv[0].endswith("metadata-probe"):
+                return replace(result, returncode=3)
+            return result
+
+    runner = InvalidAccountingRun()
+    runner.metadata_output = (
+        b"global_metadata_bytes=24\n"
+        b"sample=1000 live_bytes=23 resident_objects=1000\n"
+        b"sample=5000 live_bytes=10024 resident_objects=5000\n"
+        b"sample=10000 live_bytes=30024 resident_objects=10000\n"
+        b"status=ok\n"
+    )
+    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, runner)
+    assert receipt["checks"]["metadata_probe"] is False
+    assert receipt["measured_metadata"] is None
+
+
+def test_unavailable_metadata_probe_remains_not_measured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class MetadataTimeoutRun(FakeRun):
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            if argv[0].endswith("metadata-probe"):
+                self.commands.append(list(argv))
+                raise subprocess.TimeoutExpired(argv, timeout=1)
+            return super().__call__(argv, output_dir, cwd=cwd)
+
+    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, MetadataTimeoutRun())
+    assert receipt["checks"]["metadata_probe"] is None
     assert receipt["measured_metadata"] is None
 
 

@@ -1761,17 +1761,18 @@ def evaluate_r0(
             and metadata_compile.ok
             and metadata_binary_identity is not None
         )
-        if metadata_prerequisites and metadata_run.ok:
+        if metadata_prerequisites and metadata_run.result is not None:
             try:
-                measured = parse_metadata_probe(metadata_run.stdout.decode("ascii"))
-                metadata_state = True
+                parsed_metadata = parse_metadata_probe(
+                    metadata_run.stdout.decode("ascii")
+                )
+                if metadata_run.result.returncode == 0:
+                    measured = parsed_metadata
+                    metadata_state = True
             except (UnicodeError, ValueError) as error:
                 errors.append(f"metadata probe: {_bounded(error)}")
-                if re.search(rb"(?:^|\n)status=(?!ok(?:\n|$))", metadata_run.stdout):
+                if metadata_run.result.returncode == 0 or metadata_run.stdout.strip():
                     metadata_state = False
-        elif metadata_prerequisites and metadata_run.result is not None:
-            if re.search(rb"(?:^|\n)status=(?!ok(?:\n|$))", metadata_run.stdout):
-                metadata_state = False
 
         expected_evidence = [
             trace_evidence,

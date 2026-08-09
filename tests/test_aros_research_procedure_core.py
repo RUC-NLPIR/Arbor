@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
@@ -3629,7 +3631,528 @@ def test_contract_loader_uses_only_standard_library_imports() -> None:
         "math",
         "os",
         "pathlib",
+        "re",
         "stat",
+        "subprocess",
         "types",
         "typing",
     }
+
+
+def _copied_program(tmp_path: Path) -> Path:
+    copied = tmp_path / "research_program"
+    shutil.copytree(
+        PROGRAM_ROOT,
+        copied,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    return copied
+
+
+def test_program_validator_returns_only_canonical_validation_identity(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+
+    result = module.validate_program(program)
+
+    sources = json.loads((program / "SOURCES.json").read_text(encoding="utf-8"))[
+        "sources"
+    ]
+    expected_sources = sorted(
+        ({"id": source["id"], "commit": source["commit"]} for source in sources),
+        key=lambda source: source["id"],
+    )
+    expected_procedures = [
+        {
+            "name": name,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "tools": list(EXPECTED_PROCEDURES[name][2]),
+        }
+        for name, path in sorted(
+            (path.stem, path) for path in (program / "procedures").glob("*.md")
+        )
+    ]
+    expected = {
+        "schema_version": 1,
+        "state": "valid",
+        "sources": expected_sources,
+        "contract_sha256": hashlib.sha256(
+            (program / "contracts/procedure_contracts.json").read_bytes()
+        ).hexdigest(),
+        "procedures": expected_procedures,
+    }
+    assert result == expected
+    assert not ({"score", "pass", "quality", "verdict"} & set(result))
+
+
+def test_program_validator_reads_contract_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    contract = program / "contracts/procedure_contracts.json"
+    real_open = os.open
+    contract_opens = 0
+
+    def counting_open(candidate: object, flags: int) -> int:
+        nonlocal contract_opens
+        if Path(candidate) == contract:
+            contract_opens += 1
+        return real_open(candidate, flags)
+
+    monkeypatch.setattr(module.os, "open", counting_open)
+
+    module.validate_program(program)
+
+    assert contract_opens == 1
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "target"),
+    [
+        ("SOURCES.json", SOURCES_PATH),
+        ("contracts", PROGRAM_ROOT / "contracts"),
+        ("procedures", PROCEDURES_ROOT),
+        (
+            "procedures/aros-source-research.md",
+            PROCEDURES_ROOT / "aros-source-research.md",
+        ),
+    ],
+)
+def test_program_validator_rejects_symlinked_program_paths(
+    tmp_path: Path, relative_path: str, target: Path
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    candidate = program / relative_path
+    if candidate.is_dir():
+        shutil.rmtree(candidate)
+    else:
+        candidate.unlink()
+    candidate.symlink_to(target, target_is_directory=target.is_dir())
+
+    with pytest.raises(ValueError, match="symlink"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize("payload", [b"\xff", b" " * (128 * 1024 + 1)])
+def test_program_validator_rejects_non_utf8_or_oversize_procedure(
+    tmp_path: Path, payload: bytes
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-source-research.md"
+    procedure.write_bytes(payload)
+
+    with pytest.raises(ValueError, match="UTF-8|128 KiB"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_unknown_procedure_filename(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    (program / "procedures/extra.md").write_text(
+        (program / "procedures/aros-source-research.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="exactly the six"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        ("name: aros-source-research", "name: renamed", "name"),
+        ("  - Source.search", "  - Git.read", "contract"),
+        ("source_ids:\n", "source_ids: source-1\n", "frontmatter"),
+        ("input: ResearchQuestion", "input: SourcePacket", "contract"),
+    ],
+)
+def test_program_validator_rejects_frontmatter_contract_drift(
+    tmp_path: Path, old: str, new: str, message: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-source-research.md"
+    text = procedure.read_text(encoding="utf-8")
+    assert old in text
+    procedure.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize(
+    "insertion",
+    [
+        "name: duplicate\n",
+        "unknown: value\n",
+        "tools: Git.read\n",
+    ],
+)
+def test_program_validator_rejects_duplicate_unknown_or_wrong_type_frontmatter(
+    tmp_path: Path, insertion: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-source-research.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(text.replace("---\n", f"---\n{insertion}", 1), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="frontmatter"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_reordered_or_duplicate_headings(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-rival-mechanisms.md"
+    text = procedure.read_text(encoding="utf-8")
+    text = text.replace("## Purpose", "## Temporary", 1)
+    text = text.replace("## Inputs", "## Purpose", 1)
+    text = text.replace("## Temporary", "## Inputs", 1)
+    procedure.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="headings"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_duplicate_source_json_key(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources = program / "SOURCES.json"
+    text = sources.read_text(encoding="utf-8")
+    sources.write_text(
+        text.replace(
+            '"schema_version": 1,',
+            '"schema_version": 1,\n  "schema_version": 1,',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_duplicate_source_id(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources_path = program / "SOURCES.json"
+    sources = json.loads(sources_path.read_text(encoding="utf-8"))
+    sources["sources"][1]["id"] = sources["sources"][0]["id"]
+    sources_path.write_text(json.dumps(sources), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate source id"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize("mutation", ["tree", "directory", "duplicate_path"])
+def test_program_validator_verifies_source_commits_and_blobs(
+    tmp_path: Path, mutation: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources_path = program / "SOURCES.json"
+    value = json.loads(sources_path.read_text(encoding="utf-8"))
+    source = value["sources"][0]
+    repository = Path(source["repository"])
+    if mutation == "tree":
+        source["commit"] = _git(repository, "rev-parse", f'{source["commit"]}^{{tree}}')
+    elif mutation == "directory":
+        source["selected_paths"][0] = "skills"
+    else:
+        source["selected_paths"].append(source["selected_paths"][0])
+    sources_path.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Git|commit|blob|duplicate"):
+        module.validate_program(program)
+
+
+def test_source_loader_ignores_git_replace_objects(tmp_path: Path) -> None:
+    module = _contract_module()
+    repository = tmp_path / "source-repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "source@example.invalid")
+    _git(repository, "config", "user.name", "Source Test")
+    (repository / "original.txt").write_text("original\n", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "original")
+    original_commit = _git(repository, "rev-parse", "HEAD")
+    (repository / "replacement-only.txt").write_text(
+        "replacement\n", encoding="utf-8"
+    )
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "replacement")
+    replacement_commit = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "replace", original_commit, replacement_commit)
+    sources_path = tmp_path / "SOURCES.json"
+    sources_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": [
+                    {
+                        "id": "source-1",
+                        "repository": str(repository),
+                        "commit": original_commit,
+                        "license": "MIT",
+                        "selected_paths": ["replacement-only.txt"],
+                        "adaptation": "Test replace-object isolation.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Git|blob"):
+        module.load_sources(sources_path)
+
+
+def test_program_validator_rejects_second_source_record(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    (program / "provenance.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source or provenance"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize(
+    "grant",
+    [
+        "Use Bash to execute the experiment directly.",
+        "Launch a subprocess for remote execution.",
+        "Submit the work to a job queue and upload the result.",
+        "Publish the result and merge it automatically.",
+        "Use scheduler authority to send notifications.",
+        "Use a score threshold and a fixed-round rule.",
+        "Compute a numeric score and rank the highest result first.",
+        "Automatically select a top winner.",
+    ],
+)
+def test_program_validator_rejects_runtime_authority_granted_by_method(
+    tmp_path: Path, grant: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-experiment-design.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(
+        text.replace("\n## Output\n", f"\n7. {grant}\n\n## Output\n", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="forbidden runtime authority"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize(
+    "grant",
+    [
+        "Use Bash to run the experiment.\n\n",
+        "Compute a numeric score and rank the highest result first.\n\n",
+    ],
+)
+def test_program_validator_rejects_authority_before_first_heading(
+    tmp_path: Path, grant: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-experiment-design.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(
+        text.replace("---\n\n## Purpose", f"---\n\n{grant}## Purpose", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="heading|forbidden runtime authority"):
+        module.validate_program(program)
+
+
+def test_program_validator_allows_prohibitions_but_rejects_reversed_polarity(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-experiment-design.md"
+    text = procedure.read_text(encoding="utf-8")
+    assert "Do not use a shell" in text
+    procedure.write_text(
+        text.replace("Do not use a shell", "Do not prohibit shell use", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="forbidden runtime authority|prohibitions"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_grant_after_prohibition_in_same_rule(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-experiment-design.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(
+        text.replace(
+            "Do not use a shell, subprocess, SSH, remote execution, job queue, upload, or\n"
+            "  notification service.",
+            "Do not use a shell. Use Bash to execute the experiment.",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="forbidden runtime authority"):
+        module.validate_program(program)
+
+
+def test_program_validator_does_not_borrow_unrelated_negative_polarity(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-experiment-design.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(
+        text.replace(
+            "\n## Output\n",
+            "\n7. Proceed without delay and use Bash to execute the experiment.\n"
+            "\n## Output\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="forbidden runtime authority"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize(
+    "grant",
+    [
+        "Do not hesitate to use Bash to execute the experiment.",
+        "It is not an error to use Bash to execute the experiment.",
+        "Do not use delays while Bash is authorized for direct work.",
+        "Do not use delays, Bash is permitted for direct work.",
+    ],
+)
+def test_program_validator_rejects_negation_complement_grants(
+    tmp_path: Path, grant: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-experiment-design.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(
+        text.replace("\n## Output\n", f"\n7. {grant}\n\n## Output\n", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="forbidden runtime authority"):
+        module.validate_program(program)
+
+
+def test_program_validator_keeps_exact_source_details_only_in_sources(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources = json.loads((program / "SOURCES.json").read_text(encoding="utf-8"))
+    leaked_commit = sources["sources"][0]["commit"]
+    procedure = program / "procedures/aros-source-research.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(
+        text.replace(
+            "Build an auditable",
+            f"Inspect source commit {leaked_commit} and build an auditable",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="source details"):
+        module.validate_program(program)
+
+
+def test_program_validator_scans_yaml_for_source_detail_leaks(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources = json.loads((program / "SOURCES.json").read_text(encoding="utf-8"))
+    leaked_commit = sources["sources"][0]["commit"]
+    (program / "notes.yaml").write_text(
+        f"source_commit: {leaked_commit}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="source details"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize("suffix", [".toml", ".bin"])
+def test_program_validator_scans_every_file_for_source_detail_leaks(
+    tmp_path: Path, suffix: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources = json.loads((program / "SOURCES.json").read_text(encoding="utf-8"))
+    leaked_commit = sources["sources"][0]["commit"]
+    (program / f"notes{suffix}").write_bytes(leaked_commit.encode())
+
+    with pytest.raises(ValueError, match="source details"):
+        module.validate_program(program)
+
+
+def test_program_validator_errors_are_bounded(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources_path = program / "SOURCES.json"
+    oversized_key = "x" * 100_000
+    sources_path.write_text(
+        json.dumps({"schema_version": 1, "sources": [], oversized_key: None}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as error:
+        module.validate_program(program)
+
+    assert len(str(error.value)) <= 512
+
+
+def test_program_validator_path_errors_are_bounded(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    directory = program
+    for index in range(15):
+        directory /= f"{index:02d}-" + "x" * 190
+        directory.mkdir()
+    (directory / "linked").symlink_to(SOURCES_PATH)
+
+    with pytest.raises(ValueError) as error:
+        module.validate_program(program)
+
+    assert len(str(error.value)) <= 512
+
+
+@pytest.mark.parametrize("upstream_name", UPSTREAM_PRODUCT_NAMES)
+def test_program_validator_allows_upstream_names_only_in_sources(
+    tmp_path: Path, upstream_name: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-source-research.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(
+        text.replace("Build an auditable", f"Use {upstream_name} to build an auditable", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="upstream product name"):
+        module.validate_program(program)

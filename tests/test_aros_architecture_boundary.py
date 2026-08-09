@@ -52,6 +52,27 @@ BOUNDARY_PATHS = (
     REPO_ROOT / "src" / "cli" / "commands" / "aros_cmd.py",
 )
 WAVE1_PACKAGE_DIRS = {"arbor": "src", "arbor.skills_suite": "skills"}
+RESEARCH_PROCEDURE_WAVE1_BASE = "f7702af306f9669958fe657e3f4bdd186a15e3ff"
+RESEARCH_PROCEDURE_WAVE1_TESTS = {
+    "tests/test_aros_architecture_boundary.py",
+    "tests/test_aros_research_procedure_core.py",
+}
+
+
+def _assert_research_procedure_wave1_changes(name_status: str) -> None:
+    for line in name_status.splitlines():
+        fields = line.split("\t")
+        assert len(fields) == 2, f"Wave 1 change must have one path: {line!r}"
+        status_code, path = fields
+        assert status_code in {"A", "M", "D"}, (
+            f"Wave 1 change status must be A, M, or D: {line!r}"
+        )
+        assert not path.startswith("src/aros/"), (
+            f"Wave 1 must not change runtime architecture: {line!r}"
+        )
+        assert path.startswith("commissioning/research_program/") or path in (
+            RESEARCH_PROCEDURE_WAVE1_TESTS
+        ), f"path is outside the research procedure Wave 1 boundary: {line!r}"
 
 
 def _configured_package_path(package: str, package_dirs: dict[str, str]) -> Path:
@@ -2706,3 +2727,31 @@ def test_cache_campaign_boundary_detects_deleted_aros_source(tmp_path: Path) -> 
     assert "src/aros/deleted.py" in _cache_campaign_changed_paths(
         repository, baseline
     )
+
+
+def test_research_procedure_wave1_changes_stay_inside_static_boundary() -> None:
+    completed = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--name-status",
+            "--no-renames",
+            f"{RESEARCH_PROCEDURE_WAVE1_BASE}..HEAD",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    _assert_research_procedure_wave1_changes(completed.stdout)
+
+
+@pytest.mark.parametrize("status_code", ["A", "M", "D"])
+def test_research_procedure_wave1_boundary_has_no_status_bypass(
+    status_code: str,
+) -> None:
+    with pytest.raises(AssertionError, match="runtime architecture"):
+        _assert_research_procedure_wave1_changes(
+            f"{status_code}\tsrc/aros/procedure_runtime.py\n"
+        )

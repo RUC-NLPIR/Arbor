@@ -1141,13 +1141,85 @@ def _candidate_blob_is_regular(checkout, candidate, relative):
     return mode == b"100644" and kind == b"blob" and raw_path == relative.encode()
 
 
+def _safe_policy(value, label):
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > 64
+        or value[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        or any(
+            character
+            not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+            for character in value
+        )
+    ):
+        raise VerificationError(f"{label} must be a safe policy identifier")
+    return value
+
+
+def _validate_policy_contract(value, expected_policy):
+    policy = _safe_policy(expected_policy, "expected policy")
+    contract = _exact(
+        value,
+        {
+            "schema_version", "policy", "reference_policy", "policy_source",
+            "object_metadata_bytes", "global_metadata_bytes",
+            "global_metadata_evidence", "update_complexity",
+        },
+        "policy contract",
+    )
+    if _integer(contract["schema_version"], "contract schema", 1) != 1:
+        raise VerificationError("policy contract schema_version must equal 1")
+    if _safe_policy(contract["policy"], "contract policy") != policy:
+        raise VerificationError("policy contract policy differs from candidate")
+    if type(contract["reference_policy"]) is not str or contract["reference_policy"] not in REFERENCES:
+        raise VerificationError("policy contract reference policy is invalid")
+    source = f"libCacheSim/cache/eviction/{policy}.c"
+    if contract["policy_source"] != source:
+        raise VerificationError("policy contract source path differs from candidate")
+    _integer(contract["object_metadata_bytes"], "contract object metadata")
+    _integer(contract["global_metadata_bytes"], "contract global metadata")
+    evidence = contract["global_metadata_evidence"]
+    if not isinstance(evidence, list) or not evidence:
+        raise VerificationError("policy contract metadata evidence must be nonempty")
+    for item in evidence:
+        _exact(item, {"source", "line", "expression"}, "contract metadata evidence")
+        if item["source"] != source:
+            raise VerificationError("contract metadata evidence source differs")
+        _integer(item["line"], "contract metadata evidence line", 1)
+        expression = item["expression"]
+        if (
+            type(expression) is not str
+            or not expression.strip()
+            or len(expression) > 256
+            or any(not 0x20 <= ord(character) <= 0x7E for character in expression)
+        ):
+            raise VerificationError("contract metadata expression is invalid")
+    if contract["update_complexity"] != "amortized O(1)":
+        raise VerificationError("policy contract complexity is invalid")
+    return {key: item for key, item in contract.items() if key != "schema_version"}
+
+
 def _necessary_wiring_line(relative, line, policy):
     stripped = line.strip()
     compact = "".join(stripped.split())
-    if not stripped or policy not in stripped or stripped.startswith(("#", "//", "/*")):
+    if (
+        not stripped
+        or len(stripped) > 512
+        or policy not in stripped
+        or stripped.startswith(("#", "//", "/*", "message("))
+    ):
         return False
     if relative.endswith("evictionAlgo.h"):
-        return compact.startswith(f"cache_t*{policy}_init(") and compact.endswith(");")
+        if not stripped.endswith(");") or "(" not in stripped:
+            return False
+        prefix, arguments = stripped.split("(", 1)
+        arguments = arguments[:-2]
+        return (
+            "".join(prefix.split()) == f"cache_t*{policy}_init"
+            and 1 <= len(arguments) <= 400
+            and ";" not in arguments
+        )
     if relative == "libCacheSim/cache/CMakeLists.txt":
         return stripped == f"eviction/{policy}.c"
     if relative.endswith("cache_init.h"):
@@ -1195,13 +1267,7 @@ def _wiring_is_additive(checkout, base, candidate, relative, policy):
 
 
 def _recompute_scope(checkout, base, candidate, policy, diff_hash):
-    if (
-        not policy
-        or not policy[0].isalpha()
-        or len(policy) > 64
-        or any(not (character.isalnum() or character == "_") for character in policy)
-    ):
-        raise VerificationError("candidate policy identifier is unsafe")
+    policy = _safe_policy(policy, "candidate policy")
     raw_status = _git(
         checkout,
         "diff",
@@ -1261,6 +1327,16 @@ def _recompute_scope(checkout, base, candidate, policy, diff_hash):
     baseline_unchanged = allowed_paths and additive and not any(
         status in {"D", "T"} for status in statuses.values()
     )
+    try:
+        contract_record = json.loads(
+            _git_blob(checkout, candidate, contract),
+            object_pairs_hook=_unique_object,
+            parse_constant=_invalid_constant,
+            parse_float=_finite_float,
+        )
+    except (UnicodeError, json.JSONDecodeError, VerificationError) as error:
+        raise VerificationError("candidate policy contract Git blob is invalid") from error
+    _validate_policy_contract(contract_record, policy)
     return {
         "allowed_paths": allowed_paths,
         "baseline_unchanged": baseline_unchanged,
@@ -1331,6 +1407,20 @@ def _verify_artifact(root, value, label):
     if not source.is_absolute():
         raise VerificationError(f"{label} source path must be absolute")
     return snapshot
+
+
+def _r0_evaluator_hashes():
+    paths = {
+        "evaluate_sha256": REPOSITORY_ROOT / "commissioning/cache_campaign/evaluate.py",
+        "scope_sha256": REPOSITORY_ROOT / "commissioning/cache_campaign/scope.py",
+        "evidence_sha256": REPOSITORY_ROOT / "commissioning/cache_campaign/evidence.py",
+        "r0_probes_sha256": REPOSITORY_ROOT
+        / "commissioning/cache_campaign/r0_probes.py",
+        "cachesim_sha256": REPOSITORY_ROOT / "commissioning/cache_campaign/cachesim.py",
+        "linux_subreaper_sha256": REPOSITORY_ROOT
+        / "commissioning/cache_campaign/linux_subreaper.py",
+    }
+    return {name: _sha256_file(path) for name, path in paths.items()}
 
 
 def _synthetic_trace_bytes():
@@ -1526,11 +1616,7 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
             )
         except (UnicodeError, json.JSONDecodeError, VerificationError) as error:
             raise VerificationError("candidate policy contract Git blob is invalid") from error
-        if not isinstance(contract_record, dict) or contract_record.get("schema_version") != 1:
-            raise VerificationError("candidate policy contract schema mismatch")
-        declared_projection = {
-            key: value for key, value in contract_record.items() if key != "schema_version"
-        }
+        declared_projection = _validate_policy_contract(contract_record, policy)
         if receipt["declared_metadata"] != declared_projection:
             raise VerificationError("R0 declared metadata differs from candidate Git contract")
     checks = _exact(
@@ -1812,7 +1898,11 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
     if _sha256_file(interposer_path) != interposer_binary["sha256"]:
         raise VerificationError("R0 interposer binary hash mismatch")
     evaluator = receipt["evaluator"]
-    if not isinstance(evaluator, dict) or set(evaluator) != R0_EVALUATOR_KEYS:
+    if (
+        not isinstance(evaluator, dict)
+        or set(evaluator) != R0_EVALUATOR_KEYS
+        or evaluator != _r0_evaluator_hashes()
+    ):
         raise VerificationError("R0 evaluator dependency map mismatch")
     for value in evaluator.values():
         _hash(value, "R0 evaluator hash")
@@ -2606,16 +2696,98 @@ def _verify_private_snapshot(snapshot, task_root, source_path, candidate_r0, pri
     artifacts = snapshot["r0_artifact_sha256s"]
     if not isinstance(artifacts, dict) or not artifacts:
         raise VerificationError("R3 snapshot R0 artifact map is invalid")
-    evidence_hashes = set(evidence.values())
-    for name, digest in artifacts.items():
-        _string(name, "R3 snapshot artifact name")
-        _hash(digest, "R3 snapshot artifact hash")
-        if digest not in evidence_hashes:
-            raise VerificationError("R3 snapshot artifact is outside evidence closure")
-    for name in ("release_cachesim", "release_archive", "release_cmake_cache"):
-        expected = candidate_r0["record"]["artifact_snapshots"][name]["sha256"]
-        if artifacts.get(name) != expected:
-            raise VerificationError("R3 snapshot core artifact hash mismatch")
+    receipt_artifacts = candidate_r0["record"]["artifact_snapshots"]
+    r0_record = candidate_r0["record"]
+    semantic_artifact_hashes = {
+        "evaluator_evaluate": r0_record["evaluator"]["evaluate_sha256"],
+        "evaluator_scope": r0_record["evaluator"]["scope_sha256"],
+        "evaluator_evidence": r0_record["evaluator"]["evidence_sha256"],
+        "evaluator_r0_probes": r0_record["evaluator"]["r0_probes_sha256"],
+        "evaluator_cachesim": r0_record["evaluator"]["cachesim_sha256"],
+        "evaluator_linux_subreaper": r0_record["evaluator"][
+            "linux_subreaper_sha256"
+        ],
+        "metadata_probe_binary": r0_record["probes"]["metadata"]["binary"]["sha256"],
+        "metadata_interposer_binary": r0_record["probes"]["metadata"][
+            "interposer_binary"
+        ]["sha256"],
+        "metadata_probe_source": r0_record["probes"]["metadata"]["source_sha256"],
+        "metadata_interposer_source": r0_record["probes"]["metadata"][
+            "interposer_source_sha256"
+        ],
+        "synthetic_trace": r0_record["synthetic_trace"]["sha256"],
+        "fixed_time_interposer_source": r0_record["probes"]["fixed_time"][
+            "source_sha256"
+        ],
+        "fixed_time_interposer_binary": r0_record["probes"]["fixed_time"][
+            "binary"
+        ]["sha256"],
+    }
+    if any(
+        receipt_artifacts.get(name, {}).get("sha256") != digest
+        for name, digest in semantic_artifact_hashes.items()
+    ):
+        raise VerificationError("R3 snapshot semantic artifact binding mismatch")
+    expected_artifacts = {
+        name: receipt_artifacts[name]["sha256"]
+        for name in ("release_cachesim", "release_archive", "release_cmake_cache")
+    }
+    validated_names = (
+        "evaluator_evaluate",
+        "evaluator_scope",
+        "evaluator_evidence",
+        "evaluator_r0_probes",
+        "evaluator_cachesim",
+        "evaluator_linux_subreaper",
+        "metadata_probe_binary",
+        "metadata_interposer_binary",
+        "metadata_probe_source",
+        "metadata_interposer_source",
+        "synthetic_trace",
+        "fixed_time_interposer_source",
+        "fixed_time_interposer_binary",
+    )
+    for name in validated_names:
+        expected_artifacts[f"validated_{name}"] = receipt_artifacts[name]["sha256"]
+    metadata_commands = [
+        item
+        for item in candidate_r0["record"]["commands"]
+        if item["label"] == "metadata-run"
+    ]
+    if len(metadata_commands) != 1:
+        raise VerificationError("R3 snapshot metadata command binding is missing")
+    metadata_command = metadata_commands[0]
+    expected_artifacts["metadata_measurement_stdout"] = metadata_command["stdout"][
+        "sha256"
+    ]
+    stderr_name = "validated_" + metadata_command["stderr"]["path"].replace(
+        "/", "_"
+    )
+    expected_artifacts[stderr_name] = metadata_command["stderr"]["sha256"]
+    if artifacts != expected_artifacts:
+        raise VerificationError("R3 snapshot named artifact map mismatch")
+    for name in (
+        "release_cachesim",
+        "release_archive",
+        "release_cmake_cache",
+        *validated_names,
+    ):
+        alias = name if name in expected_artifacts else f"validated_{name}"
+        relative = receipt_artifacts[name]["snapshot_path"]
+        artifact_path = _relative(r0_root, relative, "R3 snapshot named artifact")
+        if _sha256_file(artifact_path) != expected_artifacts[alias]:
+            raise VerificationError("R3 snapshot named artifact binding mismatch")
+    for field, alias in (
+        ("stdout", "metadata_measurement_stdout"),
+        ("stderr", stderr_name),
+    ):
+        raw_path = _relative(
+            r0_root,
+            metadata_command[field]["path"],
+            "R3 snapshot metadata raw evidence",
+        )
+        if _sha256_file(raw_path) != expected_artifacts[alias]:
+            raise VerificationError("R3 snapshot metadata raw binding mismatch")
     expected_files = {
         "r3.json",
         "candidate-evidence/source-receipt.json",

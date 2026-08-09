@@ -466,6 +466,35 @@ def r0_receipt(
                 "binding_intact": True,
             },
         }
+    evaluator_paths = {
+        "evaluate_sha256": ROOT / "commissioning/cache_campaign/evaluate.py",
+        "scope_sha256": ROOT / "commissioning/cache_campaign/scope.py",
+        "evidence_sha256": ROOT / "commissioning/cache_campaign/evidence.py",
+        "r0_probes_sha256": ROOT / "commissioning/cache_campaign/r0_probes.py",
+        "cachesim_sha256": ROOT / "commissioning/cache_campaign/cachesim.py",
+        "linux_subreaper_sha256": ROOT
+        / "commissioning/cache_campaign/linux_subreaper.py",
+    }
+    evaluator = {
+        key: sha256_file(path) for key, path in evaluator_paths.items()
+    }
+    for key, evaluator_path in evaluator_paths.items():
+        artifact_name = f"evaluator_{key.removesuffix('_sha256')}"
+        artifacts[artifact_name] = artifact_record(
+            output, artifact_name, evaluator_path.read_bytes()
+        )
+    artifact_probe_sources = {
+        "fixed_time_interposer_source": output / probe_files["fixed_time"]["source_path"],
+        "fixed_time_interposer_binary": output / probe_files["fixed_time"]["binary"]["path"],
+        "metadata_probe_source": output / probe_files["metadata"]["source_path"],
+        "metadata_probe_binary": output / probe_files["metadata"]["binary"]["path"],
+        "metadata_interposer_source": output / probe_files["interposer"]["source_path"],
+        "metadata_interposer_binary": output / probe_files["interposer"]["binary"]["path"],
+    }
+    for artifact_name, source_path in artifact_probe_sources.items():
+        artifacts[artifact_name] = artifact_record(
+            output, artifact_name, source_path.read_bytes()
+        )
     probes = {
         "fixed_time": {
             **probe_files["fixed_time"],
@@ -495,13 +524,6 @@ def r0_receipt(
     hashes = {
         item: sha256_file(checkout / item)
         for item in changed_paths
-    }
-    evaluator = {
-        key: hashlib.sha256(key.encode()).hexdigest()
-        for key in (
-            "evaluate_sha256", "scope_sha256", "evidence_sha256",
-            "r0_probes_sha256", "cachesim_sha256", "linux_subreaper_sha256",
-        )
     }
     value: dict[str, object] = {
         "schema_version": 1,
@@ -720,15 +742,25 @@ def portfolio_receipt(
     selected = list(manifest["traces"])
     if rung == "r1":
         selected = [item for item in selected if item["split"] == "dev"][:3]
+    evaluator_paths = {
+        "evaluate_sha256": ROOT / "commissioning/cache_campaign/evaluate.py",
+        "scope_sha256": ROOT / "commissioning/cache_campaign/scope.py",
+        "evidence_sha256": ROOT / "commissioning/cache_campaign/evidence.py",
+        "r0_probes_sha256": ROOT / "commissioning/cache_campaign/r0_probes.py",
+        "cachesim_sha256": ROOT / "commissioning/cache_campaign/cachesim.py",
+        "linux_subreaper_sha256": ROOT
+        / "commissioning/cache_campaign/linux_subreaper.py",
+        "portfolio_sha256": ROOT / "commissioning/cache_campaign/portfolio.py",
+        "portfolio_evidence_sha256": ROOT
+        / "commissioning/cache_campaign/portfolio_evidence.py",
+        "oracle_sha256": ROOT / "commissioning/cache_campaign/oracle.py",
+        "records_sha256": ROOT / "commissioning/cache_campaign/records.py",
+        "diagnostics_sha256": ROOT / "commissioning/cache_campaign/diagnostics.py",
+        "source_lock_sha256": ROOT / "commissioning/cache_campaign/source.lock.json",
+        "run_aros_cache_eval_sha256": ROOT / "scripts/run_aros_cache_eval.py",
+    }
     evaluator = {
-        key: hashlib.sha256(key.encode()).hexdigest()
-        for key in (
-            "evaluate_sha256", "scope_sha256", "evidence_sha256",
-            "r0_probes_sha256", "cachesim_sha256", "linux_subreaper_sha256",
-            "portfolio_sha256", "portfolio_evidence_sha256", "oracle_sha256",
-            "records_sha256", "diagnostics_sha256", "source_lock_sha256",
-            "run_aros_cache_eval_sha256",
-        )
+        key: sha256_file(path) for key, path in evaluator_paths.items()
     }
     scientific = {
         "fixed_time_interposer": hashlib.sha256(b"fixed").hexdigest(),
@@ -873,7 +905,7 @@ def portfolio_receipt(
     for key, digest in evaluator.items():
         path = root / f"evaluator/{key}"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(key.encode())
+        path.write_bytes(evaluator_paths[key].read_bytes())
         path.chmod(0o400)
         metadata = path.stat()
         evaluator_snapshots[key] = {
@@ -1378,9 +1410,43 @@ def valid_retained_substrate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         if path.is_file() and not path.is_symlink()
     }
     snapshot_artifacts = {
-        name: sha256_file(snapshot_r0 / item["snapshot_path"])
-        for name, item in candidate_r0_value["artifact_snapshots"].items()
+        name: sha256_file(
+            snapshot_r0
+            / candidate_r0_value["artifact_snapshots"][name]["snapshot_path"]
+        )
+        for name in ("release_cachesim", "release_archive", "release_cmake_cache")
     }
+    validated_artifact_names = (
+        "evaluator_evaluate",
+        "evaluator_scope",
+        "evaluator_evidence",
+        "evaluator_r0_probes",
+        "evaluator_cachesim",
+        "evaluator_linux_subreaper",
+        "metadata_probe_binary",
+        "metadata_interposer_binary",
+        "metadata_probe_source",
+        "metadata_interposer_source",
+        "synthetic_trace",
+        "fixed_time_interposer_source",
+        "fixed_time_interposer_binary",
+    )
+    for name in validated_artifact_names:
+        snapshot_artifacts[f"validated_{name}"] = sha256_file(
+            snapshot_r0
+            / candidate_r0_value["artifact_snapshots"][name]["snapshot_path"]
+        )
+    snapshot_metadata_command = next(
+        item
+        for item in candidate_r0_value["commands"]
+        if item["label"] == "metadata-run"
+    )
+    snapshot_artifacts["metadata_measurement_stdout"] = sha256_file(
+        snapshot_r0 / snapshot_metadata_command["stdout"]["path"]
+    )
+    snapshot_artifacts[
+        "validated_" + snapshot_metadata_command["stderr"]["path"].replace("/", "_")
+    ] = sha256_file(snapshot_r0 / snapshot_metadata_command["stderr"]["path"])
     r3_evaluator_paths = {
         "seal_sha256": ROOT / "commissioning/cache_campaign/seal.py",
         "constraints_sha256": ROOT / "commissioning/cache_campaign/constraints.py",
@@ -1761,6 +1827,18 @@ def retarget_candidate_r0(path: Path, checkout: Path) -> None:
     }
     receipt["scope"]["changed_paths"] = sorted(changed)
     receipt["scope"]["diff_sha256"] = receipt["candidate_diff_sha256"]
+    contract = checkout / "commissioning/cache_policy_contract.json"
+    contract_value = json.loads(contract.read_text())
+    receipt["contract_sha256"] = sha256_file(contract)
+    receipt["declared_metadata"] = {
+        key: value for key, value in contract_value.items() if key != "schema_version"
+    }
+    receipt["policy_source_sha256"] = sha256_file(
+        checkout / "libCacheSim/cache/eviction/CandidatePolicy.c"
+    )
+    receipt["candidate_test_sha256"] = sha256_file(
+        checkout / "test/test_CandidatePolicy.c"
+    )
     rewrite_r0_receipt(path, receipt)
 
 
@@ -1935,7 +2013,15 @@ def test_verifier_rejects_checkout_head_after_active_candidate(
         fixture.module.verify(fixture.index)
 
 
-@pytest.mark.parametrize("defect", ["out_of_scope", "nonadditive_wiring"])
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "out_of_scope",
+        "nonadditive_wiring",
+        "header_extra_declaration",
+        "header_too_long",
+    ],
+)
 def test_verifier_independently_recomputes_candidate_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
 ) -> None:
@@ -1944,9 +2030,25 @@ def test_verifier_independently_recomputes_candidate_scope(
     if defect == "out_of_scope":
         (checkout / "libCacheSim/reader.c").write_text("/* forbidden */\n")
         git(checkout, "add", "libCacheSim/reader.c")
-    else:
+    elif defect == "nonadditive_wiring":
         wiring = checkout / "libCacheSim/cache/CMakeLists.txt"
         wiring.write_text(wiring.read_text() + "# CandidatePolicy extra wiring\n")
+        git(checkout, "add", str(wiring.relative_to(checkout)))
+    else:
+        wiring = checkout / "libCacheSim/include/libCacheSim/evictionAlgo.h"
+        lines = [
+            line
+            for line in wiring.read_text().splitlines()
+            if "CandidatePolicy_init" not in line
+        ]
+        if defect == "header_extra_declaration":
+            declaration = (
+                "cache_t *CandidatePolicy_init(const common_cache_params_t, "
+                "const char *); int arbitrary(void);"
+            )
+        else:
+            declaration = "cache_t *CandidatePolicy_init(" + "x" * 500 + ");"
+        wiring.write_text("\n".join([*lines, declaration]) + "\n")
         git(checkout, "add", str(wiring.relative_to(checkout)))
     git(checkout, "commit", "-qm", defect)
     candidate_r0 = fixture.paths["candidate_r0"]
@@ -1956,6 +2058,57 @@ def test_verifier_independently_recomputes_candidate_scope(
         Path(index["source_receipt"]), checkout
     )
     with pytest.raises(fixture.module.VerificationError, match="scope"):
+        fixture.module._verify_r0(
+            candidate_r0,
+            checkout,
+            source,
+            expected_policy="CandidatePolicy",
+        )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "extra_key",
+        "boolean_metadata",
+        "wrong_policy",
+        "wrong_reference",
+        "wrong_source",
+        "boolean_evidence_line",
+        "bad_complexity",
+    ],
+)
+def test_verifier_strictly_validates_policy_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    checkout = fixture.paths["checkout"]
+    contract_path = checkout / "commissioning/cache_policy_contract.json"
+    contract = json.loads(contract_path.read_text())
+    if defect == "extra_key":
+        contract["unexpected"] = True
+    elif defect == "boolean_metadata":
+        contract["object_metadata_bytes"] = True
+    elif defect == "wrong_policy":
+        contract["policy"] = "OtherPolicy"
+    elif defect == "wrong_reference":
+        contract["reference_policy"] = "LRU"
+    elif defect == "wrong_source":
+        contract["policy_source"] = "libCacheSim/cache/eviction/Sieve.c"
+    elif defect == "boolean_evidence_line":
+        contract["global_metadata_evidence"][0]["line"] = True
+    elif defect == "bad_complexity":
+        contract["update_complexity"] = "O(log n)"
+    contract_path.write_text(json.dumps(contract, sort_keys=True) + "\n")
+    git(checkout, "add", str(contract_path.relative_to(checkout)))
+    git(checkout, "commit", "-qm", defect)
+    candidate_r0 = fixture.paths["candidate_r0"]
+    retarget_candidate_r0(candidate_r0, checkout)
+    index = json.loads(fixture.index.read_text())
+    source, _state = fixture.module._verify_source(
+        Path(index["source_receipt"]), checkout
+    )
+    with pytest.raises(fixture.module.VerificationError, match="contract"):
         fixture.module._verify_r0(
             candidate_r0,
             checkout,
@@ -2015,8 +2168,33 @@ def test_verifier_rejects_rehashed_private_snapshot_artifact(
     )
     write_record(ledger_path, ledger, "ledger_sha256")
     ledger_path.chmod(0o600)
+    os.utime(ledger_path, ns=(1, 1))
     rebind_final_to_ledger(fixture.paths["r3_receipt"], ledger_path)
     with pytest.raises(fixture.module.VerificationError, match="snapshot"):
+        fixture.module.verify(fixture.index)
+
+
+@pytest.mark.parametrize("defect", ["missing", "extra", "rebound"])
+def test_verifier_requires_exact_named_snapshot_artifact_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    ledger_path = fixture.paths["ledger"]
+    ledger = json.loads(ledger_path.read_text())
+    artifacts = ledger["private_snapshot"]["r0_artifact_sha256s"]
+    if defect == "missing":
+        artifacts.pop("validated_synthetic_trace")
+    elif defect == "extra":
+        artifacts["unexpected"] = artifacts["validated_synthetic_trace"]
+    else:
+        artifacts["validated_synthetic_trace"] = artifacts[
+            "validated_evaluator_evaluate"
+        ]
+    write_record(ledger_path, ledger, "ledger_sha256")
+    ledger_path.chmod(0o600)
+    os.utime(ledger_path, ns=(1, 1))
+    rebind_final_to_ledger(fixture.paths["r3_receipt"], ledger_path)
+    with pytest.raises(fixture.module.VerificationError, match="artifact"):
         fixture.module.verify(fixture.index)
 
 

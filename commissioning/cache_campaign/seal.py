@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import pwd
 import re
 import stat
 import subprocess
@@ -152,11 +153,77 @@ def _authority_id(package: Mapping[str, object]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _host_authority_root() -> Path:
+    try:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        metadata = home.lstat()
+    except (KeyError, OSError) as error:
+        raise SealError("passwd authority home is unavailable") from error
+    if (
+        not home.is_absolute()
+        or home.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+    ):
+        raise SealError("passwd authority home is unsafe")
+    return home / ".local/state/aros/cache-campaign-r3"
+
+
+def _ensure_host_authority_root(root: Path, project: Path) -> AuthorityRoot:
+    authority = Path(root).absolute()
+    if _paths_overlap(authority.resolve(strict=False), project):
+        raise SealError("host authority root must be outside task_root")
+    if any(path.is_symlink() for path in (authority, *authority.parents)):
+        raise SealError("host authority path contains a symlink")
+    missing: list[Path] = []
+    cursor = authority
+    while not os.path.lexists(cursor):
+        missing.append(cursor)
+        if cursor.parent == cursor:
+            raise SealError("host authority root has no retained parent")
+        cursor = cursor.parent
+    existing = cursor.lstat()
+    if cursor.is_symlink() or not stat.S_ISDIR(existing.st_mode):
+        raise SealError("host authority parent is unsafe")
+    for path in reversed(missing):
+        os.mkdir(path, 0o700)
+    for path in [*reversed(missing), authority]:
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+        ):
+            raise SealError("host authority path is unsafe")
+    authority_metadata = authority.lstat()
+    if stat.S_IMODE(authority_metadata.st_mode) != 0o700:
+        raise SealError("host authority root mode must be 0700")
+    descriptor = os.open(
+        authority,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    retained = os.fstat(descriptor)
+    if (
+        (retained.st_dev, retained.st_ino)
+        != (authority_metadata.st_dev, authority_metadata.st_ino)
+        or retained.st_uid != os.getuid()
+        or stat.S_IMODE(retained.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise SealError("host authority root changed during retention")
+    return AuthorityRoot(
+        authority,
+        (retained.st_dev, retained.st_ino),
+        descriptor,
+    )
+
+
 def _canonical_authority_paths(
     package: Mapping[str, object], frozen_package: Path
 ) -> tuple[Path, Path]:
+    del frozen_package
     authority = _authority_id(package)
-    parent = Path(frozen_package).absolute().parent.resolve(strict=True)
+    parent = _host_authority_root().absolute()
     return (
         parent / f"r3-{authority}.consumed.json",
         parent / f"r3-{authority}.receipt.json",
@@ -175,6 +242,13 @@ class StickyBinding:
     file: FileBinding
     mtime_ns: int
     ctime_ns: int
+
+
+@dataclass(frozen=True)
+class AuthorityRoot:
+    path: Path
+    identity: tuple[int, int]
+    descriptor: int
 
 
 @dataclass(frozen=True)
@@ -211,6 +285,7 @@ class FrozenInputs:
     contract_binding: FileBinding
     r3_evaluator_bindings: dict[str, FileBinding]
     private_snapshot: PrivateInputSnapshot
+    authority_root: AuthorityRoot
     authority_id: str
     ledger: Path
     final_receipt: Path
@@ -845,6 +920,7 @@ def _prevalidate(
 ) -> FrozenInputs:
     private_snapshot: PrivateInputSnapshot | None = None
     preflight: Preflight | None = None
+    authority_root: AuthorityRoot | None = None
     try:
         package_bound = read_bound_json_object(frozen_package, max_bytes=1024 * 1024)
         package = load_frozen_package(package_bound.value)
@@ -858,6 +934,9 @@ def _prevalidate(
         ):
             raise SealError("frozen package authority path is not canonical")
         _external_input(package_binding.path, project.path, "frozen package")
+        authority_root = _ensure_host_authority_root(
+            _host_authority_root(), project.path
+        )
         raw_refs, ref_sha256s = _git_refs(project, package)
         reproduction = _validate_reproduction(
             raw_refs["reproduction_ref"], str(package["r2_receipt_sha256"])
@@ -895,6 +974,8 @@ def _prevalidate(
         canonical_ledger, final_receipt = _canonical_authority_paths(
             package, package_bound.path
         )
+        if canonical_ledger.parent != authority_root.path:
+            raise SealError("canonical authority root changed during validation")
         supplied_ledger = Path(ledger).absolute().resolve(strict=False)
         if os.path.lexists(canonical_ledger):
             raise SealError("R3 ledger is already consumed")
@@ -1066,12 +1147,18 @@ def _prevalidate(
             contract_binding,
             r3_evaluator_bindings,
             private_snapshot,
+            authority_root,
             authority,
             ledger_path,
             final_receipt,
             output_path,
         )
     except SealError:
+        if authority_root is not None:
+            try:
+                os.close(authority_root.descriptor)
+            except OSError:
+                pass
         if preflight is not None:
             try:
                 os.close(preflight.output_parent.descriptor)
@@ -1081,6 +1168,11 @@ def _prevalidate(
             cleanup_owned(private_snapshot.root, private_snapshot.root_identity)
         raise
     except (OSError, TypeError, ValueError, subprocess.SubprocessError) as error:
+        if authority_root is not None:
+            try:
+                os.close(authority_root.descriptor)
+            except OSError:
+                pass
         if preflight is not None:
             try:
                 os.close(preflight.output_parent.descriptor)
@@ -1115,16 +1207,21 @@ def _observe_consumed_ledger(path: Path) -> tuple[str | None, int | None]:
 
 
 def _consume_ledger(
-    path: Path, record: dict[str, object]
+    path: Path,
+    record: dict[str, object],
+    authority: AuthorityRoot | None = None,
 ) -> tuple[dict[str, object], str, int]:
     record["ledger_sha256"] = record_sha256(record, "ledger_sha256")
     raw = canonical_bytes(record) + b"\n"
     file_sha256 = hashlib.sha256(raw).hexdigest()
+    if authority is not None and path.parent != authority.path:
+        raise SealError("ledger path escaped retained host authority")
     try:
         descriptor = os.open(
-            path,
+            path.name if authority is not None else path,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o600,
+            dir_fd=authority.descriptor if authority is not None else None,
         )
     except FileExistsError as error:
         raise SealError("R3 ledger is already consumed") from error
@@ -1136,15 +1233,27 @@ def _consume_ledger(
                 _write_ledger_stream(stream, raw)
                 stream.flush()
                 os.fsync(stream.fileno())
-            _fsync_parent(path)
-            observed = file_binding(path, expected_mode=0o600)
+            if authority is None:
+                _fsync_parent(path)
+                observed_path = path
+            else:
+                os.fsync(authority.descriptor)
+                observed_path = (
+                    Path(f"/proc/self/fd/{authority.descriptor}") / path.name
+                )
+            observed = file_binding(observed_path, expected_mode=0o600)
             if observed.size_bytes != len(raw) or observed.sha256 != file_sha256:
                 raise SealError("consumed ledger changed during durable publication")
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
     except BaseException as error:
-        observed_sha256, observed_size = _observe_consumed_ledger(path)
+        observed_path = (
+            Path(f"/proc/self/fd/{authority.descriptor}") / path.name
+            if authority is not None
+            else path
+        )
+        observed_sha256, observed_size = _observe_consumed_ledger(observed_path)
         raise LedgerConsumedError(
             "R3 ledger authority was consumed before durability failed: "
             + " ".join(str(error).split())[:384],
@@ -1352,6 +1461,13 @@ def _write_final_receipt(
     return receipt
 
 
+def _close_authority_root(inputs: FrozenInputs) -> None:
+    try:
+        os.close(inputs.authority_root.descriptor)
+    except OSError:
+        pass
+
+
 def run_r3(
     frozen_package: Path,
     host_r3_manifest: Path,
@@ -1378,14 +1494,16 @@ def run_r3(
     )
     try:
         ledger_record, ledger_file_sha256, ledger_size_bytes = _consume_ledger(
-            inputs.ledger, _ledger_record(inputs)
+            inputs.ledger,
+            _ledger_record(inputs),
+            inputs.authority_root,
         )
     except LedgerConsumedError as error:
         try:
             os.close(inputs.preflight.output_parent.descriptor)
         except (AttributeError, OSError):
             pass
-        return _write_final_receipt(
+        receipt = _write_final_receipt(
             inputs,
             error.record,
             error.intended_file_sha256,
@@ -1404,11 +1522,14 @@ def run_r3(
             ],
             constraints=[],
         )
+        _close_authority_root(inputs)
+        return receipt
     except BaseException:
         try:
             os.close(inputs.preflight.output_parent.descriptor)
         except (AttributeError, OSError):
             pass
+        _close_authority_root(inputs)
         if os.path.lexists(inputs.private_snapshot.root):
             cleanup_owned(
                 inputs.private_snapshot.root,
@@ -1468,7 +1589,7 @@ def run_r3(
         )
         state = "process_failed"
     try:
-        return _write_final_receipt(
+        receipt = _write_final_receipt(
             inputs,
             ledger_record,
             ledger_file_sha256,
@@ -1481,6 +1602,8 @@ def run_r3(
             failures=failures,
             constraints=constraints,
         )
+        _close_authority_root(inputs)
+        return receipt
     except BaseException as error:
         failures.append(
             {
@@ -1489,7 +1612,7 @@ def run_r3(
                 "error": " ".join(str(error).split())[:512],
             }
         )
-        return _write_final_receipt(
+        receipt = _write_final_receipt(
             inputs,
             ledger_record,
             ledger_file_sha256,
@@ -1502,3 +1625,5 @@ def run_r3(
             failures=failures,
             constraints=constraints,
         )
+        _close_authority_root(inputs)
+        return receipt

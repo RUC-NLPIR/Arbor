@@ -221,19 +221,80 @@ def test_new_ledger_and_output_paths_must_stay_outside_task_root(
         _new_path(external / "ledger.json", project, "ledger")
 
 
-def test_authority_paths_are_fixed_by_package_and_host_manifest(
-    tmp_path: Path,
+def test_authority_paths_ignore_package_location_and_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = tmp_path / "task"
     project.mkdir()
     value = package(project, "f" * 40)
     authority_root = tmp_path / "retained-authority"
     authority_root.mkdir()
-    frozen_package = authority_root / "frozen-package.json"
+    monkeypatch.setattr(
+        seal_module, "_host_authority_root", lambda: authority_root
+    )
+    first_package = tmp_path / "copy-a/frozen-package.json"
+    second_package = tmp_path / "copy-b/frozen-package.json"
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home-a"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "fake-state-a"))
     authority = _authority_id(value)
-    ledger, receipt = _canonical_authority_paths(value, frozen_package)
+    ledger, receipt = _canonical_authority_paths(value, first_package)
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home-b"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "fake-state-b"))
+    moved_ledger, moved_receipt = _canonical_authority_paths(
+        value, second_package
+    )
     assert ledger == authority_root / f"r3-{authority}.consumed.json"
     assert receipt == authority_root / f"r3-{authority}.receipt.json"
+    assert (moved_ledger, moved_receipt) == (ledger, receipt)
+    _consume_ledger(
+        ledger,
+        {"schema_version": 1, "state": "consumed", "requested_at_unix_ns": 1},
+    )
+    with pytest.raises(SealError, match="already consumed"):
+        _consume_ledger(
+            moved_ledger,
+            {
+                "schema_version": 1,
+                "state": "consumed",
+                "requested_at_unix_ns": 2,
+            },
+        )
+
+
+def test_production_authority_resolver_uses_passwd_not_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    passwd_home = tmp_path / "passwd-home"
+    passwd_home.mkdir()
+    monkeypatch.setattr(
+        seal_module.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_dir=str(passwd_home)),
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "env-home-a"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "env-state-a"))
+    first = seal_module._host_authority_root()
+    monkeypatch.setenv("HOME", str(tmp_path / "env-home-b"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "env-state-b"))
+    assert seal_module._host_authority_root() == first
+    assert first == passwd_home / ".local/state/aros/cache-campaign-r3"
+
+
+def test_host_authority_root_is_owned_real_and_mode_0700(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "task"
+    project.mkdir()
+    authority = seal_module._ensure_host_authority_root(
+        tmp_path / "state/aros/cache-campaign-r3", project
+    )
+    assert stat.S_IMODE(authority.path.stat().st_mode) == 0o700
+    assert authority.path.stat().st_uid == os.getuid()
+    unsafe = tmp_path / "unsafe"
+    unsafe.symlink_to(authority.path, target_is_directory=True)
+    with pytest.raises(SealError, match="symlink"):
+        seal_module._ensure_host_authority_root(unsafe, project)
+    os.close(authority.descriptor)
 
 
 @pytest.mark.parametrize("placement", ["equal_final", "nested_final", "alias_ledger"])
@@ -365,6 +426,7 @@ def test_postcreate_ledger_failure_is_terminal_and_receipted(
         assert receipt["ledger_size_bytes"] > 1
     assert os.path.lexists(inputs.ledger)
     assert inputs.final_receipt.exists()
+    refresh_fake_authority(inputs)
     with pytest.raises(SealError, match="already consumed"):
         run_r3(*run_arguments(tmp_path))  # type: ignore[arg-type]
 
@@ -400,6 +462,13 @@ def fake_inputs(tmp_path: Path) -> FrozenInputs:
     )
     package_value = package(project.path, project.head)
     authority = _authority_id(package_value)
+    authority_path = project.path.parent
+    authority_metadata = authority_path.stat()
+    authority_root = seal_module.AuthorityRoot(
+        authority_path,
+        (authority_metadata.st_dev, authority_metadata.st_ino),
+        os.open(authority_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)),
+    )
     return FrozenInputs(
         package=package_value,
         package_binding=binding,
@@ -432,11 +501,20 @@ def fake_inputs(tmp_path: Path) -> FrozenInputs:
             source_receipt_original=sticky,
             r0_originals=(sticky,),
         ),
+        authority_root=authority_root,
         authority_id=authority,
         ledger=project.path.parent / f"r3-{authority}.consumed.json",
         final_receipt=project.path.parent / f"r3-{authority}.receipt.json",
         output=host / "output",
     )
+
+
+def refresh_fake_authority(inputs: FrozenInputs) -> None:
+    descriptor = os.open(
+        inputs.authority_root.path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    object.__setattr__(inputs.authority_root, "descriptor", descriptor)
 
 
 def run_arguments(tmp_path: Path) -> tuple[object, ...]:
@@ -477,6 +555,7 @@ def test_r3_consumes_ledger_before_failing_launch_and_cannot_retry(
     alternate = list(run_arguments(tmp_path))
     alternate[-2] = tmp_path / "alternate-ledger.json"
     alternate[-1] = tmp_path / "alternate-output"
+    refresh_fake_authority(inputs)
     with pytest.raises(SealError, match="already consumed"):
         run_r3(*alternate)  # type: ignore[arg-type]
     assert calls == 1
@@ -864,6 +943,9 @@ def test_real_derived_candidate_prevalidates_with_distinct_baseline_artifacts(
         write as r0_write,
     )
 
+    monkeypatch.setattr(
+        seal_module, "_host_authority_root", lambda: tmp_path / "uid-authority"
+    )
     checkout, old_base, old_candidate, lock = repository(tmp_path)
     git(checkout, "checkout", "-q", old_base)
     r0_write(
@@ -1038,6 +1120,7 @@ def test_real_derived_candidate_prevalidates_with_distinct_baseline_artifacts(
         assert inputs.preflight.r0["candidate_commit"] == candidate
     finally:
         os.close(inputs.preflight.output_parent.descriptor)
+        os.close(inputs.authority_root.descriptor)
         seal_module.cleanup_owned(
             inputs.private_snapshot.root,
             inputs.private_snapshot.root_identity,

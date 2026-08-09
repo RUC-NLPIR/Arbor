@@ -135,6 +135,12 @@ class RecordCollision(PortfolioError):
         self.path = path
 
 
+class PublicationBindingError(PortfolioError):
+    def __init__(self, message: str, *, renamed: bool) -> None:
+        super().__init__(message)
+        self.renamed = renamed
+
+
 class PhaseRunError(PortfolioError):
     def __init__(
         self,
@@ -154,6 +160,28 @@ class FileBinding:
     size_bytes: int
     sha256: str
     mode: int
+
+
+@dataclass(frozen=True)
+class PublicationFileBinding:
+    relative_path: str
+    identity: tuple[int, int]
+    mode: int
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class PublicationDirectoryBinding:
+    relative_path: str
+    identity: tuple[int, int]
+    mode: int
+
+
+@dataclass(frozen=True)
+class PublicationSnapshot:
+    files: tuple[PublicationFileBinding, ...]
+    directories: tuple[PublicationDirectoryBinding, ...]
 
 
 @dataclass(frozen=True)
@@ -1358,6 +1386,19 @@ def _inventory(stage: Path) -> list[dict[str, object]]:
     return records
 
 
+def _inventory_record(stage: Path, binding: FileBinding) -> dict[str, object]:
+    return {
+        "path": binding.path.relative_to(stage).as_posix(),
+        "identity": {
+            "device": binding.identity[0],
+            "inode": binding.identity[1],
+        },
+        "mode": binding.mode,
+        "size_bytes": binding.size_bytes,
+        "sha256": binding.sha256,
+    }
+
+
 def _tree_bindings(root: Path) -> list[FileBinding]:
     bindings: list[FileBinding] = []
     for path in sorted(root.rglob("*")):
@@ -1378,6 +1419,171 @@ def _verify_publication(stage: Path, receipt: dict[str, object]) -> None:
         receipt, "receipt_sha256"
     ):
         raise PortfolioError("portfolio root receipt changed before publication")
+
+
+def _publication_snapshot(
+    stage: Path,
+    stage_identity: tuple[int, int],
+    inventory: Sequence[Mapping[str, object]],
+    root_receipt: NewRecordReceipt,
+) -> PublicationSnapshot:
+    files: list[PublicationFileBinding] = []
+    for item in inventory:
+        if set(item) != {"path", "identity", "mode", "size_bytes", "sha256"}:
+            raise PortfolioError("publication inventory record is invalid")
+        relative = item.get("path")
+        identity = item.get("identity")
+        if (
+            type(relative) is not str
+            or not isinstance(identity, dict)
+            or set(identity) != {"device", "inode"}
+            or type(identity.get("device")) is not int
+            or type(identity.get("inode")) is not int
+            or type(item.get("mode")) is not int
+            or type(item.get("size_bytes")) is not int
+            or type(item.get("sha256")) is not str
+            or HEX64.fullmatch(str(item["sha256"])) is None
+        ):
+            raise PortfolioError("publication inventory binding is invalid")
+        pure = PurePosixPath(relative)
+        if pure.is_absolute() or ".." in pure.parts or relative == "receipt.json":
+            raise PortfolioError("publication inventory path is invalid")
+        files.append(
+            PublicationFileBinding(
+                relative,
+                (int(identity["device"]), int(identity["inode"])),
+                int(item["mode"]),
+                int(item["size_bytes"]),
+                str(item["sha256"]),
+            )
+        )
+    files.append(
+        PublicationFileBinding(
+            "receipt.json",
+            root_receipt.identity,
+            root_receipt.mode,
+            root_receipt.size_bytes,
+            root_receipt.sha256,
+        )
+    )
+    if len({item.relative_path for item in files}) != len(files):
+        raise PortfolioError("publication inventory contains duplicate files")
+
+    root_metadata = stage.lstat()
+    if (
+        stage.is_symlink()
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or (root_metadata.st_dev, root_metadata.st_ino) != stage_identity
+    ):
+        raise PortfolioError("publication root directory binding changed")
+    directories = [
+        PublicationDirectoryBinding(
+            ".",
+            stage_identity,
+            stat.S_IMODE(root_metadata.st_mode),
+        )
+    ]
+    for path in sorted(stage.rglob("*")):
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise PortfolioError("publication contains a symlink")
+        if stat.S_ISDIR(metadata.st_mode):
+            directories.append(
+                PublicationDirectoryBinding(
+                    path.relative_to(stage).as_posix(),
+                    (metadata.st_dev, metadata.st_ino),
+                    stat.S_IMODE(metadata.st_mode),
+                )
+            )
+    return PublicationSnapshot(
+        tuple(sorted(files, key=lambda item: item.relative_path)),
+        tuple(sorted(directories, key=lambda item: item.relative_path)),
+    )
+
+
+def _revalidate_publication_snapshot(
+    root: Path, snapshot: PublicationSnapshot
+) -> None:
+    observed_files: set[str] = set()
+    observed_directories = {"."}
+    root_metadata = root.lstat()
+    if root.is_symlink() or not stat.S_ISDIR(root_metadata.st_mode):
+        raise PortfolioError("publication root is not a real directory")
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        relative = path.relative_to(root).as_posix()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise PortfolioError("publication gained a symlink")
+        if stat.S_ISDIR(metadata.st_mode):
+            observed_directories.add(relative)
+        elif stat.S_ISREG(metadata.st_mode):
+            observed_files.add(relative)
+        else:
+            raise PortfolioError("publication gained a non-regular entry")
+    if observed_files != {item.relative_path for item in snapshot.files}:
+        raise PortfolioError("publication file inventory changed")
+    if observed_directories != {
+        item.relative_path for item in snapshot.directories
+    }:
+        raise PortfolioError("publication directory inventory changed")
+    for expected in snapshot.files:
+        observed = _file_binding(
+            root.joinpath(*PurePosixPath(expected.relative_path).parts),
+            expected_mode=expected.mode,
+        )
+        if (
+            observed.identity != expected.identity
+            or observed.size_bytes != expected.size_bytes
+            or observed.sha256 != expected.sha256
+        ):
+            raise PortfolioError(
+                f"publication file binding changed: {expected.relative_path}"
+            )
+    for expected in snapshot.directories:
+        path = root if expected.relative_path == "." else root.joinpath(
+            *PurePosixPath(expected.relative_path).parts
+        )
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != expected.identity
+            or stat.S_IMODE(metadata.st_mode) != expected.mode
+        ):
+            raise PortfolioError(
+                f"publication directory binding changed: {expected.relative_path}"
+            )
+
+
+def _publish_and_verify(
+    *,
+    stage: Path,
+    stage_identity: tuple[int, int],
+    output: Path,
+    receipt: dict[str, object],
+    inventory: Sequence[Mapping[str, object]],
+    root_receipt: NewRecordReceipt,
+) -> None:
+    renamed = False
+    try:
+        _verify_publication(stage, receipt)
+        _revalidate_owned_record(stage / "receipt.json", root_receipt, "root receipt")
+        snapshot = _publication_snapshot(
+            stage, stage_identity, inventory, root_receipt
+        )
+        _revalidate_publication_snapshot(stage, snapshot)
+        publish_stage(stage, stage_identity, output)
+        renamed = True
+        _revalidate_publication_snapshot(output, snapshot)
+        _revalidate_owned_record(
+            output / "receipt.json", root_receipt, "published root receipt"
+        )
+        _revalidate_publication_snapshot(output, snapshot)
+    except (OSError, ValueError) as error:
+        raise PublicationBindingError(
+            f"publication binding verification failed: {_bounded(error)}",
+            renamed=renamed,
+        ) from error
 
 
 def _publish_preflight_failure(
@@ -1407,6 +1613,7 @@ def _publish_preflight_failure(
     except (OSError, ValueError):
         return
     published = False
+    preserve_stage = False
     try:
         failure: dict[str, object] = {
             "schema_version": 1,
@@ -1415,8 +1622,11 @@ def _publish_preflight_failure(
         }
         failures = stage / "failures"
         failures.mkdir(mode=0o700)
-        write_new_record(failures / "preflight.json", failure, "failure_sha256")
-        inventory = _inventory(stage)
+        failure_binding = _write_owned_record(
+            failures / "preflight.json", failure, "failure_sha256"
+        )
+        _revalidate_file(failure_binding)
+        inventory = [_inventory_record(stage, failure_binding)]
         receipt: dict[str, object] = {
             "schema_version": 1,
             "receipt_version": 1,
@@ -1442,12 +1652,28 @@ def _publish_preflight_failure(
             "timings": {"total_wall_ns": max(0, time.monotonic_ns() - started)},
         }
         _assert_no_forbidden_keys(receipt)
-        write_new_record(stage / "receipt.json", receipt, "receipt_sha256")
-        _verify_publication(stage, receipt)
-        publish_stage(stage, stage_identity, final)
+        root_receipt = write_new_record(
+            stage / "receipt.json", receipt, "receipt_sha256"
+        )
+        if not isinstance(root_receipt, NewRecordReceipt):
+            raise PortfolioError(
+                "preflight root receipt publisher returned no ownership receipt"
+            )
+        try:
+            _publish_and_verify(
+                stage=stage,
+                stage_identity=stage_identity,
+                output=final,
+                receipt=receipt,
+                inventory=inventory,
+                root_receipt=root_receipt,
+            )
+        except PublicationBindingError as publication_error:
+            preserve_stage = not publication_error.renamed
+            raise
         published = True
     finally:
-        if not published and os.path.lexists(stage):
+        if not published and not preserve_stage and os.path.lexists(stage):
             cleanup_owned(stage, stage_identity)
 
 
@@ -2035,25 +2261,20 @@ def evaluate_portfolio(
         )
         if not isinstance(root_receipt_binding, NewRecordReceipt):
             raise PortfolioError("root receipt publisher returned no ownership receipt")
-        _revalidate_owned_record(
-            root_receipt_path, root_receipt_binding, "root receipt"
-        )
-        _verify_publication(stage, receipt)
         if provenance_intact:
             guard()
         try:
-            _revalidate_owned_record(
-                root_receipt_path, root_receipt_binding, "root receipt"
+            _publish_and_verify(
+                stage=stage,
+                stage_identity=stage_identity,
+                output=preflight.output,
+                receipt=receipt,
+                inventory=inventory,
+                root_receipt=root_receipt_binding,
             )
-        except (OSError, ValueError):
-            preserve_stage = True
+        except PublicationBindingError as publication_error:
+            preserve_stage = not publication_error.renamed
             raise
-        publish_stage(stage, stage_identity, preflight.output)
-        _revalidate_owned_record(
-            preflight.output / "receipt.json",
-            root_receipt_binding,
-            "published root receipt",
-        )
         published = True
         return receipt
     finally:

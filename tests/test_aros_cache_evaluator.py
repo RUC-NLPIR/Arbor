@@ -1267,7 +1267,7 @@ def test_root_receipt_replacement_after_verification_blocks_publish_and_is_prese
         path.write_bytes(foreign)
 
     monkeypatch.setattr(portfolio_module, "_verify_publication", replace_after_verify)
-    with pytest.raises(ValueError, match="root receipt|record collision"):
+    with pytest.raises(ValueError, match="publication|root receipt|record collision"):
         evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     output = inputs["output"]
     assert not output.exists()
@@ -1292,11 +1292,108 @@ def test_root_receipt_replacement_after_publish_blocks_return_and_is_preserved(
         path.write_bytes(foreign)
 
     monkeypatch.setattr(portfolio_module, "publish_stage", replace_after_publish)
-    with pytest.raises(ValueError, match="root receipt|record collision"):
+    with pytest.raises(ValueError, match="publication|root receipt|record collision"):
         evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     output = inputs["output"]
     assert output.exists()
     assert (output / "receipt.json").read_bytes() == foreign
+
+
+@pytest.mark.parametrize("relative", ["stdout.raw", "process.json", "measurement.json"])
+def test_success_publication_revalidates_every_file_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    real_publish = portfolio_module.publish_stage
+    foreign = f"foreign {relative}\n".encode()
+
+    def replace_during_publish(
+        stage: Path, identity: tuple[int, int], output: Path
+    ) -> None:
+        real_publish(stage, identity, output)
+        path = output / "measurements/0000" / relative
+        path.unlink()
+        path.write_bytes(foreign)
+
+    monkeypatch.setattr(portfolio_module, "publish_stage", replace_during_publish)
+    with pytest.raises(ValueError, match="publication|collision|changed"):
+        evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    output = inputs["output"]
+    assert (output / "measurements/0000" / relative).read_bytes() == foreign
+
+
+@pytest.mark.parametrize("boundary", ["before", "during", "after"])
+def test_preflight_failure_publication_revalidates_all_owned_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    snapshot = (
+        inputs["r0_receipt"].parent
+        / "artifact_snapshots/release_cachesim"
+    )
+    snapshot.chmod(0o600)
+    snapshot.write_bytes(b"invalid R0 binary\n")
+    snapshot.chmod(0o400)
+    output = inputs["output"]
+    foreign = f"foreign preflight {boundary}\n".encode()
+
+    if boundary == "before":
+        real_verify = portfolio_module._verify_publication
+
+        def replace_before_publish(
+            stage: Path, receipt: dict[str, object]
+        ) -> None:
+            real_verify(stage, receipt)
+            path = stage / "failures/preflight.json"
+            path.unlink()
+            path.write_bytes(foreign)
+
+        monkeypatch.setattr(
+            portfolio_module, "_verify_publication", replace_before_publish
+        )
+    elif boundary == "during":
+        real_publish = portfolio_module.publish_stage
+
+        def replace_during_publish(
+            stage: Path, identity: tuple[int, int], final: Path
+        ) -> None:
+            real_publish(stage, identity, final)
+            path = final / "failures/preflight.json"
+            path.unlink()
+            path.write_bytes(foreign)
+
+        monkeypatch.setattr(portfolio_module, "publish_stage", replace_during_publish)
+    else:
+        real_revalidate = portfolio_module._revalidate_owned_record
+
+        def replace_after_first_final_check(
+            path: Path, receipt: object, label: str
+        ) -> None:
+            real_revalidate(path, receipt, label)  # type: ignore[arg-type]
+            if path == output / "receipt.json":
+                target = output / "failures/preflight.json"
+                target.unlink()
+                target.write_bytes(foreign)
+
+        monkeypatch.setattr(
+            portfolio_module,
+            "_revalidate_owned_record",
+            replace_after_first_final_check,
+        )
+
+    with pytest.raises(ValueError, match="publication"):
+        evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    if boundary == "before":
+        assert not output.exists()
+        stages = list(output.parent.glob(f".{output.name}-stage-*"))
+        assert len(stages) == 1
+        assert (stages[0] / "failures/preflight.json").read_bytes() == foreign
+    else:
+        assert (output / "failures/preflight.json").read_bytes() == foreign
 
 
 def test_foreign_cell_inventory_aborts_before_next_launch(

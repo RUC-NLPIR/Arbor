@@ -12,12 +12,13 @@ import pytest
 
 from commissioning.cache_campaign import portfolio as portfolio_module
 from commissioning.cache_campaign import calibrate as calibration_module
+from commissioning.cache_campaign import evidence as cache_evidence
 from commissioning.cache_campaign.cachesim import ChildResult
 from commissioning.cache_campaign.calibrate import (
     CalibrationError,
     calibrate,
-    compare_constraints,
 )
+from commissioning.cache_campaign.constraints import compare_constraints
 from commissioning.cache_campaign.portfolio import evaluate_portfolio
 from commissioning.cache_campaign.records import record_sha256, sha256_file
 from scripts import calibrate_aros_cache_baselines as calibration_cli
@@ -39,7 +40,15 @@ POLICIES = ("LRU", "ARC", "WTinyLFU", "Sieve", "S3FIFO", "BeladySize")
 def forbidden_key(value: object) -> str | None:
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in {"score", "reward", "objective", "aggregate", "pass"}:
+            if key in {
+                "score",
+                "reward",
+                "objective",
+                "aggregate",
+                "pass",
+                "rank",
+                "ranking",
+            }:
                 return key
             nested = forbidden_key(item)
             if nested is not None:
@@ -227,6 +236,34 @@ def campaign_evidence(tmp_path_factory: pytest.TempPathFactory) -> CampaignEvide
     patcher.undo()
 
 
+def phase_bins(object_misses: int, byte_misses: int) -> list[dict[str, int]]:
+    return [
+        {
+            "index": index,
+            "requests": 10,
+            "object_misses": object_misses if index == 0 else 0,
+            "request_bytes": 100,
+            "byte_misses": byte_misses if index == 0 else 0,
+        }
+        for index in range(16)
+    ]
+
+
+def distributed_phase_bins(
+    object_misses: int, byte_misses: int
+) -> list[dict[str, int]]:
+    return [
+        {
+            "index": index,
+            "requests": 10,
+            "object_misses": object_misses,
+            "request_bytes": 100,
+            "byte_misses": byte_misses,
+        }
+        for index in range(16)
+    ]
+
+
 def candidate_measurement(**changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "rung": "r2",
@@ -239,17 +276,7 @@ def candidate_measurement(**changes: object) -> dict[str, object]:
         "metadata_bytes_per_object": "2",
         "global_metadata_bytes": 24,
         "metadata_measurement_sha256": "a" * 64,
-        "phase_diagnostic": {
-            "bins": [
-                {
-                    "index": 0,
-                    "requests": 10,
-                    "object_misses": 3,
-                    "request_bytes": 100,
-                    "byte_misses": 30,
-                }
-            ]
-        },
+        "phase_diagnostic": {"bins": phase_bins(3, 40)},
     }
     value.update(changes)
     return value
@@ -296,54 +323,70 @@ def contract(**changes: object) -> dict[str, object]:
 
 
 def calibration() -> dict[str, object]:
-    comparisons = {
-        policy: {
-            "dev-0": {
-                "0.01": {
-                    "repetitions": 5 if policy in {"Sieve", "S3FIFO"} else 1,
-                    "object_miss_ratio_values": ["0.2"]
-                    * (5 if policy in {"Sieve", "S3FIFO"} else 1),
-                    "byte_miss_ratio_values": ["0.3"]
-                    * (5 if policy in {"Sieve", "S3FIFO"} else 1),
-                    "phase_values": [
-                        {
-                            "bins": [
-                                {
-                                    "index": 0,
-                                    "requests": 10,
-                                    "object_misses": 2,
-                                    "request_bytes": 100,
-                                    "byte_misses": 20,
-                                }
-                            ]
-                        }
-                    ]
-                    * (5 if policy in {"Sieve", "S3FIFO"} else 1),
-                }
-            }
-        }
-        for policy in POLICIES
+    fractions = ("0.01", "0.05", "0.1")
+    r0_hashes = {
+        policy: f"{index + 7:x}" * 64
+        for index, policy in enumerate(POLICIES)
     }
-    reference = {
-        "metadata": {
-            "bytes_per_object": "2",
-            "global_bytes": 24,
-            "measurement_sha256": "b" * 64,
-            "probe_evidence": {
-                "r0_receipt_sha256": "a" * 64,
-                "metadata_command_sha256": "d" * 64,
-                "stdout_sha256": "b" * 64,
-                "metadata_measurement_sha256": "b" * 64,
-                "metadata_probe_source_sha256": "e" * 64,
-                "metadata_probe_binary_sha256": "f" * 64,
-                "metadata_interposer_source_sha256": "0" * 64,
-                "metadata_interposer_binary_sha256": "1" * 64,
-            },
-            "independent_audit": "pending_independent_review",
-        },
-        "dev-0": {
-            "0.01": {
+    input_hashes = [f"{index:064x}" for index in range(1, 15)]
+    policy_receipts = {
+        "LRU": input_hashes[0:1],
+        "ARC": input_hashes[1:2],
+        "WTinyLFU": input_hashes[2:3],
+        "Sieve": input_hashes[3:8],
+        "S3FIFO": input_hashes[8:13],
+        "BeladySize": input_hashes[13:14],
+    }
+    comparisons: dict[str, object] = {}
+    references: dict[str, object] = {}
+    measurement_index = 100
+    phase_index = 1_000
+    for policy in POLICIES:
+        repetitions = 5 if policy in {"Sieve", "S3FIFO"} else 1
+        trace: dict[str, object] = {}
+        for fraction in fractions:
+            measurement_hashes = [
+                f"{index:064x}"
+                for index in range(
+                    measurement_index, measurement_index + repetitions
+                )
+            ]
+            measurement_index += repetitions
+            phase_values = []
+            for _index in range(repetitions):
+                phase_values.append(
+                    {
+                        "phase_sha256": f"{phase_index:064x}",
+                        "request_count": 160,
+                        "object_misses": 32,
+                        "request_bytes": 1_600,
+                        "byte_misses": 480,
+                        "bins": distributed_phase_bins(2, 30),
+                    }
+                )
+                phase_index += 1
+            trace[fraction] = {
+                "repetitions": repetitions,
+                "input_receipt_sha256s": list(policy_receipts[policy]),
+                "measurement_sha256s": measurement_hashes,
+                "object_miss_ratio_values": ["0.2"] * repetitions,
+                "byte_miss_ratio_values": ["0.3"] * repetitions,
+                "phase_values": phase_values,
+            }
+        comparisons[policy] = {"dev-0": trace}
+    for policy in ("Sieve", "S3FIFO"):
+        comparison_trace = comparisons[policy]["dev-0"]  # type: ignore[index]
+        reference_trace: dict[str, object] = {}
+        for fraction in fractions:
+            comparison_cell = comparison_trace[fraction]
+            reference_trace[fraction] = {
                 "repetitions": 5,
+                "input_receipt_sha256s": list(
+                    comparison_cell["input_receipt_sha256s"]
+                ),
+                "measurement_sha256s": list(
+                    comparison_cell["measurement_sha256s"]
+                ),
                 "object_miss_ratio_values": ["0.2"] * 5,
                 "byte_miss_ratio_values": ["0.3"] * 5,
                 "simulator_throughput_mqps_values": [
@@ -357,8 +400,25 @@ def calibration() -> dict[str, object]:
                 "throughput_median_mqps": "20",
                 "throughput_floor_mqps": "18",
             }
-        },
-    }
+        references[policy] = {
+            "metadata": {
+                "bytes_per_object": "2",
+                "global_bytes": 24,
+                "measurement_sha256": "b" * 64,
+                "probe_evidence": {
+                    "r0_receipt_sha256": r0_hashes[policy],
+                    "metadata_command_sha256": "d" * 64,
+                    "stdout_sha256": "b" * 64,
+                    "metadata_measurement_sha256": "b" * 64,
+                    "metadata_probe_source_sha256": "e" * 64,
+                    "metadata_probe_binary_sha256": "f" * 64,
+                    "metadata_interposer_source_sha256": "0" * 64,
+                    "metadata_interposer_binary_sha256": "1" * 64,
+                },
+                "independent_audit": "pending_independent_review",
+            },
+            "dev-0": reference_trace,
+        }
     value: dict[str, object] = {
         "schema_version": 1,
         "task_manifest_sha256": "1" * 64,
@@ -396,23 +456,36 @@ def calibration() -> dict[str, object]:
             "python": "test",
         },
         "repetitions": 5,
-        "cache_fractions": ["0.01", "0.05", "0.1"],
-        "references": {"Sieve": reference, "S3FIFO": reference},
+        "cache_fractions": list(fractions),
+        "references": references,
         "comparisons": comparisons,
-        "r0_receipt_sha256s": {
-            policy: f"{index + 7:x}" * 64
-            for index, policy in enumerate(POLICIES)
-        },
-        "input_receipt_sha256s": [f"{index + 1:x}" * 64 for index in range(14)],
+        "r0_receipt_sha256s": r0_hashes,
+        "input_receipt_sha256s": input_hashes,
     }
     value["calibration_sha256"] = record_sha256(value, "calibration_sha256")
     return value
+def write_bound_calibration(
+    path: Path, value: dict[str, object]
+) -> tuple[Path, str]:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    )
+    path.chmod(0o400)
+    return path, str(value["calibration_sha256"])
 
 
-def test_compare_constraints_keeps_audit_gated_facts_separate() -> None:
+@pytest.fixture
+def bound_calibration(tmp_path: Path) -> tuple[Path, str]:
+    return write_bound_calibration(tmp_path / "calibration.json", calibration())
+
+
+def test_compare_constraints_keeps_audit_gated_facts_separate(
+    bound_calibration: tuple[Path, str],
+) -> None:
     accepted = {"metadata": "accepted", "complexity": "accepted"}
+    path, expected = bound_calibration
     result = compare_constraints(
-        candidate_measurement(), candidate_r0(), contract(), calibration(), accepted
+        candidate_measurement(), candidate_r0(), contract(), path, expected, accepted
     )
     assert result["throughput"] is True
     assert result["object_metadata"] is True
@@ -424,17 +497,14 @@ def test_compare_constraints_keeps_audit_gated_facts_separate() -> None:
     assert result["sanitizer"] is True
     assert result["object_miss_gaps"]["LRU"] == ["0.01"]  # type: ignore[index]
     assert result["byte_miss_gaps"]["LRU"] == ["0.01"]  # type: ignore[index]
-    assert result["phase_gaps"]["LRU"] == [  # type: ignore[index]
-        {
-            "bins": [
-                {
-                    "index": 0,
-                    "object_miss_ratio_gap": "0.1",
-                    "byte_miss_ratio_gap": "0.1",
-                }
-            ]
-        }
-    ]
+    lru_phase = result["phase_gaps"]["LRU"]  # type: ignore[index]
+    assert len(lru_phase) == 1
+    assert len(lru_phase[0]["bins"]) == 16
+    assert lru_phase[0]["bins"][0] == {
+        "index": 0,
+        "object_miss_ratio_gap": "0.1",
+        "byte_miss_ratio_gap": "0.1",
+    }
 
 
 @pytest.mark.parametrize(
@@ -456,9 +526,11 @@ def test_compare_constraints_never_promotes_missing_or_rejected_audit(
     audit: dict[str, str] | None,
     metadata: bool | None,
     complexity: bool | None,
+    bound_calibration: tuple[Path, str],
 ) -> None:
+    path, expected = bound_calibration
     result = compare_constraints(
-        candidate_measurement(), candidate_r0(), contract(), calibration(), audit
+        candidate_measurement(), candidate_r0(), contract(), path, expected, audit
     )
     assert result["object_metadata"] is metadata
     assert result["global_metadata"] is metadata
@@ -466,7 +538,9 @@ def test_compare_constraints_never_promotes_missing_or_rejected_audit(
     assert result["complexity"] is complexity
 
 
-def test_compare_constraints_reports_observed_failures_without_audit() -> None:
+def test_compare_constraints_reports_observed_failures_without_audit(
+    bound_calibration: tuple[Path, str],
+) -> None:
     measurement = candidate_measurement(
         metadata_bytes_per_object="2.1", global_metadata_bytes=25
     )
@@ -477,44 +551,54 @@ def test_compare_constraints_reports_observed_failures_without_audit() -> None:
             "measurement_sha256": "a" * 64,
         }
     )
-    result = compare_constraints(
-        measurement, r0, contract(), calibration(), None
-    )
+    path, expected = bound_calibration
+    result = compare_constraints(measurement, r0, contract(), path, expected, None)
     assert result["object_metadata"] is False
     assert result["global_metadata"] is False
 
 
-def test_compare_constraints_requires_exact_metadata_probe_binding() -> None:
+def test_compare_constraints_requires_exact_metadata_probe_binding(
+    bound_calibration: tuple[Path, str],
+) -> None:
+    path, expected = bound_calibration
     with pytest.raises(CalibrationError, match="metadata binding"):
         compare_constraints(
             candidate_measurement(metadata_measurement_sha256="c" * 64),
             candidate_r0(),
             contract(),
-            calibration(),
+            path,
+            expected,
             None,
         )
 
 
-def test_compare_constraints_rejects_integer_as_boolean_check() -> None:
+def test_compare_constraints_rejects_integer_as_boolean_check(
+    bound_calibration: tuple[Path, str],
+) -> None:
     r0 = candidate_r0(
         checks={"capacity": 1, "deterministic": True, "sanitizer": True}
     )
+    path, expected = bound_calibration
     with pytest.raises(CalibrationError, match="capacity"):
         compare_constraints(
-            candidate_measurement(), r0, contract(), calibration(), None
+            candidate_measurement(), r0, contract(), path, expected, None
         )
 
 
-def test_declared_metadata_consistency_compares_declared_and_measured_values() -> None:
+def test_declared_metadata_consistency_compares_declared_and_measured_values(
+    bound_calibration: tuple[Path, str],
+) -> None:
     declared = contract(object_metadata_bytes=1, global_metadata_bytes=23)
     r0_declaration = dict(declared)
     del r0_declaration["schema_version"]
     r0 = candidate_r0(declared_metadata=r0_declaration)
+    path, expected = bound_calibration
     result = compare_constraints(
         candidate_measurement(),
         r0,
         declared,
-        calibration(),
+        path,
+        expected,
         {"metadata": "accepted", "complexity": "accepted"},
     )
     assert result["declared_metadata_consistency"] is False
@@ -530,56 +614,258 @@ def test_declared_metadata_consistency_compares_declared_and_measured_values() -
         {"metadata": "unknown", "complexity": "accepted"},
     ],
 )
-def test_compare_constraints_rejects_malformed_audit(audit: object) -> None:
+def test_compare_constraints_rejects_malformed_audit(
+    audit: object, bound_calibration: tuple[Path, str]
+) -> None:
+    path, expected = bound_calibration
     with pytest.raises(CalibrationError, match="audit"):
         compare_constraints(
             candidate_measurement(),
             candidate_r0(),
             contract(),
-            calibration(),
+            path,
+            expected,
             audit,  # type: ignore[arg-type]
         )
 
 
-def test_compare_constraints_rejects_malformed_policy_contract() -> None:
+def test_compare_constraints_rejects_malformed_policy_contract(
+    bound_calibration: tuple[Path, str],
+) -> None:
     malformed = contract(extra=True)
+    path, expected = bound_calibration
     with pytest.raises(CalibrationError, match="contract"):
         compare_constraints(
             candidate_measurement(),
             candidate_r0(),
             malformed,
-            calibration(),
+            path,
+            expected,
             {"metadata": "accepted", "complexity": "accepted"},
         )
 
 
-def test_compare_constraints_rejects_rehashed_calibration_mutation() -> None:
-    changed = calibration()
-    changed["references"]["Sieve"]["dev-0"]["0.01"][  # type: ignore[index]
-        "throughput_floor_mqps"
-    ] = "17"
+@pytest.mark.parametrize("kind", ["limits", "distributions", "gaps", "ranking"])
+def test_compare_constraints_rejects_coordinated_rehash_against_old_digest(
+    tmp_path: Path, kind: str
+) -> None:
+    original = calibration()
+    expected = str(original["calibration_sha256"])
+    changed = json.loads(json.dumps(original))
+    if kind == "limits":
+        changed["references"]["Sieve"]["metadata"][  # type: ignore[index]
+            "global_bytes"
+        ] = 25
+    elif kind == "distributions":
+        changed["comparisons"]["LRU"]["dev-0"]["0.01"][  # type: ignore[index]
+            "object_miss_ratio_values"
+        ][0] = "0.19"
+    elif kind == "gaps":
+        changed["comparisons"]["LRU"]["dev-0"]["0.01"][  # type: ignore[index]
+            "phase_values"
+        ][0]["bins"][0]["object_misses"] = 1
+    else:
+        changed["comparisons"]["LRU"]["dev-0"]["0.01"][  # type: ignore[index]
+            "ranking"
+        ] = 1
     changed["calibration_sha256"] = record_sha256(
         changed, "calibration_sha256"
     )
-    with pytest.raises(CalibrationError, match="calibration"):
+    path, _changed_hash = write_bound_calibration(
+        tmp_path / "coordinated-rehash.json", changed
+    )
+    with pytest.raises(CalibrationError, match="expected|external|digest"):
         compare_constraints(
             candidate_measurement(),
             candidate_r0(),
             contract(),
-            changed,
+            path,
+            expected,
             {"metadata": "accepted", "complexity": "accepted"},
         )
 
 
-def test_compare_constraints_decimal_math_ignores_ambient_traps() -> None:
+@pytest.mark.parametrize("expected", [None, "0" * 64])
+def test_compare_constraints_requires_external_digest(
+    bound_calibration: tuple[Path, str], expected: object
+) -> None:
+    path, _actual = bound_calibration
+    with pytest.raises(CalibrationError, match="expected|digest"):
+        compare_constraints(
+            candidate_measurement(),
+            candidate_r0(),
+            contract(),
+            path,
+            expected,  # type: ignore[arg-type]
+            None,
+        )
+
+
+def test_compare_constraints_never_accepts_arbitrary_calibration_dict() -> None:
+    value = calibration()
+    with pytest.raises(CalibrationError, match="path binding"):
+        compare_constraints(
+            candidate_measurement(),
+            candidate_r0(),
+            contract(),
+            value,  # type: ignore[arg-type]
+            str(value["calibration_sha256"]),
+            None,
+        )
+
+
+def test_compare_constraints_rejects_writable_calibration(
+    bound_calibration: tuple[Path, str],
+) -> None:
+    path, expected = bound_calibration
+    path.chmod(0o600)
+    with pytest.raises(CalibrationError, match="read-only|mode"):
+        compare_constraints(
+            candidate_measurement(), candidate_r0(), contract(), path, expected, None
+        )
+
+
+def test_compare_constraints_rejects_path_replacement_restore(
+    bound_calibration: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, expected = bound_calibration
+    held = path.with_name("held.json")
+    raw = path.read_bytes()
+    real_parse = cache_evidence._strict_parse_json_bytes
+
+    def replace_while_parsing(
+        value: bytes, *, decimal_numbers: bool
+    ) -> dict[str, object]:
+        path.rename(held)
+        path.write_bytes(raw)
+        path.chmod(0o400)
+        parsed = real_parse(value, decimal_numbers=decimal_numbers)
+        path.unlink()
+        held.rename(path)
+        return parsed
+
+    monkeypatch.setattr(
+        cache_evidence, "_strict_parse_json_bytes", replace_while_parsing
+    )
+    with pytest.raises(CalibrationError, match="binding"):
+        compare_constraints(
+            candidate_measurement(), candidate_r0(), contract(), path, expected, None
+        )
+
+
+def test_compare_constraints_rejects_unknown_nested_ranking(
+    tmp_path: Path,
+) -> None:
+    changed = calibration()
+    changed["comparisons"]["LRU"]["dev-0"]["0.01"][  # type: ignore[index]
+        "ranking"
+    ] = 1
+    changed["calibration_sha256"] = record_sha256(
+        changed, "calibration_sha256"
+    )
+    path, expected = write_bound_calibration(tmp_path / "ranking.json", changed)
+    with pytest.raises(CalibrationError, match="ranking|keys|forbidden"):
+        compare_constraints(
+            candidate_measurement(), candidate_r0(), contract(), path, expected, None
+        )
+
+
+@pytest.mark.parametrize("kind", ["receipt", "measurement"])
+def test_compare_constraints_rejects_forged_cell_hash_projections(
+    tmp_path: Path, kind: str
+) -> None:
+    changed = calibration()
+    comparisons = changed["comparisons"]
+    assert isinstance(comparisons, dict)
+    if kind == "receipt":
+        arc_receipt = comparisons["ARC"]["dev-0"]["0.01"][  # type: ignore[index]
+            "input_receipt_sha256s"
+        ]
+        for cell in comparisons["LRU"]["dev-0"].values():  # type: ignore[index,union-attr]
+            cell["input_receipt_sha256s"] = list(arc_receipt)
+    else:
+        duplicate = comparisons["ARC"]["dev-0"]["0.01"][  # type: ignore[index]
+            "measurement_sha256s"
+        ][0]
+        comparisons["LRU"]["dev-0"]["0.01"][  # type: ignore[index]
+            "measurement_sha256s"
+        ][0] = duplicate
+    changed["calibration_sha256"] = record_sha256(
+        changed, "calibration_sha256"
+    )
+    path, expected = write_bound_calibration(
+        tmp_path / f"forged-{kind}.json", changed
+    )
+    with pytest.raises(CalibrationError, match="projection|reused|cover"):
+        compare_constraints(
+            candidate_measurement(), candidate_r0(), contract(), path, expected, None
+        )
+
+
+@pytest.mark.parametrize("kind", ["schema", "repetitions", "phase_total"])
+def test_compare_constraints_rejects_booleans_for_exact_integers(
+    tmp_path: Path, kind: str
+) -> None:
+    changed = calibration()
+    if kind == "schema":
+        changed["schema_version"] = True
+    elif kind == "repetitions":
+        changed["comparisons"]["LRU"]["dev-0"]["0.01"][  # type: ignore[index]
+            "repetitions"
+        ] = True
+    else:
+        phase = changed["comparisons"]["LRU"]["dev-0"]["0.01"][  # type: ignore[index]
+            "phase_values"
+        ][0]
+        phase["object_misses"] = True
+        for index, item in enumerate(phase["bins"]):
+            item["object_misses"] = 1 if index == 0 else 0
+    changed["calibration_sha256"] = record_sha256(
+        changed, "calibration_sha256"
+    )
+    path, expected = write_bound_calibration(
+        tmp_path / f"boolean-{kind}.json", changed
+    )
+    with pytest.raises(
+        CalibrationError, match="integer|schema|repetitions|phase|identity|cell"
+    ):
+        compare_constraints(
+            candidate_measurement(), candidate_r0(), contract(), path, expected, None
+        )
+
+
+def test_compare_constraints_rejects_phase_ratio_distribution_contradiction(
+    tmp_path: Path,
+) -> None:
+    changed = calibration()
+    changed["comparisons"]["LRU"]["dev-0"]["0.01"][  # type: ignore[index]
+        "object_miss_ratio_values"
+    ] = ["0.19"]
+    changed["calibration_sha256"] = record_sha256(
+        changed, "calibration_sha256"
+    )
+    path, expected = write_bound_calibration(
+        tmp_path / "phase-ratio-contradiction.json", changed
+    )
+    with pytest.raises(CalibrationError, match="phase.*ratio|distribution"):
+        compare_constraints(
+            candidate_measurement(), candidate_r0(), contract(), path, expected, None
+        )
+
+
+def test_compare_constraints_decimal_math_ignores_ambient_traps(
+    bound_calibration: tuple[Path, str],
+) -> None:
     hostile = Context(prec=2)
     hostile.traps[Inexact] = True
+    path, expected = bound_calibration
     with localcontext(hostile):
         result = compare_constraints(
             candidate_measurement(),
             candidate_r0(),
             contract(),
-            calibration(),
+            path,
+            expected,
             {"metadata": "accepted", "complexity": "accepted"},
         )
     assert result["object_miss_gaps"]["Sieve"] == ["0.01"] * 5  # type: ignore[index]
@@ -645,8 +931,25 @@ def test_calibration_freezes_all_policy_evidence_and_exact_medians(
     references = frozen["references"]
     assert isinstance(references, dict)
     cell = references["Sieve"][campaign_evidence.trace_ids[0]]["0.01"]
+    sieve_receipts = [
+        json.loads(path.read_text())
+        for path in campaign_evidence.receipts
+        if json.loads(path.read_text())["policy"] == "Sieve"
+    ]
     assert cell == {
         "repetitions": 5,
+        "input_receipt_sha256s": sorted(
+            item["receipt_sha256"] for item in sieve_receipts
+        ),
+        "measurement_sha256s": sorted(
+            next(
+                measurement["measurement_sha256"]
+                for measurement in item["measurements"]
+                if measurement["trace_id"] == campaign_evidence.trace_ids[0]
+                and measurement["cache_fraction"] == "0.01"
+            )
+            for item in sieve_receipts
+        ),
         "object_miss_ratio_values": ["0.0625"] * 5,
         "byte_miss_ratio_values": ["0.0625"] * 5,
         "simulator_throughput_mqps_values": ["18", "19", "20", "21", "22"],
@@ -716,6 +1019,16 @@ def test_calibration_freezes_all_policy_evidence_and_exact_medians(
     assert frozen["scientific_input_sha256s"] == dict(
         sorted(expected_scientific.items())
     )
+    compared = compare_constraints(
+        candidate_measurement(),
+        candidate_r0(),
+        contract(),
+        output,
+        str(frozen["calibration_sha256"]),
+        {"metadata": "accepted", "complexity": "accepted"},
+    )
+    assert compared["throughput"] is True
+    assert compared["object_metadata"] is True
 
 
 @pytest.mark.parametrize(

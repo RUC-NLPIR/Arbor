@@ -1824,6 +1824,55 @@ def rewrite_first_raw_result(receipt_path: Path, defect: str) -> None:
     write_record(receipt_path, receipt, "receipt_sha256")
 
 
+def rewrite_first_cell_to_stage_prefix(receipt_path: Path) -> None:
+    root = receipt_path.parent
+    stage = root.parent / f".{root.name}-stage-before-rename"
+    receipt = json.loads(receipt_path.read_text())
+    summary = receipt["measurements"][0]
+    measurement_path = root / summary["path"]
+    measurement = json.loads(measurement_path.read_text())
+    process = measurement["process"]
+    execution_relative = receipt["execution_copy"]["path"]
+    trace_relative = next(
+        item["snapshot_path"]
+        for item in receipt["trace_snapshots"]
+        if item["trace_id"] == measurement["trace_id"]
+    )
+    fixed_relative = receipt["scientific_inputs"]["fixed_time_interposer"]["path"]
+    output_relative = measurement["simulator_output"]["requested_path"]
+    old_trace = stage / trace_relative
+    process["argv"][1] = f"LD_PRELOAD={stage / fixed_relative}"
+    process["argv"][2] = str(stage / execution_relative)
+    process["argv"][3] = str(old_trace)
+    process["argv"][-1] = f"--output={stage / output_relative}"
+    stdout = root / process["stdout"]["path"]
+    raw = stdout.read_text()
+    final_trace = str((root / trace_relative).resolve())
+    raw = raw.replace(final_trace, str(old_trace), 1)
+    stdout.write_text(raw)
+    simulator = root / measurement["simulator_output"]["path"]
+    simulator.write_text(raw)
+    process["stdout"]["size_bytes"] = stdout.stat().st_size
+    process["stdout"]["sha256"] = sha256_file(stdout)
+    process["process_sha256"] = record_sha256(process, "process_sha256")
+    process_path = measurement_path.parent / "process.json"
+    write_record(process_path, process, "process_sha256")
+    request_path = measurement_path.parent / "request.json"
+    request = json.loads(request_path.read_text())
+    request["argv"] = list(process["argv"])
+    write_record(request_path, request, "request_sha256")
+    measurement["argv"] = list(process["argv"])
+    measurement["process"] = process
+    measurement["simulator_output"]["size_bytes"] = simulator.stat().st_size
+    measurement["simulator_output"]["sha256"] = sha256_file(simulator)
+    write_record(measurement_path, measurement, "measurement_sha256")
+    summary["measurement_sha256"] = measurement["measurement_sha256"]
+    receipt["measurement_hashes"][0] = measurement["measurement_sha256"]
+    for changed in (stdout, simulator, process_path, request_path, measurement_path):
+        update_portfolio_inventory(receipt, root, changed)
+    write_record(receipt_path, receipt, "receipt_sha256")
+
+
 def rewrite_r0_receipt(path: Path, receipt: dict[str, object]) -> None:
     write_record(path, receipt, "receipt_sha256")
 
@@ -2103,6 +2152,36 @@ def test_detailed_policy_name_allows_only_numeric_generated_suffix(
     assert matches("S3FIFO-0.1000-2", "S3FIFO") is True
     assert matches("S3FIFO-other", "S3FIFO") is False
     assert matches("S3FIFO2-0.1", "S3FIFO") is False
+
+
+def test_verifier_rebases_common_prepublication_stage_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    rewrite_first_cell_to_stage_prefix(fixture.paths["r1_receipt"])
+    result = fixture.module.verify(fixture.index)
+    assert result["r1"]["state"] == "verified"
+
+
+@pytest.mark.parametrize(
+    ("cache_size", "display"),
+    [
+        (1023, "1023B"),
+        (1024, "1KiB"),
+        (1331, "1KiB"),
+        (1536, "2KiB"),
+        (2560, "2KiB"),
+        (1024**2 - 1, "1024KiB"),
+        (1024**2, "1MiB"),
+        (1024**3, "1GiB"),
+        (1024**4, "1TiB"),
+    ],
+)
+def test_pinned_cache_size_renderer(cache_size: int, display: str) -> None:
+    module = load_verifier()
+    renderer = getattr(module, "_render_cache_size", None)
+    assert renderer is not None
+    assert renderer(cache_size) == display
 
 
 def test_verifier_recomputes_r3_transfer_constraint_facts(

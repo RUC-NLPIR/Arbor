@@ -1921,29 +1921,17 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
     }
 
 
-def _cache_size_bytes(raw):
-    units = {
-        "TiB": 1024**4,
-        "GiB": 1024**3,
-        "MiB": 1024**2,
-        "KiB": 1024,
-        "B": 1,
-    }
-    if not 1 <= len(raw) <= 64 or any(character.isspace() for character in raw):
-        raise VerificationError("simulator cache size text is invalid")
-    unit = next((name for name in units if raw.endswith(name)), None)
-    if unit is None:
-        raise VerificationError("simulator cache size unit is invalid")
-    number = _normalized_decimal(raw[: -len(unit)], "simulator cache size")
-    if number.startswith("-"):
-        raise VerificationError("simulator cache size must be positive")
-    _sign, coefficient, scale = _decimal_key(number)
-    numerator = coefficient * units[unit]
-    denominator = 10**scale
-    size, remainder = divmod(numerator, denominator)
-    if remainder or size <= 0:
-        raise VerificationError("simulator cache size is not an exact byte count")
-    return size
+def _render_cache_size(cache_size):
+    size = _integer(cache_size, "cache size", 1)
+    for suffix, unit in (
+        ("TiB", 1024**4),
+        ("GiB", 1024**3),
+        ("MiB", 1024**2),
+        ("KiB", 1024),
+    ):
+        if size >= unit:
+            return f"{format(float(size) / float(unit), '.0f')}{suffix}"
+    return f"{size}B"
 
 
 def _bounded_unsigned_decimal(raw, label, integer_digits, fraction_digits):
@@ -2009,6 +1997,10 @@ def _parse_result(raw):
             raise VerificationError("simulator result field count mismatch")
         requests = fields[1].strip().split(" ")
         cache_size = fields[0].strip()
+        if not 1 <= len(cache_size) <= 64 or any(
+            character.isspace() for character in cache_size
+        ):
+            raise VerificationError("simulator cache size text is invalid")
         object_ratio = fields[2].strip().removeprefix("miss ratio ")
         byte_ratio = fields[3].strip().removeprefix("byte miss ratio ")
         throughput = fields[4].strip().removeprefix("throughput ").removesuffix(" MQPS")
@@ -2041,7 +2033,6 @@ def _parse_result(raw):
                 "trace_path": trace_path,
                 "detailed_policy": detailed_policy,
                 "cache_size": cache_size,
-                "cache_size_bytes": _cache_size_bytes(cache_size),
                 "object_miss_ratio": parsed_object,
                 "byte_miss_ratio": parsed_byte,
                 "simulator_throughput_mqps": parsed_throughput,
@@ -2091,6 +2082,20 @@ def _verify_phase(root, value, measurement, trace):
         **totals,
         "bins": bins,
     }
+
+
+def _prepublication_prefix(root, retained_path, raw_path, label):
+    retained = Path(retained_path)
+    try:
+        relative = retained.relative_to(root)
+    except ValueError as error:
+        raise VerificationError(f"{label} retained path escapes evidence root") from error
+    raw = Path(_string(raw_path, label))
+    if not raw.is_absolute() or len(raw.parts) <= len(relative.parts):
+        raise VerificationError(f"{label} prepublication path is invalid")
+    if tuple(raw.parts[-len(relative.parts) :]) != relative.parts:
+        raise VerificationError(f"{label} does not rebase to retained evidence")
+    return Path(*raw.parts[: -len(relative.parts)])
 
 
 def _verify_measurement(
@@ -2170,12 +2175,6 @@ def _verify_measurement(
             observed = _normalized_decimal(observed, field)
         if observed != expected:
             raise VerificationError(f"raw simulator {field} differs from measurement")
-    if parsed["trace_path"] != str(trace_snapshot_path):
-        raise VerificationError("raw simulator trace differs from bound trace snapshot")
-    if not _detailed_policy_matches(parsed["detailed_policy"], measurement["policy"]):
-        raise VerificationError("raw simulator policy differs from requested policy")
-    if parsed["cache_size_bytes"] != measurement["cache_size_bytes"]:
-        raise VerificationError("raw simulator cache size differs from requested cell")
     expected_cpu = _decimal_ratio(process["cpu_ns"], measurement["request_count"])
     if measurement["cpu_ns_per_request"] != expected_cpu:
         raise VerificationError("measurement CPU nanoseconds per request mismatch")
@@ -2194,11 +2193,44 @@ def _verify_measurement(
     ):
         raise VerificationError("simulator requested output path mismatch")
     requested_path = root.joinpath(*requested.parts).resolve(strict=False)
+    argv = process["argv"]
+    if len(argv) != 13 or not argv[1].startswith("LD_PRELOAD="):
+        raise VerificationError("measurement argv shape is invalid")
+    prefixes = {
+        _prepublication_prefix(
+            root,
+            fixed_time_path,
+            argv[1].removeprefix("LD_PRELOAD="),
+            "fixed-time argv path",
+        ),
+        _prepublication_prefix(
+            root, execution_path, argv[2], "execution argv path"
+        ),
+        _prepublication_prefix(
+            root, trace_snapshot_path, argv[3], "trace argv path"
+        ),
+    }
+    if not argv[-1].startswith("--output="):
+        raise VerificationError("measurement output argv is invalid")
+    prefixes.add(
+        _prepublication_prefix(
+            root,
+            requested_path,
+            argv[-1].removeprefix("--output="),
+            "output argv path",
+        )
+    )
+    if len(prefixes) != 1:
+        raise VerificationError("measurement argv uses inconsistent stage prefixes")
+    stage_prefix = next(iter(prefixes))
+    fixed_relative = fixed_time_path.relative_to(root)
+    execution_relative = execution_path.relative_to(root)
+    trace_relative = trace_snapshot_path.relative_to(root)
     expected_argv = [
         "/usr/bin/env",
-        f"LD_PRELOAD={fixed_time_path}",
-        str(execution_path),
-        str(trace_snapshot_path),
+        f"LD_PRELOAD={stage_prefix / fixed_relative}",
+        str(stage_prefix / execution_relative),
+        str(stage_prefix / trace_relative),
         "oracleGeneral",
         measurement["policy"],
         str(measurement["cache_size_bytes"]),
@@ -2207,10 +2239,16 @@ def _verify_measurement(
         f"--warmup-sec={trace['warmup_seconds']}",
         "--consider-obj-metadata=true",
         "--print-head-req=false",
-        f"--output={requested_path}",
+        f"--output={stage_prefix / requested}",
     ]
     if measurement["argv"] != expected_argv or process["argv"] != expected_argv:
         raise VerificationError("measurement argv differs from bound execution cell")
+    if parsed["trace_path"] != argv[3]:
+        raise VerificationError("raw simulator trace differs from execution-time argv")
+    if not _detailed_policy_matches(parsed["detailed_policy"], measurement["policy"]):
+        raise VerificationError("raw simulator policy differs from requested policy")
+    if parsed["cache_size"] != _render_cache_size(measurement["cache_size_bytes"]):
+        raise VerificationError("raw simulator cache size differs from pinned rendering")
     if (
         simulator_path.stat().st_size != simulator["size_bytes"]
         or _sha256_file(simulator_path) != simulator["sha256"]

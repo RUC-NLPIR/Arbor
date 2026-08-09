@@ -83,6 +83,16 @@ _ARTIFACTS = {
         "remaining_uncertainty",
         "next_action_rationale",
     ),
+    "Preregistration": (
+        "mechanism_hypothesis",
+        "key_predictions",
+        "falsifiers",
+        "controls",
+        "primary_comparisons",
+        "transfer_prediction",
+        "stopping_rules",
+        "evaluator_version",
+    ),
     "FrozenEvidencePacket": (
         "task_brief_ref",
         "preregistration_ref",

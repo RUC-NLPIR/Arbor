@@ -592,14 +592,37 @@ def evaluate_r0(
     artifacts = ArtifactRegistry(stage)
     provenance_valid = True
     source_binding_valid = True
+    allowed_build_roots: set[Path] = set()
 
     def provenance_guard(boundary: str) -> bool:
         nonlocal provenance_valid, source_binding_valid
         if not provenance_valid:
             return False
-        allowed_roots = (root / "_build-release", root / "_build-sanitize")
+        sanitizer_root = root / "_build-sanitize"
+        if sanitizer_root not in allowed_build_roots and os.path.lexists(
+            sanitizer_root
+        ):
+            source_binding_valid = False
+            provenance_valid = False
+            errors.append(f"{boundary} unexpected sanitizer build directory")
+            return False
+        for build_root in allowed_build_roots:
+            try:
+                if _directory_identity(build_root) != build_owners[build_root]:
+                    raise EvaluationError("build directory identity changed")
+            except (OSError, ValueError) as error:
+                source_binding_valid = False
+                provenance_valid = False
+                errors.append(
+                    f"{boundary} build directory mutation: {_bounded(error)}"
+                )
+                return False
         try:
-            _post_binding(root, binding, allowed_roots=allowed_roots)
+            _post_binding(
+                root,
+                binding,
+                allowed_roots=tuple(sorted(allowed_build_roots)),
+            )
         except (OSError, ValueError) as error:
             source_binding_valid = False
             provenance_valid = False
@@ -611,6 +634,21 @@ def evaluate_r0(
                 f"{boundary} artifact binding mutation: {', '.join(mutated)}"
             )
         return provenance_valid
+
+    def allow_configured_build_root(label: str) -> None:
+        nonlocal provenance_valid, source_binding_valid
+        build_root = root / (
+            "_build-release" if label == "release-configure" else "_build-sanitize"
+        )
+        try:
+            identity = _directory_identity(build_root)
+        except (OSError, ValueError) as error:
+            provenance_valid = False
+            source_binding_valid = False
+            errors.append(f"{label} build directory invalid: {_bounded(error)}")
+            return
+        build_owners[build_root] = identity
+        allowed_build_roots.add(build_root)
 
     def capture_artifact(name: str, path: Path) -> None:
         nonlocal provenance_valid
@@ -652,6 +690,11 @@ def evaluate_r0(
         commands.append(item)
         if not item.ok:
             errors.append(f"{label}: command did not complete successfully")
+        if attempted and item.ok and label in {
+            "release-configure",
+            "sanitize-configure",
+        }:
+            allow_configured_build_root(label)
         if attempted:
             provenance_guard(f"after {label}")
         return item
@@ -678,11 +721,6 @@ def evaluate_r0(
             ],
         )
         release_root = root / "_build-release"
-        if os.path.lexists(release_root):
-            try:
-                build_owners[release_root] = _directory_identity(release_root)
-            except EvaluationError as error:
-                errors.append(_bounded(error))
         if release_config.ok:
             capture_artifact(
                 "release_cmake_cache", release_root / "CMakeCache.txt"
@@ -738,11 +776,6 @@ def evaluate_r0(
             ],
         )
         sanitize_root = root / "_build-sanitize"
-        if os.path.lexists(sanitize_root):
-            try:
-                build_owners[sanitize_root] = _directory_identity(sanitize_root)
-            except EvaluationError as error:
-                errors.append(_bounded(error))
         if sanitize_config.ok:
             capture_artifact(
                 "sanitize_cmake_cache", sanitize_root / "CMakeCache.txt"

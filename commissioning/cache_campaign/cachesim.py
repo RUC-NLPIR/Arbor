@@ -16,6 +16,7 @@ from decimal import Decimal, DecimalException
 from pathlib import Path
 from typing import BinaryIO
 
+from .linux_subreaper import SubreaperError, SubreaperScope
 from .records import quarantine_unlink, sha256_file
 
 
@@ -663,10 +664,11 @@ def _reject_surviving_process_group(process_group: int) -> None:
         time.sleep(0.01)
 
 
-def run_child(
+def _run_child_in_scope(
     argv: Sequence[str],
     output_dir: Path,
     *,
+    descendant_scope: SubreaperScope,
     cwd: Path | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
@@ -758,7 +760,10 @@ def run_child(
             )
         returncode = os.waitstatus_to_exitcode(status)
         process.returncode = returncode
+        wall_ns = max(0, time.monotonic_ns() - start)
         _reject_surviving_process_group(process.pid)
+        if descendant_scope.contain():
+            raise ChildRunError("child run retained an escaped descendant process")
         for descriptor, stream in (
             (stdout_read, stdout_stream),
             (stderr_read, stderr_stream),
@@ -769,7 +774,6 @@ def run_child(
             output_bytes += written
             if exceeded:
                 raise ChildRunError("child output limit exceeded")
-        wall_ns = max(0, time.monotonic_ns() - start)
         cpu_ns = max(
             0,
             round((usage.ru_utime + usage.ru_stime) * 1_000_000_000),
@@ -839,6 +843,11 @@ def run_child(
             stderr_sha256=stderr_sha256,
         )
     except BaseException as error:
+        containment_issue = None
+        try:
+            descendant_scope.contain()
+        except (OSError, RuntimeError) as containment_error:
+            containment_issue = _bounded_error(containment_error)
         _close_stream(stdout_pipe_stream)
         _close_stream(stderr_pipe_stream)
         _close_stream(stdout_stream)
@@ -871,6 +880,8 @@ def run_child(
             message = _bounded_error(error)
             if cleanup_issue is not None:
                 message += f"; cleanup: {cleanup_issue}"
+            if containment_issue is not None:
+                message += f"; containment: {containment_issue}"
             message = _bounded_message(message)
             if isinstance(error, ChildRunError) and cleanup_issue is None:
                 raise
@@ -889,3 +900,26 @@ def run_child(
             os.close(directory_descriptor)
         if parent_descriptor >= 0:
             os.close(parent_descriptor)
+
+
+def run_child(
+    argv: Sequence[str],
+    output_dir: Path,
+    *,
+    cwd: Path | None = None,
+    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+) -> ChildResult:
+    """Run one bounded child; cwd inherits the caller's current working directory."""
+    try:
+        with SubreaperScope() as descendant_scope:
+            return _run_child_in_scope(
+                argv,
+                output_dir,
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=max_output_bytes,
+                descendant_scope=descendant_scope,
+            )
+    except SubreaperError as error:
+        raise ChildRunError(_bounded_message(_bounded_error(error))) from error

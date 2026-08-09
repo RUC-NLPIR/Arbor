@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import signal
+import subprocess
 import sys
 import time
 from decimal import Decimal
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from commissioning.cache_campaign import cachesim as cachesim_module
+from commissioning.cache_campaign import linux_subreaper as subreaper_module
 from commissioning.cache_campaign.cachesim import (
     CacheSimOutputError,
     ChildRunError,
@@ -462,7 +464,9 @@ def test_run_child_uses_wait4_cpu_rounding_and_popen_contract(
 
     monkeypatch.setattr(cachesim_module.os, "wait4", completed_wait4)
     times = iter([1000, 2500])
-    monkeypatch.setattr(cachesim_module.time, "monotonic_ns", lambda: next(times))
+    monkeypatch.setattr(
+        cachesim_module.time, "monotonic_ns", lambda: next(times, 3000)
+    )
     group_checks: list[tuple[int, int]] = []
 
     def empty_process_group(pgid: int, sig: int) -> None:
@@ -765,6 +769,162 @@ def test_run_child_rejects_and_kills_descendant_after_leader_exit(
                 except ProcessLookupError:
                     break
                 time.sleep(0.01)
+
+
+def _escaped_descendant_leader_code(
+    pid_path: Path,
+    ready_path: Path,
+    marker_path: Path,
+    mode: str,
+) -> str:
+    descendant = (
+        "import os, pathlib, time; os.setsid(); "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+        f"pathlib.Path({str(ready_path)!r}).write_text('ready'); "
+        "time.sleep(0.3); "
+        f"pathlib.Path({str(marker_path)!r}).write_text('late'); "
+        "time.sleep(60)"
+    )
+    tail = {
+        "exit": "",
+        "sleep": "time.sleep(60)",
+        "noise": "while True: os.write(1, b'x' * 65536)",
+    }[mode]
+    return (
+        "import os, pathlib, subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {descendant!r}]); "
+        f"ready = pathlib.Path({str(ready_path)!r}); "
+        "deadline = time.monotonic() + 5; "
+        "\nwhile not ready.exists():\n"
+        "  assert time.monotonic() < deadline\n"
+        "  time.sleep(0.005)\n"
+        + tail
+    )
+
+
+def _assert_process_absent(pid: int) -> None:
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"process survived: {pid}")
+
+
+def test_run_child_rejects_setsid_descendant_after_leader_exit(tmp_path: Path) -> None:
+    pid_path = tmp_path / "escaped.pid"
+    ready_path = tmp_path / "escaped.ready"
+    marker_path = tmp_path / "late.marker"
+    output = tmp_path / "escaped-run"
+    try:
+        with pytest.raises(ChildRunError, match="descendant"):
+            run_child(
+                [
+                    sys.executable,
+                    "-c",
+                    _escaped_descendant_leader_code(
+                        pid_path, ready_path, marker_path, "exit"
+                    ),
+                ],
+                output,
+                timeout_seconds=2,
+                max_output_bytes=1024 * 1024,
+            )
+        escaped_pid = int(pid_path.read_text())
+        _assert_process_absent(escaped_pid)
+        time.sleep(0.35)
+        assert not marker_path.exists()
+        assert not output.exists()
+    finally:
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize(
+    ("mode", "timeout_seconds", "max_output_bytes", "message"),
+    [
+        ("sleep", 0.1, 1024 * 1024, "timeout"),
+        ("noise", 2.0, 32 * 1024, "output limit"),
+    ],
+)
+def test_run_child_reaps_setsid_descendant_on_operational_failure(
+    tmp_path: Path,
+    mode: str,
+    timeout_seconds: float,
+    max_output_bytes: int,
+    message: str,
+) -> None:
+    pid_path = tmp_path / f"{mode}.pid"
+    ready_path = tmp_path / f"{mode}.ready"
+    marker_path = tmp_path / f"{mode}.marker"
+    output = tmp_path / f"{mode}-run"
+    try:
+        with pytest.raises(ChildRunError, match=message):
+            run_child(
+                [
+                    sys.executable,
+                    "-c",
+                    _escaped_descendant_leader_code(
+                        pid_path, ready_path, marker_path, mode
+                    ),
+                ],
+                output,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=max_output_bytes,
+            )
+        escaped_pid = int(pid_path.read_text())
+        _assert_process_absent(escaped_pid)
+        assert not marker_path.exists()
+        assert not output.exists()
+    finally:
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_run_child_does_not_reap_preexisting_child(tmp_path: Path) -> None:
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        result = run_child(
+            [sys.executable, "-c", "pass"],
+            tmp_path / "isolated-run",
+            timeout_seconds=2,
+        )
+        assert result.returncode == 0
+        assert unrelated.poll() is None
+    finally:
+        unrelated.kill()
+        unrelated.wait()
+
+
+def test_run_child_restores_process_subreaper_state(tmp_path: Path) -> None:
+    before = subreaper_module._get_subreaper()
+    result = run_child(
+        [sys.executable, "-c", "pass"],
+        tmp_path / "subreaper-state-run",
+    )
+    assert result.returncode == 0
+    assert subreaper_module._get_subreaper() is before
+
+
+def test_run_child_preserves_previously_enabled_subreaper_state(tmp_path: Path) -> None:
+    before = subreaper_module._get_subreaper()
+    subreaper_module._set_subreaper(True)
+    try:
+        result = run_child(
+            [sys.executable, "-c", "pass"],
+            tmp_path / "enabled-subreaper-run",
+        )
+        assert result.returncode == 0
+        assert subreaper_module._get_subreaper() is True
+    finally:
+        subreaper_module._set_subreaper(before)
 
 
 def test_run_child_cleanup_preserves_a_replacement_file(

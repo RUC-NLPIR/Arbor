@@ -1051,6 +1051,60 @@ def test_source_mutation_is_sticky_even_if_later_command_would_restore(
     assert any("source binding" in error for error in receipt["errors"])
 
 
+def test_candidate_ctest_cannot_preseed_sanitizer_build_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class SanitizerPreseedRun(FakeRun):
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            result = super().__call__(argv, output_dir, cwd=cwd)
+            if argv[0] == "ctest" and "-R" in argv:
+                assert cwd is not None
+                attacker = Path(cwd) / "_build-sanitize"
+                attacker.mkdir()
+                (attacker / "foreign-marker").write_text("keep\n")
+            return result
+
+    receipt, runner, checkout, *_rest = evaluated(
+        tmp_path, monkeypatch, SanitizerPreseedRun()
+    )
+    assert receipt["checks"]["source_binding"] is False
+    assert receipt["checks"]["sanitizer"] is None
+    assert not any(
+        command[:5] == ["cmake", "-S", ".", "-B", "_build-sanitize"]
+        for command in runner.commands
+    )
+    marker = checkout / "_build-sanitize/foreign-marker"
+    assert marker.read_text() == "keep\n"
+    assert any("sanitizer build directory" in error for error in receipt["errors"])
+
+
+def test_preexisting_sanitizer_build_directory_is_rejected_and_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout, base, candidate, lock = repository(tmp_path)
+    monkeypatch.setattr("commissioning.cache_campaign.evaluate.SOURCE_LOCK", lock)
+    source = source_receipt(tmp_path / "source.json", lock)
+    attacker = checkout / "_build-sanitize"
+    attacker.mkdir()
+    marker = attacker / "foreign-marker"
+    marker.write_text("keep\n")
+    runner = FakeRun()
+    with pytest.raises(EvaluationError, match="dirty|build directory"):
+        evaluate_r0(
+            checkout=checkout,
+            base=base,
+            candidate=candidate,
+            policy=POLICY,
+            source_receipt=source,
+            output=tmp_path / "failure-output",
+            run=runner,
+        )
+    assert marker.read_text() == "keep\n"
+    assert runner.commands == []
+
+
 def test_release_archive_or_cache_mutation_stops_probe_linking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

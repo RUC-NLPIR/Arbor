@@ -14,6 +14,10 @@ PROGRAM_ROOT = ROOT / "commissioning/research_program"
 SOURCES_PATH = PROGRAM_ROOT / "SOURCES.json"
 UPSTREAM_PRODUCT_NAMES = ("claude", "gemini")
 SOURCE_RECORD_SUFFIXES = {".json", ".jsonl", ".yaml", ".yml", ".md"}
+SOURCE_RECORD_EXEMPTIONS = {
+    "SOURCES.json",
+    "procedures/aros-source-research.md",
+}
 RUNTIME_SOURCE_SUFFIXES = {".json", ".md", ".py"}
 RUNTIME_ARTIFACT_PARTS = {"__pycache__", "build"}
 APPROVED_SOURCE_RECORD = {
@@ -122,15 +126,14 @@ def _is_source_or_provenance_record(program_root: Path, path: Path) -> bool:
     relative = path.relative_to(program_root)
     if path.suffix.casefold() not in SOURCE_RECORD_SUFFIXES:
         return False
-    if relative.as_posix().casefold() == "procedures/aros-source-research.md":
+    if relative.as_posix() in SOURCE_RECORD_EXEMPTIONS:
         return False
     candidates = (*relative.parts[:-1], path.stem)
     for candidate in candidates:
-        folded = candidate.casefold()
-        tokens = [token for token in re.split(r"[^a-z0-9]+", folded) if token]
-        if folded.startswith("provenance"):
-            return True
-        if tokens and tokens[0] in {"source", "sources"}:
+        tokens = {
+            token for token in re.split(r"[^a-z0-9]+", candidate.casefold()) if token
+        }
+        if tokens & {"source", "sources", "provenance"}:
             return True
     return False
 
@@ -138,14 +141,14 @@ def _is_source_or_provenance_record(program_root: Path, path: Path) -> bool:
 def _assert_sole_source_or_provenance_record(
     program_root: Path, sources_path: Path
 ) -> None:
+    assert sources_path.relative_to(program_root).as_posix() == "SOURCES.json"
+    assert sources_path.is_file()
     records = {
         path
         for path in program_root.rglob("*")
         if path.is_file() and _is_source_or_provenance_record(program_root, path)
     }
-    assert records == {sources_path}, (
-        f"unexpected source or provenance record: {records}"
-    )
+    assert not records, f"unexpected source or provenance record: {records}"
 
 
 def _assert_no_upstream_product_names(program_root: Path, sources_path: Path) -> None:
@@ -243,7 +246,9 @@ def test_source_runtime_names_do_not_reuse_upstream_product_names() -> None:
     _assert_no_upstream_product_names(PROGRAM_ROOT, SOURCES_PATH)
 
 
-def test_source_record_scan_allows_runtime_source_procedure(tmp_path: Path) -> None:
+def test_source_record_scan_allows_exact_scientific_source_research(
+    tmp_path: Path,
+) -> None:
     program_root = tmp_path / "research_program"
     sources_path = program_root / "SOURCES.json"
     procedure = program_root / "procedures/aros-source-research.md"
@@ -270,6 +275,9 @@ def test_source_record_scan_allows_runtime_source_procedure(tmp_path: Path) -> N
         "source/record.YAML",
         "Provenance-notes.YML",
         "PROVENANCE.MD",
+        "research-provenance.json",
+        "upstream-source-record.json",
+        "nested/record-sources.yaml",
     ],
 )
 def test_source_record_scan_rejects_second_record_location(

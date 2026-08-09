@@ -29,6 +29,7 @@ from commissioning.cache_campaign.seal import (
     _new_path,
     _project_binding,
     _scan_task,
+    _validate_authority_paths,
     _validate_reproduction,
     load_frozen_package,
     run_r3,
@@ -231,6 +232,28 @@ def test_authority_paths_are_fixed_by_package_and_host_manifest(
     ledger, receipt = _canonical_authority_paths(value, host)
     assert ledger == project.parent / f"r3-{authority}.consumed.json"
     assert receipt == project.parent / f"r3-{authority}.receipt.json"
+
+
+@pytest.mark.parametrize("placement", ["equal_final", "nested_final", "alias_ledger"])
+def test_authority_output_overlap_rejects_before_ledger_consumption(
+    tmp_path: Path, placement: str
+) -> None:
+    ledger = tmp_path / "ledger.json"
+    final_receipt = tmp_path / "final.json"
+    if placement == "equal_final":
+        output = final_receipt
+    elif placement == "nested_final":
+        output = final_receipt / "nested-output"
+    else:
+        target = tmp_path / "target"
+        target.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(target, target_is_directory=True)
+        ledger = target / "authority.json"
+        output = alias / "authority.json"
+    with pytest.raises(SealError, match="overlap"):
+        _validate_authority_paths(ledger, final_receipt, output)
+    assert not ledger.exists()
 
 
 def test_ledger_is_exclusive_canonical_and_fsynced_before_parent(

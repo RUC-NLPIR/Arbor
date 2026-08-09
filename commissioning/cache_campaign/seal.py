@@ -492,6 +492,21 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+def _validate_authority_paths(
+    ledger: Path, final_receipt: Path, output: Path
+) -> None:
+    resolved = tuple(
+        Path(path).absolute().resolve(strict=False)
+        for path in (ledger, final_receipt, output)
+    )
+    for index, left in enumerate(resolved):
+        for right in resolved[index + 1 :]:
+            if _paths_overlap(left, right):
+                raise SealError(
+                    "ledger, final receipt, and output paths must not overlap"
+                )
+
+
 def _sticky_binding(binding: FileBinding) -> StickyBinding:
     metadata = binding.path.stat(follow_symlinks=False)
     if (
@@ -788,8 +803,7 @@ def _prevalidate(
         ledger_path = _new_path(canonical_ledger, project.path, "ledger")
         final_receipt = _new_path(final_receipt, project.path, "final receipt")
         output_path = _new_path(output, project.path, "output")
-        if _paths_overlap(ledger_path, output_path):
-            raise SealError("ledger and output paths must not overlap")
+        _validate_authority_paths(ledger_path, final_receipt, output_path)
         raw_traces = host.get("traces")
         if not isinstance(raw_traces, list):
             raise SealError("host R3 manifest traces are invalid")

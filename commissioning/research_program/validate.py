@@ -157,6 +157,7 @@ _ARTIFACTS = {
         "disposition",
         "principal_decision_receipt_ref",
         "authority_class",
+        "principal_authority_ref",
     ),
     "ClaimPackage": (
         "claim",
@@ -178,6 +179,7 @@ _ARTIFACTS = {
         "checkpoint_ref",
         "principal_decision_receipt_ref",
         "authority_class",
+        "principal_authority_ref",
     ),
 }
 _PROCEDURES = {

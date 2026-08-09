@@ -137,7 +137,8 @@
       "principal_checkpoint_ref",
       "disposition",
       "principal_decision_receipt_ref",
-      "authority_class"
+      "authority_class",
+      "principal_authority_ref"
     ],
     "ClaimPackage": [
       "claim",
@@ -158,7 +159,8 @@
       "environment_ref",
       "checkpoint_ref",
       "principal_decision_receipt_ref",
-      "authority_class"
+      "authority_class",
+      "principal_authority_ref"
     ]
   },
   "procedures": {

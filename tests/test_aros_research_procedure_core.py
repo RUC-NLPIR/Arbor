@@ -222,6 +222,7 @@ EXPECTED_ARTIFACTS = {
         "disposition",
         "principal_decision_receipt_ref",
         "authority_class",
+        "principal_authority_ref",
     ),
     "ClaimPackage": (
         "claim",
@@ -243,6 +244,7 @@ EXPECTED_ARTIFACTS = {
         "checkpoint_ref",
         "principal_decision_receipt_ref",
         "authority_class",
+        "principal_authority_ref",
     ),
 }
 EXPECTED_PROCEDURES = {
@@ -925,7 +927,7 @@ EXPECTED_CLAIM_INPUT_RULES = (
         "`principal_response_ref`, `root_question_ref`, `candidate_commit`, "
         "`preregistration_ref`, `reproduction_ref`, `principal_actor_ref`, "
         "`principal_checkpoint_ref`, `disposition`, `principal_decision_receipt_ref`, "
-        "`authority_class`."
+        "`authority_class`, `principal_authority_ref`."
     ),
     (
         "Exact reads: Read the exact Claim draft, every evidence reference, Reviewer "
@@ -933,17 +935,19 @@ EXPECTED_CLAIM_INPUT_RULES = (
         "value to its immutable reference."
     ),
     (
-        "Authority: Derive adjudication authority only from the exact "
-        "`principal_decision_receipt_ref` read with `Receipt.read`; do not infer actor "
-        "authority, enforcement, acceptance, narrowing, rejection, or objection resolution "
-        "from names or labels."
+        "Authority: Derive adjudication authority only from exact "
+        "`principal_authority_ref` and `principal_decision_receipt_ref` values read with "
+        "`Receipt.read` from the canonical AROS receipt store; do not infer actor authority, "
+        "enforcement, acceptance, narrowing, rejection, or objection resolution from names, "
+        "labels, inline payloads, or paths."
     ),
 )
 EXPECTED_CLAIM_METHOD_RULES = (
     (
         "Read the exact Claim draft, every evidence reference, Reviewer report, Principal "
-        "response, Principal actor record, Principal checkpoint, Principal decision "
-        "receipt, preregistration, and reproduction package before packaging."
+        "response, Principal actor record, Principal checkpoint, Principal authority "
+        "receipt, Principal decision receipt, preregistration, and reproduction package "
+        "before packaging."
     ),
     (
         "Require `root_question_ref`, `candidate_commit`, `preregistration_ref`, "
@@ -952,16 +956,25 @@ EXPECTED_CLAIM_METHOD_RULES = (
         "or cross-lineage references."
     ),
     (
-        "Use `Receipt.read` to read exact `principal_decision_receipt_ref`; require the "
-        "immutable receipt to bind exactly `actor_ref`, `principal_response_ref`, "
-        "`principal_checkpoint_ref`, `disposition`, and `enforcement_class`."
+        "Use `Receipt.read` to read exact `principal_authority_ref` from the canonical AROS "
+        "receipt store; require the immutable authority receipt to bind exactly `issuer`, "
+        "`actor`, `enforcement_class`, and `authority_context_sha256`."
     ),
     (
-        "Require decision-receipt `actor_ref` to equal input `principal_actor_ref`, its "
-        "response, checkpoint, and disposition references to equal the corresponding "
-        "inputs, its checkpoint to bind the same response and lineage, and input "
-        "`authority_class` to equal `enforcement_class`, which must be exactly "
-        "`cooperative` or `protected`."
+        "Use `Receipt.read` to read exact `principal_decision_receipt_ref` from the canonical "
+        "AROS receipt store; require the canonical immutable receipt returned by "
+        "`Receipt.read`, not an inline or unbound payload, to bind exactly `issuer`, "
+        "`actor`, `principal_response_ref`, `principal_checkpoint_ref`, `disposition`, "
+        "`enforcement_class`, and `authority_context_sha256`."
+    ),
+    (
+        "Require decision-receipt `issuer` and `actor` to equal the issuer and actor "
+        "authorized by the Principal authority receipt, decision-receipt `actor` to equal "
+        "input `principal_actor_ref`, its response, checkpoint, and disposition references "
+        "to equal the corresponding inputs, its checkpoint to bind the same response and "
+        "lineage, its `authority_context_sha256` and `enforcement_class` to equal the "
+        "authority receipt, and input `authority_class` to equal that "
+        "`enforcement_class`, which must be exactly `cooperative` or `protected`."
     ),
     (
         "Require input `disposition` and the Principal response disposition to match and "
@@ -1015,17 +1028,20 @@ EXPECTED_CLAIM_METHOD_RULES = (
 EXPECTED_CLAIM_COMPLETION_RULES = (
     (
         "Complete only after every exact input reference and cross-artifact lineage is "
-        "verified, the Principal decision receipt exactly binds actor, response, "
-        "checkpoint, disposition, and enforcement class, every material objection has an "
-        "explicit Principal disposition, no fatal objection remains unresolved, and all "
-        "`ClaimPackage` fields are populated."
+        "verified, canonical Principal authority and decision receipts exactly bind and "
+        "authorize issuer, actor, response, checkpoint, disposition, authority context, "
+        "and enforcement class, every material objection has an explicit Principal "
+        "disposition, no fatal objection remains unresolved, and all `ClaimPackage` fields "
+        "are populated."
     ),
     (
         "If any required reference is missing or cross-lineage, "
-        "`principal_decision_receipt_ref` is missing or unreadable, its actor, response, "
-        "checkpoint, disposition, or enforcement class mismatches input, its checkpoint "
-        "does not bind the same response and lineage, any material objection is unanswered, "
-        "or any fatal objection remains unresolved, do not emit or checkpoint a "
+        "`principal_authority_ref` or `principal_decision_receipt_ref` is missing, unreadable, "
+        "noncanonical, inline, or unbound, either receipt has an unknown field, decision "
+        "issuer or actor is not authorized by the authority receipt, actor, response, "
+        "checkpoint, disposition, authority context, or enforcement class mismatches, the "
+        "checkpoint does not bind the same response and lineage, any material objection is "
+        "unanswered, or any fatal objection remains unresolved, do not emit or checkpoint a "
         "`ClaimPackage`; return incomplete for Principal adjudication."
     ),
     (
@@ -1040,8 +1056,9 @@ EXPECTED_CLAIM_COMPLETION_RULES = (
     (
         "Only after adjudication, call `Research.checkpoint` with the complete package, "
         "exact lineage and evidence references, `review_ref`, `principal_response_ref`, "
-        "and `principal_decision_receipt_ref`, preserved `authority_class`, and "
-        "`checkpoint_ref` set exactly to verified `principal_checkpoint_ref`."
+        "`principal_authority_ref`, `principal_decision_receipt_ref`, preserved "
+        "`authority_class`, and `checkpoint_ref` set exactly to verified "
+        "`principal_checkpoint_ref`."
     ),
     "Exit immediately after the successful checkpoint; do not continue the research session.",
 )
@@ -1055,10 +1072,16 @@ EXPECTED_CLAIM_FORBIDDEN_RULES = (
         "alter adjudicated wording or scope."
     ),
     (
-        "Do not accept a missing, unreadable, altered, or mismatched "
-        "`principal_decision_receipt_ref`, and do not combine references from different "
-        "questions, candidates, preregistrations, reproductions, reviews, responses, "
-        "actors, or checkpoints."
+        "Do not accept a missing, unreadable, noncanonical, altered, or mismatched "
+        "`principal_authority_ref` or `principal_decision_receipt_ref`, and do not combine "
+        "references from different questions, candidates, preregistrations, reproductions, "
+        "reviews, responses, actors, checkpoints, authority contexts, or enforcement "
+        "classes."
+    ),
+    (
+        "Do not accept an inline or unbound authority or decision receipt payload, read a "
+        "receipt from a path or noncanonical store, or treat any value except the exact "
+        "`Receipt.read` result as a canonical AROS receipt."
     ),
     (
         "Do not call cooperative authority protected, infer protected enforcement from a "
@@ -1541,6 +1564,7 @@ def test_contract_set_has_exact_canonical_values() -> None:
         ("AdjudicatedEvidence", "disposition"),
         ("AdjudicatedEvidence", "principal_decision_receipt_ref"),
         ("AdjudicatedEvidence", "authority_class"),
+        ("AdjudicatedEvidence", "principal_authority_ref"),
         ("ClaimPackage", "disposition"),
         ("ClaimPackage", "root_question_ref"),
         ("ClaimPackage", "candidate_commit"),
@@ -1552,6 +1576,7 @@ def test_contract_set_has_exact_canonical_values() -> None:
         ("ClaimPackage", "checkpoint_ref"),
         ("ClaimPackage", "principal_decision_receipt_ref"),
         ("ClaimPackage", "authority_class"),
+        ("ClaimPackage", "principal_authority_ref"),
     ],
 )
 def test_contract_rejects_missing_review_claim_lineage_and_authority_fields(
@@ -3007,10 +3032,10 @@ def test_claim_package_returns_all_fields_after_principal_adjudication() -> None
         "`reproduction_ref` exactly from the verified input lineage."
     )
     assert output[4] == (
-        "Decision authority binding: Copy `principal_decision_receipt_ref` unchanged and "
-        "set `authority_class` exactly to its `enforcement_class`; `cooperative` remains "
-        "`cooperative`, and `protected` is permitted only when the exact receipt says "
-        "`protected`."
+        "Decision authority binding: Copy `principal_authority_ref` and "
+        "`principal_decision_receipt_ref` unchanged and set `authority_class` exactly to "
+        "their matching `enforcement_class`; `cooperative` remains `cooperative`, and "
+        "`protected` is permitted only when both exact canonical receipts say `protected`."
     )
     assert output[5] == (
         "Environment and checkpoint binding: Set `environment_ref` to the exact matching "
@@ -3114,20 +3139,20 @@ def test_claim_package_rejects_objection_and_admission_polarity_mutations(
         ),
         (
             "Method",
-            "decision-receipt `actor_ref` to equal input `principal_actor_ref`",
-            "decision-receipt `actor_ref` may differ from input `principal_actor_ref`",
+            "decision-receipt `issuer` and `actor` to equal the issuer and actor",
+            "decision-receipt `issuer` and `actor` may be unauthorized",
             True,
         ),
         (
             "Method",
-            "response, checkpoint, and disposition references to equal the corresponding",
-            "response, checkpoint, and disposition references may differ from the",
+            "response, checkpoint, and disposition references",
+            "unrelated response, checkpoint, and disposition references",
             True,
         ),
         (
             "Completion",
-            "enforcement class mismatches input",
-            "enforcement class may mismatch input",
+            "authority context, or enforcement class mismatches",
+            "authority context or enforcement class may mismatch",
             False,
         ),
     ],
@@ -3158,9 +3183,67 @@ def test_claim_package_rejects_cross_lineage_and_forged_principal_authority(
     ("heading", "old", "new", "numbered"),
     [
         (
+            "Inputs",
+            "canonical AROS receipt store",
+            "an inline payload from a filesystem path",
+            False,
+        ),
+        (
             "Method",
-            "`authority_class` to equal `enforcement_class`",
-            "`authority_class` may differ from `enforcement_class`",
+            "canonical immutable receipt returned by",
+            "inline unbound receipt payload",
+            True,
+        ),
+        (
+            "Method",
+            "`authority_context_sha256` and `enforcement_class`",
+            "mismatched `authority_context_sha256` and `enforcement_class`",
+            True,
+        ),
+        (
+            "Forbidden",
+            "Do not accept an inline or unbound authority or decision receipt payload",
+            "Accept an inline or unbound authority or decision receipt payload",
+            False,
+        ),
+        (
+            "Forbidden",
+            "path or noncanonical store",
+            "path or any noncanonical store",
+            False,
+        ),
+    ],
+)
+def test_claim_package_rejects_forged_payload_noncanonical_path_and_context_mismatch(
+    heading: str, old: str, new: str, numbered: bool
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-claim-package.md"
+    )
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+    expected = {
+        "Inputs": EXPECTED_CLAIM_INPUT_RULES,
+        "Method": EXPECTED_CLAIM_METHOD_RULES,
+        "Forbidden": EXPECTED_CLAIM_FORBIDDEN_RULES,
+    }[heading]
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            heading,
+            expected,
+            numbered=numbered,
+        )
+
+
+@pytest.mark.parametrize(
+    ("heading", "old", "new", "numbered"),
+    [
+        (
+            "Method",
+            "`authority_class` to equal that `enforcement_class`",
+            "`authority_class` may differ from that `enforcement_class`",
             True,
         ),
         (

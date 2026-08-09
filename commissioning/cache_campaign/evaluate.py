@@ -15,6 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .cachesim import ChildResult, parse_cachesim_output, run_child
+from .portfolio import evaluate_portfolio
 from .evidence import (
     ArtifactRegistry,
     Binding as _Binding,
@@ -64,6 +65,9 @@ from .r0_probes import (
 )
 from .scope import PolicyContract, ScopeFacts, evaluate_scope
 from .source import validate_source
+
+
+__all__ = ["evaluate_portfolio", "evaluate_r0"]
 
 
 SOURCE_LOCK = load_object(Path(__file__).with_name("source.lock.json"))

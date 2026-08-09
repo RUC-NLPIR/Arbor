@@ -142,6 +142,33 @@ def _integer(value: object, label: str, *, minimum: int) -> int:
     return value
 
 
+def canonical_decimal(value: Decimal) -> str:
+    if type(value) is not Decimal or not value.is_finite():
+        raise ContractError("canonical decimal must be finite")
+    if value.is_zero():
+        return "0"
+    return format(value.normalize(), "f")
+
+
+def _decimal(
+    value: object,
+    label: str,
+    *,
+    minimum: Decimal,
+    maximum: Decimal | None = None,
+    minimum_inclusive: bool = True,
+) -> Decimal:
+    if type(value) is not Decimal or not value.is_finite():
+        raise ContractError(f"{label} must be a finite Decimal")
+    if (value < minimum if minimum_inclusive else value <= minimum) or (
+        maximum is not None and value > maximum
+    ):
+        interval = "[" if minimum_inclusive else "("
+        upper = str(maximum) if maximum is not None else "infinity"
+        raise ContractError(f"{label} must be in {interval}{minimum}, {upper}]")
+    return value
+
+
 def _hash_regular_file(path: Path) -> tuple[str, int]:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
@@ -270,6 +297,150 @@ class Portfolio:
             source_commit=source_commit,
             cache_fractions=(0.01, 0.05, 0.10),
             traces=tuple(traces),
+        )
+
+
+@dataclass(frozen=True)
+class ParetoMeasurement:
+    rung: Literal["r1", "r2", "r3"]
+    split: Literal["dev", "visible", "r3"]
+    trace_id: str
+    policy: str
+    cache_fraction: Decimal
+    cache_size_bytes: int
+    request_count: int
+    object_miss_ratio: Decimal
+    byte_miss_ratio: Decimal
+    simulator_throughput_mqps: Decimal
+    cpu_ns_per_request: Decimal
+    metadata_bytes_per_object: Decimal
+    global_metadata_bytes: int
+    metadata_measurement_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.rung not in {"r1", "r2", "r3"}:
+            raise ContractError("rung must be r1, r2, or r3")
+        if self.split not in {"dev", "visible", "r3"}:
+            raise ContractError("split must be dev, visible, or r3")
+        _nonempty_string(self.trace_id, "trace_id")
+        _nonempty_string(self.policy, "policy")
+        _decimal(
+            self.cache_fraction,
+            "cache_fraction",
+            minimum=Decimal(0),
+            maximum=Decimal(1),
+            minimum_inclusive=False,
+        )
+        _integer(self.cache_size_bytes, "cache_size_bytes", minimum=1)
+        _integer(self.request_count, "request_count", minimum=1)
+        _decimal(
+            self.object_miss_ratio,
+            "object_miss_ratio",
+            minimum=Decimal(0),
+            maximum=Decimal(1),
+        )
+        _decimal(
+            self.byte_miss_ratio,
+            "byte_miss_ratio",
+            minimum=Decimal(0),
+            maximum=Decimal(1),
+        )
+        _decimal(
+            self.simulator_throughput_mqps,
+            "simulator_throughput_mqps",
+            minimum=Decimal(0),
+            minimum_inclusive=False,
+        )
+        _decimal(
+            self.cpu_ns_per_request,
+            "cpu_ns_per_request",
+            minimum=Decimal(0),
+            minimum_inclusive=False,
+        )
+        _decimal(
+            self.metadata_bytes_per_object,
+            "metadata_bytes_per_object",
+            minimum=Decimal(0),
+        )
+        _integer(self.global_metadata_bytes, "global_metadata_bytes", minimum=0)
+        if HEX64.fullmatch(self.metadata_measurement_sha256) is None:
+            raise ContractError(
+                "metadata_measurement_sha256 must be a lowercase SHA-256"
+            )
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "rung": self.rung,
+            "split": self.split,
+            "trace_id": self.trace_id,
+            "policy": self.policy,
+            "cache_fraction": canonical_decimal(self.cache_fraction),
+            "cache_size_bytes": self.cache_size_bytes,
+            "request_count": self.request_count,
+            "object_miss_ratio": canonical_decimal(self.object_miss_ratio),
+            "byte_miss_ratio": canonical_decimal(self.byte_miss_ratio),
+            "simulator_throughput_mqps": canonical_decimal(
+                self.simulator_throughput_mqps
+            ),
+            "cpu_ns_per_request": canonical_decimal(self.cpu_ns_per_request),
+            "metadata_bytes_per_object": canonical_decimal(
+                self.metadata_bytes_per_object
+            ),
+            "global_metadata_bytes": self.global_metadata_bytes,
+            "metadata_measurement_sha256": self.metadata_measurement_sha256,
+        }
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, object]) -> ParetoMeasurement:
+        expected = {
+            "rung",
+            "split",
+            "trace_id",
+            "policy",
+            "cache_fraction",
+            "cache_size_bytes",
+            "request_count",
+            "object_miss_ratio",
+            "byte_miss_ratio",
+            "simulator_throughput_mqps",
+            "cpu_ns_per_request",
+            "metadata_bytes_per_object",
+            "global_metadata_bytes",
+            "metadata_measurement_sha256",
+        }
+        _exact_keys(value, expected, "Pareto measurement")
+
+        def parsed_decimal(name: str) -> Decimal:
+            raw = value[name]
+            if type(raw) is not str:
+                raise ContractError(f"{name} must be a canonical Decimal string")
+            try:
+                parsed = Decimal(raw)
+            except Exception as error:
+                raise ContractError(f"{name} must be a canonical Decimal string") from error
+            if not parsed.is_finite() or canonical_decimal(parsed) != raw:
+                raise ContractError(f"{name} must be a canonical Decimal string")
+            return parsed
+
+        return cls(
+            rung=value["rung"],  # type: ignore[arg-type]
+            split=value["split"],  # type: ignore[arg-type]
+            trace_id=value["trace_id"],  # type: ignore[arg-type]
+            policy=value["policy"],  # type: ignore[arg-type]
+            cache_fraction=parsed_decimal("cache_fraction"),
+            cache_size_bytes=value["cache_size_bytes"],  # type: ignore[arg-type]
+            request_count=value["request_count"],  # type: ignore[arg-type]
+            object_miss_ratio=parsed_decimal("object_miss_ratio"),
+            byte_miss_ratio=parsed_decimal("byte_miss_ratio"),
+            simulator_throughput_mqps=parsed_decimal(
+                "simulator_throughput_mqps"
+            ),
+            cpu_ns_per_request=parsed_decimal("cpu_ns_per_request"),
+            metadata_bytes_per_object=parsed_decimal("metadata_bytes_per_object"),
+            global_metadata_bytes=value["global_metadata_bytes"],  # type: ignore[arg-type]
+            metadata_measurement_sha256=value[  # type: ignore[arg-type]
+                "metadata_measurement_sha256"
+            ],
         )
 
 

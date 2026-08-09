@@ -61,15 +61,15 @@ performing admission or laundering rejection into evidence.
    authority receipt, and input `authority_class` to equal that `enforcement_class`,
    which must be exactly `cooperative` or `protected`.
 6. Use `Receipt.read` to read exact `checkpoint_reservation_ref` from the canonical
-   AROS receipt store; require the immutable host-issued unused reservation to bind
+   AROS receipt store; require the immutable host-issued reservation to bind
    exactly `planned_checkpoint_ref`, `idempotency_key`, `claim_package_path`,
    `claim_package_hash_protocol`, `principal_decision_receipt_ref`,
-   `principal_authority_ref`, and `reservation_nonce`.
-7. Require reservation Principal decision and authority references to equal the
-   verified input references, its `planned_checkpoint_ref` and `idempotency_key` to be
-   unique and unused, and its package path and hash protocol to identify the exact
-   future `ClaimPackage`; reject an expired, consumed, replayed, or mismatched
-   reservation.
+   `principal_authority_ref`, `reservation_nonce`, and `status`.
+7. Require reservation `status` to be exactly `pending` or `consumed`, Principal
+   decision and authority references to equal the verified input references, and its
+   package path and hash protocol to identify the exact future `ClaimPackage`; when
+   status is `pending`, require `planned_checkpoint_ref` and `idempotency_key` to be
+   unique and unused.
 8. Require input `disposition` and the Principal response disposition to match and
    to equal exactly one of `accept`, `narrow`, or `reject`; copy the disposition,
    rationale, and evidence references without changing them.
@@ -136,9 +136,9 @@ performing admission or laundering rejection into evidence.
 - Complete only after every exact input reference and cross-artifact lineage is
   verified, canonical Principal authority and decision receipts exactly bind and
   authorize issuer, actor, response, checkpoint, disposition, authority context, and
-  enforcement class, the checkpoint reservation is canonical, matching, and unused,
-  every material objection has an explicit Principal disposition, no fatal objection
-  remains unresolved, and all `ClaimPackage` fields are populated.
+  enforcement class, the checkpoint reservation is canonical and matching with known
+  status, every material objection has an explicit Principal disposition, no fatal
+  objection remains unresolved, and all `ClaimPackage` fields are populated.
 - If any required reference is missing or cross-lineage,
   `principal_authority_ref` or `principal_decision_receipt_ref` is missing, unreadable,
   noncanonical, inline, or unbound, either receipt has an unknown field, decision
@@ -147,23 +147,39 @@ performing admission or laundering rejection into evidence.
   checkpoint does not bind the same response and lineage, any material objection is
   unanswered, or any fatal objection remains unresolved, do not emit or checkpoint a
   `ClaimPackage`; return incomplete for Principal adjudication.
-- If `checkpoint_reservation_ref` is missing, unreadable, noncanonical, expired,
-  consumed, or replayed, its decision or authority reference mismatches, its
-  `planned_checkpoint_ref` or `idempotency_key` is not unique and unused, or its
-  package path or hash protocol does not match the exact future `ClaimPackage`, do not
-  emit or checkpoint a `ClaimPackage`; return incomplete for a new host-issued
+- If `checkpoint_reservation_ref` is missing, unreadable, noncanonical, or expired,
+  its status is neither `pending` nor `consumed`, its decision or authority reference
+  mismatches, or its package path or hash protocol does not match the exact future
+  `ClaimPackage`, do not emit or checkpoint a `ClaimPackage`; return incomplete for a
+  new host-issued reservation.
+- If reservation status is `consumed`, use `Receipt.read` to read the canonical
+  checkpoint receipt and status; require `checkpoint_reservation_ref`,
+  `idempotency_key`, reserved `checkpoint_ref`, `claim_package_path`,
+  `claim_package_sha256` computed under the reserved hash protocol,
+  `principal_decision_receipt_ref`, `principal_authority_ref`, and terminal `complete`
+  status to match exactly, then treat the checkpoint as already complete, return the
+  existing `checkpoint_ref`, and do not call `Research.checkpoint` or request a new
+  reservation.
+- If reservation status is `consumed` but any reservation id, idempotency key,
+  reserved checkpoint reference, ClaimPackage path or hash, Principal decision or
+  authority reference, or terminal status mismatches, block as a replay conflict; do
+  not return a checkpoint reference, call `Research.checkpoint`, or request a new
   reservation.
 - For disposition `accept` or `narrow`, emit only the scoped admitted Claim that the
   verified Principal response authorizes.
 - For disposition `reject`, emit a rejected adjudication package and set
   `disposition` to `reject`; do not emit an admitted or supported Claim and do not
   convert rejection into a scientific negative result.
-- Only after writing the complete package with reserved `checkpoint_ref`, call
-  `Research.checkpoint` using the reservation `idempotency_key`, exact package path
-  and hash, lineage and evidence references, `review_ref`, `principal_response_ref`,
-  `principal_authority_ref`, `principal_decision_receipt_ref`, and preserved
-  `authority_class`; complete only if the returned `checkpoint_ref` equals reserved
-  `planned_checkpoint_ref` exactly.
+- Only when reservation status is `pending`, after writing the complete package with
+  reserved `checkpoint_ref`, call `Research.checkpoint` exactly once using the
+  reservation `idempotency_key`, exact package path and hash, lineage and evidence
+  references, `review_ref`, `principal_response_ref`, `principal_authority_ref`,
+  `principal_decision_receipt_ref`, and preserved `authority_class`; complete only if
+  the returned `checkpoint_ref` equals reserved `planned_checkpoint_ref` exactly.
+- If the response to the single pending checkpoint call is lost, do not call
+  `Research.checkpoint` again and do not request a new reservation; exit incomplete,
+  then in the next session reread canonical reservation status and follow the exact
+  `consumed` recovery rule.
 - Exit immediately after the successful checkpoint; do not continue the research
   session.
 
@@ -186,7 +202,8 @@ performing admission or laundering rejection into evidence.
 - Do not copy `principal_checkpoint_ref` into output `checkpoint_ref`, invent or alter
   a checkpoint reference or idempotency key, or checkpoint without the exact
   host-issued `checkpoint_reservation_ref`.
-- Do not reuse or replay a consumed, expired, or mismatched checkpoint reservation or
+- Do not call `Research.checkpoint` or request a new reservation for an exactly matching
+  consumed checkpoint, and do not treat a consumed mismatch as successful recovery or
   accept a returned checkpoint reference that differs from reserved
   `planned_checkpoint_ref`.
 - Do not launder disposition `reject` into an admitted, supported, or scientific

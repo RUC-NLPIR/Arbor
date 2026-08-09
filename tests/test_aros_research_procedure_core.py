@@ -992,17 +992,17 @@ EXPECTED_CLAIM_METHOD_RULES = (
     ),
     (
         "Use `Receipt.read` to read exact `checkpoint_reservation_ref` from the canonical "
-        "AROS receipt store; require the immutable host-issued unused reservation to bind "
+        "AROS receipt store; require the immutable host-issued reservation to bind "
         "exactly `planned_checkpoint_ref`, `idempotency_key`, `claim_package_path`, "
         "`claim_package_hash_protocol`, `principal_decision_receipt_ref`, "
-        "`principal_authority_ref`, and `reservation_nonce`."
+        "`principal_authority_ref`, `reservation_nonce`, and `status`."
     ),
     (
-        "Require reservation Principal decision and authority references to equal the "
-        "verified input references, its `planned_checkpoint_ref` and `idempotency_key` to "
-        "be unique and unused, and its package path and hash protocol to identify the exact "
-        "future `ClaimPackage`; reject an expired, consumed, replayed, or mismatched "
-        "reservation."
+        "Require reservation `status` to be exactly `pending` or `consumed`, Principal "
+        "decision and authority references to equal the verified input references, and its "
+        "package path and hash protocol to identify the exact future `ClaimPackage`; when "
+        "status is `pending`, require `planned_checkpoint_ref` and `idempotency_key` to be "
+        "unique and unused."
     ),
     (
         "Require input `disposition` and the Principal response disposition to match and "
@@ -1064,9 +1064,9 @@ EXPECTED_CLAIM_COMPLETION_RULES = (
         "Complete only after every exact input reference and cross-artifact lineage is "
         "verified, canonical Principal authority and decision receipts exactly bind and "
         "authorize issuer, actor, response, checkpoint, disposition, authority context, "
-        "and enforcement class, the checkpoint reservation is canonical, matching, and "
-        "unused, every material objection has an explicit Principal disposition, no fatal "
-        "objection remains unresolved, and all `ClaimPackage` fields are populated."
+        "and enforcement class, the checkpoint reservation is canonical and matching with "
+        "known status, every material objection has an explicit Principal disposition, no "
+        "fatal objection remains unresolved, and all `ClaimPackage` fields are populated."
     ),
     (
         "If any required reference is missing or cross-lineage, "
@@ -1079,11 +1079,27 @@ EXPECTED_CLAIM_COMPLETION_RULES = (
         "`ClaimPackage`; return incomplete for Principal adjudication."
     ),
     (
-        "If `checkpoint_reservation_ref` is missing, unreadable, noncanonical, expired, "
-        "consumed, or replayed, its decision or authority reference mismatches, its "
-        "`planned_checkpoint_ref` or `idempotency_key` is not unique and unused, or its "
-        "package path or hash protocol does not match the exact future `ClaimPackage`, do "
-        "not emit or checkpoint a `ClaimPackage`; return incomplete for a new host-issued "
+        "If `checkpoint_reservation_ref` is missing, unreadable, noncanonical, or expired, "
+        "its status is neither `pending` nor `consumed`, its decision or authority reference "
+        "mismatches, or its package path or hash protocol does not match the exact future "
+        "`ClaimPackage`, do not emit or checkpoint a `ClaimPackage`; return incomplete for "
+        "a new host-issued reservation."
+    ),
+    (
+        "If reservation status is `consumed`, use `Receipt.read` to read the canonical "
+        "checkpoint receipt and status; require `checkpoint_reservation_ref`, "
+        "`idempotency_key`, reserved `checkpoint_ref`, `claim_package_path`, "
+        "`claim_package_sha256` computed under the reserved hash protocol, "
+        "`principal_decision_receipt_ref`, `principal_authority_ref`, and terminal "
+        "`complete` status to match exactly, then treat the checkpoint as already complete, "
+        "return the existing `checkpoint_ref`, and do not call `Research.checkpoint` or "
+        "request a new reservation."
+    ),
+    (
+        "If reservation status is `consumed` but any reservation id, idempotency key, "
+        "reserved checkpoint reference, ClaimPackage path or hash, Principal decision or "
+        "authority reference, or terminal status mismatches, block as a replay conflict; "
+        "do not return a checkpoint reference, call `Research.checkpoint`, or request a new "
         "reservation."
     ),
     (
@@ -1096,12 +1112,18 @@ EXPECTED_CLAIM_COMPLETION_RULES = (
         "convert rejection into a scientific negative result."
     ),
     (
-        "Only after writing the complete package with reserved `checkpoint_ref`, call "
-        "`Research.checkpoint` using the reservation `idempotency_key`, exact package path "
-        "and hash, lineage and evidence references, `review_ref`, `principal_response_ref`, "
-        "`principal_authority_ref`, `principal_decision_receipt_ref`, and preserved "
-        "`authority_class`; complete only if the returned `checkpoint_ref` equals reserved "
-        "`planned_checkpoint_ref` exactly."
+        "Only when reservation status is `pending`, after writing the complete package with "
+        "reserved `checkpoint_ref`, call `Research.checkpoint` exactly once using the "
+        "reservation `idempotency_key`, exact package path and hash, lineage and evidence "
+        "references, `review_ref`, `principal_response_ref`, `principal_authority_ref`, "
+        "`principal_decision_receipt_ref`, and preserved `authority_class`; complete only if "
+        "the returned `checkpoint_ref` equals reserved `planned_checkpoint_ref` exactly."
+    ),
+    (
+        "If the response to the single pending checkpoint call is lost, do not call "
+        "`Research.checkpoint` again and do not request a new reservation; exit incomplete, "
+        "then in the next session reread canonical reservation status and follow the exact "
+        "`consumed` recovery rule."
     ),
     "Exit immediately after the successful checkpoint; do not continue the research session.",
 )
@@ -1137,8 +1159,9 @@ EXPECTED_CLAIM_FORBIDDEN_RULES = (
         "host-issued `checkpoint_reservation_ref`."
     ),
     (
-        "Do not reuse or replay a consumed, expired, or mismatched checkpoint reservation "
-        "or accept a returned checkpoint reference that differs from reserved "
+        "Do not call `Research.checkpoint` or request a new reservation for an exactly "
+        "matching consumed checkpoint, and do not treat a consumed mismatch as successful "
+        "recovery or accept a returned checkpoint reference that differs from reserved "
         "`planned_checkpoint_ref`."
     ),
     (
@@ -3198,7 +3221,7 @@ def test_claim_package_returns_all_fields_after_principal_adjudication() -> None
         ),
         (
             "Completion",
-            "no fatal objection\n  remains",
+            "no fatal\n  objection",
             "fatal objections may remain",
             False,
         ),
@@ -3353,7 +3376,7 @@ def test_claim_package_rejects_forged_payload_noncanonical_path_and_context_mism
     [
         (
             "Method",
-            "immutable host-issued unused reservation",
+            "immutable host-issued reservation",
             "mutable self-issued reservation",
             True,
         ),
@@ -3365,20 +3388,26 @@ def test_claim_package_rejects_forged_payload_noncanonical_path_and_context_mism
         ),
         (
             "Completion",
-            "consumed, or replayed",
-            "consumed, or replayed but accepted",
+            "treat the checkpoint as already complete",
+            "call the checkpoint again",
             False,
         ),
         (
             "Completion",
-            "`Research.checkpoint` using the reservation `idempotency_key`",
-            "`Research.checkpoint` without the reservation key",
+            "block as a replay conflict",
+            "treat the mismatch as complete",
             False,
         ),
         (
             "Completion",
-            "returned `checkpoint_ref` equals reserved",
-            "returned `checkpoint_ref` may differ from the reservation",
+            "call `Research.checkpoint` exactly once",
+            "call `Research.checkpoint` twice",
+            False,
+        ),
+        (
+            "Completion",
+            "response to the single pending checkpoint call is lost",
+            "response to the pending call is lost, call again",
             False,
         ),
         (
@@ -3410,6 +3439,36 @@ def test_claim_package_rejects_checkpoint_reservation_mismatch_and_replay(
             expected,
             numbered=numbered,
         )
+
+
+def test_claim_package_calls_checkpoint_once_only_for_pending_status() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-claim-package.md"
+    )
+    rules = _procedure_rules(_procedure_section(body, "Completion"), numbered=False)
+
+    pending_calls = [
+        rule
+        for rule in rules
+        if "call `Research.checkpoint` exactly once" in rule
+    ]
+    consumed_recovery = [
+        rule
+        for rule in rules
+        if "status is `consumed`" in rule
+        and "do not call `Research.checkpoint`" in rule
+        and "return the existing `checkpoint_ref`" in rule
+    ]
+    response_loss = [
+        rule
+        for rule in rules
+        if "response to the single pending checkpoint call is lost" in rule
+        and "do not call `Research.checkpoint` again" in rule
+    ]
+
+    assert len(pending_calls) == 1
+    assert len(consumed_recovery) == 1
+    assert len(response_loss) == 1
 
 
 @pytest.mark.parametrize(

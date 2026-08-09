@@ -226,12 +226,13 @@ def test_authority_paths_are_fixed_by_package_and_host_manifest(
     project = tmp_path / "task"
     project.mkdir()
     value = package(project, "f" * 40)
-    host = tmp_path / "host/r3.json"
-    host.parent.mkdir()
+    authority_root = tmp_path / "retained-authority"
+    authority_root.mkdir()
+    frozen_package = authority_root / "frozen-package.json"
     authority = _authority_id(value)
-    ledger, receipt = _canonical_authority_paths(value, host)
-    assert ledger == project.parent / f"r3-{authority}.consumed.json"
-    assert receipt == project.parent / f"r3-{authority}.receipt.json"
+    ledger, receipt = _canonical_authority_paths(value, frozen_package)
+    assert ledger == authority_root / f"r3-{authority}.consumed.json"
+    assert receipt == authority_root / f"r3-{authority}.receipt.json"
 
 
 @pytest.mark.parametrize("placement", ["equal_final", "nested_final", "alias_ledger"])
@@ -304,6 +305,46 @@ def test_concurrent_consumers_have_exactly_one_ledger_winner(
     assert sorted(results) == ["consumed", "rejected"]
 
 
+@pytest.mark.parametrize("failure", ["write", "file_fsync", "parent_fsync"])
+def test_postcreate_ledger_failure_is_terminal_and_receipted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    inputs = fake_inputs(tmp_path)
+    monkeypatch.setattr(seal_module, "_prevalidate", lambda *args: inputs)
+    monkeypatch.setattr(
+        seal_module,
+        "_evaluate_temporal_portfolio",
+        lambda **kwargs: pytest.fail("evaluation must not launch"),
+    )
+    if failure == "write":
+        def fail_write(stream: object, raw: bytes) -> None:
+            stream.write(raw[:7])  # type: ignore[attr-defined]
+            raise OSError("injected ledger write failure")
+
+        monkeypatch.setattr(seal_module, "_write_ledger_stream", fail_write)
+    else:
+        real_fsync = os.fsync
+        injected = False
+
+        def fail_fsync(descriptor: int) -> None:
+            nonlocal injected
+            is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            target = is_directory if failure == "parent_fsync" else not is_directory
+            if target and not injected:
+                injected = True
+                raise OSError(f"injected {failure}")
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(seal_module.os, "fsync", fail_fsync)
+    receipt = run_r3(*run_arguments(tmp_path))  # type: ignore[arg-type]
+    assert receipt["state"] == "process_failed"
+    assert receipt["failures"][0]["kind"] == "ledger_consumption_failure"
+    assert os.path.lexists(inputs.ledger)
+    assert inputs.final_receipt.exists()
+    with pytest.raises(SealError, match="already consumed"):
+        run_r3(*run_arguments(tmp_path))  # type: ignore[arg-type]
+
+
 def fake_inputs(tmp_path: Path) -> FrozenInputs:
     project = project_repository(tmp_path / "task")
     host = tmp_path / "host"
@@ -322,10 +363,11 @@ def fake_inputs(tmp_path: Path) -> FrozenInputs:
         checkout=tmp_path / "checkout",
         checkout_binding=SimpleNamespace(tree="c" * 40),
         source={"receipt_sha256": "1" * 64},
-        source_binding=binding,
-        r0_binding=binding,
-        artifact_bindings={"release_cachesim": binding},
+        source_binding=snapshot_binding,
+        r0_binding=snapshot_binding,
+        artifact_bindings={"release_cachesim": snapshot_binding},
         evaluator_bindings={},
+        output_parent=SimpleNamespace(descriptor=-1),
     )
     calibration = SimpleNamespace(
         path=host / "calibration.json",
@@ -358,6 +400,13 @@ def fake_inputs(tmp_path: Path) -> FrozenInputs:
             trace_bindings=(snapshot_binding,),
             source_manifest=sticky,
             source_traces=(sticky,),
+            source_receipt=snapshot_binding,
+            r0_receipt=snapshot_binding,
+            r0_root=private_root,
+            r0_artifacts={"release_cachesim": snapshot_binding},
+            r0_files={"receipt.json": snapshot_binding},
+            source_receipt_original=sticky,
+            r0_originals=(sticky,),
         ),
         authority_id=authority,
         ledger=project.path.parent / f"r3-{authority}.consumed.json",
@@ -555,6 +604,38 @@ def test_postconsume_source_restore_uses_snapshot_and_fails_sticky_check(
     assert inputs.final_receipt.exists()
 
 
+def test_postconsume_r0_replacement_never_changes_measured_snapshot_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = fake_inputs(tmp_path)
+    monkeypatch.setattr(seal_module, "_prevalidate", lambda *args: inputs)
+    original_r0 = inputs.private_snapshot.r0_originals[0].file.path
+    snapshot_binary = inputs.preflight.artifact_bindings["release_cachesim"]
+
+    def replace_r0_after_ledger(**kwargs: object) -> dict[str, object]:
+        prepared = kwargs["prepared"]
+        assert prepared.r0_binding.path == inputs.private_snapshot.r0_receipt.path
+        assert prepared.artifact_bindings["release_cachesim"] == snapshot_binary
+        original_r0.write_bytes(b"valid replacement R0 with different binary\n")
+        return {"receipt_sha256": "8" * 64, "failures": []}
+
+    monkeypatch.setattr(
+        seal_module, "_evaluate_temporal_portfolio", replace_r0_after_ledger
+    )
+    monkeypatch.setattr(
+        seal_module,
+        "_measurement_facts",
+        lambda *args: (
+            [{"cell_index": index} for index in range(3)],
+            [{"cell_index": index, "facts": {}} for index in range(3)],
+        ),
+    )
+    receipt = run_r3(*run_arguments(tmp_path))  # type: ignore[arg-type]
+    assert receipt["state"] == "process_failed"
+    assert receipt["r0_receipt_sha256"] == inputs.package["r0_receipt_sha256"]
+    assert receipt["failures"][-1]["kind"] == "evaluation_failure"
+
+
 def test_postconsume_output_failure_still_writes_canonical_final_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -660,7 +741,7 @@ def test_temporal_portfolio_runs_every_r3_trace_at_three_exact_sizes(
 
     monkeypatch.setattr(seal_module, "compare_transfer_constraints", transfer_compare)
     facts, constraints = seal_module._measurement_facts(
-        outer_output,
+        output,
         receipt,
         SimpleNamespace(
             preflight=SimpleNamespace(r0={}),
@@ -916,7 +997,7 @@ def test_real_derived_candidate_prevalidates_with_distinct_baseline_artifacts(
     }
     package_path = tmp_path / "host/frozen-package.json"
     package_path.write_text(json.dumps(package_value, sort_keys=True) + "\n")
-    ledger, _final = _canonical_authority_paths(package_value, host_manifest)
+    ledger, _final = _canonical_authority_paths(package_value, package_path)
     inputs = seal_module._prevalidate(
         package_path,
         host_manifest,
@@ -932,6 +1013,7 @@ def test_real_derived_candidate_prevalidates_with_distinct_baseline_artifacts(
         assert r0["binary_sha256"] != calibration_record["binary_sha256"]
         assert inputs.preflight.r0["candidate_commit"] == candidate
     finally:
+        os.close(inputs.preflight.output_parent.descriptor)
         seal_module.cleanup_owned(
             inputs.private_snapshot.root,
             inputs.private_snapshot.root_identity,
@@ -940,7 +1022,7 @@ def test_real_derived_candidate_prevalidates_with_distinct_baseline_artifacts(
     mismatch_path = tmp_path / "host/mismatched-package.json"
     mismatch_path.write_text(json.dumps(mismatched, sort_keys=True) + "\n")
     mismatch_ledger, _receipt = _canonical_authority_paths(
-        mismatched, host_manifest
+        mismatched, mismatch_path
     )
     with pytest.raises(SealError, match="candidate"):
         seal_module._prevalidate(

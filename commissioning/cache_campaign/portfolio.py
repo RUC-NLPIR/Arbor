@@ -1524,39 +1524,45 @@ def _evaluate_portfolio(
     output: Path,
     run: Run = run_child,
     temporal_r3: bool = False,
+    prepared: Preflight | None = None,
 ) -> dict[str, object]:
     if rung == "r3" and not temporal_r3:
         raise PortfolioError("R3 is reserved for the temporal-seal evaluator")
     if rung not in {"r1", "r2", "r3"}:
         raise PortfolioError("portfolio rung must be r1 or r2")
     started = time.monotonic_ns()
-    try:
-        preflight = _preflight(
-            task_root=task_root,
-            task_manifest=task_manifest,
-            checkout=checkout,
-            candidate=candidate,
-            policy=policy,
-            source_receipt=source_receipt,
-            r0_receipt=r0_receipt,
-            output=output,
-            temporal_r3=temporal_r3,
-        )
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        _publish_preflight_failure(
-            rung=rung,
-            task_root=task_root,
-            task_manifest=task_manifest,
-            checkout=checkout,
-            candidate=candidate,
-            policy=policy,
-            source_receipt=source_receipt,
-            r0_receipt=r0_receipt,
-            output=output,
-            error=error,
-            started=started,
-        )
-        raise PortfolioError(_bounded(error)) from error
+    if prepared is not None:
+        if not temporal_r3 or rung != "r3":
+            raise PortfolioError("prepared portfolio input is reserved for R3")
+        preflight = prepared
+    else:
+        try:
+            preflight = _preflight(
+                task_root=task_root,
+                task_manifest=task_manifest,
+                checkout=checkout,
+                candidate=candidate,
+                policy=policy,
+                source_receipt=source_receipt,
+                r0_receipt=r0_receipt,
+                output=output,
+                temporal_r3=temporal_r3,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            _publish_preflight_failure(
+                rung=rung,
+                task_root=task_root,
+                task_manifest=task_manifest,
+                checkout=checkout,
+                candidate=candidate,
+                policy=policy,
+                source_receipt=source_receipt,
+                r0_receipt=r0_receipt,
+                output=output,
+                error=error,
+                started=started,
+            )
+            raise PortfolioError(_bounded(error)) from error
     output_parent = preflight.output_parent
     stage: Path | None = None
     stage_identity: tuple[int, int] | None = None
@@ -2292,6 +2298,7 @@ def _evaluate_temporal_portfolio(
     r0_receipt: Path,
     output: Path,
     run: Run = run_child,
+    prepared: Preflight | None = None,
 ) -> dict[str, object]:
     return _evaluate_portfolio(
         rung="r3",
@@ -2305,4 +2312,5 @@ def _evaluate_temporal_portfolio(
         output=output,
         run=run,
         temporal_r3=True,
+        prepared=prepared,
     )

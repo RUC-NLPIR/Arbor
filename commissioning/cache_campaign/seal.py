@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 from .cachesim import run_child
@@ -123,6 +123,20 @@ class SealError(ValueError):
     pass
 
 
+class LedgerConsumedError(SealError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        record: dict[str, object],
+        intended_file_sha256: str,
+    ) -> None:
+        super().__init__(message)
+        self.record = record
+        self.intended_file_sha256 = intended_file_sha256
+        self.consumed = True
+
+
 def _authority_id(package: Mapping[str, object]) -> str:
     raw = (
         str(package["frozen_commit"])
@@ -135,11 +149,10 @@ def _authority_id(package: Mapping[str, object]) -> str:
 
 
 def _canonical_authority_paths(
-    package: Mapping[str, object], host_manifest: Path
+    package: Mapping[str, object], frozen_package: Path
 ) -> tuple[Path, Path]:
-    del host_manifest
     authority = _authority_id(package)
-    parent = Path(str(package["project"])).resolve(strict=True).parent
+    parent = Path(frozen_package).absolute().parent.resolve(strict=True)
     return (
         parent / f"r3-{authority}.consumed.json",
         parent / f"r3-{authority}.receipt.json",
@@ -169,6 +182,13 @@ class PrivateInputSnapshot:
     trace_bindings: tuple[FileBinding, ...]
     source_manifest: StickyBinding
     source_traces: tuple[StickyBinding, ...]
+    source_receipt: FileBinding | None = None
+    r0_receipt: FileBinding | None = None
+    r0_root: Path | None = None
+    r0_artifacts: dict[str, FileBinding] | None = None
+    r0_files: dict[str, FileBinding] | None = None
+    source_receipt_original: StickyBinding | None = None
+    r0_originals: tuple[StickyBinding, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -589,6 +609,73 @@ def _snapshot_private_inputs(
         raise
 
 
+def _snapshot_candidate_evidence(
+    snapshot: PrivateInputSnapshot, preflight: Preflight
+) -> tuple[PrivateInputSnapshot, Preflight]:
+    source_copy = copy_verified_input(
+        preflight.source_binding.path,
+        snapshot.root / "candidate-evidence/source-receipt.json",
+        expected_sha256=preflight.source_binding.sha256,
+        expected_identity=preflight.source_binding.identity,
+        expected_size=preflight.source_binding.size_bytes,
+        expected_mode=preflight.source_binding.mode,
+        destination_mode=0o400,
+    )
+    original_r0_root = preflight.r0_root
+    snapshot_r0_root = snapshot.root / "candidate-evidence/r0"
+    copied_by_relative: dict[Path, FileBinding] = {}
+    sticky_originals: list[StickyBinding] = []
+    for path in sorted(original_r0_root.rglob("*")):
+        metadata = path.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise SealError("candidate R0 evidence tree contains a non-regular file")
+        original = file_binding(path)
+        relative = path.relative_to(original_r0_root)
+        copied = copy_verified_input(
+            original.path,
+            snapshot_r0_root / relative,
+            expected_sha256=original.sha256,
+            expected_identity=original.identity,
+            expected_size=original.size_bytes,
+            expected_mode=original.mode,
+            destination_mode=original.mode,
+        )
+        copied_by_relative[relative] = copied.snapshot
+        sticky_originals.append(_sticky_binding(copied.source))
+    try:
+        r0_receipt_relative = preflight.r0_binding.path.relative_to(original_r0_root)
+        r0_receipt = copied_by_relative[r0_receipt_relative]
+        artifacts = {
+            name: copied_by_relative[binding.path.relative_to(original_r0_root)]
+            for name, binding in preflight.artifact_bindings.items()
+        }
+    except (KeyError, ValueError) as error:
+        raise SealError("candidate R0 snapshot closure is incomplete") from error
+    retained = replace(
+        snapshot,
+        source_receipt=source_copy.snapshot,
+        r0_receipt=r0_receipt,
+        r0_root=snapshot_r0_root,
+        r0_artifacts=artifacts,
+        r0_files={
+            relative.as_posix(): binding
+            for relative, binding in sorted(copied_by_relative.items())
+        },
+        source_receipt_original=_sticky_binding(source_copy.source),
+        r0_originals=tuple(sticky_originals),
+    )
+    prepared = replace(
+        preflight,
+        source_binding=source_copy.snapshot,
+        r0_binding=r0_receipt,
+        r0_root=snapshot_r0_root,
+        artifact_bindings=artifacts,
+    )
+    return retained, prepared
+
+
 def _external_input(path: Path, project: Path, label: str) -> None:
     if _paths_overlap(path, project):
         raise SealError(f"{label} must be outside task_root")
@@ -753,11 +840,20 @@ def _prevalidate(
     output: Path,
 ) -> FrozenInputs:
     private_snapshot: PrivateInputSnapshot | None = None
+    preflight: Preflight | None = None
     try:
         package_bound = read_bound_json_object(frozen_package, max_bytes=1024 * 1024)
         package = load_frozen_package(package_bound.value)
         package_binding = _binding(package_bound)
         project = _project_binding(package["project"], str(package["frozen_commit"]))
+        raw_package = Path(frozen_package).absolute()
+        if (
+            raw_package.parent.is_symlink()
+            or raw_package.resolve(strict=True) != package_binding.path
+            or raw_package.parent.resolve(strict=True) != raw_package.parent
+        ):
+            raise SealError("frozen package authority path is not canonical")
+        _external_input(package_binding.path, project.path, "frozen package")
         raw_refs, ref_sha256s = _git_refs(project, package)
         reproduction = _validate_reproduction(
             raw_refs["reproduction_ref"], str(package["r2_receipt_sha256"])
@@ -793,7 +889,7 @@ def _prevalidate(
         _external_input(bound_calibration.path, project.path, "calibration")
         authority = _authority_id(package)
         canonical_ledger, final_receipt = _canonical_authority_paths(
-            package, host_binding.path
+            package, package_bound.path
         )
         supplied_ledger = Path(ledger).absolute().resolve(strict=False)
         if os.path.lexists(canonical_ledger):
@@ -840,7 +936,6 @@ def _prevalidate(
             output=output_path,
             temporal_r3=True,
         )
-        os.close(preflight.output_parent.descriptor)
         _external_input(preflight.source_binding.path, project.path, "source receipt")
         _external_input(preflight.r0_binding.path, project.path, "candidate R0 receipt")
         _external_input(preflight.r0_root, project.path, "candidate R0 evidence")
@@ -941,8 +1036,15 @@ def _prevalidate(
             revalidate_file(binding)
         revalidate_checkout(preflight.checkout, preflight.checkout_binding)
         _project_binding(project.path, project.head)
+        private_snapshot, preflight = _snapshot_candidate_evidence(
+            private_snapshot, preflight
+        )
         _revalidate_sticky(private_snapshot.source_manifest)
         for sticky in private_snapshot.source_traces:
+            _revalidate_sticky(sticky)
+        assert private_snapshot.source_receipt_original is not None
+        _revalidate_sticky(private_snapshot.source_receipt_original)
+        for sticky in private_snapshot.r0_originals:
             _revalidate_sticky(sticky)
         _project_binding(project.path, project.head)
         return FrozenInputs(
@@ -966,10 +1068,20 @@ def _prevalidate(
             output_path,
         )
     except SealError:
+        if preflight is not None:
+            try:
+                os.close(preflight.output_parent.descriptor)
+            except OSError:
+                pass
         if private_snapshot is not None and os.path.lexists(private_snapshot.root):
             cleanup_owned(private_snapshot.root, private_snapshot.root_identity)
         raise
     except (OSError, TypeError, ValueError, subprocess.SubprocessError) as error:
+        if preflight is not None:
+            try:
+                os.close(preflight.output_parent.descriptor)
+            except OSError:
+                pass
         if private_snapshot is not None and os.path.lexists(private_snapshot.root):
             cleanup_owned(private_snapshot.root, private_snapshot.root_identity)
         raise SealError(str(error)) from error
@@ -986,11 +1098,16 @@ def _fsync_parent(path: Path) -> None:
         os.close(descriptor)
 
 
+def _write_ledger_stream(stream: object, raw: bytes) -> None:
+    stream.write(raw)  # type: ignore[attr-defined]
+
+
 def _consume_ledger(
     path: Path, record: dict[str, object]
 ) -> tuple[dict[str, object], str]:
     record["ledger_sha256"] = record_sha256(record, "ledger_sha256")
     raw = canonical_bytes(record) + b"\n"
+    file_sha256 = hashlib.sha256(raw).hexdigest()
     try:
         descriptor = os.open(
             path,
@@ -1000,20 +1117,27 @@ def _consume_ledger(
     except FileExistsError as error:
         raise SealError("R3 ledger is already consumed") from error
     try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            descriptor = -1
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    _fsync_parent(path)
-    observed = file_binding(path, expected_mode=0o600)
-    file_sha256 = hashlib.sha256(raw).hexdigest()
-    if observed.size_bytes != len(raw) or observed.sha256 != file_sha256:
-        raise SealError("consumed ledger changed during durable publication")
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                descriptor = -1
+                _write_ledger_stream(stream, raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _fsync_parent(path)
+            observed = file_binding(path, expected_mode=0o600)
+            if observed.size_bytes != len(raw) or observed.sha256 != file_sha256:
+                raise SealError("consumed ledger changed during durable publication")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    except BaseException as error:
+        raise LedgerConsumedError(
+            "R3 ledger authority was consumed before durability failed: "
+            + " ".join(str(error).split())[:384],
+            record=record,
+            intended_file_sha256=file_sha256,
+        ) from error
     return record, file_sha256
 
 
@@ -1061,6 +1185,28 @@ def _ledger_record(inputs: FrozenInputs) -> dict[str, object]:
                 binding.sha256
                 for binding in inputs.private_snapshot.trace_bindings
             ],
+            "source_receipt_sha256": (
+                inputs.private_snapshot.source_receipt.sha256
+                if inputs.private_snapshot.source_receipt is not None
+                else None
+            ),
+            "r0_receipt_sha256": (
+                inputs.private_snapshot.r0_receipt.sha256
+                if inputs.private_snapshot.r0_receipt is not None
+                else None
+            ),
+            "r0_artifact_sha256s": {
+                name: binding.sha256
+                for name, binding in sorted(
+                    (inputs.private_snapshot.r0_artifacts or {}).items()
+                )
+            },
+            "r0_evidence_sha256s": {
+                name: binding.sha256
+                for name, binding in sorted(
+                    (inputs.private_snapshot.r0_files or {}).items()
+                )
+            },
         },
     }
 
@@ -1092,7 +1238,7 @@ def _measurement_facts(
     for summary in raw_measurements:
         if not isinstance(summary, dict) or type(summary.get("path")) is not str:
             raise SealError("R3 measurement summary is invalid")
-        measurement_path = output / "evidence" / str(summary["path"])
+        measurement_path = output / str(summary["path"])
         bound = read_bound_json_object(measurement_path, max_bytes=64 * 1024 * 1024)
         measurement = bound.value
         digest = record_sha256(measurement, "measurement_sha256")
@@ -1115,7 +1261,7 @@ def _measurement_facts(
         facts.append(
             {
                 "cell_index": summary["index"],
-                "path": str(Path("evidence") / str(summary["path"])),
+                "path": str(summary["path"]),
                 "measurement_sha256": digest,
                 "pareto": pareto,
             }
@@ -1171,7 +1317,7 @@ def _write_final_receipt(
         "started_at_unix_ns": started_at,
         "ended_at_unix_ns": ended_at,
         "portfolio_receipt_path": (
-            "evidence/receipt.json" if portfolio_receipt is not None else None
+            "receipt.json" if portfolio_receipt is not None else None
         ),
         "portfolio_receipt_sha256": (
             portfolio_receipt.get("receipt_sha256")
@@ -1215,7 +1361,33 @@ def run_r3(
         ledger_record, ledger_file_sha256 = _consume_ledger(
             inputs.ledger, _ledger_record(inputs)
         )
+    except LedgerConsumedError as error:
+        try:
+            os.close(inputs.preflight.output_parent.descriptor)
+        except (AttributeError, OSError):
+            pass
+        return _write_final_receipt(
+            inputs,
+            error.record,
+            error.intended_file_sha256,
+            started_at=time.time_ns(),
+            state="process_failed",
+            portfolio_receipt=None,
+            measurements=[],
+            failures=[
+                {
+                    "kind": "ledger_consumption_failure",
+                    "state": "process_failed",
+                    "error": " ".join(str(error).split())[:512],
+                }
+            ],
+            constraints=[],
+        )
     except BaseException:
+        try:
+            os.close(inputs.preflight.output_parent.descriptor)
+        except (AttributeError, OSError):
+            pass
         if os.path.lexists(inputs.private_snapshot.root):
             cleanup_owned(
                 inputs.private_snapshot.root,
@@ -1229,9 +1401,6 @@ def run_r3(
     failures: list[dict[str, object]] = []
     state = "process_failed"
     try:
-        inputs.output.mkdir(mode=0o700)
-        inputs.output.chmod(0o700)
-        _fsync_parent(inputs.output)
         portfolio_receipt = _evaluate_temporal_portfolio(
             task_root=inputs.project.path,
             host_manifest=inputs.private_snapshot.manifest_binding.path,
@@ -1240,8 +1409,9 @@ def run_r3(
             policy=str(inputs.package["policy"]),
             source_receipt=inputs.preflight.source_binding.path,
             r0_receipt=inputs.preflight.r0_binding.path,
-            output=inputs.output / "evidence",
+            output=inputs.output,
             run=runner,
+            prepared=inputs.preflight,
         )
         raw_failures = portfolio_receipt.get("failures")
         if not isinstance(raw_failures, list):
@@ -1261,6 +1431,10 @@ def run_r3(
         )
         _revalidate_sticky(inputs.private_snapshot.source_manifest)
         for sticky in inputs.private_snapshot.source_traces:
+            _revalidate_sticky(sticky)
+        assert inputs.private_snapshot.source_receipt_original is not None
+        _revalidate_sticky(inputs.private_snapshot.source_receipt_original)
+        for sticky in inputs.private_snapshot.r0_originals:
             _revalidate_sticky(sticky)
         _project_binding(inputs.project.path, inputs.project.head)
     except BaseException as error:

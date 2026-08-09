@@ -331,7 +331,8 @@ static int remove_pointer(void *pointer, size_t size, unsigned kind,
   return found;
 }
 
-static void discard_replaced_mappings(void *address, size_t size) {
+static void discard_replaced_mappings(void *address, size_t size,
+                                      void *preserve_pointer) {
   uintptr_t replacement_start = (uintptr_t)address;
   uintptr_t replacement_end = replacement_start + size;
   int found = 0;
@@ -350,6 +351,10 @@ static void discard_replaced_mappings(void *address, size_t size) {
       continue;
     }
     if (entry_start >= replacement_end || replacement_start >= entry_end) continue;
+    if (pointer_table[i].pointer == preserve_pointer) {
+      error_flags |= AROS_ERROR_MMAP_ACCOUNTING;
+      continue;
+    }
     if (entry_start != replacement_start || pointer_table[i].size != size)
       error_flags |= AROS_ERROR_MMAP_ACCOUNTING;
     if (live_bytes < pointer_table[i].size || live_allocations == 0) {
@@ -518,7 +523,7 @@ void *mmap(void *address, size_t length, int protection, int flags,
   if (result == MAP_FAILED) return MAP_FAILED;
   if (accounting_is_enabled() && !recursion_guard) {
     recursion_guard = 1;
-    if (flags & MAP_FIXED) discard_replaced_mappings(result, length);
+    if (flags & MAP_FIXED) discard_replaced_mappings(result, length, NULL);
     record_pointer(result, length, 2u);
     recursion_guard = 0;
   }
@@ -543,6 +548,8 @@ void *mremap(void *old_address, size_t old_size, size_t new_size, int flags,
                                  flags, new_address);
   if (result == MAP_FAILED || !accounting_is_enabled() || recursion_guard) return result;
   recursion_guard = 1;
+  if (flags & MREMAP_FIXED)
+    discard_replaced_mappings(result, new_size, old_address);
 #ifdef MREMAP_DONTUNMAP
   if (flags & MREMAP_DONTUNMAP) {
     pthread_mutex_lock(&pointer_lock);
@@ -558,7 +565,6 @@ void *mremap(void *old_address, size_t old_size, size_t new_size, int flags,
   }
 #endif
   remove_pointer(old_address, old_size, 2u, AROS_ERROR_MMAP_ACCOUNTING);
-  if (flags & MREMAP_FIXED) discard_replaced_mappings(result, new_size);
   record_pointer(result, new_size, 2u);
   recursion_guard = 0;
   return result;

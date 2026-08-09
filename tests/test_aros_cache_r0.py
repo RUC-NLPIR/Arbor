@@ -481,6 +481,7 @@ def test_allocator_interposer_observes_shared_aligned_and_direct_mmap(
         + 8192
         + 4096
         + 4096
+        + 8192
     )
     harness_source.write_text(
         """
@@ -540,13 +541,22 @@ int main(int argc, char **argv) {
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
                                 -1, 0);
+  void *dontunmap_source = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *dontunmap_destination = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *dontunmap_result = mremap(
+      dontunmap_source, 4096, 4096,
+      MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP,
+      dontunmap_destination);
   if (!small || !large || !aligned || !positioned || !legacy_aligned ||
       !page_aligned || !page_rounded ||
       mapped == MAP_FAILED || mapped64 == MAP_FAILED ||
       resize_source == MAP_FAILED || resized == MAP_FAILED ||
       fixed_source == MAP_FAILED || fixed_destination == MAP_FAILED ||
       fixed_result == MAP_FAILED || map_fixed_source == MAP_FAILED ||
-      map_fixed_result == MAP_FAILED) return 7;
+      map_fixed_result == MAP_FAILED || dontunmap_source == MAP_FAILED ||
+      dontunmap_destination == MAP_FAILED || dontunmap_result == MAP_FAILED) return 7;
   aros_alloc_snapshot_t observed;
   snapshot(&observed);
   aros_alloc_snapshot_t first = observed;
@@ -558,6 +568,8 @@ int main(int argc, char **argv) {
   if (munmap(resized, 8192) != 0) return 10;
   if (munmap(fixed_result, 4096) != 0) return 11;
   if (munmap(map_fixed_result, 4096) != 0) return 12;
+  if (munmap(dontunmap_source, 4096) != 0) return 13;
+  if (munmap(dontunmap_result, 4096) != 0) return 14;
   snapshot(&observed);
   enable(0);
   printf("live=%zu allocations=%zu errors=%u\\n", first.live_bytes,
@@ -606,7 +618,7 @@ int main(int argc, char **argv) {
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == (
-        f"live={expected_live} allocations=12 errors=0\n"
+        f"live={expected_live} allocations=14 errors=0\n"
         "final=0 allocations=0 errors=0\n"
     )
 

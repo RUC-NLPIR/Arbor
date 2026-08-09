@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-import ast
 import importlib
 import json
 import re
 import subprocess
 from pathlib import Path, PurePosixPath
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parent.parent
 PROGRAM_ROOT = ROOT / "commissioning/research_program"
 SOURCES_PATH = PROGRAM_ROOT / "SOURCES.json"
+UPSTREAM_PRODUCT_NAMES = ("claude", "gemini")
 SOURCE_KEYS = {
     "id",
     "repository",
@@ -63,17 +65,50 @@ def _git(repository: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
-def _defined_python_names(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            names.add(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update(alias.asname or alias.name for alias in node.names)
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            names.add(node.id)
-    return names
+def _is_source_or_provenance_record(program_root: Path, path: Path) -> bool:
+    relative = path.relative_to(program_root)
+    if path.name.casefold() == "sources.json":
+        return True
+    for index, component in enumerate(relative.parts):
+        candidate = (
+            Path(component).stem if index == len(relative.parts) - 1 else component
+        )
+        tokens = [
+            token for token in re.split(r"[^a-z0-9]+", candidate.casefold()) if token
+        ]
+        if "provenance" in tokens:
+            return True
+        if any(pair == ("source", "record") for pair in zip(tokens, tokens[1:])):
+            return True
+    return False
+
+
+def _assert_sole_source_or_provenance_record(
+    program_root: Path, sources_path: Path
+) -> None:
+    records = {
+        path
+        for path in program_root.rglob("*")
+        if path.is_file() and _is_source_or_provenance_record(program_root, path)
+    }
+    assert records == {sources_path}, (
+        f"unexpected source or provenance record: {records}"
+    )
+
+
+def _assert_no_upstream_product_names(program_root: Path, sources_path: Path) -> None:
+    for path in program_root.rglob("*"):
+        relative_name = path.relative_to(program_root).as_posix().casefold()
+        for upstream_name in UPSTREAM_PRODUCT_NAMES:
+            assert upstream_name not in relative_name, (
+                f"upstream product name {upstream_name!r} in path {path}"
+            )
+        if path.is_file() and path != sources_path:
+            content = path.read_bytes().lower()
+            for upstream_name in UPSTREAM_PRODUCT_NAMES:
+                assert upstream_name.encode() not in content, (
+                    f"upstream product name {upstream_name!r} in {path}"
+                )
 
 
 def test_source_schema_versions_are_exact_int_one() -> None:
@@ -140,43 +175,79 @@ def test_source_repositories_commits_and_selected_paths_are_real() -> None:
             assert all(part not in {"", ".", ".."} for part in path.parts)
             assert "\\" not in selected_path
             assert "\x00" not in selected_path
-            assert _git(repository, "cat-file", "-t", f"{commit}:{selected_path}") == "blob"
+            assert (
+                _git(repository, "cat-file", "-t", f"{commit}:{selected_path}")
+                == "blob"
+            )
 
 
 def test_sources_json_is_the_sole_source_or_provenance_record() -> None:
-    records = {
-        path
-        for path in PROGRAM_ROOT.rglob("*")
-        if path.is_file()
-        and any(label in path.stem.casefold() for label in ("source", "provenance"))
-    }
-    assert records == {SOURCES_PATH}
+    _assert_sole_source_or_provenance_record(PROGRAM_ROOT, SOURCES_PATH)
 
 
 def test_source_runtime_names_do_not_reuse_upstream_product_names() -> None:
-    sources = _load_source_record()["sources"]
-    assert isinstance(sources, list)
-    upstream_names = {
-        path.parent.name.removesuffix("-review").casefold()
-        for source in sources
-        for selected_path in source["selected_paths"]
-        for path in (PurePosixPath(selected_path),)
-        if path.name == "server.py"
-        and path.parent.name.endswith("-review")
-        and path.parent.name != "manual-review"
-    }
-    assert len(upstream_names) == 2
+    _assert_no_upstream_product_names(PROGRAM_ROOT, SOURCES_PATH)
 
-    component_names = {
-        component
-        for path in PROGRAM_ROOT.rglob("*")
-        if path != SOURCES_PATH
-        for component in path.relative_to(PROGRAM_ROOT).parts
-    }
-    runtime_names = set(component_names)
-    for path in PROGRAM_ROOT.rglob("*.py"):
-        runtime_names.update(_defined_python_names(path))
 
-    for runtime_name in runtime_names:
-        folded = runtime_name.casefold()
-        assert all(upstream_name not in folded for upstream_name in upstream_names)
+def test_source_record_scan_allows_runtime_source_procedure(tmp_path: Path) -> None:
+    program_root = tmp_path / "research_program"
+    sources_path = program_root / "SOURCES.json"
+    procedure = program_root / "procedures/aros-source-research.md"
+    procedure.parent.mkdir(parents=True)
+    sources_path.write_text("{}\n", encoding="utf-8")
+    procedure.write_text("# Runtime procedure\n", encoding="utf-8")
+
+    _assert_sole_source_or_provenance_record(program_root, sources_path)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "provenance.json",
+        "source-record.json",
+        "provenance/record.json",
+        "source-record/record.json",
+        "duplicate/SOURCES.json",
+    ],
+)
+def test_source_record_scan_rejects_second_record_location(
+    tmp_path: Path, relative_path: str
+) -> None:
+    program_root = tmp_path / "research_program"
+    sources_path = program_root / "SOURCES.json"
+    second_record = program_root / relative_path
+    second_record.parent.mkdir(parents=True, exist_ok=True)
+    sources_path.write_text("{}\n", encoding="utf-8")
+    second_record.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="source or provenance record"):
+        _assert_sole_source_or_provenance_record(program_root, sources_path)
+
+
+@pytest.mark.parametrize("upstream_name", UPSTREAM_PRODUCT_NAMES)
+@pytest.mark.parametrize("placement", ["filename", "content"])
+def test_source_runtime_name_scan_rejects_filename_and_content(
+    tmp_path: Path, upstream_name: str, placement: str
+) -> None:
+    program_root = tmp_path / "research_program"
+    program_root.mkdir()
+    sources_path = program_root / "SOURCES.json"
+    sources_path.write_text("{}\n", encoding="utf-8")
+    if placement == "filename":
+        bad_path = program_root / f"adapter-{upstream_name.upper()}.py"
+        bad_path.write_text("pass\n", encoding="utf-8")
+    else:
+        bad_path = program_root / "adapter.py"
+        bad_path.write_text(f"UPSTREAM = {upstream_name.upper()!r}\n", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match=upstream_name):
+        _assert_no_upstream_product_names(program_root, sources_path)
+
+
+def test_source_runtime_name_scan_allows_sources_json_bytes(tmp_path: Path) -> None:
+    program_root = tmp_path / "research_program"
+    program_root.mkdir()
+    sources_path = program_root / "SOURCES.json"
+    sources_path.write_text("ClAuDe and GeMiNi\n", encoding="utf-8")
+
+    _assert_no_upstream_product_names(program_root, sources_path)

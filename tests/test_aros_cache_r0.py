@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 from dataclasses import replace
 from decimal import Decimal
@@ -11,7 +13,8 @@ from pathlib import Path
 import pytest
 
 from commissioning.cache_campaign import evaluate as evaluate_module
-from commissioning.cache_campaign.cachesim import ChildResult
+from commissioning.cache_campaign import evidence as evidence_module
+from commissioning.cache_campaign.cachesim import ChildResult, ChildRunError
 from commissioning.cache_campaign.evaluate import (
     EvaluationError,
     evaluate_r0,
@@ -446,6 +449,246 @@ def test_probe_parsers_enforce_capacity_and_decimal_accounting() -> None:
     assert metadata == (Decimal("3"), 24)
 
 
+def test_allocator_interposer_observes_shared_aligned_and_direct_mmap(
+    tmp_path: Path,
+) -> None:
+    from commissioning.cache_campaign.r0_probes import allocator_interposer_source
+
+    compiler = shutil.which("cc")
+    assert compiler is not None
+    interposer_source = tmp_path / "allocator_interposer.c"
+    interposer_source.write_bytes(allocator_interposer_source())
+    interposer = tmp_path / "allocator_interposer.so"
+    client_source = tmp_path / "client.c"
+    client_source.write_text(
+        "#include <stdlib.h>\n"
+        "void *shared_malloc(size_t n) { return malloc(n); }\n"
+        "void shared_free(void *p) { free(p); }\n"
+    )
+    client = tmp_path / "libclient.so"
+    harness_source = tmp_path / "harness.c"
+    page_size = os.sysconf("SC_PAGESIZE")
+    expected_live = (
+        111
+        + 2 * 1024 * 1024
+        + 128
+        + 192
+        + 256
+        + 123
+        + page_size
+        + 4096
+        + 8192
+        + 8192
+        + 4096
+        + 4096
+    )
+    harness_source.write_text(
+        """
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <malloc.h>
+#include <sys/mman.h>
+typedef struct {
+  size_t live_bytes;
+  size_t live_allocations;
+  unsigned error_flags;
+} aros_alloc_snapshot_t;
+typedef void (*reset_fn)(void);
+typedef void (*enable_fn)(int);
+typedef void (*snapshot_fn)(aros_alloc_snapshot_t *);
+int main(int argc, char **argv) {
+  if (argc != 2) return 2;
+  void *library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+  if (!library) return 3;
+  void *(*shared_malloc)(size_t) = dlsym(library, "shared_malloc");
+  void (*shared_free)(void *) = dlsym(library, "shared_free");
+  reset_fn reset = dlsym(RTLD_DEFAULT, "aros_alloc_reset");
+  enable_fn enable = dlsym(RTLD_DEFAULT, "aros_alloc_set_enabled");
+  snapshot_fn snapshot = dlsym(RTLD_DEFAULT, "aros_alloc_snapshot");
+  if (!shared_malloc || !shared_free || !reset || !enable || !snapshot) return 4;
+  reset(); enable(1);
+  void *zero = shared_malloc(77);
+  if (realloc(zero, 0) != NULL) return 5;
+  void *small = shared_malloc(111);
+  void *large = shared_malloc(2 * 1024 * 1024);
+  void *aligned = aligned_alloc(64, 128);
+  void *positioned = NULL;
+  if (posix_memalign(&positioned, 64, 192) != 0) return 6;
+  void *legacy_aligned = memalign(64, 256);
+  void *page_aligned = valloc(123);
+  void *page_rounded = pvalloc(123);
+  void *mapped = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *mapped64 = mmap64(NULL, 8192, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *resize_source = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *resized = mremap(resize_source, 4096, 8192, MREMAP_MAYMOVE);
+  void *fixed_source = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *fixed_destination = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *fixed_result = mremap(fixed_source, 4096, 4096,
+                              MREMAP_MAYMOVE | MREMAP_FIXED,
+                              fixed_destination);
+  void *map_fixed_source = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *map_fixed_result = mmap(map_fixed_source, 4096,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                -1, 0);
+  if (!small || !large || !aligned || !positioned || !legacy_aligned ||
+      !page_aligned || !page_rounded ||
+      mapped == MAP_FAILED || mapped64 == MAP_FAILED ||
+      resize_source == MAP_FAILED || resized == MAP_FAILED ||
+      fixed_source == MAP_FAILED || fixed_destination == MAP_FAILED ||
+      fixed_result == MAP_FAILED || map_fixed_source == MAP_FAILED ||
+      map_fixed_result == MAP_FAILED) return 7;
+  aros_alloc_snapshot_t observed;
+  snapshot(&observed);
+  aros_alloc_snapshot_t first = observed;
+  shared_free(small); shared_free(large); free(aligned); free(positioned);
+  free(legacy_aligned);
+  free(page_aligned); free(page_rounded);
+  if (munmap(mapped, 4096) != 0) return 8;
+  if (munmap(mapped64, 8192) != 0) return 9;
+  if (munmap(resized, 8192) != 0) return 10;
+  if (munmap(fixed_result, 4096) != 0) return 11;
+  if (munmap(map_fixed_result, 4096) != 0) return 12;
+  snapshot(&observed);
+  enable(0);
+  printf("live=%zu allocations=%zu errors=%u\\n", first.live_bytes,
+         first.live_allocations, first.error_flags);
+  printf("final=%zu allocations=%zu errors=%u\\n", observed.live_bytes,
+         observed.live_allocations, observed.error_flags);
+  return 0;
+}
+"""
+    )
+    harness = tmp_path / "harness"
+    subprocess.run(
+        [compiler, "-shared", "-fPIC", "-O2", "-o", str(client), str(client_source)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-pthread",
+            "-ldl",
+            "-o",
+            str(interposer),
+            str(interposer_source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [compiler, "-O2", "-ldl", "-o", str(harness), str(harness_source)],
+        check=True,
+        capture_output=True,
+    )
+    environment = dict(os.environ)
+    environment["LD_PRELOAD"] = str(interposer)
+    result = subprocess.run(
+        [str(harness), str(client)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        f"live={expected_live} allocations=12 errors=0\n"
+        "final=0 allocations=0 errors=0\n"
+    )
+
+
+def test_allocator_interposer_flags_unknown_and_table_overflow(
+    tmp_path: Path,
+) -> None:
+    from commissioning.cache_campaign.r0_probes import allocator_interposer_source
+
+    compiler = shutil.which("cc")
+    assert compiler is not None
+    source = tmp_path / "interposer.c"
+    source.write_bytes(allocator_interposer_source())
+    interposer = tmp_path / "interposer.so"
+    harness_source = tmp_path / "errors.c"
+    harness_source.write_text(
+        r'''
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+typedef struct { size_t live_bytes; size_t live_allocations; unsigned error_flags; } snapshot_t;
+typedef void (*reset_fn)(void);
+typedef void (*enable_fn)(int);
+typedef void (*snapshot_fn)(snapshot_t *);
+int main(void) {
+  reset_fn reset = dlsym(RTLD_DEFAULT, "aros_alloc_reset");
+  enable_fn enable = dlsym(RTLD_DEFAULT, "aros_alloc_set_enabled");
+  snapshot_fn snapshot = dlsym(RTLD_DEFAULT, "aros_alloc_snapshot");
+  snapshot_t observed;
+  void *unknown_free = malloc(11);
+  reset(); enable(1); free(unknown_free); snapshot(&observed); enable(0);
+  unsigned free_error = observed.error_flags;
+  void *unknown_realloc = malloc(12);
+  reset(); enable(1); void *replacement = realloc(unknown_realloc, 24);
+  snapshot(&observed); enable(0); free(replacement);
+  unsigned realloc_error = observed.error_flags;
+  reset(); enable(1);
+  void *items[5]; for (int i = 0; i < 5; ++i) items[i] = malloc(16);
+  snapshot(&observed); enable(0);
+  for (int i = 0; i < 5; ++i) free(items[i]);
+  printf("free=%u realloc=%u table=%u\n", free_error, realloc_error,
+         observed.error_flags);
+  return 0;
+}
+'''
+    )
+    harness = tmp_path / "errors"
+    subprocess.run(
+        [
+            compiler,
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-pthread",
+            "-DAROS_POINTER_CAPACITY=4",
+            "-o",
+            str(interposer),
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [compiler, "-O0", "-ldl", "-o", str(harness), str(harness_source)],
+        check=True,
+        capture_output=True,
+    )
+    environment = dict(os.environ)
+    environment["LD_PRELOAD"] = str(interposer)
+    result = subprocess.run(
+        [str(harness)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "free=2 realloc=4 table=8\n"
+
+
 @pytest.mark.parametrize(
     "output",
     [
@@ -465,10 +708,15 @@ def test_metadata_probe_rejects_accounting_failures(output: str) -> None:
         parse_metadata_probe(output)
 
 
+def invoked_program(argv: list[str]) -> str:
+    return argv[2] if argv[0] == "/usr/bin/env" else argv[0]
+
+
 class FakeRun:
     def __init__(self) -> None:
         self.commands: list[list[str]] = []
         self.cwds: list[Path] = []
+        self.limits: list[tuple[float, int]] = []
         self.simulation_count = 0
         self.request_count = 9_999
         self.candidate_test_registered = True
@@ -487,8 +735,16 @@ class FakeRun:
         )
 
     def __call__(
-        self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        self,
+        argv: list[str],
+        output_dir: Path,
+        *,
+        cwd: Path | None = None,
+        timeout_seconds: float | None = None,
+        max_output_bytes: int | None = None,
     ) -> ChildResult:
+        if timeout_seconds is not None and max_output_bytes is not None:
+            self.limits.append((timeout_seconds, max_output_bytes))
         command = list(argv)
         self.commands.append(command)
         checkout = Path(cwd) if cwd is not None else None
@@ -496,6 +752,7 @@ class FakeRun:
         self.cwds.append(checkout)
         stdout = b""
         stderr = b""
+        program = invoked_program(command)
         if command[:4] == ["cmake", "-S", ".", "-B"]:
             build = checkout / command[4]
             build.mkdir()
@@ -514,11 +771,17 @@ class FakeRun:
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"release candidate")
             binary.chmod(0o755)
+            (checkout / "_build-release/liblibCacheSim.a").write_bytes(
+                b"release static archive"
+            )
         elif command[:3] == ["cmake", "--build", "_build-sanitize"]:
             binary = checkout / "_build-sanitize/bin/cachesim"
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"sanitize candidate")
             binary.chmod(0o755)
+            (checkout / "_build-sanitize/liblibCacheSim.a").write_bytes(
+                b"sanitize static archive"
+            )
         elif command[0] == "/usr/bin/cc":
             binary = Path(command[command.index("-o") + 1])
             binary.write_bytes(b"probe")
@@ -532,11 +795,11 @@ class FakeRun:
                 )
             else:
                 stdout = b"Test project /build\nNo tests were found!!!\n"
-        elif command[0].endswith("capacity-probe"):
+        elif program.endswith("capacity-probe"):
             stdout = self.capacity_output
-        elif command[0].endswith("metadata-probe"):
+        elif program.endswith("metadata-probe"):
             stdout = self.metadata_output
-        elif command[0].endswith("cachesim"):
+        elif program.endswith("cachesim"):
             self.simulation_count += 1
             ratio = "0.3000" if self.mismatch and self.simulation_count == 2 else "0.2000"
             throughput = "2.0" if self.simulation_count == 1 else "9.0"
@@ -586,6 +849,18 @@ def evaluated(
     if baseline:
         git(checkout, "checkout", "-q", base)
     output = tmp_path / "r0-output"
+
+    def bounded_run(
+        argv: list[str],
+        output_dir: Path,
+        *,
+        cwd: Path | None,
+        timeout_seconds: float,
+        max_output_bytes: int,
+    ) -> ChildResult:
+        runner.limits.append((timeout_seconds, max_output_bytes))
+        return runner(argv, output_dir, cwd=cwd)
+
     receipt = evaluate_r0(
         checkout=checkout,
         base=base,
@@ -593,7 +868,7 @@ def evaluated(
         policy="Sieve" if baseline else POLICY,
         source_receipt=receipt_path,
         output=output,
-        run=runner,
+        run=bounded_run,
     )
     return receipt, runner, checkout, base, selected_candidate
 
@@ -615,10 +890,11 @@ def test_r0_exact_command_order_flags_and_separate_facts(
         str(checkout / "_build-release/bin/cachesim"),
         "/usr/bin/cc",
     ]
-    assert len(names) == 13
+    assert len(names) == 14
     assert names[10].endswith("/capacity-probe")
     assert names[11] == "/usr/bin/cc"
-    assert names[12].endswith("/metadata-probe")
+    assert names[12] == "/usr/bin/cc"
+    assert names[13] == "/usr/bin/env"
     assert [item["label"] for item in receipt["commands"]] == [
         "release-configure",
         "release-build",
@@ -631,8 +907,14 @@ def test_r0_exact_command_order_flags_and_separate_facts(
         "determinism-run-2",
         "capacity-compile",
         "capacity-run",
+        "metadata-interposer-compile",
         "metadata-compile",
         "metadata-run",
+    ]
+    assert runner.limits == [
+        (item["timeout_seconds"], item["max_output_bytes"])
+        for item in receipt["commands"]
+        if item["returncode"] is not None
     ]
     assert runner.commands[0] == [
         "cmake",
@@ -682,6 +964,9 @@ def test_r0_exact_command_order_flags_and_separate_facts(
     assert "/usr/lib/test/libzstd.so" in capacity_compile
     assert "/usr/lib/test/libtcmalloc_minimal.so" in capacity_compile
     assert "-lstdc++" in capacity_compile
+    metadata_compile = runner.commands[12]
+    assert not any(item.startswith("-Wl,--wrap=") for item in metadata_compile)
+    assert runner.commands[13][1].startswith("LD_PRELOAD=")
     assert receipt["checks"] == {
         "source_binding": True,
         "evidence_binding": True,
@@ -710,6 +995,155 @@ def test_r0_exact_command_order_flags_and_separate_facts(
     assert not (checkout / "_build-sanitize").exists()
 
 
+def test_candidate_ctest_binary_replacement_stops_dependent_launches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class BinaryReplacingRun(FakeRun):
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            result = super().__call__(argv, output_dir, cwd=cwd)
+            if argv[0] == "ctest" and "-R" in argv:
+                assert cwd is not None
+                binary = Path(cwd) / "_build-release/bin/cachesim"
+                binary.write_bytes(b"candidate replacement")
+                binary.chmod(0o755)
+            return result
+
+    receipt, runner, *_rest = evaluated(tmp_path, monkeypatch, BinaryReplacingRun())
+    assert receipt["checks"]["evidence_binding"] is False
+    assert receipt["checks"]["deterministic"] is None
+    assert "sanitize-configure" not in {
+        item["label"]
+        for item in receipt["commands"]
+        if item["returncode"] is not None
+    }
+    assert not any(command[:4] == ["cmake", "-S", ".", "-B"] and command[4] == "_build-sanitize" for command in runner.commands)
+    snapshot = receipt["artifact_snapshots"]["release_cachesim"]
+    assert snapshot["binding_intact"] is False
+    assert (tmp_path / "r0-output" / snapshot["snapshot_path"]).read_bytes() == b"release candidate"
+
+
+def test_source_mutation_is_sticky_even_if_later_command_would_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class SourceRestoreRun(FakeRun):
+        original: bytes | None = None
+
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            assert cwd is not None
+            source = Path(cwd) / SOURCE
+            if argv[:5] == ["cmake", "-S", ".", "-B", "_build-sanitize"]:
+                assert self.original is not None
+                source.write_bytes(self.original)
+            result = super().__call__(argv, output_dir, cwd=cwd)
+            if argv[0] == "ctest" and "-R" in argv:
+                self.original = source.read_bytes()
+                source.write_bytes(b"temporary tracked mutation\n")
+            return result
+
+    receipt, runner, *_rest = evaluated(tmp_path, monkeypatch, SourceRestoreRun())
+    assert receipt["checks"]["source_binding"] is False
+    assert receipt["checks"]["deterministic"] is None
+    assert not any(command[4:5] == ["_build-sanitize"] for command in runner.commands)
+    assert any("source binding" in error for error in receipt["errors"])
+
+
+def test_release_archive_or_cache_mutation_stops_probe_linking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class BuildArtifactReplacingRun(FakeRun):
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            result = super().__call__(argv, output_dir, cwd=cwd)
+            if argv[0].endswith("cachesim") and self.simulation_count == 2:
+                assert cwd is not None
+                checkout = Path(argv[0]).parents[2]
+                (checkout / "_build-release/liblibCacheSim.a").write_bytes(
+                    b"replacement archive"
+                )
+                with (checkout / "_build-release/CMakeCache.txt").open("ab") as stream:
+                    stream.write(b"MUTATED:STRING=yes\n")
+            return result
+
+    receipt, runner, *_rest = evaluated(
+        tmp_path, monkeypatch, BuildArtifactReplacingRun()
+    )
+    assert receipt["checks"]["evidence_binding"] is False
+    assert receipt["checks"]["capacity"] is None
+    assert "capacity-compile" not in {
+        item["label"]
+        for item in receipt["commands"]
+        if item["returncode"] is not None
+    }
+    assert not any(command and command[0] == "/usr/bin/cc" for command in runner.commands)
+    assert receipt["artifact_snapshots"]["release_archive"]["binding_intact"] is False
+    assert receipt["artifact_snapshots"]["release_cmake_cache"]["binding_intact"] is False
+    output = tmp_path / "r0-output"
+    archive_snapshot = receipt["artifact_snapshots"]["release_archive"]
+    cache_snapshot = receipt["artifact_snapshots"]["release_cmake_cache"]
+    assert (output / archive_snapshot["snapshot_path"]).read_bytes() == (
+        b"release static archive"
+    )
+    assert b"MUTATED" not in (output / cache_snapshot["snapshot_path"]).read_bytes()
+
+
+def test_interposer_mutation_stops_metadata_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class InterposerReplacingRun(FakeRun):
+        interposer: Path | None = None
+
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            result = super().__call__(argv, output_dir, cwd=cwd)
+            if argv[0] == "/usr/bin/cc" and "-shared" in argv:
+                self.interposer = Path(argv[argv.index("-o") + 1])
+            if argv[0] == "/usr/bin/cc" and any(
+                item.endswith("metadata_probe.c") for item in argv
+            ):
+                assert self.interposer is not None
+                self.interposer.write_bytes(b"replacement interposer")
+            return result
+
+    receipt, runner, *_rest = evaluated(
+        tmp_path, monkeypatch, InterposerReplacingRun()
+    )
+    assert receipt["checks"]["evidence_binding"] is False
+    assert receipt["checks"]["metadata_probe"] is None
+    assert not any(command and command[0] == "/usr/bin/env" for command in runner.commands)
+    assert receipt["artifact_snapshots"]["metadata_interposer_binary"][
+        "binding_intact"
+    ] is False
+
+
+def test_artifact_mutation_during_receipt_cannot_contradict_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_receipt = evidence_module.ArtifactRegistry.receipt
+
+    def mutate_then_receipt(
+        registry: evidence_module.ArtifactRegistry,
+    ) -> dict[str, dict[str, object]]:
+        snapshot = registry._snapshots["sanitize_archive"]
+        snapshot.source_path.write_bytes(b"late sanitize archive mutation")
+        return original_receipt(registry)
+
+    monkeypatch.setattr(
+        evidence_module.ArtifactRegistry, "receipt", mutate_then_receipt
+    )
+    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch)
+    assert receipt["artifact_snapshots"]["sanitize_archive"][
+        "binding_intact"
+    ] is False
+    assert receipt["checks"]["evidence_binding"] is False
+    assert receipt["checks"]["sanitizer"] is None
+
+
 def test_baseline_skips_contract_and_candidate_ctest_but_runs_probes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -719,7 +1153,7 @@ def test_baseline_skips_contract_and_candidate_ctest_but_runs_probes(
     assert receipt["scope"]["changed_paths"] == []
     assert receipt["scope"]["contract_bound"] is None
     assert receipt["checks"]["candidate_test"] is None
-    assert len(runner.commands) == 12
+    assert len(runner.commands) == 13
 
 
 def test_candidate_ctest_must_run_exact_registered_test(
@@ -903,7 +1337,7 @@ def test_nonzero_probe_with_conclusive_invalid_accounting_is_false(
             self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
         ) -> ChildResult:
             result = super().__call__(argv, output_dir, cwd=cwd)
-            if argv[0].endswith("metadata-probe"):
+            if invoked_program(argv).endswith("metadata-probe"):
                 return replace(result, returncode=3)
             return result
 
@@ -927,7 +1361,7 @@ def test_unavailable_metadata_probe_remains_not_measured(
         def __call__(
             self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
         ) -> ChildResult:
-            if argv[0].endswith("metadata-probe"):
+            if invoked_program(argv).endswith("metadata-probe"):
                 self.commands.append(list(argv))
                 raise subprocess.TimeoutExpired(argv, timeout=1)
             return super().__call__(argv, output_dir, cwd=cwd)
@@ -978,6 +1412,30 @@ def test_timeout_is_an_explicit_command_failure_with_retained_receipt(
     assert (tmp_path / "r0-output/receipt.json").is_file()
 
 
+def test_output_limit_is_an_explicit_operational_failure_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class OutputLimitRun(FakeRun):
+        raised = False
+
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            if not self.raised and argv[0].endswith("cachesim"):
+                self.raised = True
+                self.commands.append(list(argv))
+                raise ChildRunError("child output limit exceeded")
+            return super().__call__(argv, output_dir, cwd=cwd)
+
+    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, OutputLimitRun())
+    process = next(
+        item for item in receipt["commands"] if item["label"] == "determinism-run-1"
+    )
+    assert process["returncode"] is None
+    assert process["error"] == "child output limit exceeded"
+    assert receipt["checks"]["deterministic"] is None
+
+
 def recursive_keys(value: object) -> set[str]:
     if isinstance(value, dict):
         return set(value) | {key for item in value.values() for key in recursive_keys(item)}
@@ -998,25 +1456,40 @@ def test_receipt_is_self_hashed_and_has_no_aggregate_vocabulary(
     assert published == receipt
 
 
-def test_generated_probes_bind_exact_policy_reader_and_allocation_wrappers(
+def test_generated_probes_bind_policy_reader_and_process_wide_interposer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch)
     output = tmp_path / "r0-output"
     capacity = (output / receipt["probes"]["capacity"]["source_path"]).read_text()
     metadata = (output / receipt["probes"]["metadata"]["source_path"]).read_text()
+    interposer = (
+        output / receipt["probes"]["metadata"]["interposer_source_path"]
+    ).read_text()
     assert f"{POLICY}_init" in capacity
     assert "setup_reader" in capacity
     assert "ORACLE_GENERAL_TRACE" in capacity
     assert "cache->get(cache, request)" in capacity
     assert f"{POLICY}_init" in metadata
-    assert "__wrap_malloc" in metadata
-    assert "__wrap_calloc" in metadata
-    assert "__wrap_realloc" in metadata
-    assert "__wrap_free" in metadata
-    assert "unknown free" in metadata
-    assert "unknown realloc" in metadata
-    assert "fixed table overflow" in metadata
+    assert "aros_alloc_reset" in metadata
+    assert "aros_alloc_set_enabled" in metadata
+    assert "aros_alloc_snapshot" in metadata
+    for symbol in (
+        "malloc",
+        "calloc",
+        "realloc",
+        "free",
+        "aligned_alloc",
+        "posix_memalign",
+        "mmap",
+        "munmap",
+    ):
+        assert f"{symbol}(" in interposer
+    assert "recursion_guard" in interposer
+    assert "size == 0" in interposer
+    assert receipt["probes"]["metadata"]["accounting_scope"] == (
+        "process_wide_ld_preload"
+    )
 
 
 def test_untracked_source_mutation_invalidates_facts_but_retains_receipt(
@@ -1036,7 +1509,7 @@ def test_untracked_source_mutation_invalidates_facts_but_retains_receipt(
         tmp_path, monkeypatch, MutatingRun()
     )
     assert receipt["checks"]["source_binding"] is False
-    assert receipt["checks"]["evidence_binding"] is True
+    assert receipt["checks"]["evidence_binding"] is False
     assert all(
         value is None
         for key, value in receipt["checks"].items()
@@ -1061,12 +1534,22 @@ def test_synthetic_trace_mutation_invalidates_dependent_measurements(
                 self.simulation_count += 1
             return result
 
-    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, TraceMutatingRun())
+    receipt, runner, *_rest = evaluated(tmp_path, monkeypatch, TraceMutatingRun())
     assert receipt["checks"]["deterministic"] is None
     assert receipt["checks"]["capacity"] is None
     assert receipt["checks"]["metadata_probe"] is None
     assert receipt["measured_metadata"] is None
     assert any("synthetic trace" in error for error in receipt["errors"])
+    executed = {
+        item["label"]
+        for item in receipt["commands"]
+        if item["returncode"] is not None
+    }
+    assert "determinism-run-2" not in executed
+    assert not any(command and command[0] == "/usr/bin/cc" for command in runner.commands)
+    assert receipt["artifact_snapshots"]["synthetic_trace"][
+        "binding_intact"
+    ] is False
 
 
 def test_late_evidence_mutation_is_recorded_and_invalidates_every_fact(
@@ -1077,7 +1560,7 @@ def test_late_evidence_mutation_is_recorded_and_invalidates_every_fact(
             self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
         ) -> ChildResult:
             result = super().__call__(argv, output_dir, cwd=cwd)
-            if argv[0].endswith("metadata-probe"):
+            if invoked_program(argv).endswith("metadata-probe"):
                 assert cwd is not None
                 stage = Path(cwd)
                 (stage / "commands/08-determinism-run-1/stdout.raw").write_bytes(
@@ -1111,7 +1594,7 @@ def test_unregistered_stage_output_is_removed_and_invalidates_every_fact(
             self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
         ) -> ChildResult:
             result = super().__call__(argv, output_dir, cwd=cwd)
-            if argv[0].endswith("metadata-probe"):
+            if invoked_program(argv).endswith("metadata-probe"):
                 assert cwd is not None
                 (Path(cwd) / "unbound-candidate-output.bin").write_bytes(b"unbound")
             return result
@@ -1155,7 +1638,7 @@ def test_final_inventory_records_missing_and_late_mutated_evidence(
             self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
         ) -> ChildResult:
             result = super().__call__(argv, output_dir, cwd=cwd)
-            if argv[0].endswith("metadata-probe"):
+            if invoked_program(argv).endswith("metadata-probe"):
                 assert cwd is not None
                 target = Path(cwd) / relative
                 if delete:
@@ -1216,7 +1699,10 @@ def test_post_receipt_evidence_mutation_blocks_publication(
     ) -> None:
         real_write(path, value, hash_field)
         if path.name == "receipt.json":
-            (path.parent / "commands/13-metadata-run/stdout.raw").write_bytes(
+            command = next(
+                item for item in value["commands"] if item["label"] == "metadata-run"
+            )
+            (path.parent / command["stdout"]["path"]).write_bytes(
                 b"post-receipt mutation\n"
             )
 
@@ -1476,6 +1962,32 @@ def test_checkout_equal_to_or_below_output_is_rejected_without_creation(
             run=FakeRun(),
         )
     assert not list(tmp_path.glob(".*-stage-*"))
+
+
+@pytest.mark.parametrize("parent_name", ["unsafe output", "unsafe:output"])
+def test_output_path_must_be_safe_for_ld_preload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_name: str,
+) -> None:
+    checkout, base, candidate, lock = repository(tmp_path)
+    monkeypatch.setattr("commissioning.cache_campaign.evaluate.SOURCE_LOCK", lock)
+    source = source_receipt(tmp_path / "source.json", lock)
+    parent = tmp_path / parent_name
+    parent.mkdir()
+    output = parent / "r0-output"
+    with pytest.raises(EvaluationError, match="LD_PRELOAD"):
+        evaluate_r0(
+            checkout=checkout,
+            base=base,
+            candidate=candidate,
+            policy=POLICY,
+            source_receipt=source,
+            output=output,
+            run=FakeRun(),
+        )
+    assert not output.exists()
+    assert not list(parent.glob(".r0-output-stage-*"))
 
 
 def test_cli_supports_only_r0_and_prints_individual_checks(

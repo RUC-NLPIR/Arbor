@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import math
 import os
 import re
 import secrets
@@ -16,6 +17,12 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .records import quarantine_unlink, sha256_file
+
+
+_DEFAULT_TIMEOUT_SECONDS = 3600.0
+_DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+_MAX_TIMEOUT_SECONDS = 24 * 60 * 60
+_MAX_OUTPUT_BYTES = 1024 * 1024 * 1024
 
 
 RESULT = re.compile(
@@ -159,6 +166,28 @@ def _bounded_message(message: str, limit: int = 512) -> str:
     if len(message) <= limit:
         return message
     return message[: limit - 3] + "..."
+
+
+def _validated_limits(
+    timeout_seconds: float,
+    max_output_bytes: int,
+) -> tuple[int, int]:
+    if (
+        type(timeout_seconds) not in {int, float}
+        or not math.isfinite(timeout_seconds)
+        or not 0 < timeout_seconds <= _MAX_TIMEOUT_SECONDS
+    ):
+        raise ChildRunError(
+            f"timeout_seconds must be in (0, {_MAX_TIMEOUT_SECONDS}]"
+        )
+    if (
+        type(max_output_bytes) is not int
+        or not 2 <= max_output_bytes <= _MAX_OUTPUT_BYTES
+    ):
+        raise ChildRunError(
+            f"max_output_bytes must be in [2, {_MAX_OUTPUT_BYTES}]"
+        )
+    return max(1, round(timeout_seconds * 1_000_000_000)), max_output_bytes
 
 
 def _identity(metadata: os.stat_result) -> tuple[int, int]:
@@ -532,6 +561,66 @@ def _kill_process_group_and_reap(process: subprocess.Popen[bytes]) -> None:
     process.returncode = returncode
 
 
+def _drain_pipe(
+    descriptor: int,
+    stream: BinaryIO,
+    remaining: int,
+) -> tuple[int, bool]:
+    written = 0
+    while True:
+        try:
+            block = os.read(descriptor, 64 * 1024)
+        except BlockingIOError:
+            return written, False
+        if not block:
+            return written, False
+        allowed = min(len(block), remaining - written)
+        if allowed:
+            stream.write(block[:allowed])
+            written += allowed
+        if allowed != len(block):
+            return written, True
+
+
+def _wait4_bounded(
+    process: subprocess.Popen[bytes],
+    wait4: object,
+    stdout_read: int,
+    stderr_read: int,
+    stdout_stream: BinaryIO,
+    stderr_stream: BinaryIO,
+    *,
+    started_ns: int,
+    timeout_ns: int,
+    max_output_bytes: int,
+) -> tuple[int, int, object, int]:
+    deadline_ns = started_ns + timeout_ns
+    output_bytes = 0
+    while True:
+        for descriptor, stream in (
+            (stdout_read, stdout_stream),
+            (stderr_read, stderr_stream),
+        ):
+            written, exceeded = _drain_pipe(
+                descriptor, stream, max_output_bytes - output_bytes
+            )
+            output_bytes += written
+            if exceeded:
+                raise ChildRunError("child output limit exceeded")
+        pid, status, usage = wait4(process.pid, os.WNOHANG)  # type: ignore[operator]
+        if pid == process.pid:
+            return pid, status, usage, output_bytes
+        if pid != 0:
+            raise ChildRunError(
+                f"os.wait4 returned unexpected pid: expected 0 or {process.pid}, "
+                f"observed {pid}"
+            )
+        now_ns = time.monotonic_ns()
+        if now_ns >= deadline_ns:
+            raise ChildRunError("child timeout exceeded")
+        time.sleep(min(0.01, max(0.0, (deadline_ns - now_ns) / 1_000_000_000)))
+
+
 def _reject_surviving_process_group(process_group: int) -> None:
     # Linux can reuse a PGID after its leader is reaped, so this check must stay
     # immediately after wait4 and before any hashing or other fallible work.
@@ -579,6 +668,8 @@ def run_child(
     output_dir: Path,
     *,
     cwd: Path | None = None,
+    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
 ) -> ChildResult:
     """Run one child; by default it inherits the caller's current working directory."""
     wait4 = getattr(os, "wait4", None)
@@ -586,6 +677,9 @@ def run_child(
         raise ChildRunError("os.wait4 is required for child CPU accounting")
     argv_tuple = _validated_argv(argv)
     child_cwd = _validated_cwd(cwd)
+    timeout_ns, output_limit = _validated_limits(
+        timeout_seconds, max_output_bytes
+    )
 
     output: Path | None = None
     parent: Path | None = None
@@ -597,6 +691,12 @@ def run_child(
     files: dict[str, _RawFileReceipt] = {}
     stdout_stream: BinaryIO | None = None
     stderr_stream: BinaryIO | None = None
+    stdout_pipe_stream: BinaryIO | None = None
+    stderr_pipe_stream: BinaryIO | None = None
+    stdout_read = -1
+    stderr_read = -1
+    stdout_write = -1
+    stderr_write = -1
     try:
         (
             output,
@@ -616,17 +716,39 @@ def run_child(
         stderr_stream = _create_raw_file(
             directory_descriptor, "stderr.raw", files
         )
+        stdout_read, stdout_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+        stderr_read, stderr_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+        os.set_blocking(stdout_read, False)
+        os.set_blocking(stderr_read, False)
+        stdout_pipe_stream = os.fdopen(stdout_write, "wb", buffering=0)
+        stdout_write = -1
+        stderr_pipe_stream = os.fdopen(stderr_write, "wb", buffering=0)
+        stderr_write = -1
         start = time.monotonic_ns()
         process = subprocess.Popen(
             argv_tuple,
             cwd=child_cwd,
-            stdout=stdout_stream,
-            stderr=stderr_stream,
+            stdout=stdout_pipe_stream,
+            stderr=stderr_pipe_stream,
             shell=False,
             start_new_session=True,
         )
+        _close_stream(stdout_pipe_stream)
+        stdout_pipe_stream = None
+        _close_stream(stderr_pipe_stream)
+        stderr_pipe_stream = None
         try:
-            pid, status, usage = wait4(process.pid, 0)
+            pid, status, usage, output_bytes = _wait4_bounded(
+                process,
+                wait4,
+                stdout_read,
+                stderr_read,
+                stdout_stream,
+                stderr_stream,
+                started_ns=start,
+                timeout_ns=timeout_ns,
+                max_output_bytes=output_limit,
+            )
         except BaseException:
             _kill_process_group_and_reap(process)
             raise
@@ -637,6 +759,16 @@ def run_child(
         returncode = os.waitstatus_to_exitcode(status)
         process.returncode = returncode
         _reject_surviving_process_group(process.pid)
+        for descriptor, stream in (
+            (stdout_read, stdout_stream),
+            (stderr_read, stderr_stream),
+        ):
+            written, exceeded = _drain_pipe(
+                descriptor, stream, output_limit - output_bytes
+            )
+            output_bytes += written
+            if exceeded:
+                raise ChildRunError("child output limit exceeded")
         wall_ns = max(0, time.monotonic_ns() - start)
         cpu_ns = max(
             0,
@@ -707,6 +839,8 @@ def run_child(
             stderr_sha256=stderr_sha256,
         )
     except BaseException as error:
+        _close_stream(stdout_pipe_stream)
+        _close_stream(stderr_pipe_stream)
         _close_stream(stdout_stream)
         _close_stream(stderr_stream)
         cleanup_issue = None
@@ -743,6 +877,14 @@ def run_child(
             raise ChildRunError(message) from error
         raise
     finally:
+        if stdout_read >= 0:
+            os.close(stdout_read)
+        if stderr_read >= 0:
+            os.close(stderr_read)
+        if stdout_write >= 0:
+            os.close(stdout_write)
+        if stderr_write >= 0:
+            os.close(stderr_write)
         if directory_descriptor >= 0:
             os.close(directory_descriptor)
         if parent_descriptor >= 0:

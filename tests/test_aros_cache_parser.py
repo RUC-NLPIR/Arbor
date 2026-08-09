@@ -189,6 +189,151 @@ def test_run_child_records_exact_output_exit_and_resource_cost(tmp_path: Path) -
     assert result.stderr_sha256 == sha256_file(result.stderr_path)
 
 
+def test_run_child_timeout_kills_group_and_leaves_no_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_popen = cachesim_module.subprocess.Popen
+    processes: list[object] = []
+
+    def capture_process(*args: object, **kwargs: object) -> object:
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(cachesim_module.subprocess, "Popen", capture_process)
+    output = tmp_path / "timeout-run"
+    started = time.monotonic()
+    with pytest.raises(ChildRunError, match="timeout") as caught:
+        run_child(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            output,
+            timeout_seconds=0.05,
+            max_output_bytes=1024,
+        )
+    assert time.monotonic() - started < 2
+    assert len(str(caught.value)) <= 512
+    process = processes[0]
+    with pytest.raises(ProcessLookupError):
+        os.kill(process.pid, 0)  # type: ignore[union-attr]
+    with pytest.raises(ProcessLookupError):
+        os.killpg(process.pid, 0)  # type: ignore[union-attr]
+    assert not output.exists()
+    assert not list(tmp_path.glob(".cachesim-stage-*"))
+
+
+def test_run_child_output_limit_kills_noisy_group_and_leaves_no_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_popen = cachesim_module.subprocess.Popen
+    processes: list[object] = []
+
+    def capture_process(*args: object, **kwargs: object) -> object:
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(cachesim_module.subprocess, "Popen", capture_process)
+    real_cleanup = cachesim_module._cleanup_outputs
+    retained_sizes: list[int] = []
+
+    def observe_then_cleanup(*args: object, **kwargs: object) -> object:
+        directory_descriptor = args[2]
+        retained_sizes.extend(
+            os.stat(name, dir_fd=directory_descriptor).st_size
+            for name in ("stdout.raw", "stderr.raw")
+        )
+        return real_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(cachesim_module, "_cleanup_outputs", observe_then_cleanup)
+    output = tmp_path / "noisy-run"
+    code = "import os\nwhile True: os.write(1, b'x' * 65536)"
+    started = time.monotonic()
+    with pytest.raises(ChildRunError, match="output limit") as caught:
+        run_child(
+            [sys.executable, "-c", code],
+            output,
+            timeout_seconds=2,
+            max_output_bytes=32 * 1024,
+        )
+    assert time.monotonic() - started < 2
+    assert len(str(caught.value)) <= 512
+    process = processes[0]
+    with pytest.raises(ProcessLookupError):
+        os.kill(process.pid, 0)  # type: ignore[union-attr]
+    with pytest.raises(ProcessLookupError):
+        os.killpg(process.pid, 0)  # type: ignore[union-attr]
+    assert not output.exists()
+    assert not list(tmp_path.glob(".cachesim-stage-*"))
+    assert retained_sizes
+    assert sum(retained_sizes) <= 32 * 1024
+
+
+def test_output_limit_does_not_truncate_unrelated_child_artifacts(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    artifact = cwd / "artifact.bin"
+    result = run_child(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('artifact.bin').write_bytes(b'x' * 20000)",
+        ],
+        tmp_path / "artifact-run",
+        cwd=cwd,
+        timeout_seconds=2,
+        max_output_bytes=32 * 1024,
+    )
+    assert result.returncode == 0
+    assert artifact.read_bytes() == b"x" * 20000
+
+
+@pytest.mark.parametrize(
+    ("timeout_seconds", "max_output_bytes"),
+    [(0, 1024), (True, 1024), (1, 0), (1, True), (1, 2**31)],
+)
+def test_run_child_rejects_invalid_resource_limits_before_output(
+    tmp_path: Path, timeout_seconds: object, max_output_bytes: object
+) -> None:
+    output = tmp_path / "invalid-limit"
+    with pytest.raises(ChildRunError, match="timeout|output"):
+        run_child(
+            [sys.executable, "-c", "pass"],
+            output,
+            timeout_seconds=timeout_seconds,  # type: ignore[arg-type]
+            max_output_bytes=max_output_bytes,  # type: ignore[arg-type]
+        )
+    assert not output.exists()
+
+
+def test_run_child_closes_partial_pipe_setup_after_second_pipe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_pipe2 = cachesim_module.os.pipe2
+    created: list[int] = []
+    calls = 0
+
+    def fail_second_pipe(flags: int) -> tuple[int, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("second pipe failed")
+        descriptors = real_pipe2(flags)
+        created.extend(descriptors)
+        return descriptors
+
+    monkeypatch.setattr(cachesim_module.os, "pipe2", fail_second_pipe)
+    output = tmp_path / "partial-pipe"
+    with pytest.raises(ChildRunError, match="second pipe failed"):
+        run_child([sys.executable, "-c", "pass"], output)
+    assert len(created) == 2
+    for descriptor in created:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    assert not output.exists()
+
+
 def test_run_child_creates_a_new_directory_without_replacement(tmp_path: Path) -> None:
     output = tmp_path / "run"
     output.mkdir()
@@ -305,15 +450,17 @@ def test_run_child_uses_wait4_cpu_rounding_and_popen_contract(
             observed["process"] = self
 
     monkeypatch.setattr(cachesim_module.subprocess, "Popen", FakeProcess)
-    monkeypatch.setattr(
-        cachesim_module.os,
-        "wait4",
-        lambda pid, options: (
+    wait_options: list[int] = []
+
+    def completed_wait4(pid: int, options: int) -> tuple[int, int, object]:
+        wait_options.append(options)
+        return (
             pid,
             7 << 8,
             SimpleNamespace(ru_utime=0.000000001, ru_stime=0.000000002),
-        ),
-    )
+        )
+
+    monkeypatch.setattr(cachesim_module.os, "wait4", completed_wait4)
     times = iter([1000, 2500])
     monkeypatch.setattr(cachesim_module.time, "monotonic_ns", lambda: next(times))
     group_checks: list[tuple[int, int]] = []
@@ -336,6 +483,7 @@ def test_run_child_uses_wait4_cpu_rounding_and_popen_contract(
     assert result.cpu_ns == 3
     assert observed["process"].returncode == 7  # type: ignore[union-attr]
     assert group_checks == [(4321, 0)]
+    assert wait_options == [os.WNOHANG]
 
 
 def test_run_child_requires_wait4_before_creating_output(
@@ -624,18 +772,26 @@ def test_run_child_cleanup_preserves_a_replacement_file(
 ) -> None:
     output = tmp_path / "run"
     replaced: dict[str, Path] = {}
+    real_create = cachesim_module._create_raw_file
 
-    def replace_stdout_then_fail(argv: tuple[str, ...], **kwargs: object) -> object:
-        stdout = kwargs["stdout"]
-        path = Path(os.readlink(f"/proc/self/fd/{stdout.fileno()}"))  # type: ignore[union-attr]
-        path.unlink()
-        path.write_bytes(b"foreign")
-        replaced["path"] = path
+    def create_then_replace(
+        directory_descriptor: int,
+        name: str,
+        files: dict[str, object],
+    ) -> object:
+        stream = real_create(directory_descriptor, name, files)  # type: ignore[arg-type]
+        if name == "stdout.raw":
+            path = Path(os.readlink(f"/proc/self/fd/{stream.fileno()}"))
+            path.unlink()
+            path.write_bytes(b"foreign")
+            replaced["path"] = path
+        return stream
+
+    def fail_spawn(argv: tuple[str, ...], **kwargs: object) -> object:
         raise OSError("spawn failed")
 
-    monkeypatch.setattr(
-        cachesim_module.subprocess, "Popen", replace_stdout_then_fail
-    )
+    monkeypatch.setattr(cachesim_module, "_create_raw_file", create_then_replace)
+    monkeypatch.setattr(cachesim_module.subprocess, "Popen", fail_spawn)
     with pytest.raises(ChildRunError, match="spawn failed"):
         run_child(["program"], output)
     assert replaced["path"].read_bytes() == b"foreign"
@@ -648,20 +804,30 @@ def test_run_child_cleanup_preserves_a_replacement_directory(
     output = tmp_path / "run"
     moved = tmp_path / "moved-owned-run"
     replaced: dict[str, Path] = {}
+    real_create = cachesim_module._create_raw_file
 
-    def replace_directory_then_fail(argv: tuple[str, ...], **kwargs: object) -> object:
-        stdout = kwargs["stdout"]
-        stage = Path(os.readlink(f"/proc/self/fd/{stdout.fileno()}"))  # type: ignore[union-attr]
-        stage = stage.parent
-        stage.rename(moved)
-        stage.mkdir()
-        (stage / "foreign").write_bytes(b"keep")
-        replaced["stage"] = stage
+    def create_then_replace_directory(
+        directory_descriptor: int,
+        name: str,
+        files: dict[str, object],
+    ) -> object:
+        stream = real_create(directory_descriptor, name, files)  # type: ignore[arg-type]
+        if name == "stdout.raw":
+            stage = Path(os.readlink(f"/proc/self/fd/{stream.fileno()}"))
+            stage = stage.parent
+            stage.rename(moved)
+            stage.mkdir()
+            (stage / "foreign").write_bytes(b"keep")
+            replaced["stage"] = stage
+        return stream
+
+    def fail_spawn(argv: tuple[str, ...], **kwargs: object) -> object:
         raise OSError("spawn failed")
 
     monkeypatch.setattr(
-        cachesim_module.subprocess, "Popen", replace_directory_then_fail
+        cachesim_module, "_create_raw_file", create_then_replace_directory
     )
+    monkeypatch.setattr(cachesim_module.subprocess, "Popen", fail_spawn)
     with pytest.raises(ChildRunError, match="spawn failed"):
         run_child(["program"], output)
     assert (replaced["stage"] / "foreign").read_bytes() == b"keep"
@@ -813,7 +979,7 @@ def test_run_child_detects_same_inode_mutation_after_task1_hash(
             [sys.executable, "-c", "import os; os.write(1, b'alpha')"],
             tmp_path / "run",
         )
-    assert stdout_calls == 2
+    assert stdout_calls >= 2
     assert not (tmp_path / "run").exists()
 
 

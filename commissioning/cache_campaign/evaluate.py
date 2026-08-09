@@ -1,30 +1,66 @@
 from __future__ import annotations
 
-import ctypes
-import errno
 import hashlib
-import json
 import os
 import platform
 import re
-import shutil
 import stat
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
-from decimal import Decimal, InvalidOperation
-from pathlib import Path, PurePosixPath
+from dataclasses import asdict
+from decimal import Decimal
+from pathlib import Path
 
 from .cachesim import ChildResult, parse_cachesim_output, run_child
+from .evidence import (
+    ArtifactRegistry,
+    Binding as _Binding,
+    EvidenceError,
+    Invocation as _Invocation,
+    capture_binding as _binding,
+    capture_executable as _capture_executable,
+    capture_expected_evidence as _capture_expected_evidence,
+    checkout_path as _checkout_path,
+    cleanup_owned as _cleanup_owned,
+    command_evidence_expectations as _command_evidence_expectations,
+    command_record as _command_record,
+    directory_identity as _directory_identity,
+    discover_static_archive,
+    evidence_inventory as _evidence_inventory,
+    executable_hash as _executable_hash,
+    output_path as _output_path,
+    publish_stage as _publish_stage,
+    refresh_file_record as _refresh_file_record,
+    regular_bytes as _regular_bytes,
+    regular_identity as _regular_identity,
+    revalidate_checkout as _post_binding,
+    revalidate_command_evidence as _revalidate_command_evidence,
+    skipped_command_record as _skipped_command_record,
+    stage_directory as _stage_directory,
+    unexpected_stage_entries as _unexpected_stage_entries,
+    verify_final_stage as _verify_final_stage,
+)
 from .records import (
     load_object,
     record_sha256,
     sha256_file,
     write_new_record,
+)
+from .r0_probes import (
+    ProbeError,
+    allocator_compile_argv,
+    allocator_interposer_source,
+    capacity_compile_argv,
+    capacity_probe_source,
+    metadata_compile_argv,
+    metadata_probe_source,
+    metadata_run_argv,
+    parse_capacity_probe as _parse_capacity_probe,
+    parse_metadata_probe as _parse_metadata_probe,
+    probe_build_flags,
 )
 from .scope import PolicyContract, ScopeFacts, evaluate_scope
 from .source import validate_source
@@ -42,6 +78,23 @@ _SANITIZER = re.compile(
 )
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+_MIB = 1024 * 1024
+_COMMAND_LIMITS: dict[str, tuple[float, int]] = {
+    "release-configure": (600.0, 16 * _MIB),
+    "release-build": (1800.0, 64 * _MIB),
+    "release-full-tests": (1800.0, 64 * _MIB),
+    "candidate-test": (600.0, 16 * _MIB),
+    "sanitize-configure": (600.0, 16 * _MIB),
+    "sanitize-build": (1800.0, 64 * _MIB),
+    "sanitize-full-tests": (1800.0, 64 * _MIB),
+    "determinism-run-1": (120.0, 16 * _MIB),
+    "determinism-run-2": (120.0, 16 * _MIB),
+    "capacity-compile": (300.0, 16 * _MIB),
+    "capacity-run": (120.0, 16 * _MIB),
+    "metadata-interposer-compile": (300.0, 16 * _MIB),
+    "metadata-compile": (300.0, 16 * _MIB),
+    "metadata-run": (120.0, 16 * _MIB),
+}
 _GIT_CONFIG = [
     "-c",
     "core.fsmonitor=false",
@@ -56,42 +109,7 @@ _GIT_CONFIG = [
 ]
 
 
-class EvaluationError(ValueError):
-    pass
-
-
-@dataclass(frozen=True)
-class _Binding:
-    head: str
-    tree: str
-    origin: bytes
-    push_urls: bytes
-    index: bytes
-    index_flags: bytes
-    tracked: tuple[tuple[str, str, str], ...]
-
-
-@dataclass
-class _Invocation:
-    record: dict[str, object]
-    result: ChildResult | None
-    stdout: bytes
-    stderr: bytes
-    stdout_identity: tuple[int, int] | None
-    stderr_identity: tuple[int, int] | None
-
-    @property
-    def ok(self) -> bool:
-        return self.result is not None and self.result.returncode == 0
-
-
-@dataclass(frozen=True)
-class _EvidenceExpectation:
-    path: str
-    identity: tuple[int, int] | None
-    size_bytes: int | None
-    sha256: str | None
-
+EvaluationError = EvidenceError
 
 def _command_outcome(invocation: _Invocation) -> bool | None:
     if invocation.result is None:
@@ -157,169 +175,6 @@ def _git(checkout: Path, *argv: str) -> str:
         raise EvaluationError("Git binding output is not UTF-8") from error
 
 
-def _regular_bytes(path: Path) -> bytes:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise EvaluationError(f"expected a regular file: {path}")
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            return stream.read()
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _regular_identity(path: Path) -> tuple[int, int]:
-    metadata = path.lstat()
-    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-        raise EvaluationError(f"expected a regular non-symlink file: {path}")
-    return metadata.st_dev, metadata.st_ino
-
-
-def _refresh_file_record(
-    path: Path,
-    record: dict[str, object],
-    identity: tuple[int, int],
-) -> bool:
-    initial_size = record.get("size_bytes")
-    initial_sha256 = record.get("sha256")
-    try:
-        raw = _regular_bytes(path)
-        observed_identity = _regular_identity(path)
-        observed_size: int | None = len(raw)
-        observed_sha256: str | None = hashlib.sha256(raw).hexdigest()
-    except (OSError, ValueError):
-        observed_identity = None
-        observed_size = None
-        observed_sha256 = None
-    intact = (
-        observed_identity == identity
-        and observed_size == initial_size
-        and observed_sha256 == initial_sha256
-    )
-    record["binding_intact"] = intact
-    if not intact:
-        record["initial_size_bytes"] = initial_size
-        record["initial_sha256"] = initial_sha256
-        record["size_bytes"] = observed_size
-        record["sha256"] = observed_sha256
-    return intact
-
-
-def _capture_expected_evidence(path: Path, stage: Path) -> _EvidenceExpectation:
-    relative = str(path.relative_to(stage))
-    try:
-        raw = _regular_bytes(path)
-        identity = _regular_identity(path)
-    except (OSError, ValueError):
-        return _EvidenceExpectation(relative, None, None, None)
-    return _EvidenceExpectation(
-        relative,
-        identity,
-        len(raw),
-        hashlib.sha256(raw).hexdigest(),
-    )
-
-
-def _checkout_path(path: Path) -> Path:
-    candidate = Path(path).absolute()
-    try:
-        metadata = candidate.lstat()
-        if candidate.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
-            raise EvaluationError("checkout must be a real directory")
-        return candidate.resolve(strict=True)
-    except EvaluationError:
-        raise
-    except OSError as error:
-        raise EvaluationError("checkout must exist") from error
-
-
-def _paths_overlap(left: Path, right: Path) -> bool:
-    return left == right or left in right.parents or right in left.parents
-
-
-def _output_path(path: Path, checkout: Path) -> Path:
-    candidate = Path(path)
-    if not candidate.is_absolute():
-        raise EvaluationError("output must be absolute")
-    if candidate.name in {"", ".", ".."}:
-        raise EvaluationError("output must name a new directory")
-    parent = candidate.parent
-    try:
-        metadata = parent.lstat()
-        if parent.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
-            raise EvaluationError("output parent must be a real directory")
-        resolved_parent = parent.resolve(strict=True)
-    except EvaluationError:
-        raise
-    except OSError as error:
-        raise EvaluationError("output parent must exist") from error
-    resolved = (resolved_parent / candidate.name).resolve(strict=False)
-    if _paths_overlap(checkout, resolved):
-        raise EvaluationError("checkout and output paths must not overlap")
-    if os.path.lexists(candidate) or os.path.lexists(resolved):
-        raise EvaluationError(f"output must not exist: {resolved}")
-    return resolved
-
-
-def _stage_directory(output: Path) -> tuple[Path, tuple[int, int]]:
-    stage = Path(
-        tempfile.mkdtemp(prefix=f".{output.name}-stage-", dir=output.parent)
-    )
-    stage.chmod(0o700)
-    metadata = stage.lstat()
-    return stage, (metadata.st_dev, metadata.st_ino)
-
-
-def _directory_identity(path: Path) -> tuple[int, int]:
-    metadata = path.lstat()
-    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
-        raise EvaluationError(f"apparatus directory is not real: {path}")
-    return metadata.st_dev, metadata.st_ino
-
-
-def _cleanup_owned(path: Path, identity: tuple[int, int]) -> None:
-    try:
-        observed = _directory_identity(path)
-    except FileNotFoundError:
-        return
-    if observed != identity:
-        raise EvaluationError(f"refusing to remove replaced apparatus directory: {path}")
-    shutil.rmtree(path)
-
-
-def _publish_stage(stage: Path, identity: tuple[int, int], output: Path) -> None:
-    if _directory_identity(stage) != identity:
-        raise EvaluationError("evaluation stage changed before publication")
-    if os.path.lexists(output):
-        raise EvaluationError(f"refusing to replace output directory: {output}")
-    try:
-        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
-    except AttributeError as error:
-        raise EvaluationError("atomic no-replace publication is unavailable") from error
-    renameat2.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    ]
-    renameat2.restype = ctypes.c_int
-    result = renameat2(-100, os.fsencode(stage), -100, os.fsencode(output), 1)
-    if result != 0:
-        number = ctypes.get_errno()
-        if number == errno.EEXIST:
-            raise EvaluationError(f"refusing to replace output directory: {output}")
-        raise OSError(number, os.strerror(number), output)
-    descriptor = os.open(output.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _write_private(path: Path, raw: bytes, mode: int = 0o600) -> None:
     descriptor = os.open(
         path,
@@ -371,75 +226,18 @@ def generate_synthetic_trace(path: Path) -> dict[str, object]:
     }
 
 
-def _printable_output(raw: str, label: str) -> list[str]:
-    if type(raw) is not str or any(
-        character != "\n" and not 0x20 <= ord(character) <= 0x7E
-        for character in raw
-    ):
-        raise EvaluationError(f"{label} output must be printable ASCII and LF")
-    return raw.splitlines()
-
-
 def parse_capacity_probe(output: str) -> dict[str, int | bool]:
-    lines = _printable_output(output, "capacity probe")
-    pattern = re.compile(r"([a-z_]+)=([0-9]+)\Z")
-    values: dict[str, int] = {}
-    for line in lines:
-        match = pattern.fullmatch(line)
-        if match is None or match.group(1) in values:
-            raise EvaluationError("malformed capacity probe output")
-        values[match.group(1)] = int(match.group(2))
-    expected = {
-        "capacity_conserved",
-        "requests",
-        "max_occupied_bytes",
-        "cache_size_bytes",
-    }
-    if set(values) != expected:
-        raise EvaluationError("capacity probe fields mismatch")
-    if (
-        values["capacity_conserved"] != 1
-        or values["requests"] != _REQUEST_COUNT
-        or values["cache_size_bytes"] <= 0
-        or not 0 <= values["max_occupied_bytes"] <= values["cache_size_bytes"]
-    ):
-        raise EvaluationError("capacity probe reported a capacity violation")
-    return {
-        "capacity_conserved": True,
-        "requests": values["requests"],
-        "max_occupied_bytes": values["max_occupied_bytes"],
-        "cache_size_bytes": values["cache_size_bytes"],
-    }
+    try:
+        return _parse_capacity_probe(output)
+    except ProbeError as error:
+        raise EvaluationError(str(error)) from error
 
 
 def parse_metadata_probe(output: str) -> tuple[Decimal, int]:
-    lines = _printable_output(output, "metadata probe")
-    if len(lines) != 5 or lines[-1] != "status=ok":
-        raise EvaluationError("allocation-accounting metadata probe failed")
-    global_match = re.fullmatch(r"global_metadata_bytes=([0-9]+)", lines[0])
-    if global_match is None:
-        raise EvaluationError("malformed global metadata measurement")
-    global_bytes = int(global_match.group(1))
-    sample_pattern = re.compile(
-        r"sample=([0-9]+) live_bytes=([0-9]+) resident_objects=([0-9]+)\Z"
-    )
-    expected_points = (1_000, 5_000, 10_000)
-    measurements: list[Decimal] = []
-    for line, expected_point in zip(lines[1:4], expected_points, strict=True):
-        match = sample_pattern.fullmatch(line)
-        if match is None or int(match.group(1)) != expected_point:
-            raise EvaluationError("malformed metadata sample")
-        live_bytes = int(match.group(2))
-        resident = int(match.group(3))
-        if live_bytes < global_bytes or resident <= 0:
-            raise EvaluationError("invalid allocation-accounting metadata sample")
-        try:
-            measurements.append(
-                Decimal(live_bytes - global_bytes) / Decimal(resident)
-            )
-        except (InvalidOperation, ZeroDivisionError) as error:
-            raise EvaluationError("invalid exact metadata arithmetic") from error
-    return max(measurements), global_bytes
+    try:
+        return _parse_metadata_probe(output)
+    except ProbeError as error:
+        raise EvaluationError(str(error)) from error
 
 
 def _candidate_ctest_passed(invocation: _Invocation, policy: str) -> bool:
@@ -461,103 +259,6 @@ def _candidate_ctest_passed(invocation: _Invocation, policy: str) -> bool:
         is not None
         and "100% tests passed, 0 tests failed out of 1" in output
     )
-
-
-def _tracked_snapshot(checkout: Path) -> tuple[tuple[str, str, str], ...]:
-    raw_paths = _git_bytes(checkout, "ls-files", "-z")
-    entries: list[tuple[str, str, str]] = []
-    for raw_path in raw_paths.split(b"\0"):
-        if not raw_path:
-            continue
-        try:
-            relative = os.fsdecode(raw_path)
-            path = checkout.joinpath(*PurePosixPath(relative).parts)
-            metadata = path.lstat()
-            if stat.S_ISLNK(metadata.st_mode):
-                mode = "symlink"
-                value = os.fsencode(os.readlink(path))
-            elif stat.S_ISREG(metadata.st_mode):
-                mode = "executable" if metadata.st_mode & stat.S_IXUSR else "regular"
-                value = _regular_bytes(path)
-            else:
-                raise EvaluationError(f"unsupported tracked source entry: {relative}")
-        except (OSError, ValueError) as error:
-            raise EvaluationError("cannot snapshot tracked source bytes") from error
-        entries.append((relative, mode, hashlib.sha256(value).hexdigest()))
-    return tuple(sorted(entries))
-
-
-def _binding(checkout: Path) -> _Binding:
-    push_result = _git_result(
-        checkout, "config", "--get-regexp", r"^remote\.origin\.pushurl$"
-    )
-    if push_result.returncode not in {0, 1}:
-        raise EvaluationError("cannot audit candidate origin push URLs")
-    return _Binding(
-        head=_git(checkout, "rev-parse", "HEAD"),
-        tree=_git(checkout, "rev-parse", "HEAD^{tree}"),
-        origin=_git_bytes(checkout, "remote", "get-url", "--all", "origin"),
-        push_urls=push_result.stdout,
-        index=_git_bytes(checkout, "ls-files", "--stage", "-z"),
-        index_flags=_git_bytes(checkout, "ls-files", "-v", "-z"),
-        tracked=_tracked_snapshot(checkout),
-    )
-
-
-def _audit_filesystem(
-    checkout: Path,
-    tracked: tuple[tuple[str, str, str], ...],
-    allowed_roots: Sequence[Path],
-) -> None:
-    tracked_files = {path for path, _mode, _digest in tracked}
-    tracked_directories: set[str] = set()
-    for relative in tracked_files:
-        parent = PurePosixPath(relative).parent
-        while parent.as_posix() != ".":
-            tracked_directories.add(parent.as_posix())
-            parent = parent.parent
-    allowed: set[str] = set()
-    for root in allowed_roots:
-        try:
-            relative = Path(root).absolute().relative_to(checkout).as_posix()
-        except ValueError:
-            continue
-        if relative != ".":
-            allowed.add(relative)
-
-    directories: list[tuple[Path, str]] = [(checkout, "")]
-    while directories:
-        directory, prefix = directories.pop()
-        with os.scandir(directory) as scanner:
-            for entry in scanner:
-                if not prefix and entry.name == ".git":
-                    continue
-                relative = f"{prefix}/{entry.name}" if prefix else entry.name
-                if relative in allowed:
-                    continue
-                metadata = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(metadata.st_mode):
-                    if relative not in tracked_directories:
-                        raise EvaluationError(
-                            f"candidate source gained an untracked directory: {relative}"
-                        )
-                    directories.append((Path(entry.path), relative))
-                elif relative not in tracked_files:
-                    raise EvaluationError(
-                        f"candidate source gained an untracked entry: {relative}"
-                    )
-
-
-def _post_binding(
-    checkout: Path,
-    expected: _Binding,
-    *,
-    allowed_roots: Sequence[Path] = (),
-) -> None:
-    observed = _binding(checkout)
-    if observed != expected:
-        raise EvaluationError("candidate source binding mutated during evaluation")
-    _audit_filesystem(checkout, expected.tracked, allowed_roots)
 
 
 def _source_receipt(path: Path, lock: Mapping[str, object]) -> dict[str, object]:
@@ -737,594 +438,6 @@ def _preflight(
     return source, tree, facts, contract, _binding(root)
 
 
-def _command_record(
-    stage: Path,
-    index: int,
-    label: str,
-    argv: Sequence[str],
-    cwd: Path,
-    run: Run,
-) -> _Invocation:
-    output = stage / "commands" / f"{index:02d}-{label}"
-    output.parent.mkdir(exist_ok=True)
-    command = list(argv)
-    try:
-        result = run(command, output, cwd=cwd)
-        if not isinstance(result, ChildResult):
-            raise EvaluationError("command runner returned an invalid process receipt")
-        if result.argv != tuple(command):
-            raise EvaluationError("command runner argv receipt mismatch")
-        expected_stdout = output / "stdout.raw"
-        expected_stderr = output / "stderr.raw"
-        if result.stdout_path != expected_stdout or result.stderr_path != expected_stderr:
-            raise EvaluationError("command runner raw output path mismatch")
-        stdout = _regular_bytes(expected_stdout)
-        stderr = _regular_bytes(expected_stderr)
-        stdout_identity = _regular_identity(expected_stdout)
-        stderr_identity = _regular_identity(expected_stderr)
-        if (
-            len(stdout) != result.stdout_bytes
-            or len(stderr) != result.stderr_bytes
-            or hashlib.sha256(stdout).hexdigest() != result.stdout_sha256
-            or hashlib.sha256(stderr).hexdigest() != result.stderr_sha256
-        ):
-            raise EvaluationError("command runner raw output receipt mismatch")
-        record: dict[str, object] = {
-            "index": index,
-            "label": label,
-            "argv": command,
-            "cwd": str(cwd),
-            "returncode": result.returncode,
-            "wall_ns": result.wall_ns,
-            "cpu_ns": result.cpu_ns,
-            "stdout": {
-                "path": str(expected_stdout.relative_to(stage)),
-                "size_bytes": result.stdout_bytes,
-                "sha256": result.stdout_sha256,
-            },
-            "stderr": {
-                "path": str(expected_stderr.relative_to(stage)),
-                "size_bytes": result.stderr_bytes,
-                "sha256": result.stderr_sha256,
-            },
-        }
-        return _Invocation(
-            record,
-            result,
-            stdout,
-            stderr,
-            stdout_identity,
-            stderr_identity,
-        )
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-        if isinstance(error, subprocess.TimeoutExpired):
-            error_message = f"command timed out after {error.timeout} seconds"
-        else:
-            error_message = _bounded(error)
-        record = {
-            "index": index,
-            "label": label,
-            "argv": command,
-            "cwd": str(cwd),
-            "returncode": None,
-            "error": error_message,
-            "stdout": {
-                "path": str((output / "stdout.raw").relative_to(stage)),
-                "size_bytes": None,
-                "sha256": None,
-                "binding_intact": False,
-            },
-            "stderr": {
-                "path": str((output / "stderr.raw").relative_to(stage)),
-                "size_bytes": None,
-                "sha256": None,
-                "binding_intact": False,
-            },
-        }
-        return _Invocation(record, None, b"", b"", None, None)
-
-
-def _revalidate_command_evidence(stage: Path, commands: list[_Invocation]) -> bool:
-    intact = True
-    for invocation in commands:
-        if invocation.result is None:
-            continue
-        for name, identity in (
-            ("stdout", invocation.stdout_identity),
-            ("stderr", invocation.stderr_identity),
-        ):
-            raw_record = invocation.record.get(name)
-            if not isinstance(raw_record, dict) or identity is None:
-                intact = False
-                continue
-            raw_path = raw_record.get("path")
-            if type(raw_path) is not str:
-                intact = False
-                continue
-            if not _refresh_file_record(stage / raw_path, raw_record, identity):
-                intact = False
-    return intact
-
-
-def _command_evidence_expectations(
-    commands: list[_Invocation],
-) -> list[_EvidenceExpectation]:
-    expected: list[_EvidenceExpectation] = []
-    for invocation in commands:
-        for name, raw, identity in (
-            (
-                "stdout",
-                invocation.stdout if invocation.result is not None else None,
-                invocation.stdout_identity,
-            ),
-            (
-                "stderr",
-                invocation.stderr if invocation.result is not None else None,
-                invocation.stderr_identity,
-            ),
-        ):
-            record = invocation.record.get(name)
-            raw_path = record.get("path") if isinstance(record, dict) else None
-            if type(raw_path) is not str:
-                raise EvaluationError("command evidence path is unavailable")
-            expected.append(
-                _EvidenceExpectation(
-                    raw_path,
-                    identity,
-                    len(raw) if raw is not None else None,
-                    hashlib.sha256(raw).hexdigest() if raw is not None else None,
-                )
-            )
-    return expected
-
-
-def _expected_directories(expected: list[_EvidenceExpectation]) -> set[str]:
-    directories: set[str] = set()
-    for item in expected:
-        parent = PurePosixPath(item.path).parent
-        while parent.as_posix() != ".":
-            directories.add(parent.as_posix())
-            parent = parent.parent
-    return directories
-
-
-def _present_inventory_directories(
-    inventory: list[dict[str, object]],
-) -> set[str]:
-    paths = [
-        _EvidenceExpectation(str(item["path"]), None, None, None)
-        for item in inventory
-        if item["present"] is True
-    ]
-    directories = _expected_directories(paths)
-    if any(str(item["path"]).startswith("commands/") for item in inventory):
-        directories.add("commands")
-    return directories
-
-
-def _stage_paths(stage: Path) -> tuple[set[str], set[str]]:
-    files: set[str] = set()
-    directories: set[str] = set()
-    pending: list[tuple[Path, str]] = [(stage, "")]
-    while pending:
-        directory, prefix = pending.pop()
-        with os.scandir(directory) as scanner:
-            for entry in scanner:
-                relative = f"{prefix}/{entry.name}" if prefix else entry.name
-                metadata = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(metadata.st_mode):
-                    directories.add(relative)
-                    pending.append((Path(entry.path), relative))
-                else:
-                    files.add(relative)
-    return files, directories
-
-
-def _evidence_inventory(
-    stage: Path,
-    expected: list[_EvidenceExpectation],
-) -> tuple[list[dict[str, object]], bool]:
-    if len({item.path for item in expected}) != len(expected):
-        raise EvaluationError("duplicate expected evidence path")
-    inventory: list[dict[str, object]] = []
-    intact = True
-    for item in sorted(expected, key=lambda value: value.path):
-        path = stage / item.path
-        try:
-            raw = _regular_bytes(path)
-            identity = _regular_identity(path)
-            present = True
-            size_bytes: int | None = len(raw)
-            sha256: str | None = hashlib.sha256(raw).hexdigest()
-        except (OSError, ValueError):
-            identity = None
-            present = False
-            size_bytes = None
-            sha256 = None
-        binding_intact = (
-            present
-            and item.identity is not None
-            and identity == item.identity
-            and size_bytes == item.size_bytes
-            and sha256 == item.sha256
-        )
-        intact = binding_intact and intact
-        inventory.append(
-            {
-                "path": item.path,
-                "identity": (
-                    {"device": item.identity[0], "inode": item.identity[1]}
-                    if item.identity is not None
-                    else None
-                ),
-                "size_bytes": item.size_bytes,
-                "sha256": item.sha256,
-                "present": present,
-                "observed_identity": (
-                    {"device": identity[0], "inode": identity[1]}
-                    if identity is not None
-                    else None
-                ),
-                "observed_size_bytes": size_bytes,
-                "observed_sha256": sha256,
-                "binding_intact": binding_intact,
-            }
-        )
-    files, directories = _stage_paths(stage)
-    expected_files = {item.path for item in expected}
-    evidence_files = files - {"receipt.json"}
-    intact = (
-        evidence_files
-        == {item["path"] for item in inventory if item["present"]}
-        and intact
-    )
-    intact = directories == _present_inventory_directories(inventory) and intact
-    if evidence_files - expected_files:
-        intact = False
-    return inventory, intact
-
-
-def _canonical_record_bytes(value: dict[str, object]) -> bytes:
-    return (
-        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    ).encode("utf-8")
-
-
-def _verify_final_stage(
-    stage: Path,
-    expected: list[_EvidenceExpectation],
-    inventory: list[dict[str, object]],
-    receipt: dict[str, object],
-) -> None:
-    observed_inventory, _inventory_intact = _evidence_inventory(stage, expected)
-    if observed_inventory != inventory:
-        raise EvaluationError("evidence inventory changed after final receipt write")
-    receipt_path = stage / "receipt.json"
-    receipt_identity = _regular_identity(receipt_path)
-    raw = _regular_bytes(receipt_path)
-    if raw != _canonical_record_bytes(receipt):
-        raise EvaluationError("final receipt canonical bytes changed")
-    if receipt.get("receipt_sha256") != record_sha256(receipt, "receipt_sha256"):
-        raise EvaluationError("final receipt self-hash mismatch")
-    if _regular_identity(receipt_path) != receipt_identity:
-        raise EvaluationError("final receipt identity changed")
-    files, directories = _stage_paths(stage)
-    present_evidence = {
-        item["path"] for item in inventory if item["present"] is True
-    }
-    if files != present_evidence | {"receipt.json"}:
-        raise EvaluationError("final publication file inventory mismatch")
-    if directories != _present_inventory_directories(inventory):
-        raise EvaluationError("final publication directory inventory mismatch")
-
-
-def _unexpected_stage_entries(
-    stage: Path,
-    commands: list[_Invocation],
-) -> list[dict[str, object]]:
-    expected_files = {
-        "synthetic.oracleGeneral.bin",
-        "simulator-results.cachesim",
-        "capacity_probe.c",
-        "capacity-probe",
-        "metadata_probe.c",
-        "metadata-probe",
-    }
-    expected_directories = {"commands"}
-    for invocation in commands:
-        for name in ("stdout", "stderr"):
-            raw_record = invocation.record.get(name)
-            if not isinstance(raw_record, dict):
-                continue
-            raw_path = raw_record.get("path")
-            if type(raw_path) is str:
-                expected_files.add(raw_path)
-                expected_directories.add(str(PurePosixPath(raw_path).parent))
-
-    unexpected: list[
-        tuple[Path, tuple[int, int], dict[str, object], bool]
-    ] = []
-    directories: list[tuple[Path, str]] = [(stage, "")]
-    while directories:
-        directory, prefix = directories.pop()
-        with os.scandir(directory) as scanner:
-            for entry in scanner:
-                relative = f"{prefix}/{entry.name}" if prefix else entry.name
-                path = Path(entry.path)
-                metadata = entry.stat(follow_symlinks=False)
-                identity = (metadata.st_dev, metadata.st_ino)
-                if stat.S_ISDIR(metadata.st_mode):
-                    if relative in expected_directories:
-                        directories.append((path, relative))
-                        continue
-                    record = {
-                        "path": relative,
-                        "type": "directory",
-                        "size_bytes": None,
-                        "sha256": None,
-                    }
-                    unexpected.append((path, identity, record, True))
-                    continue
-                if relative in expected_files and stat.S_ISREG(metadata.st_mode):
-                    continue
-                if stat.S_ISREG(metadata.st_mode):
-                    raw = _regular_bytes(path)
-                    entry_type = "regular"
-                elif stat.S_ISLNK(metadata.st_mode):
-                    raw = os.fsencode(os.readlink(path))
-                    entry_type = "symlink"
-                else:
-                    raw = b""
-                    entry_type = "other"
-                record = {
-                    "path": relative,
-                    "type": entry_type,
-                    "size_bytes": len(raw),
-                    "sha256": hashlib.sha256(raw).hexdigest(),
-                }
-                unexpected.append((path, identity, record, False))
-
-    for path, identity, _record, is_directory in unexpected:
-        metadata = path.lstat()
-        if (metadata.st_dev, metadata.st_ino) != identity:
-            raise EvaluationError(f"unexpected stage entry changed: {path.name}")
-        if is_directory:
-            _cleanup_owned(path, identity)
-        else:
-            os.unlink(path)
-    if unexpected:
-        descriptor = os.open(stage, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    return [record for _path, _identity, record, _is_directory in unexpected]
-
-
-_CAPACITY_TEMPLATE = r'''#include <inttypes.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "libCacheSim.h"
-
-int main(int argc, char **argv) {
-  if (argc != 4 || strcmp(argv[2], "@POLICY@") != 0) return 2;
-  char *end = NULL;
-  uint64_t cache_size = strtoull(argv[3], &end, 10);
-  if (!end || *end != '\0' || cache_size == 0) return 2;
-  reader_init_param_t reader_params = default_reader_init_params();
-  reader_params.cap_at_n_req = 10000;
-  reader_t *reader = setup_reader(argv[1], ORACLE_GENERAL_TRACE, &reader_params);
-  common_cache_params_t cache_params = default_common_cache_params();
-  cache_params.cache_size = cache_size;
-  cache_params.hashpower = 16;
-  cache_params.consider_obj_metadata = true;
-  cache_t *cache = @POLICY@_init(cache_params, NULL);
-  if (!reader || !cache) return 2;
-  int64_t maximum = 0;
-  uint64_t requests = 0;
-  request_t *request = new_request();
-  while (requests < 10000 && read_one_req(reader, request) == 0) {
-    cache->get(cache, request);
-    int64_t occupied = cache->get_occupied_byte(cache);
-    if (occupied < 0 || occupied > cache->cache_size) {
-      fprintf(stderr, "capacity violation at request %" PRIu64 "\n", requests + 1);
-      return 3;
-    }
-    if (occupied > maximum) maximum = occupied;
-    requests++;
-  }
-  if (requests != 10000) return 4;
-  printf("capacity_conserved=1\nrequests=%" PRIu64
-         "\nmax_occupied_bytes=%" PRId64 "\ncache_size_bytes=%" PRId64 "\n",
-         requests, maximum, cache->cache_size);
-  free_request(request);
-  close_reader(reader);
-  cache->cache_free(cache);
-  return 0;
-}
-'''.encode()
-
-
-_METADATA_TEMPLATE = r'''#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "libCacheSim.h"
-
-#define POINTER_CAPACITY 262144
-struct pointer_entry { void *pointer; size_t requested; };
-static struct pointer_entry pointers[POINTER_CAPACITY];
-static size_t live_bytes;
-static int accounting_error;
-void *__real_malloc(size_t);
-void *__real_calloc(size_t, size_t);
-void *__real_realloc(void *, size_t);
-void __real_free(void *);
-static int remember(void *pointer, size_t requested) {
-  if (!pointer) return 1;
-  for (size_t i = 0; i < POINTER_CAPACITY; i++) if (!pointers[i].pointer) {
-    pointers[i].pointer = pointer; pointers[i].requested = requested;
-    live_bytes += requested; return 1;
-  }
-  accounting_error = 1; return 0; /* fixed table overflow */
-}
-void *__wrap_malloc(size_t size) { void *p = __real_malloc(size); remember(p, size); return p; }
-void *__wrap_calloc(size_t n, size_t size) {
-  if (size && n > SIZE_MAX / size) { accounting_error = 1; return NULL; }
-  void *p = __real_calloc(n, size); remember(p, n * size); return p;
-}
-void __wrap_free(void *pointer) {
-  if (!pointer) return;
-  for (size_t i = 0; i < POINTER_CAPACITY; i++) if (pointers[i].pointer == pointer) {
-    live_bytes -= pointers[i].requested; pointers[i].pointer = NULL;
-    pointers[i].requested = 0; __real_free(pointer); return;
-  }
-  accounting_error = 1; /* unknown free */
-}
-void *__wrap_realloc(void *pointer, size_t size) {
-  if (!pointer) return __wrap_malloc(size);
-  size_t old = 0; size_t slot = POINTER_CAPACITY;
-  for (size_t i = 0; i < POINTER_CAPACITY; i++) if (pointers[i].pointer == pointer) {
-    old = pointers[i].requested; slot = i; break;
-  }
-  if (slot == POINTER_CAPACITY) { accounting_error = 1; return NULL; } /* unknown realloc */
-  void *replacement = __real_realloc(pointer, size);
-  if (replacement) { pointers[slot].pointer = replacement; pointers[slot].requested = size;
-    live_bytes = live_bytes - old + size; }
-  return replacement;
-}
-int main(int argc, char **argv) {
-  if (argc != 4 || strcmp(argv[2], "@POLICY@") != 0) return 2;
-  char *end = NULL;
-  uint64_t cache_size = strtoull(argv[3], &end, 10);
-  if (!end || *end != '\0' || cache_size == 0) return 2;
-  common_cache_params_t cache_params = default_common_cache_params();
-  cache_params.cache_size = cache_size;
-  cache_params.hashpower = 16;
-  cache_params.consider_obj_metadata = true;
-  cache_t *cache = @POLICY@_init(cache_params, NULL);
-  if (!cache) return 2;
-  size_t global = live_bytes;
-  size_t samples[3] = {0, 0, 0};
-  int64_t residents[3] = {0, 0, 0};
-  size_t sample_index = 0;
-  request_t request;
-  memset(&request, 0, sizeof(request));
-  request.obj_size = 64;
-  request.valid = true;
-  for (size_t inserted = 1; inserted <= 10000; inserted++) {
-    request.obj_id = inserted;
-    request.clock_time = inserted - 1;
-    cache->get(cache, &request);
-    if (inserted == 1000 || inserted == 5000 || inserted == 10000) {
-      samples[sample_index] = live_bytes;
-      residents[sample_index] = cache->get_n_obj(cache);
-      sample_index++;
-    }
-  }
-  cache->cache_free(cache);
-  printf("global_metadata_bytes=%zu\n", global);
-  printf("sample=1000 live_bytes=%zu resident_objects=%lld\n",
-         samples[0], (long long)residents[0]);
-  printf("sample=5000 live_bytes=%zu resident_objects=%lld\n",
-         samples[1], (long long)residents[1]);
-  printf("sample=10000 live_bytes=%zu resident_objects=%lld\n",
-         samples[2], (long long)residents[2]);
-  printf("status=%s\n", accounting_error ? "accounting_error" : "ok");
-  return accounting_error ? 3 : 0;
-}
-'''.encode()
-
-
-def _probe_source(template: bytes, policy: str) -> bytes:
-    return template.replace(b"@POLICY@", policy.encode("ascii"))
-
-
-def _probe_build_flags(
-    cache_path: Path, source_receipt: Mapping[str, object]
-) -> tuple[list[str], list[str], str]:
-    raw = _regular_bytes(cache_path)
-    if len(raw) > 4 * 1024 * 1024:
-        raise EvaluationError("Release CMake cache is too large")
-    try:
-        lines = raw.decode("utf-8").splitlines()
-    except UnicodeError as error:
-        raise EvaluationError("Release CMake cache is not UTF-8") from error
-    values: dict[str, str] = {}
-    for line in lines:
-        if not line or line.startswith(("#", "//")) or ":" not in line or "=" not in line:
-            continue
-        name = line.split(":", 1)[0]
-        value = line.split("=", 1)[1]
-        if name in values:
-            raise EvaluationError(f"duplicate Release CMake cache binding: {name}")
-        values[name] = value
-
-    compilers = source_receipt["compilers"]
-    expected_c = compilers["c"]["path"]
-    expected_cxx = compilers["cxx"]["path"]
-    if (
-        values.get("CMAKE_C_COMPILER") != expected_c
-        or values.get("CMAKE_CXX_COMPILER") != expected_cxx
-    ):
-        raise EvaluationError("Release compiler selection differs from the source receipt")
-    raw_includes = values.get("GLib_INCLUDE_DIRS", "").split(";")
-    if not raw_includes or any(
-        not item or not Path(item).is_absolute() for item in raw_includes
-    ):
-        raise EvaluationError("Release GLib include binding is invalid")
-    raw_glib_libraries = values.get("GLib_LIBRARIES", "").split(";")
-    if not raw_glib_libraries or any(
-        re.fullmatch(r"[A-Za-z0-9_.+-]+", item) is None
-        for item in raw_glib_libraries
-    ):
-        raise EvaluationError("Release GLib library binding is invalid")
-    include_flags = [flag for item in raw_includes for flag in ("-I", item)]
-    link_flags = [f"-l{item}" for item in raw_glib_libraries]
-    if values.get("OPT_SUPPORT_ZSTD_TRACE") == "ON":
-        zstd = values.get("ZSTD_LIBRARY_RELEASE")
-        if zstd is None or not Path(zstd).is_absolute() or zstd.endswith("-NOTFOUND"):
-            raise EvaluationError("Release ZSTD library binding is invalid")
-        link_flags.append(zstd)
-    tcmalloc = values.get("Tcmalloc_LIBRARY")
-    if tcmalloc and not tcmalloc.endswith("-NOTFOUND"):
-        if not Path(tcmalloc).is_absolute():
-            raise EvaluationError("Release tcmalloc library binding is invalid")
-        link_flags.append(tcmalloc)
-    link_flags.extend(["-lstdc++", "-lm", "-ldl", "-pthread"])
-    return include_flags, link_flags, hashlib.sha256(raw).hexdigest()
-
-
-def _executable_hash(path: Path) -> str | None:
-    try:
-        metadata = path.lstat()
-    except OSError:
-        return None
-    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or not os.access(path, os.X_OK):
-        return None
-    return sha256_file(path)
-
-
-def _capture_executable(
-    path: Path, stage: Path
-) -> tuple[dict[str, object], tuple[int, int] | None]:
-    digest = _executable_hash(path)
-    record: dict[str, object] = {
-        "path": str(path.relative_to(stage)),
-        "size_bytes": None,
-        "sha256": digest,
-        "binding_intact": digest is not None,
-    }
-    if digest is None:
-        return record, None
-    metadata = path.lstat()
-    record["size_bytes"] = metadata.st_size
-    return record, (metadata.st_dev, metadata.st_ino)
-
-
 def _contract_receipt(contract: PolicyContract | None) -> dict[str, object] | None:
     if contract is None:
         return None
@@ -1443,6 +556,11 @@ def evaluate_r0(
         evaluator_hashes = {
             "evaluate_sha256": sha256_file(Path(__file__)),
             "scope_sha256": sha256_file(Path(__file__).with_name("scope.py")),
+            "evidence_sha256": sha256_file(Path(__file__).with_name("evidence.py")),
+            "r0_probes_sha256": sha256_file(
+                Path(__file__).with_name("r0_probes.py")
+            ),
+            "cachesim_sha256": sha256_file(Path(__file__).with_name("cachesim.py")),
         }
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         stage, stage_identity = _stage_directory(final)
@@ -1471,21 +589,77 @@ def evaluate_r0(
     build_owners: dict[Path, tuple[int, int]] = {}
     errors: list[str] = []
     commands: list[_Invocation] = []
+    artifacts = ArtifactRegistry(stage)
+    provenance_valid = True
+    source_binding_valid = True
+
+    def provenance_guard(boundary: str) -> bool:
+        nonlocal provenance_valid, source_binding_valid
+        if not provenance_valid:
+            return False
+        allowed_roots = (root / "_build-release", root / "_build-sanitize")
+        try:
+            _post_binding(root, binding, allowed_roots=allowed_roots)
+        except (OSError, ValueError) as error:
+            source_binding_valid = False
+            provenance_valid = False
+            errors.append(f"{boundary} source binding mutation: {_bounded(error)}")
+        mutated = artifacts.revalidate()
+        if mutated:
+            provenance_valid = False
+            errors.append(
+                f"{boundary} artifact binding mutation: {', '.join(mutated)}"
+            )
+        return provenance_valid
+
+    def capture_artifact(name: str, path: Path) -> None:
+        nonlocal provenance_valid
+        if not provenance_valid:
+            return
+        try:
+            artifacts.capture(name, path)
+        except (OSError, ValueError) as error:
+            provenance_valid = False
+            errors.append(f"artifact snapshot failed for {name}: {_bounded(error)}")
 
     def invoke(
         label: str, argv: Sequence[str], *, command_cwd: Path = root
     ) -> _Invocation:
-        item = _command_record(
-            stage, len(commands) + 1, label, argv, command_cwd, run
-        )
+        timeout_seconds, max_output_bytes = _COMMAND_LIMITS[label]
+        attempted = provenance_guard(f"before {label}")
+        if attempted:
+            item = _command_record(
+                stage,
+                len(commands) + 1,
+                label,
+                argv,
+                command_cwd,
+                run,
+                timeout_seconds,
+                max_output_bytes,
+            )
+        else:
+            item = _skipped_command_record(
+                stage,
+                len(commands) + 1,
+                label,
+                argv,
+                command_cwd,
+                "skipped after provenance mutation",
+                timeout_seconds,
+                max_output_bytes,
+            )
         commands.append(item)
         if not item.ok:
             errors.append(f"{label}: command did not complete successfully")
+        if attempted:
+            provenance_guard(f"after {label}")
         return item
 
     try:
         trace_path = stage / "synthetic.oracleGeneral.bin"
         synthetic = generate_synthetic_trace(trace_path)
+        capture_artifact("synthetic_trace", trace_path)
         trace_evidence = _capture_expected_evidence(trace_path, stage)
         cache_bytes = int(synthetic["working_set_bytes"]) // 10
 
@@ -1509,9 +683,23 @@ def evaluate_r0(
                 build_owners[release_root] = _directory_identity(release_root)
             except EvaluationError as error:
                 errors.append(_bounded(error))
+        if release_config.ok:
+            capture_artifact(
+                "release_cmake_cache", release_root / "CMakeCache.txt"
+            )
         release_build = invoke(
             "release-build", ["cmake", "--build", "_build-release", "-j", "8"]
         )
+        release_archive = release_root / "liblibCacheSim.a"
+        if release_build.ok and provenance_valid:
+            try:
+                release_archive = discover_static_archive(release_root)
+            except (OSError, ValueError) as error:
+                provenance_valid = False
+                errors.append(f"release archive discovery failed: {_bounded(error)}")
+            if provenance_valid:
+                capture_artifact("release_cachesim", release_root / "bin/cachesim")
+                capture_artifact("release_archive", release_archive)
         release_tests = invoke(
             "release-full-tests",
             ["ctest", "--test-dir", "_build-release", "--output-on-failure"],
@@ -1555,9 +743,24 @@ def evaluate_r0(
                 build_owners[sanitize_root] = _directory_identity(sanitize_root)
             except EvaluationError as error:
                 errors.append(_bounded(error))
+        if sanitize_config.ok:
+            capture_artifact(
+                "sanitize_cmake_cache", sanitize_root / "CMakeCache.txt"
+            )
         sanitize_build = invoke(
             "sanitize-build", ["cmake", "--build", "_build-sanitize", "-j", "8"]
         )
+        if sanitize_build.ok and provenance_valid:
+            try:
+                sanitize_archive = discover_static_archive(sanitize_root)
+            except (OSError, ValueError) as error:
+                provenance_valid = False
+                errors.append(f"sanitize archive discovery failed: {_bounded(error)}")
+            if provenance_valid:
+                capture_artifact(
+                    "sanitize_cachesim", sanitize_root / "bin/cachesim"
+                )
+                capture_artifact("sanitize_archive", sanitize_archive)
         sanitize_tests = invoke(
             "sanitize-full-tests",
             ["ctest", "--test-dir", "_build-sanitize", "--output-on-failure"],
@@ -1659,40 +862,42 @@ def evaluate_r0(
         probe_include_flags: list[str] = []
         probe_link_flags: list[str] = ["-lm", "-ldl", "-pthread"]
         release_cache_sha256: str | None = None
-        try:
-            (
-                probe_include_flags,
-                probe_link_flags,
-                release_cache_sha256,
-            ) = _probe_build_flags(release_root / "CMakeCache.txt", source)
-        except (OSError, ValueError) as error:
-            errors.append(f"probe toolchain binding: {_bounded(error)}")
+        if provenance_valid:
+            try:
+                (
+                    probe_include_flags,
+                    probe_link_flags,
+                    release_cache_sha256,
+                ) = probe_build_flags(release_root / "CMakeCache.txt", source)
+            except (OSError, ValueError) as error:
+                errors.append(f"probe toolchain binding: {_bounded(error)}")
+                probe_toolchain_clean = False
+        else:
             probe_toolchain_clean = False
 
         capacity_source = stage / "capacity_probe.c"
-        capacity_source_raw = _probe_source(_CAPACITY_TEMPLATE, policy)
+        capacity_source_raw = capacity_probe_source(policy)
         _write_private(capacity_source, capacity_source_raw)
+        capture_artifact("capacity_probe_source", capacity_source)
         capacity_source_evidence = _capture_expected_evidence(capacity_source, stage)
         capacity_binary = stage / "capacity-probe"
         capacity_compile = invoke(
             "capacity-compile",
-            [
+            capacity_compile_argv(
                 compiler,
-                "-std=c11",
-                "-O2",
-                "-I",
-                str(root / "libCacheSim/include"),
-                *probe_include_flags,
-                "-o",
-                str(capacity_binary),
-                str(capacity_source),
-                str(release_root / "liblibCacheSim.a"),
-                *probe_link_flags,
-            ],
+                root,
+                capacity_binary,
+                capacity_source,
+                release_archive,
+                probe_include_flags,
+                probe_link_flags,
+            ),
         )
         capacity_binary_receipt, capacity_binary_identity = _capture_executable(
             capacity_binary, stage
         )
+        if capacity_compile.ok:
+            capture_artifact("capacity_probe_binary", capacity_binary)
         capacity_binary_evidence = _capture_expected_evidence(capacity_binary, stage)
         capacity_run = invoke(
             "capacity-run",
@@ -1719,38 +924,60 @@ def evaluate_r0(
                 if "capacity violation" in str(error):
                     capacity = False
 
+        interposer_source = stage / "allocator_interposer.c"
+        interposer_source_raw = allocator_interposer_source()
+        _write_private(interposer_source, interposer_source_raw)
+        capture_artifact("metadata_interposer_source", interposer_source)
+        interposer_source_evidence = _capture_expected_evidence(
+            interposer_source, stage
+        )
+        interposer_binary = stage / "allocator-interposer.so"
+        interposer_compile = invoke(
+            "metadata-interposer-compile",
+            allocator_compile_argv(compiler, interposer_binary, interposer_source),
+        )
+        interposer_binary_receipt, interposer_binary_identity = _capture_executable(
+            interposer_binary, stage
+        )
+        if interposer_compile.ok:
+            capture_artifact("metadata_interposer_binary", interposer_binary)
+        interposer_binary_evidence = _capture_expected_evidence(
+            interposer_binary, stage
+        )
+
         metadata_source = stage / "metadata_probe.c"
-        metadata_source_raw = _probe_source(_METADATA_TEMPLATE, policy)
+        metadata_source_raw = metadata_probe_source(policy)
         _write_private(metadata_source, metadata_source_raw)
+        capture_artifact("metadata_probe_source", metadata_source)
         metadata_source_evidence = _capture_expected_evidence(metadata_source, stage)
         metadata_binary = stage / "metadata-probe"
         metadata_compile = invoke(
             "metadata-compile",
-            [
+            metadata_compile_argv(
                 compiler,
-                "-std=c11",
-                "-O2",
-                "-I",
-                str(root / "libCacheSim/include"),
-                *probe_include_flags,
-                "-o",
-                str(metadata_binary),
-                str(metadata_source),
-                str(release_root / "liblibCacheSim.a"),
-                "-Wl,--wrap=malloc",
-                "-Wl,--wrap=calloc",
-                "-Wl,--wrap=realloc",
-                "-Wl,--wrap=free",
-                *probe_link_flags,
-            ],
+                root,
+                metadata_binary,
+                metadata_source,
+                release_archive,
+                probe_include_flags,
+                probe_link_flags,
+            ),
         )
         metadata_binary_receipt, metadata_binary_identity = _capture_executable(
             metadata_binary, stage
         )
+        if metadata_compile.ok:
+            capture_artifact("metadata_probe_binary", metadata_binary)
         metadata_binary_evidence = _capture_expected_evidence(metadata_binary, stage)
         metadata_run = invoke(
             "metadata-run",
-            [str(metadata_binary), str(trace_path), policy, str(cache_bytes)],
+            metadata_run_argv(
+                interposer_binary,
+                metadata_binary,
+                trace_path,
+                policy,
+                cache_bytes,
+            ),
             command_cwd=stage,
         )
         measured: tuple[Decimal, int] | None = None
@@ -1758,6 +985,8 @@ def evaluate_r0(
         metadata_prerequisites = (
             build_state is True
             and probe_toolchain_clean
+            and interposer_compile.ok
+            and interposer_binary_identity is not None
             and metadata_compile.ok
             and metadata_binary_identity is not None
         )
@@ -1781,10 +1010,30 @@ def evaluate_r0(
             capacity_binary_evidence,
             metadata_source_evidence,
             metadata_binary_evidence,
+            interposer_source_evidence,
+            interposer_binary_evidence,
+            *(
+                _capture_expected_evidence(path, stage)
+                for path in artifacts.snapshot_paths()
+            ),
             *_command_evidence_expectations(commands),
         ]
 
-        evidence_binding_clean = _revalidate_command_evidence(stage, commands)
+        final_artifact_mutations = artifacts.revalidate()
+        if final_artifact_mutations:
+            errors.append(
+                "final artifact binding mutation: "
+                + ", ".join(final_artifact_mutations)
+            )
+        artifact_receipts = artifacts.receipt()
+        if not artifacts.valid and not final_artifact_mutations:
+            errors.append("artifact binding changed during final receipt capture")
+        evidence_binding_clean = (
+            _revalidate_command_evidence(stage, commands)
+            and provenance_valid
+            and artifacts.valid
+            and not final_artifact_mutations
+        )
         if simulator_result_receipt is not None and simulator_result_identity is not None:
             evidence_binding_clean = (
                 _refresh_file_record(
@@ -1812,6 +1061,15 @@ def evaluate_r0(
                 )
                 and evidence_binding_clean
             )
+        if interposer_binary_identity is not None:
+            evidence_binding_clean = (
+                _refresh_file_record(
+                    interposer_binary,
+                    interposer_binary_receipt,
+                    interposer_binary_identity,
+                )
+                and evidence_binding_clean
+            )
         if release_cache_sha256 is not None:
             try:
                 evidence_binding_clean = (
@@ -1821,7 +1079,9 @@ def evaluate_r0(
                 )
             except OSError:
                 evidence_binding_clean = False
-        unexpected_stage_entries = _unexpected_stage_entries(stage, commands)
+        unexpected_stage_entries = _unexpected_stage_entries(
+            stage, commands, artifacts.snapshot_paths()
+        )
         if unexpected_stage_entries:
             evidence_binding_clean = False
             errors.append("candidate created an unregistered stage entry")
@@ -1846,7 +1106,7 @@ def evaluate_r0(
             else None
         )
         checks: dict[str, bool | None] = {
-            "source_binding": True,
+            "source_binding": source_binding_valid,
             "evidence_binding": evidence_binding_clean,
             "build": build_state,
             "full_tests": full_tests_state,
@@ -1888,13 +1148,18 @@ def evaluate_r0(
         try:
             if sha256_file(Path(source["_resolved_path"])) != source["_file_sha256"]:
                 raise EvaluationError("source receipt changed")
-            if sha256_file(Path(__file__)) != evaluator_hashes["evaluate_sha256"]:
-                raise EvaluationError("R0 evaluator changed")
-            if (
-                sha256_file(Path(__file__).with_name("scope.py"))
-                != evaluator_hashes["scope_sha256"]
+            evaluator_paths = {
+                "evaluate_sha256": Path(__file__),
+                "scope_sha256": Path(__file__).with_name("scope.py"),
+                "evidence_sha256": Path(__file__).with_name("evidence.py"),
+                "r0_probes_sha256": Path(__file__).with_name("r0_probes.py"),
+                "cachesim_sha256": Path(__file__).with_name("cachesim.py"),
+            }
+            if any(
+                sha256_file(path) != evaluator_hashes[key]
+                for key, path in evaluator_paths.items()
             ):
-                raise EvaluationError("R0 scope evaluator changed")
+                raise EvaluationError("R0 evaluator apparatus changed")
         except (OSError, ValueError) as error:
             errors.append(f"apparatus binding: {_bounded(error)}")
             apparatus_binding_clean = False
@@ -1994,6 +1259,7 @@ def evaluate_r0(
             "simulator_result": simulator_result_receipt,
             "capacity_measurement": capacity_values,
             "commands": [item.record for item in commands],
+            "artifact_snapshots": artifact_receipts,
             "probes": {
                 "release_cmake_cache_sha256": release_cache_sha256,
                 "include_flags": probe_include_flags,
@@ -2007,6 +1273,14 @@ def evaluate_r0(
                     "source_path": str(metadata_source.relative_to(stage)),
                     "source_sha256": hashlib.sha256(metadata_source_raw).hexdigest(),
                     "binary": metadata_binary_receipt,
+                    "interposer_source_path": str(
+                        interposer_source.relative_to(stage)
+                    ),
+                    "interposer_source_sha256": hashlib.sha256(
+                        interposer_source_raw
+                    ).hexdigest(),
+                    "interposer_binary": interposer_binary_receipt,
+                    "accounting_scope": "process_wide_ld_preload",
                 },
             },
             "evaluator": evaluator_hashes,

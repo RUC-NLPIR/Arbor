@@ -2648,3 +2648,37 @@ def test_phase0a_aros_source_budget_after_task_carrier_deletion() -> None:
     root = Path(__file__).resolve().parents[1] / "src/aros"
     lines = sum(len(path.read_bytes().splitlines()) for path in root.rglob("*.py"))
     assert lines <= 17_700, f"Phase 0A AROS source budget exceeded: {lines}"
+
+
+def test_cache_campaign_tasks_do_not_change_aros_product_source() -> None:
+    """The commissioning-only cache substrate must remain outside src/aros."""
+    repository = Path(__file__).resolve().parents[1]
+    baseline = "a49632b581578d0e026ae10772df391b3b2ab465"
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "diff",
+            "--name-only",
+            "--diff-filter=ACMRTUXB",
+            f"{baseline}...HEAD",
+            "--",
+        ],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    changed = set(result.stdout.splitlines())
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "--", "src/aros"],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    changed.update(untracked.stdout.splitlines())
+    assert not sorted(path for path in changed if path.startswith("src/aros/"))

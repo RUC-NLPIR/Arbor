@@ -243,7 +243,9 @@ The valid fixture has three dev windows across Meta/key-value and Twitter/key-va
 
 ```python
 def test_freeze_writes_visible_splits_and_only_r3_commitment(tmp_path: Path) -> None:
-    task, host = freeze_manifests(input_path, tmp_path / "task", tmp_path / "host")
+    task, host = freeze_manifests(
+        input_path, task_root, tmp_path / "task", tmp_path / "host"
+    )
     task_bytes = b"".join(path.read_bytes() for path in sorted((tmp_path / "task").rglob("*")) if path.is_file())
     assert b"r3-tencent-photo" not in task_bytes
     assert os.fsencode(r3_path) not in task_bytes
@@ -260,7 +262,9 @@ def test_freeze_rejects_contaminated_or_incomplete_portfolio(tmp_path: Path, def
     candidate = valid_candidate(tmp_path)
     inject(candidate, defect)
     with pytest.raises(ManifestError):
-        freeze_manifests(candidate.path, tmp_path / "task", tmp_path / "host")
+        freeze_manifests(
+            candidate.path, task_root, tmp_path / "task", tmp_path / "host"
+        )
 ```
 
 Also assert the freezer recomputes file byte size and SHA-256, refuses symlinks/non-regular files, refuses any `sampling` field, requires `start_request >= 0`, `warmup_seconds > 0`, `max_requests > 0`, and requires all intervals sharing an `origin_sha256` to be disjoint. Failed freezing must leave neither output directory behind.
@@ -309,7 +313,7 @@ Implement `TraceWindow.from_candidate` with exact-key validation, absolute path 
 
 - [ ] **Step 4: Implement transactional split freezing**
 
-`freeze_manifests(candidate_path, task_output, host_output)` must validate everything before creating a sibling temporary directory. Enforce:
+`freeze_manifests(candidate_path, task_root, task_output, host_output)` must validate everything before creating a sibling temporary directory. Enforce:
 
 ```python
 if len(dev) < 3 or len({(t.organization, t.application) for t in dev}) < 2:
@@ -325,7 +329,11 @@ The task manifest contains all dev/visible fields plus measured hashes, paths, a
 
 - [ ] **Step 5: Add the freeze CLI and verify GREEN**
 
-The script accepts `--input`, `--task-output`, and `--host-output`, resolves the input, requires both output paths not to exist, calls `freeze_manifests`, and prints only the task manifest path plus R3 commitment.
+The script accepts required `--input`, `--task-root`, `--task-output`, and
+`--host-output` arguments, requires `task-output` strictly beneath the real
+task root and the host output outside it, resolves the input, requires both
+output paths not to exist, calls `freeze_manifests`, and prints only the task
+manifest path plus R3 commitment.
 
 ```bash
 /workspace/Arbor/.venv/bin/python -m pytest -q tests/test_aros_cache_manifests.py
@@ -555,7 +563,17 @@ Use a fake cachesim executable that appends its argv to a log and emits a valid 
 
 ```python
 def test_r1_is_three_dev_windows_by_three_sizes(tmp_path: Path) -> None:
-    receipt = evaluate_portfolio("r1", task_manifest, checkout, "CandidatePolicy", r0_receipt, output)
+    receipt = evaluate_portfolio(
+        rung="r1",
+        task_root=task_root,
+        task_manifest=task_manifest,
+        checkout=checkout,
+        candidate=candidate,
+        policy="CandidatePolicy",
+        source_receipt=source_receipt,
+        r0_receipt=r0_receipt,
+        output=output,
+    )
     assert len(receipt["measurements"]) == 9
     assert {m["trace_id"] for m in receipt["measurements"]} == set(first_three_dev_ids)
     assert {Decimal(m["cache_fraction"]) for m in receipt["measurements"]} == {
@@ -564,7 +582,17 @@ def test_r1_is_three_dev_windows_by_three_sizes(tmp_path: Path) -> None:
 
 
 def test_r2_covers_every_dev_and_visible_window(tmp_path: Path) -> None:
-    receipt = evaluate_portfolio("r2", task_manifest, checkout, "Sieve", r0_receipt, output)
+    receipt = evaluate_portfolio(
+        rung="r2",
+        task_root=task_root,
+        task_manifest=task_manifest,
+        checkout=checkout,
+        candidate=candidate,
+        policy="Sieve",
+        source_receipt=source_receipt,
+        r0_receipt=r0_receipt,
+        output=output,
+    )
     assert len(receipt["measurements"]) == len(task_manifest["traces"]) * 3
 ```
 
@@ -629,7 +657,8 @@ Extend the CLI with:
 
 ```text
 --rung {r1,r2} --checkout PATH --candidate COMMIT --policy NAME
---task-manifest PATH --source-receipt PATH --r0-receipt PATH --output NEW_DIRECTORY
+--task-root PATH --task-manifest PATH --source-receipt PATH
+--r0-receipt PATH --output NEW_DIRECTORY
 ```
 
 - [ ] **Step 5: Verify GREEN and commit**
@@ -661,16 +690,28 @@ Expected: all commands exit 0.
 
 - [ ] **Step 1: Write failing calibration tests**
 
-Feed one valid baseline R0 receipt and five complete R2 repetitions for each constraint baseline (`Sieve`, `S3FIFO`), plus one complete R2 receipt for `LRU`, `ARC`, `WTinyLFU`, and the `BeladySize` oracle. Assert the calibrator refuses a missing/failed R0, fewer than five constraint repetitions, any missing comparison policy/cell, duplicate receipt hashes, different manifests/source/evaluator, failed measurements, incomplete trace-size cells, mixed host fingerprints, or an existing output.
+Feed one valid baseline R0 receipt for each of the six comparison policies,
+five complete R2 repetitions for each constraint baseline (`Sieve`,
+`S3FIFO`), plus one complete R2 receipt for `LRU`, `ARC`, `WTinyLFU`, and the
+`BeladySize` oracle. Assert the calibrator refuses any missing/failed policy R0,
+fewer than five constraint repetitions, any missing comparison policy/cell,
+duplicate receipt hashes, different manifests/source/evaluator, failed
+measurements, incomplete trace-size cells, mixed host fingerprints, or an
+existing output.
 
 ```python
 def test_calibration_freezes_both_reference_distributions(tmp_path: Path) -> None:
-    frozen = calibrate(r0_receipts, inputs, tmp_path / "baseline-calibration.json")
+    frozen = calibrate(
+        task_manifest,
+        r0_receipts,
+        inputs,
+        tmp_path / "baseline-calibration.json",
+    )
     assert set(frozen["references"]) == {"Sieve", "S3FIFO"}
     cell = frozen["references"]["Sieve"]["dev-meta-kv-a"]["0.01"]
     assert cell["repetitions"] == 5
-    assert cell["throughput_median_mqps"] == "20.00"
-    assert cell["throughput_floor_mqps"] == "18.000"
+    assert cell["throughput_median_mqps"] == "20"
+    assert cell["throughput_floor_mqps"] == "18"
     assert "object_miss_ratio_values" in cell
     assert "byte_miss_ratio_values" in cell
     assert "cpu_ns_per_request_values" in cell
@@ -712,17 +753,32 @@ Group by `(policy, trace_id, cache_fraction)`, require five unique measurement r
     "cache_fractions": ["0.01", "0.05", "0.10"],
     "references": references,
     "comparisons": comparisons,
-    "r0_receipt_sha256s": {"Sieve": sieve_r0_sha, "S3FIFO": s3fifo_r0_sha},
+    "r0_receipt_sha256s": {
+        "LRU": lru_r0_sha, "ARC": arc_r0_sha,
+        "WTinyLFU": wtinylfu_r0_sha, "Sieve": sieve_r0_sha,
+        "S3FIFO": s3fifo_r0_sha, "BeladySize": beladysize_r0_sha,
+    },
     "input_receipt_sha256s": sorted(input_hashes),
     "calibration_sha256": digest,
 }
 ```
 
-Expose `compare_constraints(candidate_measurement, candidate_r0, contract, calibration, independent_audit)` returning separate values for throughput, measured object metadata, measured global metadata, declared-metadata consistency, amortized-complexity audit, capacity, determinism, sanitizer, and signed object/byte/phase gaps to each comparison policy. Missing or rejected audit is false/unknown, never true.
+Expose `compare_constraints(candidate_measurement, candidate_r0, contract,
+calibration_path, expected_calibration_sha256, independent_audit)` returning
+separate values for throughput, measured object metadata, measured global
+metadata, declared-metadata consistency, amortized-complexity audit, capacity,
+determinism, sanitizer, and signed object/byte/phase gaps to each comparison
+policy. The read-only calibration path must match the externally supplied
+digest. Missing or rejected audit is false/unknown, never true.
 
 - [ ] **Step 4: Add the one-way calibration CLI**
 
-The CLI accepts exactly two repeated `--r0-receipt PATH` values, repeated `--receipt PATH`, exactly one `--task-manifest`, and a new `--output`. It prints the calibration SHA only after `write_new_record` succeeds. It has no update or force flag; changing traces, sizes, baseline repetitions, or host requires a new campaign identity and fresh output.
+The CLI accepts exactly six repeated `--r0-receipt PATH` values, exactly
+fourteen repeated `--receipt PATH` values, exactly one `--task-manifest`, and a
+new `--output`. It prints the calibration SHA only after the read-only record
+is durably published. It has no update or force flag; changing traces, sizes,
+baseline repetitions, or host requires a new campaign identity and fresh
+output.
 
 - [ ] **Step 5: Verify GREEN and commit**
 
@@ -777,15 +833,17 @@ Test that all refs are regular Git blobs at `frozen_commit`, the worktree is cle
 ```python
 def test_r3_consumes_ledger_before_launch_and_cannot_retry(tmp_path: Path) -> None:
     first = run_r3(
-        package, host_manifest, calibration, source_receipt, candidate_r0,
-        ledger, output, runner=failing_runner,
+        package, host_manifest, calibration, calibration_sha256,
+        source_receipt, candidate_r0, checkout, canonical_ledger, output,
+        runner=failing_runner,
     )
     assert first["state"] == "process_failed"
-    assert ledger.exists()
+    assert canonical_ledger.exists()
     with pytest.raises(SealError, match="already consumed"):
         run_r3(
-            package, host_manifest, calibration, source_receipt, candidate_r0,
-            ledger, tmp_path / "again",
+            package, host_manifest, calibration, calibration_sha256,
+            source_receipt, candidate_r0, checkout, canonical_ledger,
+            tmp_path / "again",
         )
 ```
 
@@ -811,11 +869,19 @@ Require all arguments explicitly:
 
 ```text
 --frozen-package PATH --host-r3-manifest PATH --calibration PATH
---source-receipt PATH --candidate-r0-receipt PATH --checkout PATH
+--calibration-sha256 SHA256 --source-receipt PATH
+--candidate-r0-receipt PATH --checkout PATH
 --ledger NEW_PATH --output NEW_DIRECTORY
 ```
 
-At startup, reject when the host manifest, ledger, or output resolves beneath the project path from the frozen package. Do not expose R3 through `run_aros_cache_eval.py`.
+At startup, require the external calibration digest to match both the frozen
+package and read-only calibration file. Derive the fixed authority ID from the
+frozen commit, R3 commitment, candidate commit, and policy, and accept only the
+canonical per-UID ledger path beneath the passwd-home authority directory;
+moving the package or changing `HOME`/XDG variables cannot create a fresh
+authority. Reject when the host manifest, ledger, or output resolves beneath
+the project path from the frozen package. Do not expose R3 through
+`run_aros_cache_eval.py`.
 
 - [ ] **Step 5: Verify GREEN and commit**
 
@@ -891,21 +957,27 @@ The CLI exits 0 for structurally verified evidence, 2 for invalid evidence, and 
 
 ```bash
 python scripts/prepare_aros_cache_source.py --checkout "$LIBCACHESIM" --receipt "$HOST/source.json"
-python scripts/freeze_aros_cache_manifests.py --input "$HOST/candidate-input.json" --task-output "$TASK/manifests" --host-output "$HOST/sealed"
+python scripts/freeze_aros_cache_manifests.py --input "$HOST/candidate-input.json" --task-root "$TASK" --task-output "$TASK/manifests" --host-output "$HOST/sealed"
 python scripts/run_aros_cache_eval.py --rung r0 --checkout "$LIBCACHESIM" --candidate "$BASE" --base "$BASE" --policy Sieve --source-receipt "$HOST/source.json" --output "$HOST/r0-sieve"
-python scripts/run_aros_cache_eval.py --rung r2 --checkout "$LIBCACHESIM" --candidate "$BASE" --policy Sieve --task-manifest "$TASK/manifests/task.json" --source-receipt "$HOST/source.json" --r0-receipt "$HOST/r0-sieve/receipt.json" --output "$HOST/r2-sieve-1"
-python scripts/calibrate_aros_cache_baselines.py --task-manifest "$TASK/manifests/task.json" --r0-receipt "$HOST/r0-sieve/receipt.json" --r0-receipt "$HOST/r0-s3fifo/receipt.json" --receipt "$HOST/r2-sieve-1/receipt.json" --receipt "$HOST/r2-s3fifo-1/receipt.json" --output "$HOST/baseline-calibration.json"
-python scripts/run_aros_cache_r3.py --frozen-package "$HOST/frozen-package.json" --host-r3-manifest "$HOST/sealed/r3.json" --calibration "$HOST/baseline-calibration.json" --source-receipt "$HOST/source.json" --candidate-r0-receipt "$HOST/candidate-r0/receipt.json" --checkout "$LIBCACHESIM" --ledger "$HOST/r3-consumed.json" --output "$HOST/r3-result"
+python scripts/run_aros_cache_eval.py --rung r2 --task-root "$TASK" --checkout "$LIBCACHESIM" --candidate "$BASE" --policy Sieve --task-manifest "$TASK/manifests/task.json" --source-receipt "$HOST/source.json" --r0-receipt "$HOST/r0-sieve/receipt.json" --output "$HOST/r2-sieve-1"
+python scripts/calibrate_aros_cache_baselines.py --task-manifest "$TASK/manifests/task.json" --r0-receipt "$HOST/r0-lru/receipt.json" --r0-receipt "$HOST/r0-arc/receipt.json" --r0-receipt "$HOST/r0-wtinylfu/receipt.json" --r0-receipt "$HOST/r0-sieve/receipt.json" --r0-receipt "$HOST/r0-s3fifo/receipt.json" --r0-receipt "$HOST/r0-beladysize/receipt.json" --receipt "$HOST/r2-sieve-1/receipt.json" --receipt "$HOST/r2-sieve-2/receipt.json" --receipt "$HOST/r2-sieve-3/receipt.json" --receipt "$HOST/r2-sieve-4/receipt.json" --receipt "$HOST/r2-sieve-5/receipt.json" --receipt "$HOST/r2-s3fifo-1/receipt.json" --receipt "$HOST/r2-s3fifo-2/receipt.json" --receipt "$HOST/r2-s3fifo-3/receipt.json" --receipt "$HOST/r2-s3fifo-4/receipt.json" --receipt "$HOST/r2-s3fifo-5/receipt.json" --receipt "$HOST/r2-lru/receipt.json" --receipt "$HOST/r2-arc/receipt.json" --receipt "$HOST/r2-wtinylfu/receipt.json" --receipt "$HOST/r2-beladysize/receipt.json" --output "$HOST/baseline-calibration.json"
+python scripts/run_aros_cache_r3.py --frozen-package "$HOST/frozen-package.json" --host-r3-manifest "$HOST/sealed/r3.json" --calibration "$HOST/baseline-calibration.json" --calibration-sha256 "$CALIBRATION_SHA256" --source-receipt "$HOST/source.json" --candidate-r0-receipt "$HOST/candidate-r0/receipt.json" --checkout "$LIBCACHESIM" --ledger "$PASSWD_HOME/.local/state/aros/cache-campaign-r3/r3-$AUTHORITY_ID.consumed.json" --output "$HOST/r3-result"
 python scripts/verify_aros_cache_substrate.py "$HOST/retained/index.json"
 ```
 
-Explain that calibration requires one R0 plus five R2 receipts for each constraint baseline and one R2 receipt for every other comparison policy even though the abbreviated example shows one R2 flag per constraint policy; include this exact expanded form:
+Explain that calibration requires one R0 receipt for each of all six policies,
+five R2 receipts for each constraint baseline, and one R2 receipt for every
+other comparison policy; include this exact expanded form:
 
 ```bash
 python scripts/calibrate_aros_cache_baselines.py \
   --task-manifest "$TASK/manifests/task.json" \
+  --r0-receipt "$HOST/r0-lru/receipt.json" \
+  --r0-receipt "$HOST/r0-arc/receipt.json" \
+  --r0-receipt "$HOST/r0-wtinylfu/receipt.json" \
   --r0-receipt "$HOST/r0-sieve/receipt.json" \
   --r0-receipt "$HOST/r0-s3fifo/receipt.json" \
+  --r0-receipt "$HOST/r0-beladysize/receipt.json" \
   --receipt "$HOST/r2-sieve-1/receipt.json" --receipt "$HOST/r2-sieve-2/receipt.json" \
   --receipt "$HOST/r2-sieve-3/receipt.json" --receipt "$HOST/r2-sieve-4/receipt.json" \
   --receipt "$HOST/r2-sieve-5/receipt.json" --receipt "$HOST/r2-s3fifo-1/receipt.json" \
@@ -954,7 +1026,13 @@ The human/host supplies an already cloned pinned source checkout and candidate t
 
 - [ ] **Step 2: Calibrate the exact baseline apparatus**
 
-Run R0 for both Sieve and S3FIFO, including allocation-accounting probes. Run R1 once for a timing sanity check, R2 five times per constraint baseline, and R2 once each for LRU, ARC, WTinyLFU, and BeladySize on the same idle host fingerprint. Freeze the calibration and run the standalone verifier without R3. If host noise or process failure invalidates a repetition, preserve that failed receipt and start a new campaign calibration identity rather than replacing it.
+Run R0 once for each of LRU, ARC, WTinyLFU, Sieve, S3FIFO, and BeladySize,
+including allocation-accounting probes. Run R1 once for a timing sanity check,
+R2 five times per constraint baseline, and R2 once each for LRU, ARC,
+WTinyLFU, and BeladySize on the same idle host fingerprint. Freeze the
+calibration and run the standalone verifier without R3. If host noise or
+process failure invalidates a repetition, preserve that failed receipt and
+start a new campaign calibration identity rather than replacing it.
 
 - [ ] **Step 3: Write the factual retained result**
 

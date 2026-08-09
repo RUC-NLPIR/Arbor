@@ -106,7 +106,8 @@
       "researcher_model_family",
       "researcher_session_refs",
       "researcher_worktree_ref",
-      "packet_sha256"
+      "packet_sha256",
+      "review_session_receipt_ref"
     ],
     "ReviewerReport": [
       "reproduction_refs",
@@ -134,7 +135,9 @@
       "reproduction_ref",
       "principal_actor_ref",
       "principal_checkpoint_ref",
-      "disposition"
+      "disposition",
+      "principal_decision_receipt_ref",
+      "authority_class"
     ],
     "ClaimPackage": [
       "claim",
@@ -153,7 +156,9 @@
       "principal_response_ref",
       "reproduction_ref",
       "environment_ref",
-      "checkpoint_ref"
+      "checkpoint_ref",
+      "principal_decision_receipt_ref",
+      "authority_class"
     ]
   },
   "procedures": {

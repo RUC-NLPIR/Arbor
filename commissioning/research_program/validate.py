@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -125,6 +126,7 @@ _ARTIFACTS = {
         "researcher_session_refs",
         "researcher_worktree_ref",
         "packet_sha256",
+        "review_session_receipt_ref",
     ),
     "ReviewerReport": (
         "reproduction_refs",
@@ -153,6 +155,8 @@ _ARTIFACTS = {
         "principal_actor_ref",
         "principal_checkpoint_ref",
         "disposition",
+        "principal_decision_receipt_ref",
+        "authority_class",
     ),
     "ClaimPackage": (
         "claim",
@@ -172,6 +176,8 @@ _ARTIFACTS = {
         "reproduction_ref",
         "environment_ref",
         "checkpoint_ref",
+        "principal_decision_receipt_ref",
+        "authority_class",
     ),
 }
 _PROCEDURES = {
@@ -255,6 +261,19 @@ def _finite_float(value: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError(f"JSON numbers must be finite: {value}")
     return parsed
+
+
+def frozen_evidence_packet_sha256(packet: Mapping[str, object]) -> str:
+    canonical = dict(packet)
+    canonical.pop("packet_sha256", None)
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _same_file(left: os.stat_result, right: os.stat_result) -> bool:

@@ -191,6 +191,7 @@ EXPECTED_ARTIFACTS = {
         "researcher_session_refs",
         "researcher_worktree_ref",
         "packet_sha256",
+        "review_session_receipt_ref",
     ),
     "ReviewerReport": (
         "reproduction_refs",
@@ -219,6 +220,8 @@ EXPECTED_ARTIFACTS = {
         "principal_actor_ref",
         "principal_checkpoint_ref",
         "disposition",
+        "principal_decision_receipt_ref",
+        "authority_class",
     ),
     "ClaimPackage": (
         "claim",
@@ -238,6 +241,8 @@ EXPECTED_ARTIFACTS = {
         "reproduction_ref",
         "environment_ref",
         "checkpoint_ref",
+        "principal_decision_receipt_ref",
+        "authority_class",
     ),
 }
 EXPECTED_PROCEDURES = {
@@ -749,7 +754,7 @@ EXPECTED_REVIEW_INPUT_RULES = (
         "`candidate_commit`, `source_refs`, `raw_refs`, `reproduction_ref`, "
         "`root_question_ref`, `claim_draft_ref`, `researcher_model_id`, "
         "`researcher_model_family`, `researcher_session_refs`, "
-        "`researcher_worktree_ref`, `packet_sha256`."
+        "`researcher_worktree_ref`, `packet_sha256`, `review_session_receipt_ref`."
     ),
     (
         "Context isolation: Start a fresh Reviewer model with empty message history, "
@@ -764,8 +769,17 @@ EXPECTED_REVIEW_INPUT_RULES = (
 )
 EXPECTED_REVIEW_METHOD_RULES = (
     (
-        "Verify `packet_sha256` against the canonical frozen packet bytes excluding the "
-        "`packet_sha256` field before dereferencing or reviewing any packet content."
+        "Require `packet_sha256` to equal SHA-256 of the UTF-8 bytes of canonical JSON "
+        "for the `FrozenEvidencePacket` excluding `packet_sha256`, encoded with "
+        "`sort_keys=True`, `separators=(\",\", \":\")`, and `ensure_ascii=False`; compute "
+        "and compare it before dereferencing or reviewing any packet content."
+    ),
+    (
+        "Use `Receipt.read` to read exact `review_session_receipt_ref` before any Reviewer "
+        "analysis; require it to be immutable, host-issued before the Reviewer started, "
+        "and to contain `reviewer_model_id`, `reviewer_model_family`, "
+        "`researcher_model_id`, `researcher_model_family`, `initial_message_count`, "
+        "`supplied_packet_sha256`, `created_at`, and `issuer`."
     ),
     (
         "Read the exact TaskBrief, root question, Claim draft, preregistration, candidate "
@@ -776,18 +790,19 @@ EXPECTED_REVIEW_METHOD_RULES = (
     (
         "Read and bind `researcher_model_id`, `researcher_model_family`, every "
         "`researcher_session_refs` entry, and `researcher_worktree_ref`; reject a missing, "
-        "unknown, unverifiable, or cross-lineage Researcher identity or execution reference."
+        "unknown, unverifiable, cross-lineage, or review-receipt-mismatched Researcher "
+        "identity or execution reference."
     ),
     (
-        "Obtain an immutable `independence_evidence_ref` that proves the Reviewer context "
-        "started with empty message history, received no Researcher transcript, and did "
-        "not continue any Researcher or prior Reviewer session."
+        "Require the review session receipt `supplied_packet_sha256` to equal input "
+        "`packet_sha256`, `initial_message_count` to be the plain integer 0, its Reviewer "
+        "identity to equal the active Reviewer, its Researcher identity to equal the "
+        "packet, and both model families to be known and different."
     ),
     (
-        "Record the exact `reviewer_model_id` and `reviewer_model_family` before "
-        "reproduction, prove that the Reviewer family differs from "
-        "`researcher_model_family`, and bind both identities and the independence evidence "
-        "to every new Reviewer Run and Eval receipt."
+        "Set `independence_evidence_ref` exactly to input `review_session_receipt_ref`; "
+        "bind its exact Reviewer and Researcher identities to every new Reviewer Run and "
+        "Eval receipt, and do not self-issue or replace the host receipt."
     ),
     (
         "Independently rebuild the exact `candidate_commit` in a clean isolated Reviewer "
@@ -828,7 +843,8 @@ EXPECTED_REVIEW_METHOD_RULES = (
 )
 EXPECTED_REVIEW_COMPLETION_RULES = (
     (
-        "Complete only after the packet hash and one coherent lineage are verified, "
+        "Complete only after the exact canonical packet hash, host-issued review session "
+        "receipt, zero-message fresh context, and one coherent lineage are verified, "
         "cross-family independence is proven, every frozen reference is read, every "
         "primary evidence path has an independent Reviewer reproduction attempt, every "
         "required audit is performed, and all `ReviewerReport` fields are populated."
@@ -840,10 +856,13 @@ EXPECTED_REVIEW_COMPLETION_RULES = (
         "call `Research.petition` with the exact lineage blocker and exit incomplete."
     ),
     (
-        "If `reviewer_model_family` equals `researcher_model_family`, either family is "
-        "unknown or unverifiable, or `independence_evidence_ref` does not prove fresh "
-        "empty history without a Researcher transcript, do not emit a `ReviewerReport`; "
-        "call `Research.petition` with the exact independence blocker and exit incomplete."
+        "If `review_session_receipt_ref` is missing or unreadable, the receipt is not "
+        "host-issued before Reviewer start, `supplied_packet_sha256` mismatches, "
+        "`initial_message_count` is not the plain integer 0, either identity mismatches, "
+        "the families are equal, unknown, or unverifiable, or "
+        "`independence_evidence_ref` cannot equal that receipt, do not emit a "
+        "`ReviewerReport`; call `Research.petition` with the exact independence blocker "
+        "and exit incomplete."
     ),
     (
         "If Reviewer transport is unavailable, a required new Reviewer Run or Eval "
@@ -884,6 +903,11 @@ EXPECTED_REVIEW_FORBIDDEN_RULES = (
         "spliced packet references."
     ),
     (
+        "Do not issue, synthesize, alter, or substitute `review_session_receipt_ref`; it "
+        "must be the pre-existing host receipt read with `Receipt.read`, and output "
+        "`independence_evidence_ref` must equal it."
+    ),
+    (
         "Do not use a shell, subprocess, SSH, direct remote execution, job queue, upload, "
         "or notification service; experimental work must use the declared AROS Run and "
         "Eval tools."
@@ -900,7 +924,8 @@ EXPECTED_CLAIM_INPUT_RULES = (
         "Required fields: `claim_draft_ref`, `evidence_refs`, `review_ref`, "
         "`principal_response_ref`, `root_question_ref`, `candidate_commit`, "
         "`preregistration_ref`, `reproduction_ref`, `principal_actor_ref`, "
-        "`principal_checkpoint_ref`, `disposition`."
+        "`principal_checkpoint_ref`, `disposition`, `principal_decision_receipt_ref`, "
+        "`authority_class`."
     ),
     (
         "Exact reads: Read the exact Claim draft, every evidence reference, Reviewer "
@@ -908,16 +933,17 @@ EXPECTED_CLAIM_INPUT_RULES = (
         "value to its immutable reference."
     ),
     (
-        "Authority: Treat only the referenced Principal actor, Principal checkpoint, and "
-        "Principal response as adjudication; do not infer actor authority, acceptance, "
-        "narrowing, rejection, or objection resolution."
+        "Authority: Derive adjudication authority only from the exact "
+        "`principal_decision_receipt_ref` read with `Receipt.read`; do not infer actor "
+        "authority, enforcement, acceptance, narrowing, rejection, or objection resolution "
+        "from names or labels."
     ),
 )
 EXPECTED_CLAIM_METHOD_RULES = (
     (
         "Read the exact Claim draft, every evidence reference, Reviewer report, Principal "
-        "response, Principal actor record, Principal checkpoint, preregistration, and "
-        "reproduction package before packaging."
+        "response, Principal actor record, Principal checkpoint, Principal decision "
+        "receipt, preregistration, and reproduction package before packaging."
     ),
     (
         "Require `root_question_ref`, `candidate_commit`, `preregistration_ref`, "
@@ -926,9 +952,16 @@ EXPECTED_CLAIM_METHOD_RULES = (
         "or cross-lineage references."
     ),
     (
-        "Verify that `principal_actor_ref` identifies the canonical Principal actor and "
-        "that `principal_checkpoint_ref` is an immutable successful checkpoint by that "
-        "same actor binding the exact Principal response, lineage, and disposition."
+        "Use `Receipt.read` to read exact `principal_decision_receipt_ref`; require the "
+        "immutable receipt to bind exactly `actor_ref`, `principal_response_ref`, "
+        "`principal_checkpoint_ref`, `disposition`, and `enforcement_class`."
+    ),
+    (
+        "Require decision-receipt `actor_ref` to equal input `principal_actor_ref`, its "
+        "response, checkpoint, and disposition references to equal the corresponding "
+        "inputs, its checkpoint to bind the same response and lineage, and input "
+        "`authority_class` to equal `enforcement_class`, which must be exactly "
+        "`cooperative` or `protected`."
     ),
     (
         "Require input `disposition` and the Principal response disposition to match and "
@@ -982,16 +1015,18 @@ EXPECTED_CLAIM_METHOD_RULES = (
 EXPECTED_CLAIM_COMPLETION_RULES = (
     (
         "Complete only after every exact input reference and cross-artifact lineage is "
-        "verified, Principal actor and checkpoint authority are proven, every material "
-        "objection has an explicit Principal disposition, no fatal objection remains "
-        "unresolved, and all `ClaimPackage` fields are populated."
+        "verified, the Principal decision receipt exactly binds actor, response, "
+        "checkpoint, disposition, and enforcement class, every material objection has an "
+        "explicit Principal disposition, no fatal objection remains unresolved, and all "
+        "`ClaimPackage` fields are populated."
     ),
     (
-        "If any required reference is missing or cross-lineage, Principal actor authority "
-        "or checkpoint binding is absent or forged, the Principal response is missing, "
-        "any material objection is unanswered, or any fatal objection remains unresolved, "
-        "do not emit or checkpoint a `ClaimPackage`; return incomplete for Principal "
-        "adjudication."
+        "If any required reference is missing or cross-lineage, "
+        "`principal_decision_receipt_ref` is missing or unreadable, its actor, response, "
+        "checkpoint, disposition, or enforcement class mismatches input, its checkpoint "
+        "does not bind the same response and lineage, any material objection is unanswered, "
+        "or any fatal objection remains unresolved, do not emit or checkpoint a "
+        "`ClaimPackage`; return incomplete for Principal adjudication."
     ),
     (
         "For disposition `accept` or `narrow`, emit only the scoped admitted Claim that "
@@ -1005,7 +1040,8 @@ EXPECTED_CLAIM_COMPLETION_RULES = (
     (
         "Only after adjudication, call `Research.checkpoint` with the complete package, "
         "exact lineage and evidence references, `review_ref`, `principal_response_ref`, "
-        "and `checkpoint_ref` set exactly to verified `principal_checkpoint_ref`."
+        "and `principal_decision_receipt_ref`, preserved `authority_class`, and "
+        "`checkpoint_ref` set exactly to verified `principal_checkpoint_ref`."
     ),
     "Exit immediately after the successful checkpoint; do not continue the research session.",
 )
@@ -1019,9 +1055,15 @@ EXPECTED_CLAIM_FORBIDDEN_RULES = (
         "alter adjudicated wording or scope."
     ),
     (
-        "Do not trust a claimed Principal role without `principal_actor_ref`, accept a "
-        "missing or forged `principal_checkpoint_ref`, or combine references from different "
-        "questions, candidates, preregistrations, reproductions, reviews, or responses."
+        "Do not accept a missing, unreadable, altered, or mismatched "
+        "`principal_decision_receipt_ref`, and do not combine references from different "
+        "questions, candidates, preregistrations, reproductions, reviews, responses, "
+        "actors, or checkpoints."
+    ),
+    (
+        "Do not call cooperative authority protected, infer protected enforcement from a "
+        "Principal label, or change `authority_class`; preserve the exact decision-receipt "
+        "`enforcement_class`."
     ),
     (
         "Do not launder disposition `reject` into an admitted, supported, or scientific "
@@ -1483,6 +1525,7 @@ def test_contract_set_has_exact_canonical_values() -> None:
         ("FrozenEvidencePacket", "researcher_session_refs"),
         ("FrozenEvidencePacket", "researcher_worktree_ref"),
         ("FrozenEvidencePacket", "packet_sha256"),
+        ("FrozenEvidencePacket", "review_session_receipt_ref"),
         ("ReviewerReport", "reviewer_model_id"),
         ("ReviewerReport", "reviewer_model_family"),
         ("ReviewerReport", "independence_evidence_ref"),
@@ -1496,6 +1539,8 @@ def test_contract_set_has_exact_canonical_values() -> None:
         ("AdjudicatedEvidence", "principal_actor_ref"),
         ("AdjudicatedEvidence", "principal_checkpoint_ref"),
         ("AdjudicatedEvidence", "disposition"),
+        ("AdjudicatedEvidence", "principal_decision_receipt_ref"),
+        ("AdjudicatedEvidence", "authority_class"),
         ("ClaimPackage", "disposition"),
         ("ClaimPackage", "root_question_ref"),
         ("ClaimPackage", "candidate_commit"),
@@ -1505,6 +1550,8 @@ def test_contract_set_has_exact_canonical_values() -> None:
         ("ClaimPackage", "reproduction_ref"),
         ("ClaimPackage", "environment_ref"),
         ("ClaimPackage", "checkpoint_ref"),
+        ("ClaimPackage", "principal_decision_receipt_ref"),
+        ("ClaimPackage", "authority_class"),
     ],
 )
 def test_contract_rejects_missing_review_claim_lineage_and_authority_fields(
@@ -1533,6 +1580,34 @@ def test_contract_names_candidate_and_reproduction_lineage_unambiguously() -> No
     assert "reproduction_ref" in EXPECTED_ARTIFACTS["AdjudicatedEvidence"]
     assert "reproduction_ref" in claim_fields
     assert "checkpoint_ref" in claim_fields
+
+
+def test_frozen_evidence_packet_hash_is_exact_canonical_utf8_and_detects_tamper() -> None:
+    module = _contract_module()
+    assert hasattr(module, "frozen_evidence_packet_sha256")
+    packet = {
+        "z_ref": "最后",
+        "a_ref": "α",
+        "packet_sha256": "stale",
+    }
+    original = dict(packet)
+
+    assert module.frozen_evidence_packet_sha256(packet) == (
+        "85742e4e59b03e3f1635d4cecbf4c5dcef840428cf99d819573fa8aa60e4d95b"
+    )
+    reordered = dict(reversed(tuple(packet.items())))
+    assert module.frozen_evidence_packet_sha256(reordered) == (
+        "85742e4e59b03e3f1635d4cecbf4c5dcef840428cf99d819573fa8aa60e4d95b"
+    )
+    changed_hash = {**packet, "packet_sha256": "ignored replacement"}
+    assert module.frozen_evidence_packet_sha256(changed_hash) == (
+        "85742e4e59b03e3f1635d4cecbf4c5dcef840428cf99d819573fa8aa60e4d95b"
+    )
+    tampered = {**packet, "a_ref": "β"}
+    assert module.frozen_evidence_packet_sha256(tampered) != (
+        "85742e4e59b03e3f1635d4cecbf4c5dcef840428cf99d819573fa8aa60e4d95b"
+    )
+    assert packet == original
 
 
 def test_evidence_update_cross_contract_lineage_is_explicit_and_update_only() -> None:
@@ -2675,9 +2750,9 @@ def test_independent_review_returns_all_report_fields_and_blocks_on_transport() 
     assert output[0] == "Artifact: Return exactly one `ReviewerReport`."
     assert _required_fields(output[1]) == EXPECTED_ARTIFACTS["ReviewerReport"]
     assert output[2] == (
-        "Independence binding: Set `reviewer_model_id`, `reviewer_model_family`, and "
-        "`independence_evidence_ref` to the exact verified Reviewer identity and fresh-"
-        "context evidence."
+        "Independence binding: Set `reviewer_model_id` and `reviewer_model_family` "
+        "exactly from the host-issued review session receipt, and set "
+        "`independence_evidence_ref` exactly to input `review_session_receipt_ref`."
     )
     assert output[3] == (
         "Lineage binding: Copy input `packet_sha256`, `claim_draft_ref`, and "
@@ -2788,14 +2863,14 @@ def test_independent_review_rejects_isolation_and_reproduction_polarity_mutation
         ),
         (
             "Method",
-            "Reviewer family differs from\n   `researcher_model_family`",
-            "Reviewer family equals\n   `researcher_model_family`",
+            "both model families to be known and different",
+            "both model families may be unknown or the same",
             True,
         ),
         (
             "Completion",
-            "either family is\n  unknown or unverifiable",
-            "either family may be\n  unknown or unverifiable",
+            "families are equal, unknown, or unverifiable",
+            "families are equal, unknown, or unverifiable but accepted",
             False,
         ),
         (
@@ -2806,8 +2881,8 @@ def test_independent_review_rejects_isolation_and_reproduction_polarity_mutation
         ),
         (
             "Completion",
-            "call\n  `Research.petition` with the exact independence blocker",
-            "ignore\n  the independence blocker",
+            "exact independence blocker",
+            "ignored independence blocker",
             False,
         ),
     ],
@@ -2823,6 +2898,56 @@ def test_independent_review_rejects_cross_lineage_and_nonindependent_family(
     expected = {
         "Method": EXPECTED_REVIEW_METHOD_RULES,
         "Completion": EXPECTED_REVIEW_COMPLETION_RULES,
+    }[heading]
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            heading,
+            expected,
+            numbered=numbered,
+        )
+
+
+@pytest.mark.parametrize(
+    ("heading", "old", "new", "numbered"),
+    [
+        ("Method", "excluding `packet_sha256`", "including `packet_sha256`", True),
+        ("Method", "`sort_keys=True`", "`sort_keys=False`", True),
+        (
+            "Method",
+            "host-issued before the Reviewer started",
+            "self-issued after the Reviewer started",
+            True,
+        ),
+        ("Method", "plain integer 0", "nonzero integer", True),
+        (
+            "Method",
+            "`independence_evidence_ref` exactly to input "
+            "`review_session_receipt_ref`",
+            "`independence_evidence_ref` to a self-issued receipt",
+            True,
+        ),
+        (
+            "Forbidden",
+            "Do not issue, synthesize, alter, or substitute "
+            "`review_session_receipt_ref`",
+            "The Reviewer may issue or substitute `review_session_receipt_ref`",
+            False,
+        ),
+    ],
+)
+def test_independent_review_rejects_hash_tamper_and_self_issued_receipt(
+    heading: str, old: str, new: str, numbered: bool
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-independent-review.md"
+    )
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+    expected = {
+        "Method": EXPECTED_REVIEW_METHOD_RULES,
+        "Forbidden": EXPECTED_REVIEW_FORBIDDEN_RULES,
     }[heading]
 
     with pytest.raises(AssertionError):
@@ -2868,7 +2993,7 @@ def test_claim_package_returns_all_fields_after_principal_adjudication() -> None
     )
     output = _procedure_rules(_procedure_section(body, "Output"), numbered=False)
 
-    assert len(output) == 7
+    assert len(output) == 8
     assert output[0] == "Artifact: Return exactly one `ClaimPackage`."
     assert _required_fields(output[1]) == EXPECTED_ARTIFACTS["ClaimPackage"]
     assert output[2] == (
@@ -2882,15 +3007,21 @@ def test_claim_package_returns_all_fields_after_principal_adjudication() -> None
         "`reproduction_ref` exactly from the verified input lineage."
     )
     assert output[4] == (
+        "Decision authority binding: Copy `principal_decision_receipt_ref` unchanged and "
+        "set `authority_class` exactly to its `enforcement_class`; `cooperative` remains "
+        "`cooperative`, and `protected` is permitted only when the exact receipt says "
+        "`protected`."
+    )
+    assert output[5] == (
         "Environment and checkpoint binding: Set `environment_ref` to the exact matching "
         "environment receipt and `checkpoint_ref` exactly to verified input "
         "`principal_checkpoint_ref`."
     )
-    assert output[5] == (
+    assert output[6] == (
         "Evidence binding: Bind every evidence and counterevidence entry, limitation, "
         "uncertainty, reproduction command, and objection to its exact input reference."
     )
-    assert output[6] == (
+    assert output[7] == (
         "Review traceability: Include every material review objection and its explicit "
         "Principal disposition without omission, repair, or reinterpretation."
     )
@@ -2937,8 +3068,8 @@ def test_claim_package_returns_all_fields_after_principal_adjudication() -> None
         ),
         (
             "Completion",
-            "unresolved, do not\n  emit or checkpoint a `ClaimPackage`",
-            "unresolved; emit and checkpoint a `ClaimPackage`",
+            "fatal objection remains unresolved, do not emit or checkpoint",
+            "fatal objection remains unresolved; emit and checkpoint",
             False,
         ),
         (
@@ -2983,20 +3114,20 @@ def test_claim_package_rejects_objection_and_admission_polarity_mutations(
         ),
         (
             "Method",
-            "`principal_actor_ref` identifies the canonical Principal actor",
-            "`principal_actor_ref` may identify any actor",
+            "decision-receipt `actor_ref` to equal input `principal_actor_ref`",
+            "decision-receipt `actor_ref` may differ from input `principal_actor_ref`",
             True,
         ),
         (
             "Method",
-            "immutable successful checkpoint by that same\n   actor",
-            "forged checkpoint from another\n   actor",
+            "response, checkpoint, and disposition references to equal the corresponding",
+            "response, checkpoint, and disposition references may differ from the",
             True,
         ),
         (
             "Completion",
-            "checkpoint binding is absent or forged",
-            "checkpoint binding is assumed",
+            "enforcement class mismatches input",
+            "enforcement class may mismatch input",
             False,
         ),
     ],
@@ -3012,6 +3143,57 @@ def test_claim_package_rejects_cross_lineage_and_forged_principal_authority(
     expected = {
         "Method": EXPECTED_CLAIM_METHOD_RULES,
         "Completion": EXPECTED_CLAIM_COMPLETION_RULES,
+    }[heading]
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            heading,
+            expected,
+            numbered=numbered,
+        )
+
+
+@pytest.mark.parametrize(
+    ("heading", "old", "new", "numbered"),
+    [
+        (
+            "Method",
+            "`authority_class` to equal `enforcement_class`",
+            "`authority_class` may differ from `enforcement_class`",
+            True,
+        ),
+        (
+            "Method",
+            "must be exactly `cooperative`",
+            "may use any enforcement label",
+            True,
+        ),
+        (
+            "Forbidden",
+            "Do not call cooperative authority protected",
+            "Call cooperative authority protected",
+            False,
+        ),
+        (
+            "Forbidden",
+            "change `authority_class`; preserve",
+            "change `authority_class`; upgrade",
+            False,
+        ),
+    ],
+)
+def test_claim_package_preserves_cooperative_and_protected_authority_class(
+    heading: str, old: str, new: str, numbered: bool
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-claim-package.md"
+    )
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+    expected = {
+        "Method": EXPECTED_CLAIM_METHOD_RULES,
+        "Forbidden": EXPECTED_CLAIM_FORBIDDEN_RULES,
     }[heading]
 
     with pytest.raises(AssertionError):
@@ -3125,6 +3307,7 @@ def test_contract_loader_uses_only_standard_library_imports() -> None:
     assert imports <= {
         "__future__",
         "dataclasses",
+        "hashlib",
         "json",
         "math",
         "os",

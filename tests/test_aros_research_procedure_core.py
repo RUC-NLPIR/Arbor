@@ -192,6 +192,7 @@ EXPECTED_ARTIFACTS = {
         "researcher_worktree_ref",
         "packet_sha256",
         "review_session_receipt_ref",
+        "reviewer_session_id",
     ),
     "ReviewerReport": (
         "reproduction_refs",
@@ -207,6 +208,7 @@ EXPECTED_ARTIFACTS = {
         "packet_sha256",
         "claim_draft_ref",
         "candidate_commit",
+        "reviewer_session_id",
     ),
     "AdjudicatedEvidence": (
         "claim_draft_ref",
@@ -223,6 +225,7 @@ EXPECTED_ARTIFACTS = {
         "principal_decision_receipt_ref",
         "authority_class",
         "principal_authority_ref",
+        "checkpoint_reservation_ref",
     ),
     "ClaimPackage": (
         "claim",
@@ -756,7 +759,8 @@ EXPECTED_REVIEW_INPUT_RULES = (
         "`candidate_commit`, `source_refs`, `raw_refs`, `reproduction_ref`, "
         "`root_question_ref`, `claim_draft_ref`, `researcher_model_id`, "
         "`researcher_model_family`, `researcher_session_refs`, "
-        "`researcher_worktree_ref`, `packet_sha256`, `review_session_receipt_ref`."
+        "`researcher_worktree_ref`, `packet_sha256`, `review_session_receipt_ref`, "
+        "`reviewer_session_id`."
     ),
     (
         "Context isolation: Start a fresh Reviewer model with empty message history, "
@@ -781,7 +785,8 @@ EXPECTED_REVIEW_METHOD_RULES = (
         "analysis; require it to be immutable, host-issued before the Reviewer started, "
         "and to contain `reviewer_model_id`, `reviewer_model_family`, "
         "`researcher_model_id`, `researcher_model_family`, `initial_message_count`, "
-        "`supplied_packet_sha256`, `created_at`, and `issuer`."
+        "`supplied_packet_sha256`, `reviewer_session_id`, `nonce`, `created_at`, and "
+        "`issuer`."
     ),
     (
         "Read the exact TaskBrief, root question, Claim draft, preregistration, candidate "
@@ -797,9 +802,11 @@ EXPECTED_REVIEW_METHOD_RULES = (
     ),
     (
         "Require the review session receipt `supplied_packet_sha256` to equal input "
-        "`packet_sha256`, `initial_message_count` to be the plain integer 0, its Reviewer "
-        "identity to equal the active Reviewer, its Researcher identity to equal the "
-        "packet, and both model families to be known and different."
+        "`packet_sha256`, `initial_message_count` to be the plain integer 0, receipt "
+        "`reviewer_session_id` to equal both input `reviewer_session_id` and the active "
+        "host Reviewer session or thread, `nonce` to be unique and unused, its Reviewer "
+        "identity to equal the active Reviewer, its Researcher identity to equal the packet, "
+        "and both model families to be known and different."
     ),
     (
         "Set `independence_evidence_ref` exactly to input `review_session_receipt_ref`; "
@@ -846,10 +853,11 @@ EXPECTED_REVIEW_METHOD_RULES = (
 EXPECTED_REVIEW_COMPLETION_RULES = (
     (
         "Complete only after the exact canonical packet hash, host-issued review session "
-        "receipt, zero-message fresh context, and one coherent lineage are verified, "
-        "cross-family independence is proven, every frozen reference is read, every "
-        "primary evidence path has an independent Reviewer reproduction attempt, every "
-        "required audit is performed, and all `ReviewerReport` fields are populated."
+        "receipt, unique active `reviewer_session_id`, unused nonce, zero-message fresh "
+        "context, and one coherent lineage are verified, cross-family independence is "
+        "proven, every frozen reference is read, every primary evidence path has an "
+        "independent Reviewer reproduction attempt, every required audit is performed, "
+        "and all `ReviewerReport` fields are populated."
     ),
     (
         "If the packet hash fails, any required reference is missing, or question, Claim, "
@@ -860,11 +868,12 @@ EXPECTED_REVIEW_COMPLETION_RULES = (
     (
         "If `review_session_receipt_ref` is missing or unreadable, the receipt is not "
         "host-issued before Reviewer start, `supplied_packet_sha256` mismatches, "
-        "`initial_message_count` is not the plain integer 0, either identity mismatches, "
-        "the families are equal, unknown, or unverifiable, or "
-        "`independence_evidence_ref` cannot equal that receipt, do not emit a "
-        "`ReviewerReport`; call `Research.petition` with the exact independence blocker "
-        "and exit incomplete."
+        "`initial_message_count` is not the plain integer 0, receipt, input, and active "
+        "`reviewer_session_id` values do not all match, the receipt or nonce belongs to an "
+        "old session or has been replayed, either identity mismatches, the families are "
+        "equal, unknown, or unverifiable, or `independence_evidence_ref` cannot equal that "
+        "receipt, do not emit a `ReviewerReport`; call `Research.petition` with the exact "
+        "independence blocker and exit incomplete."
     ),
     (
         "If Reviewer transport is unavailable, a required new Reviewer Run or Eval "
@@ -910,6 +919,11 @@ EXPECTED_REVIEW_FORBIDDEN_RULES = (
         "`independence_evidence_ref` must equal it."
     ),
     (
+        "Do not reuse a review session receipt, `reviewer_session_id`, or nonce from an old "
+        "session, and do not echo a session identifier that differs from the active host "
+        "Reviewer session or thread."
+    ),
+    (
         "Do not use a shell, subprocess, SSH, direct remote execution, job queue, upload, "
         "or notification service; experimental work must use the declared AROS Run and "
         "Eval tools."
@@ -927,7 +941,7 @@ EXPECTED_CLAIM_INPUT_RULES = (
         "`principal_response_ref`, `root_question_ref`, `candidate_commit`, "
         "`preregistration_ref`, `reproduction_ref`, `principal_actor_ref`, "
         "`principal_checkpoint_ref`, `disposition`, `principal_decision_receipt_ref`, "
-        "`authority_class`, `principal_authority_ref`."
+        "`authority_class`, `principal_authority_ref`, `checkpoint_reservation_ref`."
     ),
     (
         "Exact reads: Read the exact Claim draft, every evidence reference, Reviewer "
@@ -946,8 +960,8 @@ EXPECTED_CLAIM_METHOD_RULES = (
     (
         "Read the exact Claim draft, every evidence reference, Reviewer report, Principal "
         "response, Principal actor record, Principal checkpoint, Principal authority "
-        "receipt, Principal decision receipt, preregistration, and reproduction package "
-        "before packaging."
+        "receipt, Principal decision receipt, checkpoint reservation, preregistration, and "
+        "reproduction package before packaging."
     ),
     (
         "Require `root_question_ref`, `candidate_commit`, `preregistration_ref`, "
@@ -975,6 +989,20 @@ EXPECTED_CLAIM_METHOD_RULES = (
         "lineage, its `authority_context_sha256` and `enforcement_class` to equal the "
         "authority receipt, and input `authority_class` to equal that "
         "`enforcement_class`, which must be exactly `cooperative` or `protected`."
+    ),
+    (
+        "Use `Receipt.read` to read exact `checkpoint_reservation_ref` from the canonical "
+        "AROS receipt store; require the immutable host-issued unused reservation to bind "
+        "exactly `planned_checkpoint_ref`, `idempotency_key`, `claim_package_path`, "
+        "`claim_package_hash_protocol`, `principal_decision_receipt_ref`, "
+        "`principal_authority_ref`, and `reservation_nonce`."
+    ),
+    (
+        "Require reservation Principal decision and authority references to equal the "
+        "verified input references, its `planned_checkpoint_ref` and `idempotency_key` to "
+        "be unique and unused, and its package path and hash protocol to identify the exact "
+        "future `ClaimPackage`; reject an expired, consumed, replayed, or mismatched "
+        "reservation."
     ),
     (
         "Require input `disposition` and the Principal response disposition to match and "
@@ -1024,15 +1052,21 @@ EXPECTED_CLAIM_METHOD_RULES = (
         "`review_ref`, its Principal disposition and `principal_response_ref`, and the "
         "resulting scope effect."
     ),
+    (
+        "Before checkpointing, write the complete `ClaimPackage` at the reserved "
+        "`claim_package_path`, set `checkpoint_ref` exactly to reserved "
+        "`planned_checkpoint_ref`, and serialize and hash it with the reserved "
+        "`claim_package_hash_protocol`."
+    ),
 )
 EXPECTED_CLAIM_COMPLETION_RULES = (
     (
         "Complete only after every exact input reference and cross-artifact lineage is "
         "verified, canonical Principal authority and decision receipts exactly bind and "
         "authorize issuer, actor, response, checkpoint, disposition, authority context, "
-        "and enforcement class, every material objection has an explicit Principal "
-        "disposition, no fatal objection remains unresolved, and all `ClaimPackage` fields "
-        "are populated."
+        "and enforcement class, the checkpoint reservation is canonical, matching, and "
+        "unused, every material objection has an explicit Principal disposition, no fatal "
+        "objection remains unresolved, and all `ClaimPackage` fields are populated."
     ),
     (
         "If any required reference is missing or cross-lineage, "
@@ -1045,6 +1079,14 @@ EXPECTED_CLAIM_COMPLETION_RULES = (
         "`ClaimPackage`; return incomplete for Principal adjudication."
     ),
     (
+        "If `checkpoint_reservation_ref` is missing, unreadable, noncanonical, expired, "
+        "consumed, or replayed, its decision or authority reference mismatches, its "
+        "`planned_checkpoint_ref` or `idempotency_key` is not unique and unused, or its "
+        "package path or hash protocol does not match the exact future `ClaimPackage`, do "
+        "not emit or checkpoint a `ClaimPackage`; return incomplete for a new host-issued "
+        "reservation."
+    ),
+    (
         "For disposition `accept` or `narrow`, emit only the scoped admitted Claim that "
         "the verified Principal response authorizes."
     ),
@@ -1054,11 +1096,12 @@ EXPECTED_CLAIM_COMPLETION_RULES = (
         "convert rejection into a scientific negative result."
     ),
     (
-        "Only after adjudication, call `Research.checkpoint` with the complete package, "
-        "exact lineage and evidence references, `review_ref`, `principal_response_ref`, "
-        "`principal_authority_ref`, `principal_decision_receipt_ref`, preserved "
-        "`authority_class`, and `checkpoint_ref` set exactly to verified "
-        "`principal_checkpoint_ref`."
+        "Only after writing the complete package with reserved `checkpoint_ref`, call "
+        "`Research.checkpoint` using the reservation `idempotency_key`, exact package path "
+        "and hash, lineage and evidence references, `review_ref`, `principal_response_ref`, "
+        "`principal_authority_ref`, `principal_decision_receipt_ref`, and preserved "
+        "`authority_class`; complete only if the returned `checkpoint_ref` equals reserved "
+        "`planned_checkpoint_ref` exactly."
     ),
     "Exit immediately after the successful checkpoint; do not continue the research session.",
 )
@@ -1087,6 +1130,16 @@ EXPECTED_CLAIM_FORBIDDEN_RULES = (
         "Do not call cooperative authority protected, infer protected enforcement from a "
         "Principal label, or change `authority_class`; preserve the exact decision-receipt "
         "`enforcement_class`."
+    ),
+    (
+        "Do not copy `principal_checkpoint_ref` into output `checkpoint_ref`, invent or "
+        "alter a checkpoint reference or idempotency key, or checkpoint without the exact "
+        "host-issued `checkpoint_reservation_ref`."
+    ),
+    (
+        "Do not reuse or replay a consumed, expired, or mismatched checkpoint reservation "
+        "or accept a returned checkpoint reference that differs from reserved "
+        "`planned_checkpoint_ref`."
     ),
     (
         "Do not launder disposition `reject` into an admitted, supported, or scientific "
@@ -1549,12 +1602,14 @@ def test_contract_set_has_exact_canonical_values() -> None:
         ("FrozenEvidencePacket", "researcher_worktree_ref"),
         ("FrozenEvidencePacket", "packet_sha256"),
         ("FrozenEvidencePacket", "review_session_receipt_ref"),
+        ("FrozenEvidencePacket", "reviewer_session_id"),
         ("ReviewerReport", "reviewer_model_id"),
         ("ReviewerReport", "reviewer_model_family"),
         ("ReviewerReport", "independence_evidence_ref"),
         ("ReviewerReport", "packet_sha256"),
         ("ReviewerReport", "claim_draft_ref"),
         ("ReviewerReport", "candidate_commit"),
+        ("ReviewerReport", "reviewer_session_id"),
         ("AdjudicatedEvidence", "root_question_ref"),
         ("AdjudicatedEvidence", "candidate_commit"),
         ("AdjudicatedEvidence", "preregistration_ref"),
@@ -1565,6 +1620,7 @@ def test_contract_set_has_exact_canonical_values() -> None:
         ("AdjudicatedEvidence", "principal_decision_receipt_ref"),
         ("AdjudicatedEvidence", "authority_class"),
         ("AdjudicatedEvidence", "principal_authority_ref"),
+        ("AdjudicatedEvidence", "checkpoint_reservation_ref"),
         ("ClaimPackage", "disposition"),
         ("ClaimPackage", "root_question_ref"),
         ("ClaimPackage", "candidate_commit"),
@@ -2777,7 +2833,9 @@ def test_independent_review_returns_all_report_fields_and_blocks_on_transport() 
     assert output[2] == (
         "Independence binding: Set `reviewer_model_id` and `reviewer_model_family` "
         "exactly from the host-issued review session receipt, and set "
-        "`independence_evidence_ref` exactly to input `review_session_receipt_ref`."
+        "`independence_evidence_ref` exactly to input `review_session_receipt_ref`; copy "
+        "input `reviewer_session_id` unchanged only after it equals the receipt and active "
+        "host Reviewer session or thread."
     )
     assert output[3] == (
         "Lineage binding: Copy input `packet_sha256`, `claim_draft_ref`, and "
@@ -2888,13 +2946,13 @@ def test_independent_review_rejects_isolation_and_reproduction_polarity_mutation
         ),
         (
             "Method",
-            "both model families to be known and different",
+            "model families to be known and different",
             "both model families may be unknown or the same",
             True,
         ),
         (
             "Completion",
-            "families are equal, unknown, or unverifiable",
+            "families are equal",
             "families are equal, unknown, or unverifiable but accepted",
             False,
         ),
@@ -2906,7 +2964,7 @@ def test_independent_review_rejects_isolation_and_reproduction_polarity_mutation
         ),
         (
             "Completion",
-            "exact independence blocker",
+            "exact independence\n  blocker",
             "ignored independence blocker",
             False,
         ),
@@ -2984,6 +3042,58 @@ def test_independent_review_rejects_hash_tamper_and_self_issued_receipt(
         )
 
 
+@pytest.mark.parametrize(
+    ("heading", "old", "new", "numbered"),
+    [
+        (
+            "Method",
+            "`reviewer_session_id` to equal both input `reviewer_session_id`",
+            "receipt `reviewer_session_id` may differ from the active session",
+            True,
+        ),
+        (
+            "Method",
+            "`nonce` to be unique and unused",
+            "`nonce` may be replayed",
+            True,
+        ),
+        (
+            "Completion",
+            "old session or has been replayed",
+            "receipt or nonce from an old session may be replayed",
+            False,
+        ),
+        (
+            "Forbidden",
+            "Do not reuse a review session receipt, `reviewer_session_id`, or nonce",
+            "Reuse a review session receipt, `reviewer_session_id`, or nonce",
+            False,
+        ),
+    ],
+)
+def test_independent_review_rejects_session_receipt_mismatch_and_replay(
+    heading: str, old: str, new: str, numbered: bool
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-independent-review.md"
+    )
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+    expected = {
+        "Method": EXPECTED_REVIEW_METHOD_RULES,
+        "Completion": EXPECTED_REVIEW_COMPLETION_RULES,
+        "Forbidden": EXPECTED_REVIEW_FORBIDDEN_RULES,
+    }[heading]
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            heading,
+            expected,
+            numbered=numbered,
+        )
+
+
 def test_claim_package_reads_adjudication_and_answers_every_objection() -> None:
     metadata, body = _parse_procedure_frontmatter(
         PROCEDURES_ROOT / "aros-claim-package.md"
@@ -3039,8 +3149,9 @@ def test_claim_package_returns_all_fields_after_principal_adjudication() -> None
     )
     assert output[5] == (
         "Environment and checkpoint binding: Set `environment_ref` to the exact matching "
-        "environment receipt and `checkpoint_ref` exactly to verified input "
-        "`principal_checkpoint_ref`."
+        "environment receipt and `checkpoint_ref` exactly to reserved "
+        "`planned_checkpoint_ref`; never copy `principal_checkpoint_ref` into output "
+        "`checkpoint_ref`."
     )
     assert output[6] == (
         "Evidence binding: Bind every evidence and counterevidence entry, limitation, "
@@ -3087,7 +3198,7 @@ def test_claim_package_returns_all_fields_after_principal_adjudication() -> None
         ),
         (
             "Completion",
-            "no fatal objection remains",
+            "no fatal objection\n  remains",
             "fatal objections may remain",
             False,
         ),
@@ -3225,6 +3336,70 @@ def test_claim_package_rejects_forged_payload_noncanonical_path_and_context_mism
     expected = {
         "Inputs": EXPECTED_CLAIM_INPUT_RULES,
         "Method": EXPECTED_CLAIM_METHOD_RULES,
+        "Forbidden": EXPECTED_CLAIM_FORBIDDEN_RULES,
+    }[heading]
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            heading,
+            expected,
+            numbered=numbered,
+        )
+
+
+@pytest.mark.parametrize(
+    ("heading", "old", "new", "numbered"),
+    [
+        (
+            "Method",
+            "immutable host-issued unused reservation",
+            "mutable self-issued reservation",
+            True,
+        ),
+        (
+            "Method",
+            "`checkpoint_ref` exactly to reserved",
+            "copy `principal_checkpoint_ref` into `checkpoint_ref`",
+            True,
+        ),
+        (
+            "Completion",
+            "consumed, or replayed",
+            "consumed, or replayed but accepted",
+            False,
+        ),
+        (
+            "Completion",
+            "`Research.checkpoint` using the reservation `idempotency_key`",
+            "`Research.checkpoint` without the reservation key",
+            False,
+        ),
+        (
+            "Completion",
+            "returned `checkpoint_ref` equals reserved",
+            "returned `checkpoint_ref` may differ from the reservation",
+            False,
+        ),
+        (
+            "Forbidden",
+            "Do not copy `principal_checkpoint_ref` into output `checkpoint_ref`",
+            "Copy `principal_checkpoint_ref` into output `checkpoint_ref`",
+            False,
+        ),
+    ],
+)
+def test_claim_package_rejects_checkpoint_reservation_mismatch_and_replay(
+    heading: str, old: str, new: str, numbered: bool
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-claim-package.md"
+    )
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+    expected = {
+        "Method": EXPECTED_CLAIM_METHOD_RULES,
+        "Completion": EXPECTED_CLAIM_COMPLETION_RULES,
         "Forbidden": EXPECTED_CLAIM_FORBIDDEN_RULES,
     }[heading]
 

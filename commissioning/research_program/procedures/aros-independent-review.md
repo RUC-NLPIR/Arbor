@@ -28,7 +28,7 @@ deciding the Claim.
   `source_refs`, `raw_refs`, `reproduction_ref`, `root_question_ref`,
   `claim_draft_ref`, `researcher_model_id`, `researcher_model_family`,
   `researcher_session_refs`, `researcher_worktree_ref`, `packet_sha256`,
-  `review_session_receipt_ref`.
+  `review_session_receipt_ref`, `reviewer_session_id`.
 - Context isolation: Start a fresh Reviewer model with empty message history, no
   Researcher transcript, no prior review conversation, and only the frozen packet
   as initial context.
@@ -46,7 +46,8 @@ deciding the Claim.
    analysis; require it to be immutable, host-issued before the Reviewer started,
    and to contain `reviewer_model_id`, `reviewer_model_family`,
    `researcher_model_id`, `researcher_model_family`, `initial_message_count`,
-   `supplied_packet_sha256`, `created_at`, and `issuer`.
+   `supplied_packet_sha256`, `reviewer_session_id`, `nonce`, `created_at`, and
+   `issuer`.
 3. Read the exact TaskBrief, root question, Claim draft, preregistration, candidate
    commit, sources, raw evidence, and reproduction package named by the packet;
    require one coherent question, Claim, candidate, preregistration, source, raw, and
@@ -56,9 +57,11 @@ deciding the Claim.
    unknown, unverifiable, cross-lineage, or review-receipt-mismatched Researcher
    identity or execution reference.
 5. Require the review session receipt `supplied_packet_sha256` to equal input
-   `packet_sha256`, `initial_message_count` to be the plain integer 0, its Reviewer
-   identity to equal the active Reviewer, its Researcher identity to equal the packet,
-   and both model families to be known and different.
+   `packet_sha256`, `initial_message_count` to be the plain integer 0, receipt
+   `reviewer_session_id` to equal both input `reviewer_session_id` and the active host
+   Reviewer session or thread, `nonce` to be unique and unused, its Reviewer identity
+   to equal the active Reviewer, its Researcher identity to equal the packet, and both
+   model families to be known and different.
 6. Set `independence_evidence_ref` exactly to input `review_session_receipt_ref`; bind
    its exact Reviewer and Researcher identities to every new Reviewer Run and Eval
    receipt, and do not self-issue or replace the host receipt.
@@ -92,10 +95,12 @@ deciding the Claim.
   `leakage_findings`, `statistical_findings`, `scope_objections`, `fatal_objections`,
   `unresolved_objections`, `reviewer_model_id`, `reviewer_model_family`,
   `independence_evidence_ref`, `packet_sha256`, `claim_draft_ref`,
-  `candidate_commit`.
+  `candidate_commit`, `reviewer_session_id`.
 - Independence binding: Set `reviewer_model_id` and `reviewer_model_family` exactly
   from the host-issued review session receipt, and set `independence_evidence_ref`
-  exactly to input `review_session_receipt_ref`.
+  exactly to input `review_session_receipt_ref`; copy input `reviewer_session_id`
+  unchanged only after it equals the receipt and active host Reviewer session or
+  thread.
 - Lineage binding: Copy input `packet_sha256`, `claim_draft_ref`, and
   `candidate_commit` unchanged into the report.
 - Reproduction binding: In `reproduction_refs`, bind exact candidate, source,
@@ -108,20 +113,23 @@ deciding the Claim.
 ## Completion
 
 - Complete only after the exact canonical packet hash, host-issued review session
-  receipt, zero-message fresh context, and one coherent lineage are verified,
-  cross-family independence is proven, every frozen reference is read, every primary
-  evidence path has an independent Reviewer reproduction attempt, every required
-  audit is performed, and all `ReviewerReport` fields are populated.
+  receipt, unique active `reviewer_session_id`, unused nonce, zero-message fresh
+  context, and one coherent lineage are verified, cross-family independence is
+  proven, every frozen reference is read, every primary evidence path has an
+  independent Reviewer reproduction attempt, every required audit is performed, and
+  all `ReviewerReport` fields are populated.
 - If the packet hash fails, any required reference is missing, or question, Claim,
   candidate, preregistration, source, raw, reproduction, identity, session, or
   worktree references are spliced across lineages, do not emit a `ReviewerReport`;
   call `Research.petition` with the exact lineage blocker and exit incomplete.
 - If `review_session_receipt_ref` is missing or unreadable, the receipt is not
   host-issued before Reviewer start, `supplied_packet_sha256` mismatches,
-  `initial_message_count` is not the plain integer 0, either identity mismatches, the
-  families are equal, unknown, or unverifiable, or `independence_evidence_ref` cannot
-  equal that receipt, do not emit a `ReviewerReport`; call `Research.petition` with
-  the exact independence blocker and exit incomplete.
+  `initial_message_count` is not the plain integer 0, receipt, input, and active
+  `reviewer_session_id` values do not all match, the receipt or nonce belongs to an
+  old session or has been replayed, either identity mismatches, the families are equal,
+  unknown, or unverifiable, or `independence_evidence_ref` cannot equal that receipt,
+  do not emit a `ReviewerReport`; call `Research.petition` with the exact independence
+  blocker and exit incomplete.
 - If Reviewer transport is unavailable, a required new Reviewer Run or Eval cannot
   be requested or observed, or the fresh model identity cannot be bound, do not emit
   a `ReviewerReport`; call `Research.petition` with the exact transport blocker and
@@ -148,6 +156,9 @@ deciding the Claim.
 - Do not issue, synthesize, alter, or substitute `review_session_receipt_ref`; it must
   be the pre-existing host receipt read with `Receipt.read`, and output
   `independence_evidence_ref` must equal it.
+- Do not reuse a review session receipt, `reviewer_session_id`, or nonce from an old
+  session, and do not echo a session identifier that differs from the active host
+  Reviewer session or thread.
 - Do not use a shell, subprocess, SSH, direct remote execution, job queue, upload, or
   notification service; experimental work must use the declared AROS Run and Eval
   tools.

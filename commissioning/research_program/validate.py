@@ -127,6 +127,7 @@ _ARTIFACTS = {
         "researcher_worktree_ref",
         "packet_sha256",
         "review_session_receipt_ref",
+        "reviewer_session_id",
     ),
     "ReviewerReport": (
         "reproduction_refs",
@@ -142,6 +143,7 @@ _ARTIFACTS = {
         "packet_sha256",
         "claim_draft_ref",
         "candidate_commit",
+        "reviewer_session_id",
     ),
     "AdjudicatedEvidence": (
         "claim_draft_ref",
@@ -158,6 +160,7 @@ _ARTIFACTS = {
         "principal_decision_receipt_ref",
         "authority_class",
         "principal_authority_ref",
+        "checkpoint_reservation_ref",
     ),
     "ClaimPackage": (
         "claim",

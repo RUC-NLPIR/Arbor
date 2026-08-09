@@ -25,7 +25,7 @@ performing admission or laundering rejection into evidence.
   `principal_response_ref`, `root_question_ref`, `candidate_commit`,
   `preregistration_ref`, `reproduction_ref`, `principal_actor_ref`,
   `principal_checkpoint_ref`, `disposition`, `principal_decision_receipt_ref`,
-  `authority_class`, `principal_authority_ref`.
+  `authority_class`, `principal_authority_ref`, `checkpoint_reservation_ref`.
 - Exact reads: Read the exact Claim draft, every evidence reference, Reviewer report,
   and Principal response before constructing the package; bind every value to its
   immutable reference.
@@ -39,8 +39,8 @@ performing admission or laundering rejection into evidence.
 
 1. Read the exact Claim draft, every evidence reference, Reviewer report, Principal
    response, Principal actor record, Principal checkpoint, Principal authority receipt,
-   Principal decision receipt, preregistration, and reproduction package before
-   packaging.
+   Principal decision receipt, checkpoint reservation, preregistration, and
+   reproduction package before packaging.
 2. Require `root_question_ref`, `candidate_commit`, `preregistration_ref`,
    `reproduction_ref`, `claim_draft_ref`, evidence lineage, and review lineage to
    match exactly across every input and every referenced artifact; reject missing
@@ -60,34 +60,48 @@ performing admission or laundering rejection into evidence.
    lineage, its `authority_context_sha256` and `enforcement_class` to equal the
    authority receipt, and input `authority_class` to equal that `enforcement_class`,
    which must be exactly `cooperative` or `protected`.
-6. Require input `disposition` and the Principal response disposition to match and
+6. Use `Receipt.read` to read exact `checkpoint_reservation_ref` from the canonical
+   AROS receipt store; require the immutable host-issued unused reservation to bind
+   exactly `planned_checkpoint_ref`, `idempotency_key`, `claim_package_path`,
+   `claim_package_hash_protocol`, `principal_decision_receipt_ref`,
+   `principal_authority_ref`, and `reservation_nonce`.
+7. Require reservation Principal decision and authority references to equal the
+   verified input references, its `planned_checkpoint_ref` and `idempotency_key` to be
+   unique and unused, and its package path and hash protocol to identify the exact
+   future `ClaimPackage`; reject an expired, consumed, replayed, or mismatched
+   reservation.
+8. Require input `disposition` and the Principal response disposition to match and
    to equal exactly one of `accept`, `narrow`, or `reject`; copy the disposition,
    rationale, and evidence references without changing them.
-7. Enumerate every material Reviewer objection, including every fatal and unresolved
+9. Enumerate every material Reviewer objection, including every fatal and unresolved
    objection, and map it one-to-one to an explicit Principal response.
-8. Require the Principal response to answer every material objection with exactly
+10. Require the Principal response to answer every material objection with exactly
    one disposition: `accept`, `narrow`, or `reject`; copy each answer, rationale,
    evidence reference, and scope effect without changing them.
-9. For disposition `accept` or `narrow`, construct `claim` and `scope` only from the
+11. For disposition `accept` or `narrow`, construct `claim` and `scope` only from the
    adjudicated wording and boundaries; never broaden the admitted result or repair
    it with new policy.
-10. For disposition `reject`, construct only a rejected adjudication package that
+12. For disposition `reject`, construct only a rejected adjudication package that
    records the rejected Claim draft and reasons; do not describe it as an admitted,
    supported, or scientific negative Claim.
-11. Describe a scientific negative Claim only when executed evidence explicitly
+13. Describe a scientific negative Claim only when executed evidence explicitly
    records a negative result and the Principal disposition `accept` or `narrow`
    admits that scoped negative Claim; rejection alone is never scientific evidence.
-12. Construct `evidence_refs` and `counterevidence` from the exact adjudicated evidence
+14. Construct `evidence_refs` and `counterevidence` from the exact adjudicated evidence
     and review references, preserving contrary observations, counterexamples, and
     executed negative results.
-13. Copy exact, bounded reproduction commands from `reproduction_ref` into
+15. Copy exact, bounded reproduction commands from `reproduction_ref` into
     `reproduction_commands`, derive `environment_ref` from matching preregistration,
     reproduction, and evidence receipts, and do not invent or execute a command.
-14. State limitations and `remaining_uncertainty` at the adjudicated scope, including
+16. State limitations and `remaining_uncertainty` at the adjudicated scope, including
     unresolved nonfatal objections and evidence that could change the conclusion.
-15. Populate `review_objections` with every material objection, its exact
+17. Populate `review_objections` with every material objection, its exact
     `review_ref`, its Principal disposition and `principal_response_ref`, and the
     resulting scope effect.
+18. Before checkpointing, write the complete `ClaimPackage` at the reserved
+    `claim_package_path`, set `checkpoint_ref` exactly to reserved
+    `planned_checkpoint_ref`, and serialize and hash it with the reserved
+    `claim_package_hash_protocol`.
 
 ## Output
 
@@ -109,8 +123,9 @@ performing admission or laundering rejection into evidence.
   matching `enforcement_class`; `cooperative` remains `cooperative`, and `protected`
   is permitted only when both exact canonical receipts say `protected`.
 - Environment and checkpoint binding: Set `environment_ref` to the exact matching
-  environment receipt and `checkpoint_ref` exactly to verified input
-  `principal_checkpoint_ref`.
+  environment receipt and `checkpoint_ref` exactly to reserved
+  `planned_checkpoint_ref`; never copy `principal_checkpoint_ref` into output
+  `checkpoint_ref`.
 - Evidence binding: Bind every evidence and counterevidence entry, limitation,
   uncertainty, reproduction command, and objection to its exact input reference.
 - Review traceability: Include every material review objection and its explicit
@@ -121,8 +136,9 @@ performing admission or laundering rejection into evidence.
 - Complete only after every exact input reference and cross-artifact lineage is
   verified, canonical Principal authority and decision receipts exactly bind and
   authorize issuer, actor, response, checkpoint, disposition, authority context, and
-  enforcement class, every material objection has an explicit Principal disposition,
-  no fatal objection remains unresolved, and all `ClaimPackage` fields are populated.
+  enforcement class, the checkpoint reservation is canonical, matching, and unused,
+  every material objection has an explicit Principal disposition, no fatal objection
+  remains unresolved, and all `ClaimPackage` fields are populated.
 - If any required reference is missing or cross-lineage,
   `principal_authority_ref` or `principal_decision_receipt_ref` is missing, unreadable,
   noncanonical, inline, or unbound, either receipt has an unknown field, decision
@@ -131,16 +147,23 @@ performing admission or laundering rejection into evidence.
   checkpoint does not bind the same response and lineage, any material objection is
   unanswered, or any fatal objection remains unresolved, do not emit or checkpoint a
   `ClaimPackage`; return incomplete for Principal adjudication.
+- If `checkpoint_reservation_ref` is missing, unreadable, noncanonical, expired,
+  consumed, or replayed, its decision or authority reference mismatches, its
+  `planned_checkpoint_ref` or `idempotency_key` is not unique and unused, or its
+  package path or hash protocol does not match the exact future `ClaimPackage`, do not
+  emit or checkpoint a `ClaimPackage`; return incomplete for a new host-issued
+  reservation.
 - For disposition `accept` or `narrow`, emit only the scoped admitted Claim that the
   verified Principal response authorizes.
 - For disposition `reject`, emit a rejected adjudication package and set
   `disposition` to `reject`; do not emit an admitted or supported Claim and do not
   convert rejection into a scientific negative result.
-- Only after adjudication, call `Research.checkpoint` with the complete package,
-  exact lineage and evidence references, `review_ref`, `principal_response_ref`,
-  `principal_authority_ref`, `principal_decision_receipt_ref`, preserved
-  `authority_class`, and `checkpoint_ref` set exactly to verified
-  `principal_checkpoint_ref`.
+- Only after writing the complete package with reserved `checkpoint_ref`, call
+  `Research.checkpoint` using the reservation `idempotency_key`, exact package path
+  and hash, lineage and evidence references, `review_ref`, `principal_response_ref`,
+  `principal_authority_ref`, `principal_decision_receipt_ref`, and preserved
+  `authority_class`; complete only if the returned `checkpoint_ref` equals reserved
+  `planned_checkpoint_ref` exactly.
 - Exit immediately after the successful checkpoint; do not continue the research
   session.
 
@@ -160,6 +183,12 @@ performing admission or laundering rejection into evidence.
 - Do not call cooperative authority protected, infer protected enforcement from a
   Principal label, or change `authority_class`; preserve the exact decision-receipt
   `enforcement_class`.
+- Do not copy `principal_checkpoint_ref` into output `checkpoint_ref`, invent or alter
+  a checkpoint reference or idempotency key, or checkpoint without the exact
+  host-issued `checkpoint_reservation_ref`.
+- Do not reuse or replay a consumed, expired, or mismatched checkpoint reservation or
+  accept a returned checkpoint reference that differs from reserved
+  `planned_checkpoint_ref`.
 - Do not launder disposition `reject` into an admitted, supported, or scientific
   negative Claim; rejection is an adjudication outcome, not scientific evidence.
 - Do not call a result scientifically negative unless exact executed evidence records

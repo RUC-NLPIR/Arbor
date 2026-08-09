@@ -33,6 +33,7 @@ from .records import (
     HEX64,
     NewRecordReceipt,
     ParetoMeasurement,
+    TraceWindow,
     canonical_decimal,
     deterministic_decimal_ratio,
     load_object,
@@ -42,6 +43,7 @@ from .records import (
 )
 from .r0_probes import fixed_time_run_argv, probe_build_flags
 from .scope import evaluate_scope
+from .oracle import scan_oracle_general
 from .portfolio_evidence import (
     BindingMutationError,
     FileBinding,
@@ -175,6 +177,8 @@ class TraceFacts:
     measured_request_bytes: int
     snapshot_mtime_ns: int
     snapshot_ctime_ns: int
+    audit_binding: FileBinding
+    audit: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -471,14 +475,45 @@ def _snapshot_trace(stage: Path, index: int, trace: TraceSpec) -> TraceFacts:
         digest.hexdigest(),
         stat.S_IMODE(before.st_mode),
     )
+    audit_root = stage / "oracle-audits" / f"{index:04d}"
+    audit_root.mkdir(parents=True, mode=0o700)
+    record = trace.record
+    window = TraceWindow(
+        trace_id=str(record["trace_id"]),
+        split=str(record["split"]),  # type: ignore[arg-type]
+        organization=str(record["organization"]),
+        application=str(record["application"]),
+        dataset=str(record["dataset"]),
+        provenance_url=str(record["provenance_url"]),
+        license_ref=str(record["license_ref"]),
+        path=snapshot_binding.path,
+        trace_type="oracleGeneral",
+        origin_sha256=str(record["origin_sha256"]),
+        start_request=int(record["start_request"]),
+        warmup_seconds=int(record["warmup_seconds"]),
+        max_requests=int(record["max_requests"]),
+        working_set_bytes=int(record["working_set_bytes"]),
+        sha256=snapshot_binding.sha256,
+        size_bytes=snapshot_binding.size_bytes,
+    )
+    audit = scan_oracle_general(window, audit_root)
+    frozen = record["diagnostics"]
+    if audit != frozen or audit.get("diagnostic_sha256") != record["diagnostic_sha256"]:
+        raise PortfolioError("private snapshot diagnostic differs from frozen manifest")
+    audit_record = dict(audit)
+    audit_binding = _write_owned_record(
+        audit_root / "diagnostic.json", audit_record, "diagnostic_sha256"
+    )
     return TraceFacts(
-        trace.record,
+        record,
         snapshot_binding,
         source_binding,
         measured_requests,
         measured_request_bytes,
         snapshot_metadata.st_mtime_ns,
         snapshot_metadata.st_ctime_ns,
+        audit_binding,
+        audit_record,
     )
 
 
@@ -719,6 +754,9 @@ def _validate_r0(
 def _evaluator_bindings() -> dict[str, FileBinding]:
     paths = {
         "portfolio_sha256": Path(__file__),
+        "portfolio_evidence_sha256": Path(__file__).with_name(
+            "portfolio_evidence.py"
+        ),
         "evaluate_sha256": Path(__file__).with_name("evaluate.py"),
         "records_sha256": Path(__file__).with_name("records.py"),
         "diagnostics_sha256": Path(__file__).with_name("diagnostics.py"),
@@ -880,6 +918,23 @@ def _copy_execution(stage: Path, source: FileBinding) -> FileBinding:
     if binding.size_bytes != source.size_bytes or binding.sha256 != source.sha256:
         raise PortfolioError("execution copy differs from the R0 binary snapshot")
     return binding
+
+
+def _snapshot_evaluator_dependencies(
+    stage: Path, dependencies: Mapping[str, FileBinding]
+) -> dict[str, FileBinding]:
+    root = stage / "evaluator-snapshots"
+    root.mkdir(mode=0o700)
+    snapshots: dict[str, FileBinding] = {}
+    for name, source in sorted(dependencies.items()):
+        destination = root / name
+        snapshot = _write_raw(destination, regular_bytes(source.path), 0o400)
+        if snapshot.size_bytes != source.size_bytes or snapshot.sha256 != source.sha256:
+            raise BindingMutationError(
+                f"evaluator dependency snapshot differs: {name}"
+            )
+        snapshots[name] = snapshot
+    return snapshots
 
 
 def _write_raw(path: Path, raw: bytes, mode: int) -> FileBinding:
@@ -1382,6 +1437,9 @@ def evaluate_portfolio(
             _snapshot_trace(stage, index, trace)
             for index, trace in enumerate(selected_traces)
         )
+        evaluator_snapshots = _snapshot_evaluator_dependencies(
+            stage, preflight.evaluator_bindings
+        )
         execution = _copy_execution(
             stage, preflight.artifact_bindings["release_cachesim"]
         )
@@ -1459,6 +1517,8 @@ def evaluate_portfolio(
             if phase_apparatus is not None
             else []
         )
+        retained_bindings.extend(trace.audit_binding for trace in selected_traces)
+        retained_bindings.extend(evaluator_snapshots.values())
         invalid_retained: set[tuple[Path, tuple[int, int]]] = set()
 
         def guard() -> None:
@@ -1678,6 +1738,10 @@ def evaluate_portfolio(
                     "evaluator": {
                         name: binding.sha256
                         for name, binding in sorted(preflight.evaluator_bindings.items())
+                    },
+                    "evaluator_snapshots": {
+                        name: snapshot.sha256
+                        for name, snapshot in sorted(evaluator_snapshots.items())
                     },
                     "argv": argv,
                     "process": process,
@@ -1911,12 +1975,30 @@ def evaluate_portfolio(
                     },
                     "snapshot_size_bytes": trace.binding.size_bytes,
                     "snapshot_sha256": trace.binding.sha256,
+                    "audit_path": str(trace.audit_binding.path.relative_to(stage)),
+                    "audit_identity": {
+                        "device": trace.audit_binding.identity[0],
+                        "inode": trace.audit_binding.identity[1],
+                    },
+                    "audit_sha256": trace.audit["diagnostic_sha256"],
                 }
                 for trace in selected_traces
             ],
             "evaluator": {
                 name: binding.sha256
                 for name, binding in sorted(preflight.evaluator_bindings.items())
+            },
+            "evaluator_snapshots": {
+                name: {
+                    "path": str(snapshot.path.relative_to(stage)),
+                    "identity": {
+                        "device": snapshot.identity[0],
+                        "inode": snapshot.identity[1],
+                    },
+                    "size_bytes": snapshot.size_bytes,
+                    "sha256": snapshot.sha256,
+                }
+                for name, snapshot in sorted(evaluator_snapshots.items())
             },
             "host": {
                 "platform": platform.platform(),

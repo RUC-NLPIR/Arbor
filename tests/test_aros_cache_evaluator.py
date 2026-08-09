@@ -626,7 +626,10 @@ def test_trace_snapshot_streams_large_input_with_bounded_memory(tmp_path: Path) 
             "denominator": request_count,
         },
         "reuse_distance": {
-            "bin_convention": "fixture",
+            "bin_convention": (
+                "1-based next_access_vtime distance d; "
+                "bin k counts 2^k <= d < 2^(k+1)"
+            ),
             "counts": {},
             "no_next_count": request_count,
         },
@@ -663,6 +666,9 @@ def test_trace_snapshot_streams_large_input_with_bounded_memory(tmp_path: Path) 
     assert facts.measured_requests == request_count - 2
     assert facts.binding.sha256 == digest.hexdigest()
     assert peak < 6 * 1024 * 1024
+    assert [path.name for path in facts.audit_binding.path.parent.iterdir()] == [
+        "diagnostic.json"
+    ]
 
 
 def portfolio_manifest(path: Path, trace_root: Path, commit: str) -> tuple[Path, list[str]]:
@@ -682,7 +688,10 @@ def portfolio_manifest(path: Path, trace_root: Path, commit: str) -> tuple[Path,
             "one_hit_object_fraction": {"numerator": 0, "denominator": 10},
             "one_hit_request_fraction": {"numerator": 0, "denominator": 162},
             "reuse_distance": {
-                "bin_convention": "fixture",
+                "bin_convention": (
+                    "1-based next_access_vtime distance d; "
+                    "bin k counts 2^k <= d < 2^(k+1)"
+                ),
                 "counts": {"3": 152},
                 "no_next_count": 10,
             },
@@ -1096,6 +1105,38 @@ def test_r0_dependency_mutation_cannot_wait_for_next_cell_to_restore(
     assert receipt["provenance"]["final_binding_intact"] is False
 
 
+def test_portfolio_evidence_dependency_mutation_is_sticky_between_cells(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    dependency = Path(portfolio_evidence_module.__file__)
+    original = dependency.read_bytes()
+
+    class RestoreOnSecondCell(PortfolioRun):
+        def __call__(self, *args: object, **kwargs: object) -> ChildResult:
+            argv = args[0]
+            assert isinstance(argv, list)
+            prior = sum(portfolio_program(item) == "cachesim" for item in self.argv)
+            if portfolio_program(argv) == "cachesim" and prior == 1:
+                dependency.write_bytes(original)
+            result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
+            if portfolio_program(argv) == "cachesim" and prior == 0:
+                dependency.write_bytes(b"temporary evidence dependency replacement\n")
+            return result
+
+    runner = RestoreOnSecondCell()
+    inputs["run"] = runner
+    try:
+        receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    finally:
+        dependency.write_bytes(original)
+    assert len(runner.argv) == 1
+    assert receipt["measurements"] == []
+    assert receipt["provenance"]["final_binding_intact"] is False
+    root = json.loads((inputs["output"] / "receipt.json").read_text())
+    assert "portfolio_evidence_sha256" in root["evaluator"]
+
+
 def test_nonzero_process_has_process_and_failure_receipts_but_no_measurement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1335,6 +1376,54 @@ def test_manifest_rehashed_but_inconsistent_frozen_diagnostics_are_rejected(
     with pytest.raises(ValueError, match="one-hit"):
         evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     assert runner.argv == []
+
+
+@pytest.mark.parametrize("mutation", ["working_set", "one_hit", "reuse"])
+def test_private_snapshot_oracle_audit_rejects_rehashed_frozen_fact_forgery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    inputs, runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    path = inputs["task_manifest"]
+    value = json.loads(path.read_text())
+    trace = value["traces"][0]
+    diagnostic = trace["diagnostics"]
+    if mutation == "working_set":
+        trace["working_set_bytes"] += 1
+        diagnostic["working_set_bytes"] += 1
+    elif mutation == "one_hit":
+        diagnostic["one_hit_object_fraction"]["numerator"] = 1
+        diagnostic["one_hit_request_fraction"]["numerator"] = 1
+    else:
+        diagnostic["reuse_distance"]["counts"] = {"2": 152}
+    diagnostic["diagnostic_sha256"] = record_sha256(
+        diagnostic, "diagnostic_sha256"
+    )
+    trace["diagnostic_sha256"] = diagnostic["diagnostic_sha256"]
+    value["manifest_sha256"] = record_sha256(value, "manifest_sha256")
+    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
+    with pytest.raises(ValueError, match="diagnostic|working set"):
+        evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert runner.argv == []
+
+
+def test_oracle_audit_runs_once_per_selected_snapshot_not_per_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    real_scan = portfolio_module.scan_oracle_general
+    trace_ids: list[str] = []
+
+    def counted_scan(*args: object, **kwargs: object) -> dict[str, object]:
+        trace = args[0]
+        trace_ids.append(trace.trace_id)  # type: ignore[attr-defined]
+        return real_scan(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(portfolio_module, "scan_oracle_general", counted_scan)
+    receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert len(receipt["measurements"]) == 9
+    assert trace_ids == ["dev-0", "dev-1", "dev-2"]
 
 
 def test_retained_raw_mutation_aborts_before_following_launch(

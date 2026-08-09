@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         result = {
             "state": receipt["state"],
-            "receipt_path": str(args.output.absolute() / "receipt.json"),
+            "receipt_path": receipt["final_receipt_path"],
             "receipt_sha256": receipt["receipt_sha256"],
         }
         sys.stdout.buffer.write(canonical_bytes(result) + b"\n")

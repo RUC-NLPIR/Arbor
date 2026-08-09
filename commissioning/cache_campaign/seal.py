@@ -7,27 +7,44 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .cachesim import run_child
-from .calibration_evidence import BoundCalibration, load_bound_calibration
+from .calibration_evidence import (
+    _R0_EVALUATOR_KEYS,
+    BoundCalibration,
+    _R0Input,
+    _validate_r2,
+    load_bound_calibration,
+)
 from .constraints import compare_transfer_constraints, validate_calibration
 from .evidence import (
     BoundJSONObject,
     _strict_parse_json_bytes,
+    cleanup_owned,
     read_bound_json_object,
     revalidate_checkout,
 )
 from .portfolio import (
+    _MANIFEST_KEYS,
     Preflight,
+    _artifact_binding,
     Run,
     _evaluate_temporal_portfolio,
     _preflight,
+    _strict_object,
+    _validate_trace_record,
 )
-from .portfolio_evidence import FileBinding, file_binding, revalidate_file
+from .portfolio_evidence import (
+    FileBinding,
+    copy_verified_input,
+    file_binding,
+    revalidate_file,
+)
 from .records import (
     HEX64,
     ParetoMeasurement,
@@ -106,11 +123,52 @@ class SealError(ValueError):
     pass
 
 
+def _authority_id(package: Mapping[str, object]) -> str:
+    raw = (
+        str(package["frozen_commit"])
+        + str(package["r3_commitment_sha256"])
+        + str(package["candidate_commit"])
+        + "/"
+        + str(package["policy"])
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _canonical_authority_paths(
+    package: Mapping[str, object], host_manifest: Path
+) -> tuple[Path, Path]:
+    del host_manifest
+    authority = _authority_id(package)
+    parent = Path(str(package["project"])).resolve(strict=True).parent
+    return (
+        parent / f"r3-{authority}.consumed.json",
+        parent / f"r3-{authority}.receipt.json",
+    )
+
+
 @dataclass(frozen=True)
 class ProjectBinding:
     path: Path
     head: str
     tree: str
+
+
+@dataclass(frozen=True)
+class StickyBinding:
+    file: FileBinding
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True)
+class PrivateInputSnapshot:
+    root: Path
+    root_identity: tuple[int, int]
+    manifest: dict[str, object]
+    manifest_binding: FileBinding
+    trace_bindings: tuple[FileBinding, ...]
+    source_manifest: StickyBinding
+    source_traces: tuple[StickyBinding, ...]
 
 
 @dataclass(frozen=True)
@@ -122,12 +180,16 @@ class FrozenInputs:
     host_manifest: dict[str, object]
     host_binding: FileBinding
     calibration: BoundCalibration
+    reproduction_r2: object
     preflight: Preflight
     trace_bindings: tuple[FileBinding, ...]
     contract: dict[str, object]
     contract_binding: FileBinding
     r3_evaluator_bindings: dict[str, FileBinding]
+    private_snapshot: PrivateInputSnapshot
+    authority_id: str
     ledger: Path
+    final_receipt: Path
     output: Path
 
 
@@ -293,14 +355,41 @@ def _git_refs(
     return raw_by_field, hashes
 
 
-def _contains_hash(value: object, field: str, expected: str) -> bool:
-    if isinstance(value, Mapping):
-        if value.get(field) == expected:
-            return True
-        return any(_contains_hash(item, field, expected) for item in value.values())
-    if isinstance(value, list):
-        return any(_contains_hash(item, field, expected) for item in value)
-    return False
+def _require_frozen_worktree_blob(
+    project: ProjectBinding, path: Path, binding: FileBinding, label: str
+) -> None:
+    try:
+        relative = binding.path.relative_to(project.path).as_posix()
+    except ValueError as error:
+        raise SealError(f"{label} must be inside the frozen project") from error
+    listing = _git(
+        project.path,
+        "ls-tree",
+        "-z",
+        project.head,
+        "--",
+        relative,
+        binary=True,
+    )
+    assert isinstance(listing, bytes)
+    records = [item for item in listing.split(b"\0") if item]
+    if len(records) != 1:
+        raise SealError(f"{label} is not present at frozen_commit")
+    try:
+        metadata, raw_path = records[0].split(b"\t", 1)
+        mode, kind, oid = metadata.split(b" ", 2)
+    except ValueError as error:
+        raise SealError(f"{label} Git entry is malformed") from error
+    raw = _git(project.path, "cat-file", "blob", oid.decode("ascii"), binary=True)
+    assert isinstance(raw, bytes)
+    if (
+        mode not in {b"100644", b"100755"}
+        or kind != b"blob"
+        or raw_path != os.fsencode(relative)
+        or hashlib.sha256(raw).hexdigest() != binding.sha256
+        or len(raw) != binding.size_bytes
+    ):
+        raise SealError(f"{label} differs from its frozen Git blob")
 
 
 def _validate_reproduction(raw: bytes, expected_r2: str) -> Mapping[str, object]:
@@ -310,16 +399,179 @@ def _validate_reproduction(raw: bytes, expected_r2: str) -> Mapping[str, object]
         raise SealError("reproduction_ref must be a JSON Git blob") from error
     if not isinstance(value, dict):
         raise SealError("reproduction_ref must contain a JSON object")
-    full_r2 = value.get("rung") == "r2" and value.get("receipt_sha256") == expected_r2
-    if full_r2 and record_sha256(value, "receipt_sha256") != expected_r2:
-        raise SealError("reproduction R2 receipt self-hash mismatch")
-    if not full_r2 and not _contains_hash(value, "r2_receipt_sha256", expected_r2):
-        raise SealError("reproduction_ref does not bind the exact R2 receipt")
+    if set(value) != {
+        "schema_version",
+        "r2_receipt_path",
+        "r2_receipt_sha256",
+    }:
+        raise SealError("reproduction_ref descriptor keys mismatch")
+    r2_path = value.get("r2_receipt_path")
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or type(r2_path) is not str
+        or not Path(r2_path).is_absolute()
+        or value.get("r2_receipt_sha256") != expected_r2
+    ):
+        raise SealError("reproduction_ref descriptor binding mismatch")
     return value
+
+
+def _validate_candidate_r2(
+    descriptor: Mapping[str, object],
+    *,
+    project: ProjectBinding,
+    package: Mapping[str, object],
+    preflight: Preflight,
+) -> object:
+    raw_r2_path = Path(str(descriptor["r2_receipt_path"]))
+    r2_path = raw_r2_path.resolve(strict=True)
+    if raw_r2_path.is_symlink() or str(r2_path) != str(raw_r2_path):
+        raise SealError("candidate R2 receipt path is not canonical")
+    _external_input(r2_path, project.path, "candidate R2 evidence")
+    receipt, _binding_value, _raw = _strict_object(r2_path, "receipt_sha256")
+    if receipt.get("receipt_sha256") != package["r2_receipt_sha256"]:
+        raise SealError("candidate R2 receipt differs from frozen package")
+    manifest_value = receipt.get("task_manifest_path")
+    if type(manifest_value) is not str:
+        raise SealError("candidate R2 task manifest path is invalid")
+    manifest_path = Path(manifest_value)
+    manifest, manifest_binding, _manifest_raw = _strict_object(
+        manifest_path, "manifest_sha256"
+    )
+    _require_frozen_worktree_blob(
+        project, manifest_path, manifest_binding, "candidate R2 task manifest"
+    )
+    if set(manifest) != _MANIFEST_KEYS:
+        raise SealError("candidate R2 task manifest keys mismatch")
+    if manifest.get("r3_commitment_sha256") != package["r3_commitment_sha256"]:
+        raise SealError("candidate R2 task manifest commitment differs")
+    raw_traces = manifest.get("traces")
+    if not isinstance(raw_traces, list):
+        raise SealError("candidate R2 task manifest traces are invalid")
+    traces = tuple(
+        _validate_trace_record(item, str(manifest["source_commit"]))
+        for item in raw_traces
+    )
+    r0 = _R0Input(
+        preflight.r0_binding.path,
+        preflight.r0,
+        preflight.r0_binding,
+        preflight.source,
+        preflight.artifact_bindings,
+        preflight.artifact_bindings,
+        {},
+    )
+    validated = _validate_r2(
+        r2_path,
+        manifest=manifest,
+        manifest_binding=manifest_binding,
+        traces=traces,
+        r0=r0,
+    )
+    evaluator = {
+        name: binding.sha256
+        for name, binding in sorted(preflight.evaluator_bindings.items())
+    }
+    if (
+        validated.receipt.get("receipt_sha256") != package["r2_receipt_sha256"]
+        or validated.receipt.get("task_root") != str(project.path)
+        or validated.receipt.get("candidate_commit") != package["candidate_commit"]
+        or validated.receipt.get("policy") != package["policy"]
+        or validated.receipt.get("r0_receipt_sha256")
+        != package["r0_receipt_sha256"]
+        or validated.receipt.get("source_receipt_sha256")
+        != preflight.source.get("receipt_sha256")
+        or validated.receipt.get("evaluator") != evaluator
+    ):
+        raise SealError("candidate R2 frozen evidence binding mismatch")
+    return validated
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
+
+
+def _sticky_binding(binding: FileBinding) -> StickyBinding:
+    metadata = binding.path.stat(follow_symlinks=False)
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != binding.identity
+        or metadata.st_size != binding.size_bytes
+    ):
+        raise SealError("private source binding changed")
+    return StickyBinding(binding, metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def _revalidate_sticky(binding: StickyBinding) -> None:
+    metadata = binding.file.path.stat(follow_symlinks=False)
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != binding.file.identity
+        or metadata.st_size != binding.file.size_bytes
+        or stat.S_IMODE(metadata.st_mode) != binding.file.mode
+        or metadata.st_mtime_ns != binding.mtime_ns
+        or metadata.st_ctime_ns != binding.ctime_ns
+    ):
+        raise SealError("private source binding changed after snapshot")
+
+
+def _snapshot_private_inputs(
+    *,
+    authority: str,
+    host_parent: Path,
+    manifest: Mapping[str, object],
+    manifest_binding: FileBinding,
+    traces: tuple[object, ...],
+) -> PrivateInputSnapshot:
+    root = Path(
+        tempfile.mkdtemp(prefix=f".r3-{authority}-inputs-", dir=host_parent)
+    )
+    metadata = root.lstat()
+    root_identity = (metadata.st_dev, metadata.st_ino)
+    try:
+        trace_root = root / "traces"
+        trace_root.mkdir(mode=0o700)
+        snapshots: list[FileBinding] = []
+        snapshot_records: list[dict[str, object]] = []
+        sticky_traces: list[StickyBinding] = []
+        for index, trace in enumerate(traces):
+            record = trace.record  # type: ignore[attr-defined]
+            copied = copy_verified_input(
+                trace.path,  # type: ignore[attr-defined]
+                trace_root / f"{index:04d}.oracleGeneral",
+                expected_sha256=str(record["sha256"]),
+                expected_size=int(record["size_bytes"]),
+                destination_mode=0o400,
+            )
+            snapshots.append(copied.snapshot)
+            sticky_traces.append(_sticky_binding(copied.source))
+            snapshot_record = dict(record)
+            snapshot_record["path"] = str(copied.snapshot.path)
+            snapshot_records.append(snapshot_record)
+        snapshot_manifest: dict[str, object] = {
+            "schema_version": manifest["schema_version"],
+            "source_commit": manifest["source_commit"],
+            "cache_fractions": manifest["cache_fractions"],
+            "traces": snapshot_records,
+        }
+        write_new_record(
+            root / "r3.json", snapshot_manifest, "manifest_sha256"
+        )
+        snapshot_manifest_binding = file_binding(root / "r3.json")
+        return PrivateInputSnapshot(
+            root,
+            root_identity,
+            snapshot_manifest,
+            snapshot_manifest_binding,
+            tuple(snapshots),
+            _sticky_binding(manifest_binding),
+            tuple(sticky_traces),
+        )
+    except BaseException:
+        cleanup_owned(root, root_identity)
+        raise
 
 
 def _external_input(path: Path, project: Path, label: str) -> None:
@@ -368,7 +620,15 @@ def _scan_task(
     project: ProjectBinding,
     package_raw: bytes,
     identities: tuple[bytes, ...],
+    private_blobs: tuple[FileBinding, ...] = (),
 ) -> None:
+    private_hashes = {
+        (binding.sha256, binding.size_bytes) for binding in private_blobs
+    }
+
+    def exact_private_blob(raw: bytes) -> bool:
+        return (hashlib.sha256(raw).hexdigest(), len(raw)) in private_hashes
+
     if _find_leak(package_raw, identities):
         raise SealError("frozen package leaks an R3 identity or path")
     for root, directories, files in os.walk(project.path, followlinks=False):
@@ -390,7 +650,7 @@ def _scan_task(
                     continue
             except OSError as error:
                 raise SealError("task tree changed during R3 leak scan") from error
-            if _find_leak(raw, identities):
+            if _find_leak(raw, identities) or exact_private_blob(raw):
                 raise SealError("task tree leaks an R3 identity or path")
     listing = _git(project.path, "ls-tree", "-r", "-z", project.head, binary=True)
     assert isinstance(listing, bytes)
@@ -406,34 +666,14 @@ def _scan_task(
             continue
         raw = _git(project.path, "cat-file", "blob", oid.decode("ascii"), binary=True)
         assert isinstance(raw, bytes)
-        if _find_leak(raw, identities):
+        if _find_leak(raw, identities) or exact_private_blob(raw):
             raise SealError("frozen Git blob leaks an R3 identity or path")
-
-
-def _scientific_hashes(preflight: Preflight) -> dict[str, str]:
-    artifacts = preflight.artifact_bindings
-    result = {
-        "fixed_time_interposer": artifacts[
-            "validated_fixed_time_interposer_binary"
-        ].sha256,
-        "release_archive": artifacts["release_archive"].sha256,
-        "release_cmake_cache": artifacts["release_cmake_cache"].sha256,
-    }
-    result.update(
-        {
-            f"header:{relative}": digest
-            for relative, _mode, digest in preflight.checkout_binding.tracked
-            if relative.startswith("libCacheSim/include/")
-            or relative == "libCacheSim/bin/cachesim/cache_init.h"
-        }
-    )
-    return dict(sorted(result.items()))
 
 
 def _validate_calibration(
     bound: BoundCalibration,
     preflight: Preflight,
-    reproduction: Mapping[str, object],
+    reproduction_r2: object,
 ) -> None:
     validated = validate_calibration(bound.record)
     del validated
@@ -442,6 +682,29 @@ def _validate_calibration(
         name: binding.sha256
         for name, binding in sorted(preflight.evaluator_bindings.items())
     }
+    calibration_evaluator = record.get("evaluator_sha256s")
+    candidate_evaluator = preflight.r0.get("evaluator")
+    if not isinstance(calibration_evaluator, dict) or not isinstance(
+        candidate_evaluator, dict
+    ) or set(candidate_evaluator) != _R0_EVALUATOR_KEYS:
+        raise SealError("candidate/calibration evaluator projection is missing")
+    for name, digest in candidate_evaluator.items():
+        if (
+            name not in evaluator
+            or digest != evaluator[name]
+            or calibration_evaluator.get(name) != digest
+        ):
+            raise SealError("candidate/calibration evaluator projection differs")
+        artifacts = preflight.r0.get("artifact_snapshots")
+        if not isinstance(artifacts, dict):
+            raise SealError("candidate R0 evaluator artifacts are missing")
+        artifact = _artifact_binding(
+            preflight.r0_root,
+            artifacts,
+            f"evaluator_{name.removesuffix('_sha256')}",
+        )
+        if artifact.sha256 != digest:
+            raise SealError("candidate R0 evaluator artifact differs")
     host = {
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -450,17 +713,17 @@ def _validate_calibration(
     if (
         record.get("source_receipt_sha256") != preflight.source.get("receipt_sha256")
         or record.get("source_commit") != preflight.manifest.get("source_commit")
-        or record.get("binary_sha256")
-        != preflight.artifact_bindings["release_cachesim"].sha256
-        or record.get("evaluator_sha256s") != evaluator
-        or record.get("scientific_input_sha256s") != _scientific_hashes(preflight)
+        or calibration_evaluator != evaluator
         or record.get("host_fingerprint") != host
     ):
         raise SealError("calibration differs from the exact R3 apparatus")
-    if "task_manifest_sha256" in reproduction and (
-        reproduction["task_manifest_sha256"] != record.get("task_manifest_sha256")
+    r2_receipt = reproduction_r2.receipt  # type: ignore[attr-defined]
+    if (
+        r2_receipt.get("task_manifest_sha256")
+        != record.get("task_manifest_sha256")
+        or r2_receipt.get("host") != record.get("host_fingerprint")
     ):
-        raise SealError("R2 reproduction and calibration manifest bindings differ")
+        raise SealError("R2 reproduction and calibration bindings differ")
 
 
 def _prevalidate(
@@ -474,6 +737,7 @@ def _prevalidate(
     ledger: Path,
     output: Path,
 ) -> FrozenInputs:
+    private_snapshot: PrivateInputSnapshot | None = None
     try:
         package_bound = read_bound_json_object(frozen_package, max_bytes=1024 * 1024)
         package = load_frozen_package(package_bound.value)
@@ -512,13 +776,48 @@ def _prevalidate(
             calibration, expected_calibration_sha256=calibration_expected
         )
         _external_input(bound_calibration.path, project.path, "calibration")
-        ledger_path = _new_path(ledger, project.path, "ledger")
+        authority = _authority_id(package)
+        canonical_ledger, final_receipt = _canonical_authority_paths(
+            package, host_binding.path
+        )
+        supplied_ledger = Path(ledger).absolute().resolve(strict=False)
+        if os.path.lexists(canonical_ledger):
+            raise SealError("R3 ledger is already consumed")
+        if supplied_ledger != canonical_ledger:
+            raise SealError("ledger path does not match the canonical R3 authority")
+        ledger_path = _new_path(canonical_ledger, project.path, "ledger")
+        final_receipt = _new_path(final_receipt, project.path, "final receipt")
         output_path = _new_path(output, project.path, "output")
         if _paths_overlap(ledger_path, output_path):
             raise SealError("ledger and output paths must not overlap")
+        raw_traces = host.get("traces")
+        if not isinstance(raw_traces, list):
+            raise SealError("host R3 manifest traces are invalid")
+        host_traces = tuple(
+            _validate_trace_record(
+                item,
+                str(host["source_commit"]),
+                allowed_splits=frozenset({"r3"}),
+            )
+            for item in raw_traces
+        )
+        if not host_traces or len(
+            {item.record["trace_id"] for item in host_traces}
+        ) != len(host_traces):
+            raise SealError("host R3 manifest trace IDs are invalid")
+        private_snapshot = _snapshot_private_inputs(
+            authority=authority,
+            host_parent=ledger_path.parent,
+            manifest=host,
+            manifest_binding=host_binding,
+            traces=host_traces,
+        )
+        trace_bindings = [
+            sticky.file for sticky in private_snapshot.source_traces
+        ]
         preflight = _preflight(
             task_root=project.path,
-            task_manifest=host_binding.path,
+            task_manifest=private_snapshot.manifest_binding.path,
             checkout=checkout,
             candidate=str(package["candidate_commit"]),
             policy=str(package["policy"]),
@@ -541,25 +840,32 @@ def _prevalidate(
             or preflight.r0.get("contract_sha256") != package["policy_contract_sha256"]
         ):
             raise SealError("candidate R0, diff, or contract binding mismatch")
+        _git(
+            preflight.checkout,
+            "merge-base",
+            "--is-ancestor",
+            str(preflight.r0["base_commit"]),
+            str(package["candidate_commit"]),
+        )
+        reproduction_r2 = _validate_candidate_r2(
+            reproduction,
+            project=project,
+            package=package,
+            preflight=preflight,
+        )
         contract_path = preflight.checkout / "commissioning/cache_policy_contract.json"
         contract_bound = read_bound_json_object(contract_path, max_bytes=65_536)
         contract_binding = _binding(contract_bound)
         if contract_binding.sha256 != package["policy_contract_sha256"]:
             raise SealError("policy contract bytes differ from frozen package")
-        trace_bindings: list[FileBinding] = []
-        for trace in preflight.traces:
-            trace_binding = file_binding(trace.path)
+        for trace_binding in trace_bindings:
             _external_input(trace_binding.path, project.path, "R3 trace")
-            if trace_binding.sha256 != trace.record.get(
-                "sha256"
-            ) or trace_binding.size_bytes != trace.record.get("size_bytes"):
-                raise SealError("R3 trace bytes differ from host manifest")
-            trace_bindings.append(trace_binding)
         protected_paths = (
             host_binding.path,
             bound_calibration.path,
             preflight.source_binding.path,
             preflight.r0_root,
+            reproduction_r2.binding.path.parent,  # type: ignore[attr-defined]
             preflight.checkout,
             *(binding.path for binding in trace_bindings),
         )
@@ -569,9 +875,31 @@ def _prevalidate(
             for protected in protected_paths
         ):
             raise SealError("ledger or output overlaps an immutable R3 input")
+        observed_calibration = file_binding(
+            bound_calibration.path, expected_mode=bound_calibration.mode
+        )
+        if (
+            observed_calibration.identity != bound_calibration.identity
+            or observed_calibration.size_bytes != bound_calibration.size_bytes
+            or observed_calibration.sha256 != bound_calibration.file_sha256
+        ):
+            raise SealError("calibration path binding changed")
         identities = _private_identities(host)
-        _scan_task(project, package_bound.raw, identities)
-        _validate_calibration(bound_calibration, preflight, reproduction)
+        _scan_task(
+            project,
+            package_bound.raw,
+            identities,
+            (
+                host_binding,
+                observed_calibration,
+                preflight.source_binding,
+                preflight.r0_binding,
+                reproduction_r2.binding,  # type: ignore[attr-defined]
+                *preflight.artifact_bindings.values(),
+                *trace_bindings,
+            ),
+        )
+        _validate_calibration(bound_calibration, preflight, reproduction_r2)
         r3_evaluator_bindings = {
             "seal_sha256": file_binding(Path(__file__)),
             "constraints_sha256": file_binding(
@@ -585,27 +913,23 @@ def _prevalidate(
             ),
         }
         revalidate_file(package_binding)
-        revalidate_file(host_binding)
         revalidate_file(contract_binding)
         revalidate_file(preflight.source_binding)
         revalidate_file(preflight.r0_binding)
-        observed_calibration = file_binding(
-            bound_calibration.path, expected_mode=bound_calibration.mode
-        )
-        if (
-            observed_calibration.identity != bound_calibration.identity
-            or observed_calibration.size_bytes != bound_calibration.size_bytes
-            or observed_calibration.sha256 != bound_calibration.file_sha256
-        ):
-            raise SealError("calibration path binding changed")
+        revalidate_file(reproduction_r2.binding)  # type: ignore[attr-defined]
         for binding in [
             *preflight.artifact_bindings.values(),
             *preflight.evaluator_bindings.values(),
-            *trace_bindings,
+            private_snapshot.manifest_binding,
+            *private_snapshot.trace_bindings,
             *r3_evaluator_bindings.values(),
         ]:
             revalidate_file(binding)
         revalidate_checkout(preflight.checkout, preflight.checkout_binding)
+        _project_binding(project.path, project.head)
+        _revalidate_sticky(private_snapshot.source_manifest)
+        for sticky in private_snapshot.source_traces:
+            _revalidate_sticky(sticky)
         _project_binding(project.path, project.head)
         return FrozenInputs(
             package,
@@ -615,17 +939,25 @@ def _prevalidate(
             host,
             host_binding,
             bound_calibration,
+            reproduction_r2,
             preflight,
             tuple(trace_bindings),
             contract_bound.value,
             contract_binding,
             r3_evaluator_bindings,
+            private_snapshot,
+            authority,
             ledger_path,
+            final_receipt,
             output_path,
         )
     except SealError:
+        if private_snapshot is not None and os.path.lexists(private_snapshot.root):
+            cleanup_owned(private_snapshot.root, private_snapshot.root_identity)
         raise
     except (OSError, TypeError, ValueError, subprocess.SubprocessError) as error:
+        if private_snapshot is not None and os.path.lexists(private_snapshot.root):
+            cleanup_owned(private_snapshot.root, private_snapshot.root_identity)
         raise SealError(str(error)) from error
 
 
@@ -676,6 +1008,8 @@ def _ledger_record(inputs: FrozenInputs) -> dict[str, object]:
     return {
         "schema_version": 1,
         "state": "consumed",
+        "authority_id": inputs.authority_id,
+        "final_receipt_path": str(inputs.final_receipt),
         "requested_at_unix_ns": time.time_ns(),
         "frozen_package_file_sha256": inputs.package_binding.sha256,
         "frozen_commit": package["frozen_commit"],
@@ -695,6 +1029,7 @@ def _ledger_record(inputs: FrozenInputs) -> dict[str, object]:
         "candidate_r0_receipt_sha256": package["r0_receipt_sha256"],
         "candidate_r0_file_sha256": inputs.preflight.r0_binding.sha256,
         "r2_receipt_sha256": package["r2_receipt_sha256"],
+        "r2_receipt_file_sha256": inputs.reproduction_r2.binding.sha256,  # type: ignore[attr-defined]
         "binary_sha256": inputs.preflight.artifact_bindings["release_cachesim"].sha256,
         "r3_evaluator_sha256s": {
             name: binding.sha256
@@ -705,6 +1040,14 @@ def _ledger_record(inputs: FrozenInputs) -> dict[str, object]:
             for name, binding in sorted(inputs.preflight.evaluator_bindings.items())
         },
         "trace_sha256s": [binding.sha256 for binding in inputs.trace_bindings],
+        "private_snapshot": {
+            "root": str(inputs.private_snapshot.root),
+            "manifest_sha256": inputs.private_snapshot.manifest_binding.sha256,
+            "trace_sha256s": [
+                binding.sha256
+                for binding in inputs.private_snapshot.trace_bindings
+            ],
+        },
     }
 
 
@@ -791,10 +1134,13 @@ def _write_final_receipt(
         "receipt_version": 1,
         "rung": "r3",
         "state": state,
+        "authority_id": inputs.authority_id,
+        "final_receipt_path": str(inputs.final_receipt),
         "frozen_commit": inputs.package["frozen_commit"],
         "candidate_commit": inputs.package["candidate_commit"],
         "candidate_tree": inputs.preflight.checkout_binding.tree,
         "policy": inputs.package["policy"],
+        "output_path": str(inputs.output),
         "ledger_path": str(inputs.ledger),
         "ledger_sha256": ledger["ledger_sha256"],
         "ledger_file_sha256": ledger_file_sha256,
@@ -823,7 +1169,7 @@ def _write_final_receipt(
         "constraints": constraints,
     }
     _assert_factual(receipt)
-    write_new_record(inputs.output / "receipt.json", receipt, "receipt_sha256")
+    write_new_record(inputs.final_receipt, receipt, "receipt_sha256")
     return receipt
 
 
@@ -851,21 +1197,30 @@ def run_r3(
         ledger,
         output,
     )
-    ledger_record, ledger_file_sha256 = _consume_ledger(
-        inputs.ledger, _ledger_record(inputs)
-    )
+    try:
+        ledger_record, ledger_file_sha256 = _consume_ledger(
+            inputs.ledger, _ledger_record(inputs)
+        )
+    except BaseException:
+        if os.path.lexists(inputs.private_snapshot.root):
+            cleanup_owned(
+                inputs.private_snapshot.root,
+                inputs.private_snapshot.root_identity,
+            )
+        raise
     started_at = time.time_ns()
-    inputs.output.mkdir(mode=0o700)
-    _fsync_parent(inputs.output)
     portfolio_receipt: dict[str, object] | None = None
     measurements: list[dict[str, object]] = []
     constraints: list[dict[str, object]] = []
     failures: list[dict[str, object]] = []
     state = "process_failed"
     try:
+        inputs.output.mkdir(mode=0o700)
+        inputs.output.chmod(0o700)
+        _fsync_parent(inputs.output)
         portfolio_receipt = _evaluate_temporal_portfolio(
             task_root=inputs.project.path,
-            host_manifest=inputs.host_binding.path,
+            host_manifest=inputs.private_snapshot.manifest_binding.path,
             checkout=inputs.preflight.checkout,
             candidate=str(inputs.package["candidate_commit"]),
             policy=str(inputs.package["policy"]),
@@ -890,13 +1245,11 @@ def run_r3(
             if not failures and len(measurements) == len(expected_cells) * 3
             else "process_failed"
         )
-    except (
-        OSError,
-        TypeError,
-        ValueError,
-        RuntimeError,
-        subprocess.SubprocessError,
-    ) as error:
+        _revalidate_sticky(inputs.private_snapshot.source_manifest)
+        for sticky in inputs.private_snapshot.source_traces:
+            _revalidate_sticky(sticky)
+        _project_binding(inputs.project.path, inputs.project.head)
+    except BaseException as error:
         failures.append(
             {
                 "kind": "evaluation_failure",
@@ -904,17 +1257,35 @@ def run_r3(
                 "error": " ".join(str(error).split())[:512],
             }
         )
-    _project_binding(inputs.project.path, inputs.project.head)
-    receipt = _write_final_receipt(
-        inputs,
-        ledger_record,
-        ledger_file_sha256,
-        started_at=started_at,
-        state=state,
-        portfolio_receipt=portfolio_receipt,
-        measurements=measurements,
-        failures=failures,
-        constraints=constraints,
-    )
-    _project_binding(inputs.project.path, inputs.project.head)
-    return receipt
+        state = "process_failed"
+    try:
+        return _write_final_receipt(
+            inputs,
+            ledger_record,
+            ledger_file_sha256,
+            started_at=started_at,
+            state=state,
+            portfolio_receipt=portfolio_receipt,
+            measurements=measurements,
+            failures=failures,
+            constraints=constraints,
+        )
+    except BaseException as error:
+        failures.append(
+            {
+                "kind": "receipt_publication_failure",
+                "state": "process_failed",
+                "error": " ".join(str(error).split())[:512],
+            }
+        )
+        return _write_final_receipt(
+            inputs,
+            ledger_record,
+            ledger_file_sha256,
+            started_at=started_at,
+            state="process_failed",
+            portfolio_receipt=portfolio_receipt,
+            measurements=measurements,
+            failures=failures,
+            constraints=constraints,
+        )

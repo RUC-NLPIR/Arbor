@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from commissioning.cache_campaign import seal as seal_module
+from commissioning.cache_campaign.calibration_evidence import CalibrationError
+from commissioning.cache_campaign.constraints import validate_calibration
 from commissioning.cache_campaign.portfolio import _evaluate_temporal_portfolio
 from commissioning.cache_campaign.records import record_sha256
 from commissioning.cache_campaign.seal import (
@@ -278,6 +280,33 @@ def test_r3_consumes_ledger_before_failing_launch_and_cannot_retry(
     assert calls == 1
 
 
+def test_invalid_transfer_calibration_fails_before_ledger_consumption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_aros_cache_calibration import calibration
+
+    invalid = calibration()
+    invalid["transfer_constraints"]["Sieve"].pop("0.01")  # type: ignore[index]
+    consumed = False
+
+    def reject_before_consumption(*args: object) -> object:
+        del args
+        return validate_calibration(invalid)
+
+    def consume(*args: object) -> object:
+        nonlocal consumed
+        del args
+        consumed = True
+        raise AssertionError("ledger must not be consumed")
+
+    monkeypatch.setattr(seal_module, "_prevalidate", reject_before_consumption)
+    monkeypatch.setattr(seal_module, "_consume_ledger", consume)
+    with pytest.raises(CalibrationError, match="transfer"):
+        run_r3(*run_arguments(tmp_path))  # type: ignore[arg-type]
+    assert consumed is False
+    assert not (tmp_path / "ledger.json").exists()
+
+
 def test_r3_success_requires_every_sealed_cell_and_preserves_frozen_git(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -313,14 +342,36 @@ def test_temporal_portfolio_runs_every_r3_trace_at_three_exact_sizes(
 ) -> None:
     inputs, runner, trace_ids = portfolio_inputs(tmp_path, monkeypatch)
     visible = json.loads(inputs["task_manifest"].read_text())
+    private_traces = []
+    unseen_ids = []
+    for index, trace in enumerate(visible["traces"]):
+        trace = dict(trace)
+        trace_id = f"unseen-r3-{index}"
+        unseen_ids.append(trace_id)
+        diagnostics = dict(trace["diagnostics"])
+        diagnostics["trace_id"] = trace_id
+        diagnostics["diagnostic_sha256"] = record_sha256(
+            diagnostics, "diagnostic_sha256"
+        )
+        trace.update(
+            {
+                "split": "r3",
+                "trace_id": trace_id,
+                "diagnostics": diagnostics,
+                "diagnostic_sha256": diagnostics["diagnostic_sha256"],
+            }
+        )
+        private_traces.append(trace)
     host = {
         "schema_version": visible["schema_version"],
         "source_commit": visible["source_commit"],
         "cache_fractions": visible["cache_fractions"],
-        "traces": [{**trace, "split": "r3"} for trace in visible["traces"]],
+        "traces": private_traces,
     }
     host_manifest = write_record(tmp_path / "private/r3.json", host, "manifest_sha256")
-    output = tmp_path / "r3-evidence"
+    outer_output = tmp_path / "r3-output"
+    outer_output.mkdir()
+    output = outer_output / "evidence"
     receipt = _evaluate_temporal_portfolio(
         task_root=inputs["task_root"],
         host_manifest=host_manifest,
@@ -343,6 +394,31 @@ def test_temporal_portfolio_runs_every_r3_trace_at_three_exact_sizes(
         type(item["cache_size_bytes"]) is int for item in receipt["selected_cells"]
     )
     assert receipt["failures"] == []
+    observed: list[str] = []
+
+    def transfer_compare(
+        measurement: dict[str, object], *args: object
+    ) -> dict[str, object]:
+        del args
+        observed.append(str(measurement["trace_id"]))
+        return {"throughput": True, "transfer_constraint": {}}
+
+    monkeypatch.setattr(seal_module, "compare_transfer_constraints", transfer_compare)
+    facts, constraints = seal_module._measurement_facts(
+        outer_output,
+        receipt,
+        SimpleNamespace(
+            preflight=SimpleNamespace(r0={}),
+            contract={},
+            calibration=SimpleNamespace(
+                path=tmp_path / "calibration.json",
+                calibration_sha256="a" * 64,
+            ),
+        ),
+    )
+    assert len(facts) == len(trace_ids) * 3
+    assert len(constraints) == len(trace_ids) * 3
+    assert set(observed) == set(unseen_ids)
 
 
 def test_cli_requires_all_host_only_arguments_and_reports_only_facts(

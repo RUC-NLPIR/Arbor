@@ -18,9 +18,16 @@ from commissioning.cache_campaign.calibrate import (
     CalibrationError,
     calibrate,
 )
-from commissioning.cache_campaign.constraints import compare_constraints
+from commissioning.cache_campaign.constraints import (
+    compare_constraints,
+    compare_transfer_constraints,
+)
 from commissioning.cache_campaign.portfolio import evaluate_portfolio
-from commissioning.cache_campaign.records import record_sha256, sha256_file
+from commissioning.cache_campaign.records import (
+    canonical_bytes,
+    record_sha256,
+    sha256_file,
+)
 from scripts import calibrate_aros_cache_baselines as calibration_cli
 from tests.test_aros_cache_evaluator import (
     PortfolioRun,
@@ -419,6 +426,37 @@ def calibration() -> dict[str, object]:
             },
             "dev-0": reference_trace,
         }
+    transfer_constraints: dict[str, object] = {}
+    for policy in ("Sieve", "S3FIFO"):
+        reference = references[policy]
+        transfer_policy: dict[str, object] = {"metadata": reference["metadata"]}
+        for fraction in fractions:
+            source = reference["dev-0"][fraction]
+            transfer_policy[fraction] = {
+                "derivation": (
+                    "0.90 * minimum(source throughput_median_mqps)"
+                ),
+                "source_cells": [
+                    {
+                        "trace_id": "dev-0",
+                        "reference_cell_sha256": hashlib.sha256(
+                            canonical_bytes(source)
+                        ).hexdigest(),
+                        "input_receipt_sha256s": list(
+                            source["input_receipt_sha256s"]
+                        ),
+                        "measurement_sha256s": list(
+                            source["measurement_sha256s"]
+                        ),
+                        "throughput_median_mqps": source[
+                            "throughput_median_mqps"
+                        ],
+                    }
+                ],
+                "minimum_throughput_median_mqps": "20",
+                "throughput_floor_mqps": "18",
+            }
+        transfer_constraints[policy] = transfer_policy
     value: dict[str, object] = {
         "schema_version": 1,
         "task_manifest_sha256": "1" * 64,
@@ -458,6 +496,7 @@ def calibration() -> dict[str, object]:
         "repetitions": 5,
         "cache_fractions": list(fractions),
         "references": references,
+        "transfer_constraints": transfer_constraints,
         "comparisons": comparisons,
         "r0_receipt_sha256s": r0_hashes,
         "input_receipt_sha256s": input_hashes,
@@ -505,6 +544,56 @@ def test_compare_constraints_keeps_audit_gated_facts_separate(
         "object_miss_ratio_gap": "0.1",
         "byte_miss_ratio_gap": "0.1",
     }
+
+
+def test_compare_transfer_constraints_accepts_unseen_trace_id(
+    bound_calibration: tuple[Path, str],
+) -> None:
+    path, expected = bound_calibration
+    result = compare_transfer_constraints(
+        candidate_measurement(rung="r3", trace_id="unseen-r3-tencent"),
+        candidate_r0(),
+        contract(),
+        path,
+        expected,
+        {"metadata": "accepted", "complexity": "accepted"},
+    )
+    assert result["throughput"] is True
+    assert result["object_metadata"] is True
+    assert result["global_metadata"] is True
+    assert result["complexity"] is True
+    assert result["object_miss_gaps"] is None
+    assert result["byte_miss_gaps"] is None
+    assert result["phase_gaps"] is None
+    source = result["transfer_constraint"]["source_cells"][0]  # type: ignore[index]
+    assert source["trace_id"] == "dev-0"
+
+
+@pytest.mark.parametrize("tamper", ["floor", "source_hash", "missing_fraction"])
+def test_transfer_constraint_projection_rejects_tampering(
+    tmp_path: Path, tamper: str
+) -> None:
+    value = calibration()
+    transfer = value["transfer_constraints"]["Sieve"]  # type: ignore[index]
+    if tamper == "floor":
+        transfer["0.01"]["throughput_floor_mqps"] = "17"  # type: ignore[index]
+    elif tamper == "source_hash":
+        transfer["0.01"]["source_cells"][0]["reference_cell_sha256"] = (  # type: ignore[index]
+            "0" * 64
+        )
+    else:
+        transfer.pop("0.01")  # type: ignore[union-attr]
+    value["calibration_sha256"] = record_sha256(value, "calibration_sha256")
+    path, expected = write_bound_calibration(tmp_path / "tampered.json", value)
+    with pytest.raises(CalibrationError, match="transfer"):
+        compare_transfer_constraints(
+            candidate_measurement(rung="r3", trace_id="unseen-r3"),
+            candidate_r0(),
+            contract(),
+            path,
+            expected,
+            None,
+        )
 
 
 @pytest.mark.parametrize(
@@ -913,6 +1002,7 @@ def test_calibration_freezes_all_policy_evidence_and_exact_medians(
         "repetitions",
         "cache_fractions",
         "references",
+        "transfer_constraints",
         "comparisons",
         "r0_receipt_sha256s",
         "input_receipt_sha256s",
@@ -924,6 +1014,10 @@ def test_calibration_freezes_all_policy_evidence_and_exact_medians(
         frozen, "calibration_sha256"
     )
     assert set(frozen["references"]) == {"Sieve", "S3FIFO"}  # type: ignore[arg-type]
+    assert set(frozen["transfer_constraints"]) == {  # type: ignore[arg-type]
+        "Sieve",
+        "S3FIFO",
+    }
     assert set(frozen["comparisons"]) == set(POLICIES)  # type: ignore[arg-type]
     assert set(frozen["r0_receipt_sha256s"]) == set(POLICIES)  # type: ignore[arg-type]
     assert frozen["repetitions"] == 5
@@ -984,6 +1078,24 @@ def test_calibration_freezes_all_policy_evidence_and_exact_medians(
         },
         "independent_audit": "pending_independent_review",
     }
+    transfer = frozen["transfer_constraints"]["Sieve"]  # type: ignore[index]
+    assert transfer["metadata"] == references["Sieve"]["metadata"]
+    assert transfer["0.01"]["derivation"] == (
+        "0.90 * minimum(source throughput_median_mqps)"
+    )
+    assert transfer["0.01"]["minimum_throughput_median_mqps"] == "20"
+    assert transfer["0.01"]["throughput_floor_mqps"] == "18"
+    assert transfer["0.01"]["source_cells"] == [
+        {
+            "trace_id": campaign_evidence.trace_ids[0],
+            "reference_cell_sha256": hashlib.sha256(
+                canonical_bytes(cell)
+            ).hexdigest(),
+            "input_receipt_sha256s": cell["input_receipt_sha256s"],
+            "measurement_sha256s": cell["measurement_sha256s"],
+            "throughput_median_mqps": "20",
+        }
+    ]
     comparisons = frozen["comparisons"]
     assert isinstance(comparisons, dict)
     assert len(

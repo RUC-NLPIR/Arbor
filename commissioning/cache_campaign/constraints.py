@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
@@ -23,7 +24,7 @@ from .calibration_evidence import (
     load_bound_calibration,
 )
 from .diagnostics import PhaseBin
-from .records import canonical_decimal, scientific_decimal_context
+from .records import canonical_bytes, canonical_decimal, scientific_decimal_context
 from .scope import _validate_contract
 
 
@@ -65,12 +66,27 @@ _PHASE_FACT_KEYS = {
     "byte_misses",
     "bins",
 }
+_TRANSFER_DERIVATION = "0.90 * minimum(source throughput_median_mqps)"
+_TRANSFER_CELL_KEYS = {
+    "derivation",
+    "source_cells",
+    "minimum_throughput_median_mqps",
+    "throughput_floor_mqps",
+}
+_TRANSFER_SOURCE_KEYS = {
+    "trace_id",
+    "reference_cell_sha256",
+    "input_receipt_sha256s",
+    "measurement_sha256s",
+    "throughput_median_mqps",
+}
 
 
 @dataclass(frozen=True)
 class ValidatedCalibration:
     record: Mapping[str, object]
     references: Mapping[str, object]
+    transfer_constraints: Mapping[str, object]
     comparisons: Mapping[str, object]
     trace_ids: tuple[str, ...]
     fractions: tuple[str, ...]
@@ -192,6 +208,89 @@ def _metadata(
     ):
         raise CalibrationError("calibration reference probe evidence differs")
     return metadata
+
+
+def _validate_transfer_constraints(
+    value: object,
+    *,
+    references: Mapping[str, object],
+    trace_ids: tuple[str, ...],
+    fractions: tuple[str, ...],
+) -> Mapping[str, object]:
+    transfer = _object(value, "calibration transfer constraints")
+    if set(transfer) != set(REFERENCE_POLICIES):
+        raise CalibrationError("calibration transfer policies are incomplete")
+    expected_policy_keys = {"metadata", *fractions}
+    for policy in REFERENCE_POLICIES:
+        policy_transfer = _object(transfer[policy], "calibration transfer policy")
+        reference = _object(references[policy], "calibration reference policy")
+        if set(policy_transfer) != expected_policy_keys:
+            raise CalibrationError("calibration transfer fractions are incomplete")
+        if policy_transfer.get("metadata") != reference.get("metadata"):
+            raise CalibrationError("calibration transfer metadata projection differs")
+        for fraction in fractions:
+            cell = _object(policy_transfer[fraction], "calibration transfer cell")
+            if (
+                set(cell) != _TRANSFER_CELL_KEYS
+                or cell.get("derivation") != _TRANSFER_DERIVATION
+            ):
+                raise CalibrationError("calibration transfer cell keys mismatch")
+            raw_sources = cell.get("source_cells")
+            if not isinstance(raw_sources, list) or len(raw_sources) != len(trace_ids):
+                raise CalibrationError(
+                    "calibration transfer source cells are incomplete"
+                )
+            medians: list[Decimal] = []
+            observed_trace_ids: list[str] = []
+            for source in raw_sources:
+                projected = _object(source, "calibration transfer source cell")
+                if set(projected) != _TRANSFER_SOURCE_KEYS:
+                    raise CalibrationError("calibration transfer source keys mismatch")
+                trace_id = projected.get("trace_id")
+                if type(trace_id) is not str or trace_id not in trace_ids:
+                    raise CalibrationError(
+                        "calibration transfer source trace is invalid"
+                    )
+                observed_trace_ids.append(trace_id)
+                reference_trace = _object(
+                    reference[trace_id], "calibration reference trace"
+                )
+                reference_cell = _object(
+                    reference_trace[fraction], "calibration reference cell"
+                )
+                expected_cell_hash = hashlib.sha256(
+                    canonical_bytes(reference_cell)
+                ).hexdigest()
+                if (
+                    _hash(
+                        projected.get("reference_cell_sha256"),
+                        "calibration transfer source cell",
+                    )
+                    != expected_cell_hash
+                    or projected.get("input_receipt_sha256s")
+                    != reference_cell.get("input_receipt_sha256s")
+                    or projected.get("measurement_sha256s")
+                    != reference_cell.get("measurement_sha256s")
+                    or projected.get("throughput_median_mqps")
+                    != reference_cell.get("throughput_median_mqps")
+                ):
+                    raise CalibrationError(
+                        "calibration transfer source projection differs"
+                    )
+                medians.append(
+                    _canonical_decimal(
+                        projected.get("throughput_median_mqps"),
+                        "calibration transfer source median",
+                    )
+                )
+            if observed_trace_ids != list(trace_ids):
+                raise CalibrationError("calibration transfer sources are out of order")
+            minimum = min(medians)
+            if cell.get("minimum_throughput_median_mqps") != canonical_decimal(
+                minimum
+            ) or cell.get("throughput_floor_mqps") != _floor_90(minimum):
+                raise CalibrationError("calibration transfer arithmetic differs")
+    return transfer
 
 
 def validate_calibration(value: Mapping[str, object]) -> ValidatedCalibration:
@@ -403,8 +502,21 @@ def validate_calibration(value: Mapping[str, object]) -> ValidatedCalibration:
                     or cell.get("throughput_floor_mqps") != _floor_90(median)
                 ):
                     raise CalibrationError("calibration throughput threshold is inconsistent")
+    transfer_constraints = _validate_transfer_constraints(
+        value.get("transfer_constraints"),
+        references=references,
+        trace_ids=trace_ids,
+        fractions=fractions,
+    )
     _forbid_campaign_scalars(value)
-    return ValidatedCalibration(value, references, comparisons, trace_ids, fractions)
+    return ValidatedCalibration(
+        value,
+        references,
+        transfer_constraints,
+        comparisons,
+        trace_ids,
+        fractions,
+    )
 
 
 def _audit_states(
@@ -658,4 +770,147 @@ def compare_constraints(
         "object_miss_gaps": object_gaps,
         "byte_miss_gaps": byte_gaps,
         "phase_gaps": phase_gaps,
+    }
+
+
+def compare_transfer_constraints(
+    candidate_measurement: Mapping[str, object],
+    candidate_r0: Mapping[str, object],
+    contract: Mapping[str, object],
+    calibration_path: Path,
+    expected_calibration_sha256: str,
+    independent_audit: Mapping[str, object] | None,
+) -> dict[str, object]:
+    bound = load_bound_calibration(
+        calibration_path,
+        expected_calibration_sha256=expected_calibration_sha256,
+    )
+    calibration = validate_calibration(bound.record)
+    metadata_audit, complexity_audit = _audit_states(independent_audit)
+    measurement = _object(candidate_measurement, "candidate transfer measurement")
+    r0 = _object(candidate_r0, "candidate R0")
+    declared = _object(contract, "policy contract")
+    policy = measurement.get("policy")
+    trace_id = measurement.get("trace_id")
+    fraction = measurement.get("cache_fraction")
+    if (
+        type(policy) is not str
+        or r0.get("policy") != policy
+        or type(trace_id) is not str
+        or not trace_id
+        or type(fraction) is not str
+    ):
+        raise CalibrationError("candidate transfer policy or cell binding mismatch")
+    try:
+        validated_contract = _validate_contract(declared, expected_policy=policy)
+    except ValueError as error:
+        raise CalibrationError(f"policy contract is invalid: {error}") from error
+    reference_policy = validated_contract.reference_policy
+    transfer_policy = _object(
+        calibration.transfer_constraints[reference_policy],
+        "transfer reference policy",
+    )
+    transfer_cell = _object(
+        transfer_policy.get(fraction), "transfer reference fraction"
+    )
+    reference_metadata = _object(
+        transfer_policy.get("metadata"), "transfer reference metadata"
+    )
+    throughput = _canonical_decimal(
+        measurement.get("simulator_throughput_mqps"), "candidate throughput"
+    )
+    floor = _canonical_decimal(
+        transfer_cell.get("throughput_floor_mqps"),
+        "transfer throughput floor",
+    )
+    object_limit = _canonical_decimal(
+        reference_metadata.get("bytes_per_object"), "reference object metadata"
+    )
+    global_limit = reference_metadata.get("global_bytes")
+    candidate_object = _canonical_decimal(
+        measurement.get("metadata_bytes_per_object"), "candidate object metadata"
+    )
+    candidate_object_miss = _canonical_decimal(
+        measurement.get("object_miss_ratio"), "candidate object miss ratio"
+    )
+    candidate_byte_miss = _canonical_decimal(
+        measurement.get("byte_miss_ratio"), "candidate byte miss ratio"
+    )
+    candidate_global = measurement.get("global_metadata_bytes")
+    measured = _object(r0.get("measured_metadata"), "candidate R0 metadata")
+    if (
+        measurement.get("rung") != "r3"
+        or throughput <= 0
+        or floor <= 0
+        or object_limit < 0
+        or candidate_object < 0
+        or not Decimal(0) <= candidate_object_miss <= Decimal(1)
+        or not Decimal(0) <= candidate_byte_miss <= Decimal(1)
+        or type(global_limit) is not int
+        or global_limit < 0
+        or type(candidate_global) is not int
+        or candidate_global < 0
+        or measured.get("bytes_per_object")
+        != measurement.get("metadata_bytes_per_object")
+        or measured.get("global_bytes") != candidate_global
+        or measured.get("measurement_sha256")
+        != measurement.get("metadata_measurement_sha256")
+    ):
+        raise CalibrationError("candidate transfer metadata binding mismatch")
+    normalized_contract = {
+        "policy": validated_contract.policy,
+        "reference_policy": validated_contract.reference_policy,
+        "policy_source": validated_contract.policy_source,
+        "object_metadata_bytes": validated_contract.object_metadata_bytes,
+        "global_metadata_bytes": validated_contract.global_metadata_bytes,
+        "global_metadata_evidence": [
+            {"source": source, "line": line, "expression": expression}
+            for source, line, expression in validated_contract.global_metadata_evidence
+        ],
+        "update_complexity": validated_contract.update_complexity,
+    }
+    r0_declared = r0.get("declared_metadata")
+    declared_consistent = (
+        isinstance(r0_declared, Mapping)
+        and dict(r0_declared) == normalized_contract
+        and candidate_object <= Decimal(validated_contract.object_metadata_bytes)
+        and candidate_global <= validated_contract.global_metadata_bytes
+    )
+    checks = _object(r0.get("checks"), "candidate R0 checks")
+    operational: dict[str, bool | None] = {}
+    for result_name, check_name in (
+        ("capacity", "capacity"),
+        ("determinism", "deterministic"),
+        ("sanitizer", "sanitizer"),
+    ):
+        item = checks.get(check_name)
+        if item is not True and item is not False and item is not None:
+            raise CalibrationError(f"candidate R0 {check_name} fact is invalid")
+        operational[result_name] = item
+    return {
+        "reference_policy": reference_policy,
+        "cache_fraction": fraction,
+        "transfer_constraint": dict(transfer_cell),
+        "reference_metadata": dict(reference_metadata),
+        "throughput": throughput >= floor,
+        "object_metadata": _audit_gated(
+            candidate_object <= object_limit, metadata_audit
+        ),
+        "global_metadata": _audit_gated(
+            candidate_global <= global_limit, metadata_audit
+        ),
+        "declared_metadata_consistency": _audit_gated(
+            declared_consistent, metadata_audit
+        ),
+        "complexity": (
+            True
+            if complexity_audit == "accepted"
+            else False
+            if complexity_audit == "rejected"
+            else None
+        ),
+        **operational,
+        "object_miss_gaps": None,
+        "byte_miss_gaps": None,
+        "phase_gaps": None,
     }

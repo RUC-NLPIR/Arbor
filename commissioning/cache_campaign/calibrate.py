@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -21,7 +22,10 @@ from .calibration_evidence import (
     _load_inputs,
     _write_calibration,
 )
-from .records import canonical_decimal, record_sha256
+from .records import canonical_bytes, canonical_decimal, record_sha256
+
+
+_TRANSFER_DERIVATION = "0.90 * minimum(source throughput_median_mqps)"
 
 
 def _probe_evidence(r0: _R0Input) -> dict[str, str]:
@@ -92,6 +96,53 @@ def _probe_evidence(r0: _R0Input) -> dict[str, str]:
             "R0 metadata interposer binary",
         ),
     }
+
+
+def _transfer_constraints(
+    references: dict[str, object],
+    trace_ids: list[str],
+    fractions: list[str],
+) -> dict[str, object]:
+    transfer: dict[str, object] = {}
+    for policy in REFERENCE_POLICIES:
+        reference = references[policy]
+        assert isinstance(reference, dict)
+        policy_projection: dict[str, object] = {"metadata": reference["metadata"]}
+        for fraction in fractions:
+            source_cells: list[dict[str, object]] = []
+            medians = []
+            for trace_id in sorted(trace_ids):
+                trace = reference[trace_id]
+                assert isinstance(trace, dict)
+                cell = trace[fraction]
+                assert isinstance(cell, dict)
+                median = _canonical_decimal(
+                    cell["throughput_median_mqps"],
+                    "reference throughput median",
+                )
+                medians.append(median)
+                source_cells.append(
+                    {
+                        "trace_id": trace_id,
+                        "reference_cell_sha256": hashlib.sha256(
+                            canonical_bytes(cell)
+                        ).hexdigest(),
+                        "input_receipt_sha256s": list(
+                            cell["input_receipt_sha256s"]
+                        ),
+                        "measurement_sha256s": list(cell["measurement_sha256s"]),
+                        "throughput_median_mqps": canonical_decimal(median),
+                    }
+                )
+            minimum = min(medians)
+            policy_projection[fraction] = {
+                "derivation": _TRANSFER_DERIVATION,
+                "source_cells": source_cells,
+                "minimum_throughput_median_mqps": canonical_decimal(minimum),
+                "throughput_floor_mqps": _floor_90(minimum),
+            }
+        transfer[policy] = policy_projection
+    return transfer
 
 
 def _freeze(inputs: _Inputs) -> dict[str, object]:
@@ -227,6 +278,11 @@ def _freeze(inputs: _Inputs) -> dict[str, object]:
         "repetitions": 5,
         "cache_fractions": fractions,
         "references": references,
+        "transfer_constraints": _transfer_constraints(
+            references,
+            [str(item["trace_id"]) for item in manifest_traces],
+            fractions,
+        ),
         "comparisons": comparisons,
         "r0_receipt_sha256s": {
             policy: inputs.r0[policy].receipt["receipt_sha256"]

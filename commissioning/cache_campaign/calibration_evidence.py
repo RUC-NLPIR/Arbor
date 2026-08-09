@@ -188,6 +188,7 @@ _CALIBRATION_KEYS = {
     "repetitions",
     "cache_fractions",
     "references",
+    "transfer_constraints",
     "comparisons",
     "r0_receipt_sha256s",
     "input_receipt_sha256s",

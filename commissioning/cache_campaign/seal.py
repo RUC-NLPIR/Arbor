@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 
 from .cachesim import run_child
 from .calibration_evidence import BoundCalibration, load_bound_calibration
-from .constraints import compare_constraints, validate_calibration
+from .constraints import compare_transfer_constraints, validate_calibration
 from .evidence import (
     BoundJSONObject,
     _strict_parse_json_bytes,
@@ -75,6 +75,22 @@ _PRIVATE_TRACE_FIELDS = (
     "origin_sha256",
     "sha256",
     "diagnostic_sha256",
+)
+_PARETO_FIELDS = (
+    "rung",
+    "split",
+    "trace_id",
+    "policy",
+    "cache_fraction",
+    "cache_size_bytes",
+    "request_count",
+    "object_miss_ratio",
+    "byte_miss_ratio",
+    "simulator_throughput_mqps",
+    "cpu_ns_per_request",
+    "metadata_bytes_per_object",
+    "global_metadata_bytes",
+    "metadata_measurement_sha256",
 )
 _FORBIDDEN_OUTCOME_KEYS = {
     "recommendation",
@@ -728,8 +744,10 @@ def _measurement_facts(
             or measurement.get("measurement_sha256") != digest
         ):
             raise SealError("R3 measurement self-hash mismatch")
-        pareto = ParetoMeasurement.from_record(measurement).to_record()
-        compared = compare_constraints(
+        pareto = ParetoMeasurement.from_record(
+            {name: measurement[name] for name in _PARETO_FIELDS}
+        ).to_record()
+        compared = compare_transfer_constraints(
             measurement,
             inputs.preflight.r0,
             inputs.contract,

@@ -9,6 +9,7 @@ import sys
 from pathlib import Path, PurePosixPath
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_URL = "https://github.com/1a1a11a/libCacheSim.git"
 SOURCE_COMMIT = "da022c2945146e9577d91375a48d53850d7041a3"
 SOURCE_TREE = "d59c0319fff072788ab5d5a5c1f204f758082c80"
@@ -1127,6 +1128,149 @@ def _git_diff(checkout, base, candidate):
     )
 
 
+def _candidate_blob_is_regular(checkout, candidate, relative):
+    listing = _git(checkout, "ls-tree", candidate, "--", relative, binary=True)
+    records = [record for record in listing.splitlines() if record]
+    if len(records) != 1:
+        return False
+    try:
+        metadata, raw_path = records[0].split(b"\t", 1)
+        mode, kind, _oid = metadata.split(b" ", 2)
+    except ValueError:
+        return False
+    return mode == b"100644" and kind == b"blob" and raw_path == relative.encode()
+
+
+def _necessary_wiring_line(relative, line, policy):
+    stripped = line.strip()
+    compact = "".join(stripped.split())
+    if not stripped or policy not in stripped or stripped.startswith(("#", "//", "/*")):
+        return False
+    if relative.endswith("evictionAlgo.h"):
+        return compact.startswith(f"cache_t*{policy}_init(") and compact.endswith(");")
+    if relative == "libCacheSim/cache/CMakeLists.txt":
+        return stripped == f"eviction/{policy}.c"
+    if relative.endswith("cache_init.h"):
+        return compact in {
+            f'{{"{policy}",{policy}_init}}',
+            f'{{"{policy}",{policy}_init}},',
+        }
+    if relative == "test/CMakeLists.txt":
+        normalized = " ".join(stripped.split())
+        return normalized in {
+            f"add_test_executable(test_{policy} test_{policy}.c)",
+            (
+                f"add_test(NAME test_{policy} COMMAND test_{policy} "
+                "WORKING_DIRECTORY .)"
+            ),
+        }
+    return False
+
+
+def _wiring_is_additive(checkout, base, candidate, relative, policy):
+    raw = _git(
+        checkout,
+        "diff",
+        "--unified=0",
+        f"{base}..{candidate}",
+        "--",
+        relative,
+        binary=True,
+    )
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise VerificationError("candidate wiring diff is not UTF-8") from error
+    additions = 0
+    for line in lines:
+        if line.startswith(("---", "+++")):
+            continue
+        if line.startswith("-"):
+            return False
+        if line.startswith("+"):
+            additions += 1
+            if not _necessary_wiring_line(relative, line[1:], policy):
+                return False
+    return additions > 0
+
+
+def _recompute_scope(checkout, base, candidate, policy, diff_hash):
+    if (
+        not policy
+        or not policy[0].isalpha()
+        or len(policy) > 64
+        or any(not (character.isalnum() or character == "_") for character in policy)
+    ):
+        raise VerificationError("candidate policy identifier is unsafe")
+    raw_status = _git(
+        checkout,
+        "diff",
+        "--name-status",
+        "--no-renames",
+        f"{base}..{candidate}",
+    )
+    entries = []
+    for line in raw_status.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2 or fields[0] not in {"A", "M", "D", "T"}:
+            raise VerificationError("candidate name-status diff is malformed")
+        status, relative = fields
+        path = PurePosixPath(relative)
+        if path.is_absolute() or ".." in path.parts:
+            raise VerificationError("candidate diff path is unsafe")
+        entries.append((status, relative))
+    if len({relative for _status, relative in entries}) != len(entries):
+        raise VerificationError("candidate diff paths are duplicated")
+    changed = tuple(sorted(relative for _status, relative in entries))
+    if candidate == base:
+        if entries or policy not in POLICIES:
+            raise VerificationError("baseline scope unexpectedly changes source")
+        return {
+            "allowed_paths": True,
+            "baseline_unchanged": True,
+            "additive_wiring_only": True,
+            "contract_bound": None,
+            "changed_paths": [],
+            "diff_sha256": diff_hash,
+        }
+    source = f"libCacheSim/cache/eviction/{policy}.c"
+    candidate_test = f"test/test_{policy}.c"
+    contract = "commissioning/cache_policy_contract.json"
+    wiring = (
+        "libCacheSim/include/libCacheSim/evictionAlgo.h",
+        "libCacheSim/cache/CMakeLists.txt",
+        "libCacheSim/bin/cachesim/cache_init.h",
+        "test/CMakeLists.txt",
+    )
+    statuses = {relative: status for status, relative in entries}
+    allowed = {source, candidate_test, contract, *wiring}
+    additions = {source, candidate_test, contract}
+    allowed_paths = (
+        set(statuses) == allowed
+        and all(statuses.get(relative) == "A" for relative in additions)
+        and all(statuses.get(relative) == "M" for relative in wiring)
+        and all(
+            _candidate_blob_is_regular(checkout, candidate, relative)
+            for relative in statuses
+        )
+    )
+    additive = all(
+        _wiring_is_additive(checkout, base, candidate, relative, policy)
+        for relative in wiring
+    )
+    baseline_unchanged = allowed_paths and additive and not any(
+        status in {"D", "T"} for status in statuses.values()
+    )
+    return {
+        "allowed_paths": allowed_paths,
+        "baseline_unchanged": baseline_unchanged,
+        "additive_wiring_only": additive,
+        "contract_bound": statuses.get(contract) == "A",
+        "changed_paths": list(changed),
+        "diff_sha256": diff_hash,
+    }
+
+
 def _verify_raw_record(root, value, label):
     _exact(value, {"path", "size_bytes", "sha256", "identity"}, label)
     path = _relative(root, value["path"], label)
@@ -1341,13 +1485,10 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
         },
         "R0 scope",
     )
-    if (
-        scope["allowed_paths"] is not True
-        or scope["baseline_unchanged"] is not True
-        or scope["additive_wiring_only"] is not True
-        or scope["changed_paths"] != sorted(changed)
-        or scope["diff_sha256"] != diff_hash
-    ):
+    recomputed_scope = _recompute_scope(
+        checkout, SOURCE_COMMIT, candidate, policy, diff_hash
+    )
+    if scope != recomputed_scope:
         raise VerificationError("R0 scope facts mismatch")
     baseline = candidate == SOURCE_COMMIT
     if scope["contract_bound"] is not (None if baseline else True):
@@ -1976,10 +2117,16 @@ def _verify_portfolio(path, expected_rung, task_root, manifest, source, r0_by_ha
     if receipt["measurement_hashes"] != [item["measurement_sha256"] for item in summaries]:
         raise VerificationError(f"{expected_rung} measurement hash order mismatch")
     by_trace = {item["trace_id"]: item for item in selected_traces}
-    measurements = [
-        _verify_measurement(root, summary, receipt, r0, by_trace[summary["trace_id"]])
-        for summary in summaries
-    ]
+    measurements = []
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            raise VerificationError("measurement summary must be an object")
+        trace_id = summary.get("trace_id")
+        if type(trace_id) is not str or trace_id not in by_trace:
+            raise VerificationError("measurement summary names an unknown trace")
+        measurements.append(
+            _verify_measurement(root, summary, receipt, r0, by_trace[trace_id])
+        )
     if expected_rung == "r1":
         if receipt["phase_probe"] is not None or receipt["frozen_trace_diagnostics"] != []:
             raise VerificationError("R1 unexpectedly contains phase apparatus")
@@ -2361,6 +2508,134 @@ def _project_blobs(project, commit):
     return blobs
 
 
+def _audit_gated(observed, state):
+    if type(observed) is not bool:
+        raise VerificationError("audit-gated observation must be boolean")
+    if state not in {None, "pending_independent_review", "accepted", "rejected"}:
+        raise VerificationError("independent audit state is invalid")
+    if not observed or state == "rejected":
+        return False
+    if state == "accepted":
+        return True
+    return None
+
+
+def _r3_evaluator_hashes():
+    paths = {
+        "seal_sha256": REPOSITORY_ROOT / "commissioning/cache_campaign/seal.py",
+        "constraints_sha256": REPOSITORY_ROOT
+        / "commissioning/cache_campaign/constraints.py",
+        "calibration_evidence_sha256": REPOSITORY_ROOT
+        / "commissioning/cache_campaign/calibration_evidence.py",
+        "run_aros_cache_r3_sha256": REPOSITORY_ROOT / "scripts/run_aros_cache_r3.py",
+    }
+    return {name: _sha256_file(path) for name, path in paths.items()}
+
+
+def _verify_private_snapshot(snapshot, task_root, source_path, candidate_r0, private):
+    root = _path(snapshot["root"], "R3 private snapshot root")
+    metadata = root.lstat()
+    if (
+        not root.is_dir()
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o777 != 0o700
+    ):
+        raise VerificationError("R3 private snapshot root is not owned mode 0700")
+    try:
+        root.relative_to(task_root)
+    except ValueError:
+        pass
+    else:
+        raise VerificationError("R3 private snapshot root is inside task_root")
+    manifest_path = root / "r3.json"
+    manifest = _exact(
+        _load_object(manifest_path), HOST_MANIFEST_KEYS, "R3 snapshot manifest"
+    )
+    _self_hash(manifest, "manifest_sha256", "R3 snapshot manifest")
+    if snapshot["manifest_sha256"] != _sha256_file(manifest_path):
+        raise VerificationError("R3 snapshot manifest file hash mismatch")
+    if (
+        manifest["schema_version"] != 1
+        or manifest["source_commit"] != SOURCE_COMMIT
+        or manifest["cache_fractions"] != [0.01, 0.05, 0.1]
+        or not isinstance(manifest["traces"], list)
+        or len(manifest["traces"]) != len(private)
+    ):
+        raise VerificationError("R3 snapshot manifest root facts mismatch")
+    snapshot_traces = []
+    for expected, value in zip(private, manifest["traces"]):
+        observed = _verify_trace(value, {"r3"})
+        if any(
+            observed[field] != expected[field]
+            for field in TRACE_KEYS - {"path"}
+        ):
+            raise VerificationError("R3 snapshot trace facts differ from sealed input")
+        try:
+            Path(observed["path"]).resolve(strict=True).relative_to(root / "traces")
+        except ValueError as error:
+            raise VerificationError("R3 snapshot trace escapes snapshot root") from error
+        snapshot_traces.append(observed)
+    if snapshot["trace_sha256s"] != [item["sha256"] for item in snapshot_traces]:
+        raise VerificationError("R3 snapshot trace hash projection mismatch")
+    source_snapshot = root / "candidate-evidence/source-receipt.json"
+    if (
+        snapshot["source_receipt_sha256"] != _sha256_file(source_snapshot)
+        or source_snapshot.read_bytes() != Path(source_path).read_bytes()
+    ):
+        raise VerificationError("R3 snapshot source receipt binding mismatch")
+    r0_root = root / "candidate-evidence/r0"
+    if r0_root.is_symlink() or not r0_root.is_dir():
+        raise VerificationError("R3 snapshot R0 root is unavailable")
+    evidence = snapshot["r0_evidence_sha256s"]
+    if not isinstance(evidence, dict):
+        raise VerificationError("R3 snapshot R0 evidence map is invalid")
+    observed_evidence = {}
+    for path in sorted(r0_root.rglob("*")):
+        if path.is_symlink():
+            raise VerificationError("R3 snapshot R0 evidence contains a symlink")
+        if path.is_file():
+            observed_evidence[path.relative_to(r0_root).as_posix()] = _sha256_file(path)
+    if evidence != observed_evidence:
+        raise VerificationError("R3 snapshot R0 evidence hash map mismatch")
+    r0_receipt = r0_root / "receipt.json"
+    if (
+        snapshot["r0_receipt_sha256"] != _sha256_file(r0_receipt)
+        or r0_receipt.read_bytes() != candidate_r0["path"].read_bytes()
+    ):
+        raise VerificationError("R3 snapshot R0 receipt binding mismatch")
+    artifacts = snapshot["r0_artifact_sha256s"]
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise VerificationError("R3 snapshot R0 artifact map is invalid")
+    evidence_hashes = set(evidence.values())
+    for name, digest in artifacts.items():
+        _string(name, "R3 snapshot artifact name")
+        _hash(digest, "R3 snapshot artifact hash")
+        if digest not in evidence_hashes:
+            raise VerificationError("R3 snapshot artifact is outside evidence closure")
+    for name in ("release_cachesim", "release_archive", "release_cmake_cache"):
+        expected = candidate_r0["record"]["artifact_snapshots"][name]["sha256"]
+        if artifacts.get(name) != expected:
+            raise VerificationError("R3 snapshot core artifact hash mismatch")
+    expected_files = {
+        "r3.json",
+        "candidate-evidence/source-receipt.json",
+        *{
+            f"candidate-evidence/r0/{relative}" for relative in evidence
+        },
+        *{
+            Path(item["path"]).relative_to(root).as_posix()
+            for item in snapshot_traces
+        },
+    }
+    actual_files = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    if actual_files != expected_files:
+        raise VerificationError("R3 private snapshot file inventory mismatch")
+
+
 def _transfer_constraint_facts(measurement, candidate_r0, calibration):
     declared = _exact(
         candidate_r0["record"]["declared_metadata"],
@@ -2403,6 +2678,8 @@ def _transfer_constraint_facts(measurement, candidate_r0, calibration):
     reference_global = _integer(
         reference_metadata["global_bytes"], "R3 reference global metadata"
     )
+    object_within = _decimal_compare(candidate_object, reference_object) <= 0
+    global_within = candidate_global <= reference_global
     declared_consistent = (
         candidate_r0["record"]["declared_metadata"] == declared
         and _decimal_compare(candidate_object, str(declared["object_metadata_bytes"])) <= 0
@@ -2423,16 +2700,15 @@ def _transfer_constraint_facts(measurement, candidate_r0, calibration):
     ):
         raise VerificationError("R3 measurement metadata binding mismatch")
     operational = candidate_r0["operational_facts"]
-    del declared_consistent, reference_global
     return {
         "reference_policy": reference,
         "cache_fraction": fraction,
         "transfer_constraint": transfer_cell,
         "reference_metadata": reference_metadata,
         "throughput": _decimal_compare(throughput, floor) >= 0,
-        "object_metadata": None,
-        "global_metadata": None,
-        "declared_metadata_consistency": None,
+        "object_metadata": _audit_gated(object_within, None),
+        "global_metadata": _audit_gated(global_within, None),
+        "declared_metadata_consistency": _audit_gated(declared_consistent, None),
         "complexity": None,
         "capacity": operational["capacity"],
         "determinism": operational["deterministic"],
@@ -2579,6 +2855,8 @@ def _verify_r3(
     if ledger_path.stat().st_mode & 0o777 != 0o600:
         raise VerificationError("R3 ledger mode must be 0600")
     ledger_digest = _self_hash(ledger, "ledger_sha256", "R3 ledger")
+    if ledger["r3_evaluator_sha256s"] != _r3_evaluator_hashes():
+        raise VerificationError("R3 evaluator dependency map mismatch")
     if (
         ledger["schema_version"] != 1
         or ledger["state"] != "consumed"
@@ -2615,13 +2893,13 @@ def _verify_r3(
         },
         "R3 private snapshot",
     )
-    if (
-        snapshot["manifest_sha256"] != _sha256_file(_path(index["host_r3_manifest"], "host R3 manifest"))
-        or snapshot["trace_sha256s"] != [item["sha256"] for item in private]
-        or snapshot["source_receipt_sha256"] != _sha256_file(_path(index["source_receipt"], "source receipt"))
-        or snapshot["r0_receipt_sha256"] != candidate_r0["file_sha256"]
-    ):
-        raise VerificationError("R3 private snapshot lineage mismatch")
+    _verify_private_snapshot(
+        snapshot,
+        task_root,
+        _path(index["source_receipt"], "source receipt"),
+        candidate_r0,
+        private,
+    )
     final = _exact(_load_object(final_path), R3_RECEIPT_KEYS, "R3 final receipt")
     final_digest = _self_hash(final, "receipt_sha256", "R3 final receipt")
     _forbid_outcomes(final, "R3 final receipt")
@@ -2645,6 +2923,7 @@ def _verify_r3(
         or final["r3_commitment_sha256"] != host["manifest_sha256"]
         or final["host_r3_manifest_sha256"] != _sha256_file(_path(index["host_r3_manifest"], "host R3 manifest"))
         or final["calibration_sha256"] != calibration["calibration_sha256"]
+        or final["r3_evaluator_sha256s"] != ledger["r3_evaluator_sha256s"]
         or final["source_receipt_sha256"] != source["receipt_sha256"]
         or final["r0_receipt_sha256"] != candidate_r0["receipt_sha256"]
         or final["r2_receipt_sha256"] != candidate_r2["receipt_sha256"]
@@ -2671,6 +2950,8 @@ def _verify_r3(
     if (
         r3_portfolio["receipt_sha256"] != final["portfolio_receipt_sha256"]
         or final["portfolio_receipt_sha256"] != _load_object(portfolio_path)["receipt_sha256"]
+        or r3_portfolio["record"]["evaluator"]
+        != ledger["portfolio_evaluator_sha256s"]
     ):
         raise VerificationError("R3 portfolio receipt binding mismatch")
     raw_paths = []
@@ -2869,7 +3150,7 @@ def main(argv=None):
         result = verify(arguments.index)
         sys.stdout.buffer.write(canonical_bytes(result) + b"\n")
         return 0
-    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+    except (KeyError, OSError, TypeError, ValueError, subprocess.SubprocessError):
         print("error: substrate verification failed", file=sys.stderr)
         return 2
 

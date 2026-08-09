@@ -1342,6 +1342,55 @@ def valid_retained_substrate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
             "principal_response_ref", "reproduction_ref",
         )
     }
+    snapshot_root = tmp_path / "host/private-snapshot"
+    snapshot_trace = snapshot_root / "traces/0000.oracleGeneral"
+    snapshot_trace.parent.mkdir(parents=True)
+    snapshot_root.chmod(0o700)
+    snapshot_trace.write_bytes(Path(private["path"]).read_bytes())
+    snapshot_trace.chmod(0o400)
+    snapshot_trace_record = dict(private)
+    snapshot_trace_record["path"] = str(snapshot_trace.resolve())
+    snapshot_manifest_value = {
+        "schema_version": 1,
+        "source_commit": base,
+        "cache_fractions": [0.01, 0.05, 0.10],
+        "traces": [snapshot_trace_record],
+    }
+    snapshot_manifest = write_record(
+        snapshot_root / "r3.json", snapshot_manifest_value, "manifest_sha256"
+    )
+    snapshot_manifest.chmod(0o400)
+    snapshot_source = snapshot_root / "candidate-evidence/source-receipt.json"
+    snapshot_source.parent.mkdir(parents=True)
+    snapshot_source.write_bytes(source.read_bytes())
+    snapshot_source.chmod(0o400)
+    snapshot_r0 = snapshot_root / "candidate-evidence/r0"
+    for original in sorted(candidate_r0.parent.rglob("*")):
+        if not original.is_file() or original.is_symlink():
+            continue
+        destination = snapshot_r0 / original.relative_to(candidate_r0.parent)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(original.read_bytes())
+        destination.chmod(original.stat().st_mode & 0o777)
+    snapshot_evidence = {
+        path.relative_to(snapshot_r0).as_posix(): sha256_file(path)
+        for path in sorted(snapshot_r0.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+    snapshot_artifacts = {
+        name: sha256_file(snapshot_r0 / item["snapshot_path"])
+        for name, item in candidate_r0_value["artifact_snapshots"].items()
+    }
+    r3_evaluator_paths = {
+        "seal_sha256": ROOT / "commissioning/cache_campaign/seal.py",
+        "constraints_sha256": ROOT / "commissioning/cache_campaign/constraints.py",
+        "calibration_evidence_sha256": ROOT
+        / "commissioning/cache_campaign/calibration_evidence.py",
+        "run_aros_cache_r3_sha256": ROOT / "scripts/run_aros_cache_r3.py",
+    }
+    r3_evaluators = {
+        name: sha256_file(path) for name, path in r3_evaluator_paths.items()
+    }
     ledger: dict[str, object] = {
         "schema_version": 1,
         "state": "consumed",
@@ -1368,19 +1417,17 @@ def valid_retained_substrate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         "r2_receipt_sha256": candidate_r2_value["receipt_sha256"],
         "r2_receipt_file_sha256": sha256_file(candidate_r2),
         "binary_sha256": candidate_r0_value["binary_sha256"],
-        "r3_evaluator_sha256s": {"seal_sha256": hashlib.sha256(b"seal").hexdigest()},
+        "r3_evaluator_sha256s": r3_evaluators,
         "portfolio_evaluator_sha256s": candidate_r2_value["evaluator"],
         "trace_sha256s": [private["sha256"]],
         "private_snapshot": {
-            "root": str((tmp_path / "host/private-snapshot").resolve()),
-            "manifest_sha256": sha256_file(host_manifest),
+            "root": str(snapshot_root.resolve()),
+            "manifest_sha256": sha256_file(snapshot_manifest),
             "trace_sha256s": [private["sha256"]],
-            "source_receipt_sha256": sha256_file(source),
-            "r0_receipt_sha256": sha256_file(candidate_r0),
-            "r0_artifact_sha256s": {
-                name: item["sha256"] for name, item in candidate_r0_value["artifact_snapshots"].items()
-            },
-            "r0_evidence_sha256s": {},
+            "source_receipt_sha256": sha256_file(snapshot_source),
+            "r0_receipt_sha256": sha256_file(snapshot_r0 / "receipt.json"),
+            "r0_artifact_sha256s": snapshot_artifacts,
+            "r0_evidence_sha256s": snapshot_evidence,
         },
     }
     write_record(ledger_path, ledger, "ledger_sha256")
@@ -1520,6 +1567,8 @@ def valid_retained_substrate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         "r0_sieve": r0s["Sieve"],
         "checkout": checkout,
         "source": source,
+        "private_snapshot": snapshot_root,
+        "candidate_r0": candidate_r0,
     }
     return fixture
 
@@ -1687,6 +1736,44 @@ def tamper_r0_semantic(path: Path, target: str) -> None:
     rewrite_r0_receipt(path, receipt)
 
 
+def retarget_candidate_r0(path: Path, checkout: Path) -> None:
+    receipt = json.loads(path.read_text())
+    base = receipt["base_commit"]
+    candidate = str(git(checkout, "rev-parse", "HEAD"))
+    tree = str(git(checkout, "rev-parse", "HEAD^{tree}"))
+    raw_diff = git(
+        checkout,
+        "diff",
+        "--binary",
+        "--full-index",
+        "--no-renames",
+        f"{base}..{candidate}",
+        binary=True,
+    )
+    changed = str(
+        git(checkout, "diff", "--name-only", "--no-renames", f"{base}..{candidate}")
+    ).splitlines()
+    receipt["candidate_commit"] = candidate
+    receipt["candidate_tree"] = tree
+    receipt["candidate_diff_sha256"] = hashlib.sha256(raw_diff).hexdigest()
+    receipt["changed_path_sha256"] = {
+        relative: sha256_file(checkout / relative) for relative in changed
+    }
+    receipt["scope"]["changed_paths"] = sorted(changed)
+    receipt["scope"]["diff_sha256"] = receipt["candidate_diff_sha256"]
+    rewrite_r0_receipt(path, receipt)
+
+
+def rebind_final_to_ledger(final_path: Path, ledger_path: Path) -> None:
+    ledger = json.loads(ledger_path.read_text())
+    final = json.loads(final_path.read_text())
+    final["ledger_sha256"] = ledger["ledger_sha256"]
+    final["ledger_intended_sha256"] = sha256_file(ledger_path)
+    final["ledger_file_sha256"] = sha256_file(ledger_path)
+    final["ledger_size_bytes"] = ledger_path.stat().st_size
+    write_record(final_path, final, "receipt_sha256")
+
+
 def forbidden_outcome_key(value: object) -> str | None:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -1846,6 +1933,132 @@ def test_verifier_rejects_checkout_head_after_active_candidate(
     git(checkout, "commit", "-qm", "post candidate")
     with pytest.raises(fixture.module.VerificationError, match="HEAD"):
         fixture.module.verify(fixture.index)
+
+
+@pytest.mark.parametrize("defect", ["out_of_scope", "nonadditive_wiring"])
+def test_verifier_independently_recomputes_candidate_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    checkout = fixture.paths["checkout"]
+    if defect == "out_of_scope":
+        (checkout / "libCacheSim/reader.c").write_text("/* forbidden */\n")
+        git(checkout, "add", "libCacheSim/reader.c")
+    else:
+        wiring = checkout / "libCacheSim/cache/CMakeLists.txt"
+        wiring.write_text(wiring.read_text() + "# CandidatePolicy extra wiring\n")
+        git(checkout, "add", str(wiring.relative_to(checkout)))
+    git(checkout, "commit", "-qm", defect)
+    candidate_r0 = fixture.paths["candidate_r0"]
+    retarget_candidate_r0(candidate_r0, checkout)
+    index = json.loads(fixture.index.read_text())
+    source, _state = fixture.module._verify_source(
+        Path(index["source_receipt"]), checkout
+    )
+    with pytest.raises(fixture.module.VerificationError, match="scope"):
+        fixture.module._verify_r0(
+            candidate_r0,
+            checkout,
+            source,
+            expected_policy="CandidatePolicy",
+        )
+
+
+def test_transfer_metadata_audit_gating_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    audit_gated = getattr(fixture.module, "_audit_gated", None)
+    assert audit_gated is not None
+    assert audit_gated(False, None) is False
+    assert audit_gated(True, None) is None
+    assert audit_gated(True, "pending_independent_review") is None
+    assert audit_gated(True, "accepted") is True
+    assert audit_gated(True, "rejected") is False
+
+
+def test_verifier_rejects_rehashed_r3_evaluator_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    ledger_path = fixture.paths["ledger"]
+    ledger = json.loads(ledger_path.read_text())
+    ledger["r3_evaluator_sha256s"]["seal_sha256"] = "0" * 64
+    write_record(ledger_path, ledger, "ledger_sha256")
+    ledger_path.chmod(0o600)
+    final_path = fixture.paths["r3_receipt"]
+    final = json.loads(final_path.read_text())
+    final["r3_evaluator_sha256s"] = ledger["r3_evaluator_sha256s"]
+    write_record(final_path, final, "receipt_sha256")
+    rebind_final_to_ledger(final_path, ledger_path)
+    with pytest.raises(fixture.module.VerificationError, match="evaluator"):
+        fixture.module.verify(fixture.index)
+
+
+def test_verifier_rejects_rehashed_private_snapshot_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    snapshot = fixture.paths["private_snapshot"]
+    artifact = snapshot / "candidate-evidence/r0/artifact_snapshots/release_cachesim"
+    artifact.chmod(0o600)
+    artifact.write_bytes(artifact.read_bytes() + b"tamper")
+    artifact.chmod(0o400)
+    ledger_path = fixture.paths["ledger"]
+    ledger = json.loads(ledger_path.read_text())
+    relative = artifact.relative_to(snapshot / "candidate-evidence/r0").as_posix()
+    ledger["private_snapshot"]["r0_evidence_sha256s"][relative] = sha256_file(
+        artifact
+    )
+    ledger["private_snapshot"]["r0_artifact_sha256s"]["release_cachesim"] = (
+        sha256_file(artifact)
+    )
+    write_record(ledger_path, ledger, "ledger_sha256")
+    ledger_path.chmod(0o600)
+    rebind_final_to_ledger(fixture.paths["r3_receipt"], ledger_path)
+    with pytest.raises(fixture.module.VerificationError, match="snapshot"):
+        fixture.module.verify(fixture.index)
+
+
+def test_unknown_trace_id_is_a_verification_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    receipt_path = fixture.paths["r1_receipt"]
+    receipt = json.loads(receipt_path.read_text())
+    receipt["measurements"][0]["trace_id"] = "unknown-trace"
+    write_record(receipt_path, receipt, "receipt_sha256")
+    with pytest.raises(fixture.module.VerificationError, match="trace"):
+        fixture.module.verify(fixture.index)
+
+
+def test_unknown_cell_key_is_a_verification_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    receipt_path = fixture.paths["r1_receipt"]
+    receipt = json.loads(receipt_path.read_text())
+    receipt["measurements"][0]["unexpected"] = True
+    write_record(receipt_path, receipt, "receipt_sha256")
+    with pytest.raises(fixture.module.VerificationError, match="keys"):
+        fixture.module.verify(fixture.index)
+
+
+def test_cli_defensively_converts_key_error_to_exit_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+
+    def missing_key(_path: Path) -> object:
+        raise KeyError("unknown trace")
+
+    monkeypatch.setattr(fixture.module, "verify", missing_key)
+    assert fixture.module.main([str(fixture.index)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: substrate verification failed\n"
 
 
 def test_cli_writes_canonical_json_and_uses_exit_two_for_invalid(

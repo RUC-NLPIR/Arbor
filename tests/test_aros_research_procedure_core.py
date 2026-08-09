@@ -139,9 +139,15 @@ EXPECTED_ARTIFACTS = {
         "raw_refs",
         "process_state",
         "budget_used",
+        "rival_mechanism_set_ref",
+        "mechanism_refs",
+        "experiment_proposal_ref",
+        "prediction_ref",
+        "preregistration_ref",
     ),
     "ObservationUpdate": (
         "evidence_refs",
+        "classifications",
         "strengthened",
         "weakened",
         "eliminated",
@@ -215,8 +221,8 @@ EXPECTED_PROCEDURES = {
         "ObservationUpdate",
         (
             "Run.status",
-            "Eval.run",
             "Receipt.read",
+            "Git.read",
             "Research.observe",
             "Research.checkpoint",
         ),
@@ -415,18 +421,52 @@ EXPECTED_EVIDENCE_INPUT_RULES = (
     "Artifact: Read exactly one `RunEvidence`.",
     (
         "Required fields: `run_ref`, `eval_refs`, `raw_refs`, `process_state`, "
-        "`budget_used`."
+        "`budget_used`, `rival_mechanism_set_ref`, `mechanism_refs`, "
+        "`experiment_proposal_ref`, `prediction_ref`, `preregistration_ref`."
     ),
     (
         "Immutability: Treat `run_ref`, every `eval_ref`, and every `raw_ref` as "
         "an immutable exact reference."
     ),
+    (
+        "Lineage: Treat `rival_mechanism_set_ref`, `mechanism_refs`, "
+        "`experiment_proposal_ref`, `prediction_ref`, and `preregistration_ref` "
+        "as the complete input lineage; do not infer omitted lineage."
+    ),
+)
+EXPECTED_EVIDENCE_CLASSIFICATION_FIELDS = (
+    "evidence_ref",
+    "operational_state",
+    "scientific_relations",
+    "relation_targets",
 )
 EXPECTED_EVIDENCE_METHOD_RULES = (
     (
         "Read the exact immutable receipts identified by `run_ref` and "
         "`eval_refs` and the exact immutable raw references identified by "
         "`raw_refs`; bind each read to its reference before interpretation."
+    ),
+    (
+        "Use `Git.read` to read the exact `RivalMechanismSet`, "
+        "`ExperimentProposal`, prediction, and `Preregistration` named by the "
+        "lineage fields before classification; reject missing or inconsistent "
+        "lineage."
+    ),
+    (
+        "Require input `mechanism_refs` to belong to the referenced "
+        "`RivalMechanismSet` and to match the `ExperimentProposal` "
+        "`mechanism_refs`; require `prediction_ref` to identify that proposal's "
+        "prediction."
+    ),
+    (
+        "Emit exactly one `classifications` entry for every evidence item; each "
+        "entry is interpreted only within the verified proposal and prediction "
+        "lineage."
+    ),
+    (
+        "Set each `evidence_ref` to exactly the input `run_ref`, one of the input "
+        "`eval_refs`, or one of the input `raw_refs`; emit no classification for "
+        "any other reference."
     ),
     (
         "For every evidence item, record exactly one `operational_state`: "
@@ -448,6 +488,21 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
         "An item whose `operational_state` is `unavailable` or `failed` must have "
         "empty `scientific_relations` and must never be recorded as a "
         "`negative_result`."
+    ),
+    (
+        "For every `supports`, `weakens`, `eliminates`, or `counterexample` "
+        "relation, require every `relation_targets` value to belong to the input "
+        "`mechanism_refs`; do not infer or name an arbitrary rival."
+    ),
+    (
+        "Connect every executed classification's `evidence_ref` to the input "
+        "`experiment_proposal_ref` and `prediction_ref` before applying any "
+        "scientific relation."
+    ),
+    (
+        "Treat a `supports` relation as confirmatory only when the input "
+        "`preregistration_ref` names a `Preregistration` that binds the same "
+        "proposal and prediction; otherwise record it as non-confirmatory support."
     ),
     (
         "Map `supports` to `strengthened`, `weakens` to `weakened`, and "
@@ -472,8 +527,14 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
 )
 EXPECTED_EVIDENCE_COMPLETION_RULES = (
     (
-        "Complete only after every declared receipt and raw reference has been "
-        "read, classified, preserved, and bound into one `ObservationUpdate`."
+        "Complete only after every declared receipt, raw reference, and lineage "
+        "artifact has been read and every evidence item has exactly one valid "
+        "classification in one `ObservationUpdate`."
+    ),
+    (
+        "If any required lineage field is missing or inconsistent, do not emit an "
+        "`ObservationUpdate`; confirmatory support additionally requires a matching "
+        "`preregistration_ref`."
     ),
     "Call `Research.observe` with the complete `ObservationUpdate`.",
     (
@@ -489,6 +550,14 @@ EXPECTED_EVIDENCE_FORBIDDEN_RULES = (
     (
         "Do not attach a scientific relation, including `negative_result`, to "
         "evidence whose `operational_state` is `unavailable` or `failed`."
+    ),
+    (
+        "Do not place a value outside the input `mechanism_refs` in "
+        "`relation_targets` or update an arbitrary rival."
+    ),
+    (
+        "Do not call `Eval.run`, create an evaluation, or execute an evaluator; "
+        "read only existing evaluation receipts."
     ),
     (
         "Do not request, retry, restart, rerun, or resubmit an experiment, and do "
@@ -927,6 +996,47 @@ def test_contract_set_has_exact_canonical_values() -> None:
         assert procedure.input == input_name
         assert procedure.output == output_name
         assert procedure.tools == tools
+
+
+def test_evidence_update_cross_contract_lineage_is_explicit_and_update_only() -> None:
+    value = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    artifacts = value["artifacts"]
+    procedures = value["procedures"]
+    assert isinstance(artifacts, dict)
+    assert isinstance(procedures, dict)
+
+    assert tuple(artifacts["RunEvidence"]) == EXPECTED_ARTIFACTS["RunEvidence"]
+    assert tuple(artifacts["ObservationUpdate"]) == EXPECTED_ARTIFACTS[
+        "ObservationUpdate"
+    ]
+    assert "mechanisms" in artifacts["RivalMechanismSet"]
+    assert "mechanism_refs" in artifacts["ExperimentProposal"]
+    assert "prediction" in artifacts["ExperimentProposal"]
+    assert "key_predictions" in artifacts["Preregistration"]
+    assert procedures["aros-evidence-update"]["tools"] == [
+        "Run.status",
+        "Receipt.read",
+        "Git.read",
+        "Research.observe",
+        "Research.checkpoint",
+    ]
+
+
+def test_evidence_update_contract_rejects_eval_run_tool_bypass(
+    tmp_path: Path,
+) -> None:
+    module, value, path = _contract_candidate(tmp_path)
+    procedures = value["procedures"]
+    assert isinstance(procedures, dict)
+    procedure = procedures["aros-evidence-update"]
+    assert isinstance(procedure, dict)
+    canonical_tools = list(EXPECTED_PROCEDURES["aros-evidence-update"][2])
+    assert procedure["tools"] == canonical_tools
+    procedure["tools"] = [*canonical_tools, "Eval.run"]
+    _write_contract_candidate(path, value)
+
+    with pytest.raises(ValueError, match="canonical contract"):
+        module.load_contracts(path)
 
 
 def test_contract_json_has_exact_container_shapes() -> None:
@@ -1582,10 +1692,13 @@ def test_evidence_update_reads_exact_evidence_and_classifies_independent_axes() 
         numbered=True,
     )
     method = _procedure_rules(_procedure_section(body, "Method"), numbered=True)
-    assert "`supports`" in method[2]
-    assert "assign zero or more" in method[2]
-    assert "both `negative_result` and `counterexample`" in method[3]
-    assert "empty `scientific_relations`" in method[4]
+    method_text = "\n".join(method)
+    assert "`supports`" in method_text
+    assert "assign zero or more" in method_text
+    assert "both `negative_result` and `counterexample`" in method_text
+    assert "empty `scientific_relations`" in method_text
+    assert "`experiment_proposal_ref` and `prediction_ref`" in method_text
+    assert "`preregistration_ref`" in method_text
     assert not any(
         rule.startswith("Classify each evidence item as exactly one of")
         for rule in method
@@ -1598,16 +1711,24 @@ def test_evidence_update_returns_exact_fields_then_checkpoints_and_exits() -> No
     )
     output = _procedure_rules(_procedure_section(body, "Output"), numbered=False)
 
-    assert len(output) == 4
+    assert len(output) == 5
     assert output[0] == "Artifact: Return exactly one `ObservationUpdate`."
     assert _required_fields(output[1]) == EXPECTED_ARTIFACTS["ObservationUpdate"]
     assert output[2] == (
+        "Classification entries: Every `classifications` item contains exactly "
+        "`evidence_ref`, `operational_state`, `scientific_relations`, and "
+        "`relation_targets`."
+    )
+    assert tuple(re.findall(r"`([a-z_]+)`", output[2]))[1:] == (
+        EXPECTED_EVIDENCE_CLASSIFICATION_FIELDS
+    )
+    assert output[3] == (
         "Evidence binding: Cite an exact input receipt or raw reference for every "
         "strengthened, weakened, eliminated, counterexample, and negative-result "
         "entry; preserve the same reference in both lists when one executed item "
         "has both relations."
     )
-    assert output[3] == (
+    assert output[4] == (
         "Budget accounting: Include the exact input `budget_used` in "
         "`next_action_rationale`; do not add an output field outside the central "
         "contract."
@@ -1627,8 +1748,8 @@ def test_evidence_update_forbids_retry_overwrite_scores_and_claim_admission() ->
 
     assert metadata["tools"] == [
         "Run.status",
-        "Eval.run",
         "Receipt.read",
+        "Git.read",
         "Research.observe",
         "Research.checkpoint",
     ]
@@ -1652,9 +1773,9 @@ def test_evidence_update_forbids_retry_overwrite_scores_and_claim_admission() ->
             "Forbid one executed item from carrying both `negative_result` and",
         ),
         (
-            "5. An item whose `operational_state` is `unavailable` or `failed` "
+            "9. An item whose `operational_state` is `unavailable` or `failed` "
             "must have empty",
-            "5. An item whose `operational_state` is `unavailable` or `failed` "
+            "9. An item whose `operational_state` is `unavailable` or `failed` "
             "may carry relations",
         ),
         ("Preserve every negative result", "Discard every negative result"),
@@ -1679,6 +1800,62 @@ def test_evidence_update_method_rejects_opposite_evidence_polarity(
             "Method",
             EXPECTED_EVIDENCE_METHOD_RULES,
             numbered=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "classification; reject missing or inconsistent lineage",
+            "classification; allow missing or inconsistent lineage",
+        ),
+        (
+            "require every `relation_targets` value to belong to the input "
+            "`mechanism_refs`",
+            "permit `relation_targets` outside the input `mechanism_refs`",
+        ),
+        (
+            "Treat a `supports` relation as confirmatory only when the input",
+            "Treat a `supports` relation as confirmatory without the input",
+        ),
+    ],
+)
+def test_evidence_update_rejects_missing_lineage_and_unrelated_targets(
+    old: str, new: str
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            "Method",
+            EXPECTED_EVIDENCE_METHOD_RULES,
+            numbered=True,
+        )
+
+
+def test_evidence_update_forbidden_rules_reject_eval_run_tool_bypass() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    mutated = body.replace(
+        "- Do not call `Eval.run`, create an evaluation, or execute an evaluator;",
+        "- Call `Eval.run` to create and execute an evaluation;",
+        1,
+    )
+    assert mutated != body
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            "Forbidden",
+            EXPECTED_EVIDENCE_FORBIDDEN_RULES,
+            numbered=False,
         )
 
 

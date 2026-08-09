@@ -54,10 +54,16 @@
       "eval_refs",
       "raw_refs",
       "process_state",
-      "budget_used"
+      "budget_used",
+      "rival_mechanism_set_ref",
+      "mechanism_refs",
+      "experiment_proposal_ref",
+      "prediction_ref",
+      "preregistration_ref"
     ],
     "ObservationUpdate": [
       "evidence_refs",
+      "classifications",
       "strengthened",
       "weakened",
       "eliminated",
@@ -143,8 +149,8 @@
       "output": "ObservationUpdate",
       "tools": [
         "Run.status",
-        "Eval.run",
         "Receipt.read",
+        "Git.read",
         "Research.observe",
         "Research.checkpoint"
       ]

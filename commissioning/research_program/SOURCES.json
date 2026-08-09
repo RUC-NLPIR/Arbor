@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "id": "source-1",
+      "repository": "/workspace/Auto-claude-code-research-in-sleep",
+      "commit": "df729a3f942e4a97646d212eb8aee1144ab5e31b",
+      "license": "MIT",
+      "selected_paths": [
+        "skills/research-lit/SKILL.md",
+        "skills/novelty-check/SKILL.md",
+        "skills/citation-audit/SKILL.md",
+        "skills/idea-creator/SKILL.md",
+        "skills/research-refine/SKILL.md",
+        "skills/experiment-plan/SKILL.md",
+        "skills/ablation-planner/SKILL.md",
+        "skills/analyze-results/SKILL.md",
+        "skills/research-wiki/SKILL.md",
+        "skills/research-review/SKILL.md",
+        "skills/experiment-audit/SKILL.md",
+        "skills/integrity-forensics/SKILL.md",
+        "skills/result-to-claim/SKILL.md",
+        "skills/claims-drafting/SKILL.md",
+        "skills/shared-references/external-cadence.md",
+        "skills/shared-references/reviewer-independence.md",
+        "mcp-servers/claude-review/server.py",
+        "mcp-servers/gemini-review/server.py",
+        "mcp-servers/manual-review/server.py"
+      ],
+      "adaptation": "Distill scientific procedures, durable recovery, cadence, and fresh review; remove scoring, paper production, remote execution, and duplicate orchestration."
+    },
+    {
+      "id": "source-2",
+      "repository": "/workspace/Arbor/.worktree/aros-long-running-research-program-design",
+      "commit": "e9c58c998767dd87bdea99a727533819850ac281",
+      "license": "Apache-2.0",
+      "selected_paths": [
+        "skills/arbor-agent-setup-intake/SKILL.md",
+        "skills/arbor-agent-ideate/SKILL.md",
+        "skills/arbor-agent-executor/SKILL.md",
+        "skills/arbor-agent-search/SKILL.md",
+        "skills/arbor-agent-resume-report/SKILL.md",
+        "skills/arbor-agent-tools/SKILL.md",
+        "src/mcp/server.py",
+        "src/mcp/session_ops.py"
+      ],
+      "adaptation": "Distill mechanism framing, deterministic tool boundaries, search, and durable handoff; remove tree authority, scalar evaluation, merge gates, and duplicate session state."
+    }
+  ]
+}

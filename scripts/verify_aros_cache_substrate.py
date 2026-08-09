@@ -1921,6 +1921,59 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
     }
 
 
+def _cache_size_bytes(raw):
+    units = {
+        "TiB": 1024**4,
+        "GiB": 1024**3,
+        "MiB": 1024**2,
+        "KiB": 1024,
+        "B": 1,
+    }
+    if not 1 <= len(raw) <= 64 or any(character.isspace() for character in raw):
+        raise VerificationError("simulator cache size text is invalid")
+    unit = next((name for name in units if raw.endswith(name)), None)
+    if unit is None:
+        raise VerificationError("simulator cache size unit is invalid")
+    number = _normalized_decimal(raw[: -len(unit)], "simulator cache size")
+    if number.startswith("-"):
+        raise VerificationError("simulator cache size must be positive")
+    _sign, coefficient, scale = _decimal_key(number)
+    numerator = coefficient * units[unit]
+    denominator = 10**scale
+    size, remainder = divmod(numerator, denominator)
+    if remainder or size <= 0:
+        raise VerificationError("simulator cache size is not an exact byte count")
+    return size
+
+
+def _bounded_unsigned_decimal(raw, label, integer_digits, fraction_digits):
+    if type(raw) is not str or raw.count(".") != 1:
+        raise VerificationError(f"{label} decimal shape is invalid")
+    integer, fraction = raw.split(".", 1)
+    if (
+        not 1 <= len(integer) <= integer_digits
+        or not 1 <= len(fraction) <= fraction_digits
+        or not integer.isdigit()
+        or not fraction.isdigit()
+    ):
+        raise VerificationError(f"{label} decimal shape is invalid")
+    return _normalized_decimal(raw, label)
+
+
+def _detailed_policy_matches(detailed, policy):
+    if detailed == policy:
+        return True
+    prefix = policy + "-"
+    if not detailed.startswith(prefix):
+        return False
+    suffix = detailed[len(prefix) :]
+    return (
+        bool(suffix)
+        and any(character.isdigit() for character in suffix)
+        and all(character in "0123456789_.:+-" for character in suffix)
+    )
+
+
 def _parse_result(raw):
     try:
         text = raw.decode("ascii")
@@ -1934,20 +1987,45 @@ def _parse_result(raw):
         if marker not in line:
             raise VerificationError("simulator stdout contains an unknown line")
         prefix, remainder = line.split(marker, 1)
-        if not prefix.startswith("/"):
+        try:
+            trace_path, detailed_policy = prefix.rsplit(" ", 1)
+        except ValueError as error:
+            raise VerificationError("simulator result identity is malformed") from error
+        if not trace_path.startswith("/") or not detailed_policy:
             raise VerificationError("simulator result trace path is not absolute")
+        if (
+            len(trace_path) > 1792
+            or len(detailed_policy) > 256
+            or detailed_policy[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+            or any(
+                character
+                not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:+-"
+                for character in detailed_policy
+            )
+        ):
+            raise VerificationError("simulator detailed policy name is invalid")
         fields = remainder.split(",")
         if len(fields) != 5:
             raise VerificationError("simulator result field count mismatch")
         requests = fields[1].strip().split(" ")
+        cache_size = fields[0].strip()
         object_ratio = fields[2].strip().removeprefix("miss ratio ")
         byte_ratio = fields[3].strip().removeprefix("byte miss ratio ")
         throughput = fields[4].strip().removeprefix("throughput ").removesuffix(" MQPS")
-        if len(requests) != 2 or requests[1] != "req" or not requests[0].isdigit():
+        if (
+            len(requests) != 2
+            or requests[1] != "req"
+            or not requests[0].isdigit()
+            or not 1 <= len(requests[0]) <= 20
+        ):
             raise VerificationError("simulator request count is malformed")
-        parsed_object = _normalized_decimal(object_ratio, "object miss ratio")
-        parsed_byte = _normalized_decimal(byte_ratio, "byte miss ratio")
-        parsed_throughput = _normalized_decimal(throughput, "throughput")
+        parsed_object = _bounded_unsigned_decimal(
+            object_ratio, "object miss ratio", 3, 12
+        )
+        parsed_byte = _bounded_unsigned_decimal(byte_ratio, "byte miss ratio", 3, 12)
+        parsed_throughput = _bounded_unsigned_decimal(
+            throughput, "throughput", 12, 12
+        )
         if (
             int(requests[0]) <= 0
             or _decimal_compare(parsed_object, "0") < 0
@@ -1960,6 +2038,10 @@ def _parse_result(raw):
         matches.append(
             {
                 "request_count": int(requests[0]),
+                "trace_path": trace_path,
+                "detailed_policy": detailed_policy,
+                "cache_size": cache_size,
+                "cache_size_bytes": _cache_size_bytes(cache_size),
                 "object_miss_ratio": parsed_object,
                 "byte_miss_ratio": parsed_byte,
                 "simulator_throughput_mqps": parsed_throughput,
@@ -2011,7 +2093,16 @@ def _verify_phase(root, value, measurement, trace):
     }
 
 
-def _verify_measurement(root, summary, receipt, r0, trace):
+def _verify_measurement(
+    root,
+    summary,
+    receipt,
+    r0,
+    trace,
+    execution_path,
+    trace_snapshot_path,
+    fixed_time_path,
+):
     _exact(
         summary,
         {"index", "trace_id", "split", "cache_fraction", "cache_size_bytes", "path", "measurement_sha256"},
@@ -2079,6 +2170,12 @@ def _verify_measurement(root, summary, receipt, r0, trace):
             observed = _normalized_decimal(observed, field)
         if observed != expected:
             raise VerificationError(f"raw simulator {field} differs from measurement")
+    if parsed["trace_path"] != str(trace_snapshot_path):
+        raise VerificationError("raw simulator trace differs from bound trace snapshot")
+    if not _detailed_policy_matches(parsed["detailed_policy"], measurement["policy"]):
+        raise VerificationError("raw simulator policy differs from requested policy")
+    if parsed["cache_size_bytes"] != measurement["cache_size_bytes"]:
+        raise VerificationError("raw simulator cache size differs from requested cell")
     expected_cpu = _decimal_ratio(process["cpu_ns"], measurement["request_count"])
     if measurement["cpu_ns_per_request"] != expected_cpu:
         raise VerificationError("measurement CPU nanoseconds per request mismatch")
@@ -2088,6 +2185,32 @@ def _verify_measurement(root, summary, receipt, r0, trace):
         "simulator output",
     )
     simulator_path = _relative(root, simulator["path"], "simulator side effect")
+    expected_requested = f"simulator-side-effects/{index:04d}.cachesim"
+    requested = PurePosixPath(simulator["requested_path"])
+    if (
+        simulator["requested_path"] != expected_requested
+        or requested.is_absolute()
+        or ".." in requested.parts
+    ):
+        raise VerificationError("simulator requested output path mismatch")
+    requested_path = root.joinpath(*requested.parts).resolve(strict=False)
+    expected_argv = [
+        "/usr/bin/env",
+        f"LD_PRELOAD={fixed_time_path}",
+        str(execution_path),
+        str(trace_snapshot_path),
+        "oracleGeneral",
+        measurement["policy"],
+        str(measurement["cache_size_bytes"]),
+        "--num-thread=1",
+        f"--num-req={trace['max_requests']}",
+        f"--warmup-sec={trace['warmup_seconds']}",
+        "--consider-obj-metadata=true",
+        "--print-head-req=false",
+        f"--output={requested_path}",
+    ]
+    if measurement["argv"] != expected_argv or process["argv"] != expected_argv:
+        raise VerificationError("measurement argv differs from bound execution cell")
     if (
         simulator_path.stat().st_size != simulator["size_bytes"]
         or _sha256_file(simulator_path) != simulator["sha256"]
@@ -2133,6 +2256,30 @@ def _scientific_projection(receipt, root=None):
         ) != projection[f"header:{name}"]:
             raise VerificationError("scientific header snapshot hash mismatch")
     return dict(sorted(projection.items()))
+
+
+def _verify_execution_copy(root, receipt, r0):
+    execution = _exact(
+        receipt["execution_copy"],
+        {"path", "identity", "mode", "size_bytes", "sha256"},
+        "portfolio execution copy",
+    )
+    path = _relative(root, execution["path"], "portfolio execution copy")
+    metadata = path.stat()
+    expected_hash = r0["record"]["artifact_snapshots"]["release_cachesim"][
+        "sha256"
+    ]
+    if (
+        execution["identity"] != {"device": metadata.st_dev, "inode": metadata.st_ino}
+        or execution["mode"] != metadata.st_mode & 0o777
+        or execution["size_bytes"] != metadata.st_size
+        or execution["sha256"] != _sha256_file(path)
+        or execution["sha256"] != expected_hash
+        or execution["sha256"] != r0["record"]["binary_sha256"]
+        or execution["sha256"] != receipt["binary_snapshot_sha256"]
+    ):
+        raise VerificationError("portfolio execution copy differs from candidate R0 binary")
+    return path
 
 
 def _verify_portfolio(path, expected_rung, task_root, manifest, source, r0_by_hash, checkout):
@@ -2202,6 +2349,31 @@ def _verify_portfolio(path, expected_rung, task_root, manifest, source, r0_by_ha
         raise VerificationError(f"{expected_rung} retains failed measurements")
     if receipt["provenance"] != {"final_binding_intact": True}:
         raise VerificationError(f"{expected_rung} final binding is not intact")
+    execution_path = _verify_execution_copy(root, receipt, r0)
+    scientific_inputs = receipt["scientific_inputs"]
+    if not isinstance(scientific_inputs, dict):
+        raise VerificationError("portfolio scientific inputs are missing")
+    fixed_record = scientific_inputs.get("fixed_time_interposer")
+    if not isinstance(fixed_record, dict) or type(fixed_record.get("path")) is not str:
+        raise VerificationError("fixed-time interposer snapshot is missing")
+    fixed_time_path = _relative(
+        root, fixed_record["path"], "fixed-time interposer snapshot"
+    )
+    raw_trace_snapshots = receipt["trace_snapshots"]
+    if not isinstance(raw_trace_snapshots, list) or len(raw_trace_snapshots) != len(
+        selected_traces
+    ):
+        raise VerificationError("portfolio trace snapshot inventory mismatch")
+    trace_snapshot_paths = {}
+    for item in raw_trace_snapshots:
+        if not isinstance(item, dict) or type(item.get("trace_id")) is not str:
+            raise VerificationError("portfolio trace snapshot entry is invalid")
+        trace_id = item["trace_id"]
+        if trace_id in trace_snapshot_paths or type(item.get("snapshot_path")) is not str:
+            raise VerificationError("portfolio trace snapshot IDs are duplicated")
+        trace_snapshot_paths[trace_id] = _relative(
+            root, item["snapshot_path"], "portfolio trace snapshot"
+        )
     summaries = receipt["measurements"]
     if not isinstance(summaries, list) or len(summaries) != len(expected_cells):
         raise VerificationError(f"{expected_rung} measurement inventory incomplete")
@@ -2216,7 +2388,16 @@ def _verify_portfolio(path, expected_rung, task_root, manifest, source, r0_by_ha
         if type(trace_id) is not str or trace_id not in by_trace:
             raise VerificationError("measurement summary names an unknown trace")
         measurements.append(
-            _verify_measurement(root, summary, receipt, r0, by_trace[trace_id])
+            _verify_measurement(
+                root,
+                summary,
+                receipt,
+                r0,
+                by_trace[trace_id],
+                execution_path,
+                trace_snapshot_paths[trace_id],
+                fixed_time_path,
+            )
         )
     if expected_rung == "r1":
         if receipt["phase_probe"] is not None or receipt["frozen_trace_diagnostics"] != []:
@@ -2318,12 +2499,6 @@ def _verify_portfolio(path, expected_rung, task_root, manifest, source, r0_by_ha
             or _load_object(audit_path) != trace["diagnostics"]
         ):
             raise VerificationError("portfolio trace snapshot binding mismatch")
-    execution = receipt["execution_copy"]
-    if not isinstance(execution, dict):
-        raise VerificationError("portfolio execution copy is missing")
-    execution_path = _relative(root, execution["path"], "portfolio execution copy")
-    if _sha256_file(execution_path) != execution["sha256"]:
-        raise VerificationError("portfolio execution-copy hash mismatch")
     _verify_inventory(root, receipt["evidence_inventory"])
     return {
         "path": Path(path).resolve(strict=True),

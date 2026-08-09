@@ -629,9 +629,9 @@ def r0_receipt(
     return write_record(output / "receipt.json", value, "receipt_sha256")
 
 
-def raw_result(trace: Path, policy: str, throughput: str) -> bytes:
+def raw_result(trace: Path, policy: str, throughput: str, cache_size: int) -> bytes:
     return (
-        f"{trace} {policy} cache size  1.00KiB, 32 req, miss ratio 0.5000, "
+        f"{trace} {policy} cache size  {cache_size}B, 32 req, miss ratio 0.5000, "
         f"byte miss ratio 0.5000, throughput {throughput}.00 MQPS\n"
     ).encode()
 
@@ -769,6 +769,20 @@ def portfolio_receipt(
         "header:libCacheSim/include/libCacheSim.h": hashlib.sha256(b"header").hexdigest(),
         "header:libCacheSim/bin/cachesim/cache_init.h": hashlib.sha256(b"init").hexdigest(),
     }
+    execution = root / "apparatus/cachesim"
+    execution.parent.mkdir(parents=True)
+    execution.write_bytes(b"binary")
+    execution.chmod(0o500)
+    fixed_time = root / "inputs/fixed"
+    fixed_time.parent.mkdir(parents=True, exist_ok=True)
+    fixed_time.write_bytes(b"fixed")
+    precreated_snapshots = {}
+    for trace_index, trace in enumerate(selected):
+        snapshot = root / f"trace-snapshots/{trace_index:04d}.oracleGeneral"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_bytes(Path(trace["path"]).read_bytes())
+        snapshot.chmod(0o400)
+        precreated_snapshots[trace["trace_id"]] = snapshot
     measurements = []
     selected_cells = []
     for trace in selected:
@@ -784,8 +798,25 @@ def portfolio_receipt(
             }
             selected_cells.append(cell_summary)
             cell = root / f"measurements/{index:04d}"
-            argv = ["cachesim", str(trace["path"]), "oracleGeneral", policy, str(cache_size)]
-            raw = raw_result(Path(str(trace["path"])), policy, throughput)
+            private_side_effect = root / f"simulator-side-effects/{index:04d}.cachesim"
+            argv = [
+                "/usr/bin/env",
+                f"LD_PRELOAD={fixed_time.resolve()}",
+                str(execution.resolve()),
+                str(precreated_snapshots[trace["trace_id"]].resolve()),
+                "oracleGeneral",
+                policy,
+                str(cache_size),
+                "--num-thread=1",
+                f"--num-req={trace['max_requests']}",
+                f"--warmup-sec={trace['warmup_seconds']}",
+                "--consider-obj-metadata=true",
+                "--print-head-req=false",
+                f"--output={private_side_effect.resolve()}",
+            ]
+            raw = raw_result(
+                precreated_snapshots[trace["trace_id"]], policy, throughput, cache_size
+            )
             process = process_record(root, cell, argv, raw, label="cachesim")
             write_record(cell / "process.json", process, "process_sha256")
             request: dict[str, object] = {
@@ -858,9 +889,6 @@ def portfolio_receipt(
                     "measurement_sha256": measurement["measurement_sha256"],
                 }
             )
-    execution = root / "execution/cachesim"
-    execution.parent.mkdir(parents=True)
-    execution.write_bytes(b"binary")
     trace_snapshots = []
     for index, trace in enumerate(selected):
         source_path = Path(trace["path"])
@@ -1707,6 +1735,95 @@ def rewrite_portfolio_measurement(receipt_path: Path, field: str, value: object)
     write_record(receipt_path, receipt, "receipt_sha256")
 
 
+def update_portfolio_inventory(
+    receipt: dict[str, object], root: Path, path: Path
+) -> None:
+    relative = path.relative_to(root).as_posix()
+    metadata = path.stat()
+    item = next(
+        (entry for entry in receipt["evidence_inventory"] if entry["path"] == relative),
+        None,
+    )
+    value = {
+        "path": relative,
+        "identity": {"device": metadata.st_dev, "inode": metadata.st_ino},
+        "mode": metadata.st_mode & 0o777,
+        "size_bytes": metadata.st_size,
+        "sha256": sha256_file(path),
+    }
+    if item is None:
+        receipt["evidence_inventory"].append(value)
+        receipt["evidence_inventory"].sort(key=lambda entry: entry["path"])
+    else:
+        item.update(value)
+
+
+def rewrite_first_cell_argv(receipt_path: Path, executable: Path) -> None:
+    root = receipt_path.parent
+    receipt = json.loads(receipt_path.read_text())
+    summary = receipt["measurements"][0]
+    measurement_path = root / summary["path"]
+    measurement = json.loads(measurement_path.read_text())
+    process = measurement["process"]
+    process["argv"][2] = str(executable.resolve())
+    process["process_sha256"] = record_sha256(process, "process_sha256")
+    process_path = measurement_path.parent / "process.json"
+    write_record(process_path, process, "process_sha256")
+    request_path = measurement_path.parent / "request.json"
+    request = json.loads(request_path.read_text())
+    request["argv"] = list(process["argv"])
+    write_record(request_path, request, "request_sha256")
+    measurement["argv"] = list(process["argv"])
+    measurement["process"] = process
+    write_record(measurement_path, measurement, "measurement_sha256")
+    summary["measurement_sha256"] = measurement["measurement_sha256"]
+    receipt["measurement_hashes"][0] = measurement["measurement_sha256"]
+    for changed in (executable, process_path, request_path, measurement_path):
+        update_portfolio_inventory(receipt, root, changed)
+    write_record(receipt_path, receipt, "receipt_sha256")
+
+
+def rewrite_first_raw_result(receipt_path: Path, defect: str) -> None:
+    root = receipt_path.parent
+    receipt = json.loads(receipt_path.read_text())
+    summary = receipt["measurements"][0]
+    measurement_path = root / summary["path"]
+    measurement = json.loads(measurement_path.read_text())
+    process = measurement["process"]
+    stdout = root / process["stdout"]["path"]
+    raw = stdout.read_text()
+    if defect == "trace":
+        raw = "/tmp/wrong.oracleGeneral" + raw[raw.index(" "):]
+    elif defect == "policy":
+        raw = raw.replace(" Sieve cache size ", " OtherPolicy cache size ", 1)
+    elif defect == "cache_size":
+        cell_bytes = measurement["cache_size_bytes"]
+        raw = raw.replace(
+            f" cache size  {cell_bytes}B,",
+            f" cache size  {cell_bytes + 1}B,",
+            1,
+        )
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(defect)
+    stdout.write_text(raw)
+    simulator = root / measurement["simulator_output"]["path"]
+    simulator.write_text(raw)
+    process["stdout"]["size_bytes"] = stdout.stat().st_size
+    process["stdout"]["sha256"] = sha256_file(stdout)
+    process["process_sha256"] = record_sha256(process, "process_sha256")
+    process_path = measurement_path.parent / "process.json"
+    write_record(process_path, process, "process_sha256")
+    measurement["process"] = process
+    measurement["simulator_output"]["size_bytes"] = simulator.stat().st_size
+    measurement["simulator_output"]["sha256"] = sha256_file(simulator)
+    write_record(measurement_path, measurement, "measurement_sha256")
+    summary["measurement_sha256"] = measurement["measurement_sha256"]
+    receipt["measurement_hashes"][0] = measurement["measurement_sha256"]
+    for changed in (stdout, simulator, process_path, measurement_path):
+        update_portfolio_inventory(receipt, root, changed)
+    write_record(receipt_path, receipt, "receipt_sha256")
+
+
 def rewrite_r0_receipt(path: Path, receipt: dict[str, object]) -> None:
     write_record(path, receipt, "receipt_sha256")
 
@@ -1935,6 +2052,57 @@ def test_verifier_recomputes_cpu_per_request_from_process_receipt(
     rewrite_portfolio_measurement(fixture.paths["r1_receipt"], "cpu_ns_per_request", "101")
     with pytest.raises(fixture.module.VerificationError, match="CPU"):
         fixture.module.verify(fixture.index)
+
+
+def test_verifier_binds_execution_copy_to_candidate_r0_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    receipt_path = fixture.paths["r1_receipt"]
+    root = receipt_path.parent
+    receipt = json.loads(receipt_path.read_text())
+    execution = root / receipt["execution_copy"]["path"]
+    execution.write_bytes(b"arbitrary executable")
+    receipt["execution_copy"]["size_bytes"] = execution.stat().st_size
+    receipt["execution_copy"]["sha256"] = sha256_file(execution)
+    update_portfolio_inventory(receipt, root, execution)
+    write_record(receipt_path, receipt, "receipt_sha256")
+    with pytest.raises(fixture.module.VerificationError, match="execution"):
+        fixture.module.verify(fixture.index)
+
+
+def test_verifier_rejects_arbitrary_measurement_executable_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    receipt_path = fixture.paths["r1_receipt"]
+    executable = receipt_path.parent / "arbitrary-executable"
+    executable.write_bytes(b"binary")
+    executable.chmod(0o500)
+    rewrite_first_cell_argv(receipt_path, executable)
+    with pytest.raises(fixture.module.VerificationError, match="argv"):
+        fixture.module.verify(fixture.index)
+
+
+@pytest.mark.parametrize("defect", ["trace", "policy", "cache_size"])
+def test_verifier_binds_raw_result_to_requested_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    rewrite_first_raw_result(fixture.paths["r1_receipt"], defect)
+    with pytest.raises(fixture.module.VerificationError, match=defect.replace("_", " ")):
+        fixture.module.verify(fixture.index)
+
+
+def test_detailed_policy_name_allows_only_numeric_generated_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    matches = fixture.module._detailed_policy_matches
+    assert matches("S3FIFO", "S3FIFO") is True
+    assert matches("S3FIFO-0.1000-2", "S3FIFO") is True
+    assert matches("S3FIFO-other", "S3FIFO") is False
+    assert matches("S3FIFO2-0.1", "S3FIFO") is False
 
 
 def test_verifier_recomputes_r3_transfer_constraint_facts(

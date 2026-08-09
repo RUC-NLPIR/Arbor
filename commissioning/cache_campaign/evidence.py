@@ -681,14 +681,30 @@ def stage_directory_in_parent(
             os.mkdir(name, mode=0o700, dir_fd=parent.descriptor)
         except FileExistsError:
             continue
-        path = parent.path / name
-        metadata = path.lstat()
-        identity = (metadata.st_dev, metadata.st_ino)
-        path_parent = parent.path.lstat()
-        if (path_parent.st_dev, path_parent.st_ino) != parent.identity:
-            cleanup_owned(parent.descriptor_path / name, identity)
-            raise EvidenceError("output parent path changed during staging")
-        return path, identity
+        try:
+            metadata = os.stat(
+                name, dir_fd=parent.descriptor, follow_symlinks=False
+            )
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise EvidenceError("descriptor-relative stage is not a directory")
+            identity = (metadata.st_dev, metadata.st_ino)
+            path_parent = parent.path.lstat()
+            if (path_parent.st_dev, path_parent.st_ino) != parent.identity:
+                raise EvidenceError("output parent path changed during staging")
+        except BaseException:
+            try:
+                owned = os.stat(
+                    name, dir_fd=parent.descriptor, follow_symlinks=False
+                )
+                if stat.S_ISDIR(owned.st_mode):
+                    cleanup_owned(
+                        parent.descriptor_path / name,
+                        (owned.st_dev, owned.st_ino),
+                    )
+            except (OSError, ValueError):
+                pass
+            raise
+        return parent.path / name, identity
     raise EvidenceError("cannot allocate descriptor-relative stage directory")
 
 

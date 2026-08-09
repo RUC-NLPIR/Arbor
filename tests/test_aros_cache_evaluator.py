@@ -140,6 +140,40 @@ def test_output_parent_replacement_before_stage_is_cleaned_via_retained_fd(
         os.close(parent.descriptor)
 
 
+def test_stage_post_mkdir_error_cleans_owned_directory_via_retained_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = tmp_path / "host"
+    host.mkdir()
+    parent = cache_evidence.retain_output_parent(
+        host / "output", tmp_path / "checkout"
+    )
+    real_stat = cache_evidence.os.stat
+    failed = False
+
+    def fail_first_stage_stat(
+        path: object, *, dir_fd: int | None = None, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        nonlocal failed
+        if (
+            not failed
+            and dir_fd == parent.descriptor
+            and isinstance(path, str)
+            and path.startswith(".output-stage-")
+        ):
+            failed = True
+            raise OSError("injected post-mkdir failure")
+        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(cache_evidence.os, "stat", fail_first_stage_stat)
+    try:
+        with pytest.raises(OSError, match="post-mkdir"):
+            cache_evidence.stage_directory_in_parent(parent)
+        assert not list(host.glob(".output-stage-*"))
+    finally:
+        os.close(parent.descriptor)
+
+
 @pytest.mark.parametrize(
     "failure", ["selection", "cache_size", "staging", "snapshot"]
 )

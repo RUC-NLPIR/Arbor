@@ -99,6 +99,12 @@ _ARTIFACTS = {
         "transfer_prediction",
         "stopping_rules",
         "evaluator_version",
+        "candidate_commit",
+        "data_manifest_refs",
+        "environment_sha256",
+        "output_schema_sha256",
+        "analysis_boundaries",
+        "rerun_rules",
     ),
     "FrozenEvidencePacket": (
         "task_brief_ref",

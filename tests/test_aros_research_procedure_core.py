@@ -165,6 +165,12 @@ EXPECTED_ARTIFACTS = {
         "transfer_prediction",
         "stopping_rules",
         "evaluator_version",
+        "candidate_commit",
+        "data_manifest_refs",
+        "environment_sha256",
+        "output_schema_sha256",
+        "analysis_boundaries",
+        "rerun_rules",
     ),
     "FrozenEvidencePacket": (
         "task_brief_ref",
@@ -441,6 +447,62 @@ EXPECTED_EVIDENCE_CLASSIFICATION_FIELDS = (
     "scientific_relations",
     "relation_targets",
     "confirmation_status",
+    "confirmation_deviations",
+)
+EXPECTED_CONFIRMATION_MATCH_FIELDS = (
+    "candidate_commit",
+    "data_manifest_refs",
+    "environment_sha256",
+    "evaluator_version",
+    "output_schema_sha256",
+    "controls",
+    "primary_comparisons",
+    "analysis_boundaries",
+    "stopping_rules",
+    "rerun_rules",
+)
+EXPECTED_CONFIRMATION_MATCH_RULES = (
+    (
+        "For `candidate_commit`, require the executed receipt value to exactly "
+        "equal the `Preregistration` value."
+    ),
+    (
+        "For `data_manifest_refs`, require the executed receipt references and "
+        "order to exactly equal the `Preregistration` value."
+    ),
+    (
+        "For `environment_sha256`, require the executed receipt value to exactly "
+        "equal the `Preregistration` value."
+    ),
+    (
+        "For `evaluator_version`, require the executed receipt value to exactly "
+        "equal the `Preregistration` value."
+    ),
+    (
+        "For `output_schema_sha256`, require the executed receipt value to exactly "
+        "equal the `Preregistration` value."
+    ),
+    (
+        "For `controls`, require the executed receipt controls and values to "
+        "exactly equal the `Preregistration` value."
+    ),
+    (
+        "For `primary_comparisons`, require the executed receipt comparison "
+        "identities and measurements to exactly equal the `Preregistration` "
+        "specification."
+    ),
+    (
+        "For `analysis_boundaries`, require the executed analysis to exactly equal "
+        "the `Preregistration` value."
+    ),
+    (
+        "For `stopping_rules`, require the executed stopping behavior to exactly "
+        "equal the `Preregistration` value."
+    ),
+    (
+        "For `rerun_rules`, require the executed rerun behavior to exactly equal "
+        "the `Preregistration` value."
+    ),
 )
 EXPECTED_EVIDENCE_METHOD_RULES = (
     (
@@ -512,11 +574,19 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
         "carry `supports`, `weakens`, `eliminates`, `counterexample`, or "
         "`negative_result`."
     ),
+    *EXPECTED_CONFIRMATION_MATCH_RULES,
     (
-        "Set `confirmation_status` to `confirmatory` only when "
-        "`preregistration_ref` is non-null and names a `Preregistration` that "
-        "binds the same `experiment_proposal_ref` and `prediction_ref`; null never "
-        "yields `confirmatory`."
+        "For any missing or deviating confirmation binding, set "
+        "`confirmation_status` to `non_confirmatory` and append a "
+        "`confirmation_deviations` item containing the field name, expected "
+        "preregistered value, observed receipt value or a missing marker, and "
+        "`evidence_ref`; record every mismatch."
+    ),
+    (
+        "Set `confirmation_status` to `confirmatory` only for executed evidence "
+        "when `preregistration_ref` is non-null, the proposal and prediction "
+        "lineage matches, every confirmation binding matches exactly, and "
+        "`confirmation_deviations` is empty; null never yields `confirmatory`."
     ),
     (
         "Map `supports` to `strengthened`, `weakens` to `weakened`, and "
@@ -571,8 +641,9 @@ EXPECTED_EVIDENCE_FORBIDDEN_RULES = (
     ),
     (
         "Do not set `confirmation_status` to `confirmatory` when "
-        "`preregistration_ref` is null or does not bind the same proposal and "
-        "prediction."
+        "`preregistration_ref` is null, the evidence is not executed, any required "
+        "receipt lineage value is missing or deviates, or "
+        "`confirmation_deviations` is nonempty."
     ),
     (
         "Do not call `Eval.run`, create an evaluation, or execute an evaluator; "
@@ -1027,6 +1098,9 @@ def test_evidence_update_cross_contract_lineage_is_explicit_and_update_only() ->
     assert tuple(artifacts["RunEvidence"]) == EXPECTED_ARTIFACTS["RunEvidence"]
     assert tuple(artifacts["ObservationUpdate"]) == EXPECTED_ARTIFACTS[
         "ObservationUpdate"
+    ]
+    assert tuple(artifacts["Preregistration"]) == EXPECTED_ARTIFACTS[
+        "Preregistration"
     ]
     assert "mechanisms" in artifacts["RivalMechanismSet"]
     assert "mechanism_refs" in artifacts["ExperimentProposal"]
@@ -1730,24 +1804,31 @@ def test_evidence_update_returns_exact_fields_then_checkpoints_and_exits() -> No
     )
     output = _procedure_rules(_procedure_section(body, "Output"), numbered=False)
 
-    assert len(output) == 5
+    assert len(output) == 6
     assert output[0] == "Artifact: Return exactly one `ObservationUpdate`."
     assert _required_fields(output[1]) == EXPECTED_ARTIFACTS["ObservationUpdate"]
     assert output[2] == (
         "Classification entries: Every `classifications` item contains exactly "
         "`evidence_ref`, `operational_state`, `scientific_relations`, and "
-        "`relation_targets`, and `confirmation_status`."
+        "`relation_targets`, `confirmation_status`, and "
+        "`confirmation_deviations`."
     )
     assert tuple(re.findall(r"`([a-z_]+)`", output[2]))[1:] == (
         EXPECTED_EVIDENCE_CLASSIFICATION_FIELDS
     )
     assert output[3] == (
+        "Confirmation deviations: `confirmation_deviations` is empty only when "
+        "`confirmation_status` is `confirmatory`; for `non_confirmatory`, list "
+        "every missing or deviating preregistration binding with its field name, "
+        "expected value, observed value or missing marker, and `evidence_ref`."
+    )
+    assert output[4] == (
         "Evidence binding: Cite an exact input receipt or raw reference for every "
         "strengthened, weakened, eliminated, counterexample, and negative-result "
         "entry; preserve the same reference in both lists when one executed item "
         "has both relations."
     )
-    assert output[4] == (
+    assert output[5] == (
         "Budget accounting: Include the exact input `budget_used` in "
         "`next_action_rationale`; do not add an output field outside the central "
         "contract."
@@ -1778,6 +1859,44 @@ def test_evidence_update_allows_null_preregistration_for_exploratory_relations()
     )
     assert "null never yields `confirmatory`" in method_text
     assert "does not block completion" in completion[1]
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_rule"),
+    tuple(zip(EXPECTED_CONFIRMATION_MATCH_FIELDS, EXPECTED_CONFIRMATION_MATCH_RULES)),
+    ids=EXPECTED_CONFIRMATION_MATCH_FIELDS,
+)
+def test_evidence_update_each_preregistration_mismatch_is_nonconfirmatory(
+    field: str, expected_rule: str
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    method = _procedure_rules(_procedure_section(body, "Method"), numbered=True)
+
+    assert expected_rule in method
+    mismatch_rule = next(
+        rule
+        for rule in method
+        if rule.startswith("For any missing or deviating confirmation binding")
+    )
+    assert "`non_confirmatory`" in mismatch_rule
+    assert "`confirmation_deviations`" in mismatch_rule
+    assert "record every mismatch" in mismatch_rule
+
+    ordinal = EXPECTED_EVIDENCE_METHOD_RULES.index(expected_rule) + 1
+    old = f"{ordinal}. For `{field}`, require"
+    new = f"{ordinal}. For `{field}`, permit a mismatch and"
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            "Method",
+            EXPECTED_EVIDENCE_METHOD_RULES,
+            numbered=True,
+        )
 
 
 def test_evidence_update_forbids_retry_overwrite_scores_and_claim_admission() -> None:
@@ -1855,8 +1974,10 @@ def test_evidence_update_method_rejects_opposite_evidence_polarity(
             "permit `relation_targets` outside the input `mechanism_refs`",
         ),
         (
-            "Set `confirmation_status` to `confirmatory` only when",
-            "Set `confirmation_status` to `confirmatory` even when",
+            "Set `confirmation_status` to `confirmatory` only for executed "
+            "evidence when",
+            "Set `confirmation_status` to `confirmatory` even for unexecuted "
+            "evidence when",
         ),
     ],
 )

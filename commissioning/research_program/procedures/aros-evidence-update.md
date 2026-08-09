@@ -71,19 +71,43 @@ without changing the evidence or continuing the experimental session.
 13. When the input `preregistration_ref` is null, set every `confirmation_status`
     to `non_confirmatory`; executed evidence may still carry `supports`, `weakens`,
     `eliminates`, `counterexample`, or `negative_result`.
-14. Set `confirmation_status` to `confirmatory` only when `preregistration_ref` is
-    non-null and names a `Preregistration` that binds the same
-    `experiment_proposal_ref` and `prediction_ref`; null never yields
-    `confirmatory`.
-15. Map `supports` to `strengthened`, `weakens` to `weakened`, and `eliminates` to
-   `eliminated`; attach the exact evidence reference to every update.
-16. Preserve every negative result, counterexample, preregistration deviation,
-   protocol deviation, and unexpected condition with its exact evidence reference.
-17. If the next action changes, cite the specific prior observation that caused the
-   change in `next_action_rationale`; otherwise state why the current action
-   remains justified.
-18. Record the most important remaining uncertainty, the next-action rationale, and
-   the exact input `budget_used` without discarding achieved evidence.
+14. For `candidate_commit`, require the executed receipt value to exactly equal the
+    `Preregistration` value.
+15. For `data_manifest_refs`, require the executed receipt references and order to
+    exactly equal the `Preregistration` value.
+16. For `environment_sha256`, require the executed receipt value to exactly equal
+    the `Preregistration` value.
+17. For `evaluator_version`, require the executed receipt value to exactly equal the
+    `Preregistration` value.
+18. For `output_schema_sha256`, require the executed receipt value to exactly equal
+    the `Preregistration` value.
+19. For `controls`, require the executed receipt controls and values to exactly equal
+    the `Preregistration` value.
+20. For `primary_comparisons`, require the executed receipt comparison identities
+    and measurements to exactly equal the `Preregistration` specification.
+21. For `analysis_boundaries`, require the executed analysis to exactly equal the
+    `Preregistration` value.
+22. For `stopping_rules`, require the executed stopping behavior to exactly equal
+    the `Preregistration` value.
+23. For `rerun_rules`, require the executed rerun behavior to exactly equal the
+    `Preregistration` value.
+24. For any missing or deviating confirmation binding, set `confirmation_status` to
+    `non_confirmatory` and append a `confirmation_deviations` item containing the
+    field name, expected preregistered value, observed receipt value or a missing
+    marker, and `evidence_ref`; record every mismatch.
+25. Set `confirmation_status` to `confirmatory` only for executed evidence when
+    `preregistration_ref` is non-null, the proposal and prediction lineage matches,
+    every confirmation binding matches exactly, and `confirmation_deviations` is
+    empty; null never yields `confirmatory`.
+26. Map `supports` to `strengthened`, `weakens` to `weakened`, and `eliminates` to
+    `eliminated`; attach the exact evidence reference to every update.
+27. Preserve every negative result, counterexample, preregistration deviation,
+    protocol deviation, and unexpected condition with its exact evidence reference.
+28. If the next action changes, cite the specific prior observation that caused the
+    change in `next_action_rationale`; otherwise state why the current action
+    remains justified.
+29. Record the most important remaining uncertainty, the next-action rationale, and
+    the exact input `budget_used` without discarding achieved evidence.
 
 ## Output
 
@@ -93,7 +117,11 @@ without changing the evidence or continuing the experimental session.
   `next_action_rationale`.
 - Classification entries: Every `classifications` item contains exactly
   `evidence_ref`, `operational_state`, `scientific_relations`, and
-  `relation_targets`, and `confirmation_status`.
+  `relation_targets`, `confirmation_status`, and `confirmation_deviations`.
+- Confirmation deviations: `confirmation_deviations` is empty only when
+  `confirmation_status` is `confirmatory`; for `non_confirmatory`, list every
+  missing or deviating preregistration binding with its field name, expected value,
+  observed value or missing marker, and `evidence_ref`.
 - Evidence binding: Cite an exact input receipt or raw reference for every
   strengthened, weakened, eliminated, counterexample, and negative-result entry;
   preserve the same reference in both lists when one executed item has both
@@ -122,7 +150,8 @@ without changing the evidence or continuing the experimental session.
 - Do not place a value outside the input `mechanism_refs` in `relation_targets` or
   update an arbitrary rival.
 - Do not set `confirmation_status` to `confirmatory` when `preregistration_ref` is
-  null or does not bind the same proposal and prediction.
+  null, the evidence is not executed, any required receipt lineage value is missing
+  or deviates, or `confirmation_deviations` is nonempty.
 - Do not call `Eval.run`, create an evaluation, or execute an evaluator; read only
   existing evaluation receipts.
 - Do not request, retry, restart, rerun, or resubmit an experiment, and do not call

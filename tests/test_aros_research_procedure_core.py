@@ -430,8 +430,9 @@ EXPECTED_EVIDENCE_INPUT_RULES = (
     ),
     (
         "Lineage: Treat `rival_mechanism_set_ref`, `mechanism_refs`, "
-        "`experiment_proposal_ref`, `prediction_ref`, and `preregistration_ref` "
-        "as the complete input lineage; do not infer omitted lineage."
+        "`experiment_proposal_ref`, and `prediction_ref` as required non-null "
+        "lineage, and treat `preregistration_ref` as a required field whose value "
+        "may be null; do not infer omitted lineage."
     ),
 )
 EXPECTED_EVIDENCE_CLASSIFICATION_FIELDS = (
@@ -439,6 +440,7 @@ EXPECTED_EVIDENCE_CLASSIFICATION_FIELDS = (
     "operational_state",
     "scientific_relations",
     "relation_targets",
+    "confirmation_status",
 )
 EXPECTED_EVIDENCE_METHOD_RULES = (
     (
@@ -448,8 +450,9 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
     ),
     (
         "Use `Git.read` to read the exact `RivalMechanismSet`, "
-        "`ExperimentProposal`, prediction, and `Preregistration` named by the "
-        "lineage fields before classification; reject missing or inconsistent "
+        "`ExperimentProposal`, and prediction named by the non-null lineage fields "
+        "before classification; when `preregistration_ref` is non-null, also read "
+        "that exact `Preregistration`; reject missing or inconsistent non-null "
         "lineage."
     ),
     (
@@ -474,6 +477,10 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
         "process, transport, evaluator, and measurement receipts."
     ),
     (
+        "Set every classification's `confirmation_status` to exactly "
+        "`confirmatory` or `non_confirmatory`."
+    ),
+    (
         "Only an item whose `operational_state` is `executed` may carry "
         "`scientific_relations`; assign zero or more of `supports`, `weakens`, "
         "`eliminates`, `counterexample`, and `negative_result` from the scientific "
@@ -487,7 +494,7 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
     (
         "An item whose `operational_state` is `unavailable` or `failed` must have "
         "empty `scientific_relations` and must never be recorded as a "
-        "`negative_result`."
+        "`negative_result`; set its `confirmation_status` to `non_confirmatory`."
     ),
     (
         "For every `supports`, `weakens`, `eliminates`, or `counterexample` "
@@ -500,9 +507,16 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
         "scientific relation."
     ),
     (
-        "Treat a `supports` relation as confirmatory only when the input "
-        "`preregistration_ref` names a `Preregistration` that binds the same "
-        "proposal and prediction; otherwise record it as non-confirmatory support."
+        "When the input `preregistration_ref` is null, set every "
+        "`confirmation_status` to `non_confirmatory`; executed evidence may still "
+        "carry `supports`, `weakens`, `eliminates`, `counterexample`, or "
+        "`negative_result`."
+    ),
+    (
+        "Set `confirmation_status` to `confirmatory` only when "
+        "`preregistration_ref` is non-null and names a `Preregistration` that "
+        "binds the same `experiment_proposal_ref` and `prediction_ref`; null never "
+        "yields `confirmatory`."
     ),
     (
         "Map `supports` to `strengthened`, `weakens` to `weakened`, and "
@@ -527,14 +541,14 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
 )
 EXPECTED_EVIDENCE_COMPLETION_RULES = (
     (
-        "Complete only after every declared receipt, raw reference, and lineage "
-        "artifact has been read and every evidence item has exactly one valid "
-        "classification in one `ObservationUpdate`."
+        "Complete only after every declared receipt, raw reference, and non-null "
+        "lineage artifact has been read and every evidence item has exactly one "
+        "valid classification in one `ObservationUpdate`."
     ),
     (
-        "If any required lineage field is missing or inconsistent, do not emit an "
-        "`ObservationUpdate`; confirmatory support additionally requires a matching "
-        "`preregistration_ref`."
+        "If required rival, proposal, or prediction lineage is missing or "
+        "inconsistent, do not emit an `ObservationUpdate`; a null "
+        "`preregistration_ref` is allowed and does not block completion."
     ),
     "Call `Research.observe` with the complete `ObservationUpdate`.",
     (
@@ -554,6 +568,11 @@ EXPECTED_EVIDENCE_FORBIDDEN_RULES = (
     (
         "Do not place a value outside the input `mechanism_refs` in "
         "`relation_targets` or update an arbitrary rival."
+    ),
+    (
+        "Do not set `confirmation_status` to `confirmatory` when "
+        "`preregistration_ref` is null or does not bind the same proposal and "
+        "prediction."
     ),
     (
         "Do not call `Eval.run`, create an evaluation, or execute an evaluator; "
@@ -1717,7 +1736,7 @@ def test_evidence_update_returns_exact_fields_then_checkpoints_and_exits() -> No
     assert output[2] == (
         "Classification entries: Every `classifications` item contains exactly "
         "`evidence_ref`, `operational_state`, `scientific_relations`, and "
-        "`relation_targets`."
+        "`relation_targets`, and `confirmation_status`."
     )
     assert tuple(re.findall(r"`([a-z_]+)`", output[2]))[1:] == (
         EXPECTED_EVIDENCE_CLASSIFICATION_FIELDS
@@ -1739,6 +1758,26 @@ def test_evidence_update_returns_exact_fields_then_checkpoints_and_exits() -> No
         EXPECTED_EVIDENCE_COMPLETION_RULES,
         numbered=False,
     )
+
+
+def test_evidence_update_allows_null_preregistration_for_exploratory_relations() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    inputs = _procedure_rules(_procedure_section(body, "Inputs"), numbered=False)
+    method = _procedure_rules(_procedure_section(body, "Method"), numbered=True)
+    completion = _procedure_rules(
+        _procedure_section(body, "Completion"), numbered=False
+    )
+    method_text = "\n".join(method)
+
+    assert "required field whose value may be null" in inputs[3]
+    assert "`confirmation_status` to `non_confirmatory`" in method_text
+    assert "executed evidence may still carry `supports`, `weakens`, `eliminates`" in (
+        method_text
+    )
+    assert "null never yields `confirmatory`" in method_text
+    assert "does not block completion" in completion[1]
 
 
 def test_evidence_update_forbids_retry_overwrite_scores_and_claim_admission() -> None:
@@ -1773,9 +1812,9 @@ def test_evidence_update_forbids_retry_overwrite_scores_and_claim_admission() ->
             "Forbid one executed item from carrying both `negative_result` and",
         ),
         (
-            "9. An item whose `operational_state` is `unavailable` or `failed` "
+            "10. An item whose `operational_state` is `unavailable` or `failed` "
             "must have empty",
-            "9. An item whose `operational_state` is `unavailable` or `failed` "
+            "10. An item whose `operational_state` is `unavailable` or `failed` "
             "may carry relations",
         ),
         ("Preserve every negative result", "Discard every negative result"),
@@ -1807,8 +1846,8 @@ def test_evidence_update_method_rejects_opposite_evidence_polarity(
     ("old", "new"),
     [
         (
-            "classification; reject missing or inconsistent lineage",
-            "classification; allow missing or inconsistent lineage",
+            "reject missing or inconsistent non-null lineage",
+            "allow missing or inconsistent non-null lineage",
         ),
         (
             "require every `relation_targets` value to belong to the input "
@@ -1816,8 +1855,8 @@ def test_evidence_update_method_rejects_opposite_evidence_polarity(
             "permit `relation_targets` outside the input `mechanism_refs`",
         ),
         (
-            "Treat a `supports` relation as confirmatory only when the input",
-            "Treat a `supports` relation as confirmatory without the input",
+            "Set `confirmation_status` to `confirmatory` only when",
+            "Set `confirmation_status` to `confirmatory` even when",
         ),
     ],
 )
@@ -1836,6 +1875,52 @@ def test_evidence_update_rejects_missing_lineage_and_unrelated_targets(
             "Method",
             EXPECTED_EVIDENCE_METHOD_RULES,
             numbered=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("heading", "old", "new", "numbered"),
+    [
+        (
+            "Inputs",
+            "required field whose value may be null",
+            "required field whose value must be non-null",
+            False,
+        ),
+        (
+            "Method",
+            "executed evidence may still carry",
+            "executed evidence must not carry",
+            True,
+        ),
+        (
+            "Completion",
+            "a null `preregistration_ref` is allowed and",
+            "a non-null `preregistration_ref` is required and",
+            False,
+        ),
+    ],
+)
+def test_evidence_update_rejects_non_nullable_preregistration_mutations(
+    heading: str, old: str, new: str, numbered: bool
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+
+    expected = {
+        "Inputs": EXPECTED_EVIDENCE_INPUT_RULES,
+        "Method": EXPECTED_EVIDENCE_METHOD_RULES,
+        "Completion": EXPECTED_EVIDENCE_COMPLETION_RULES,
+    }[heading]
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            heading,
+            expected,
+            numbered=numbered,
         )
 
 

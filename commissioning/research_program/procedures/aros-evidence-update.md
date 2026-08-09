@@ -27,17 +27,19 @@ without changing the evidence or continuing the experimental session.
 - Immutability: Treat `run_ref`, every `eval_ref`, and every `raw_ref` as an
   immutable exact reference.
 - Lineage: Treat `rival_mechanism_set_ref`, `mechanism_refs`,
-  `experiment_proposal_ref`, `prediction_ref`, and `preregistration_ref` as the
-  complete input lineage; do not infer omitted lineage.
+  `experiment_proposal_ref`, and `prediction_ref` as required non-null lineage,
+  and treat `preregistration_ref` as a required field whose value may be null; do
+  not infer omitted lineage.
 
 ## Method
 
 1. Read the exact immutable receipts identified by `run_ref` and `eval_refs` and
    the exact immutable raw references identified by `raw_refs`; bind each read to
    its reference before interpretation.
-2. Use `Git.read` to read the exact `RivalMechanismSet`, `ExperimentProposal`,
-   prediction, and `Preregistration` named by the lineage fields before
-   classification; reject missing or inconsistent lineage.
+2. Use `Git.read` to read the exact `RivalMechanismSet`, `ExperimentProposal`, and
+   prediction named by the non-null lineage fields before classification; when
+   `preregistration_ref` is non-null, also read that exact `Preregistration`;
+   reject missing or inconsistent non-null lineage.
 3. Require input `mechanism_refs` to belong to the referenced `RivalMechanismSet`
    and to match the `ExperimentProposal` `mechanism_refs`; require `prediction_ref`
    to identify that proposal's prediction.
@@ -49,31 +51,38 @@ without changing the evidence or continuing the experimental session.
 6. For every evidence item, record exactly one `operational_state`: `unavailable`,
    `failed`, or `executed`; determine it only from the exact process, transport,
    evaluator, and measurement receipts.
-7. Only an item whose `operational_state` is `executed` may carry
+7. Set every classification's `confirmation_status` to exactly `confirmatory` or
+   `non_confirmatory`.
+8. Only an item whose `operational_state` is `executed` may carry
    `scientific_relations`; assign zero or more of `supports`, `weakens`,
    `eliminates`, `counterexample`, and `negative_result` from the scientific
    evidence.
-8. Allow one executed item to carry both `negative_result` and `counterexample`
+9. Allow one executed item to carry both `negative_result` and `counterexample`
    when both apply; scientific relations are not mutually exclusive.
-9. An item whose `operational_state` is `unavailable` or `failed` must have empty
-   `scientific_relations` and must never be recorded as a `negative_result`.
-10. For every `supports`, `weakens`, `eliminates`, or `counterexample` relation,
+10. An item whose `operational_state` is `unavailable` or `failed` must have empty
+    `scientific_relations` and must never be recorded as a `negative_result`; set
+    its `confirmation_status` to `non_confirmatory`.
+11. For every `supports`, `weakens`, `eliminates`, or `counterexample` relation,
     require every `relation_targets` value to belong to the input `mechanism_refs`;
     do not infer or name an arbitrary rival.
-11. Connect every executed classification's `evidence_ref` to the input
+12. Connect every executed classification's `evidence_ref` to the input
     `experiment_proposal_ref` and `prediction_ref` before applying any scientific
     relation.
-12. Treat a `supports` relation as confirmatory only when the input
-    `preregistration_ref` names a `Preregistration` that binds the same proposal and
-    prediction; otherwise record it as non-confirmatory support.
-13. Map `supports` to `strengthened`, `weakens` to `weakened`, and `eliminates` to
+13. When the input `preregistration_ref` is null, set every `confirmation_status`
+    to `non_confirmatory`; executed evidence may still carry `supports`, `weakens`,
+    `eliminates`, `counterexample`, or `negative_result`.
+14. Set `confirmation_status` to `confirmatory` only when `preregistration_ref` is
+    non-null and names a `Preregistration` that binds the same
+    `experiment_proposal_ref` and `prediction_ref`; null never yields
+    `confirmatory`.
+15. Map `supports` to `strengthened`, `weakens` to `weakened`, and `eliminates` to
    `eliminated`; attach the exact evidence reference to every update.
-14. Preserve every negative result, counterexample, preregistration deviation,
+16. Preserve every negative result, counterexample, preregistration deviation,
    protocol deviation, and unexpected condition with its exact evidence reference.
-15. If the next action changes, cite the specific prior observation that caused the
+17. If the next action changes, cite the specific prior observation that caused the
    change in `next_action_rationale`; otherwise state why the current action
    remains justified.
-16. Record the most important remaining uncertainty, the next-action rationale, and
+18. Record the most important remaining uncertainty, the next-action rationale, and
    the exact input `budget_used` without discarding achieved evidence.
 
 ## Output
@@ -84,7 +93,7 @@ without changing the evidence or continuing the experimental session.
   `next_action_rationale`.
 - Classification entries: Every `classifications` item contains exactly
   `evidence_ref`, `operational_state`, `scientific_relations`, and
-  `relation_targets`.
+  `relation_targets`, and `confirmation_status`.
 - Evidence binding: Cite an exact input receipt or raw reference for every
   strengthened, weakened, eliminated, counterexample, and negative-result entry;
   preserve the same reference in both lists when one executed item has both
@@ -94,12 +103,12 @@ without changing the evidence or continuing the experimental session.
 
 ## Completion
 
-- Complete only after every declared receipt, raw reference, and lineage artifact
-  has been read and every evidence item has exactly one valid classification in
-  one `ObservationUpdate`.
-- If any required lineage field is missing or inconsistent, do not emit an
-  `ObservationUpdate`; confirmatory support additionally requires a matching
-  `preregistration_ref`.
+- Complete only after every declared receipt, raw reference, and non-null lineage
+  artifact has been read and every evidence item has exactly one valid
+  classification in one `ObservationUpdate`.
+- If required rival, proposal, or prediction lineage is missing or inconsistent,
+  do not emit an `ObservationUpdate`; a null `preregistration_ref` is allowed and
+  does not block completion.
 - Call `Research.observe` with the complete `ObservationUpdate`.
 - Call `Research.checkpoint` with the observation update and its exact immutable
   evidence references.
@@ -112,6 +121,8 @@ without changing the evidence or continuing the experimental session.
   whose `operational_state` is `unavailable` or `failed`.
 - Do not place a value outside the input `mechanism_refs` in `relation_targets` or
   update an arbitrary rival.
+- Do not set `confirmation_status` to `confirmatory` when `preregistration_ref` is
+  null or does not bind the same proposal and prediction.
 - Do not call `Eval.run`, create an evaluation, or execute an evaluator; read only
   existing evaluation receipts.
 - Do not request, retry, restart, rerun, or resubmit an experiment, and do not call

@@ -2175,15 +2175,22 @@ def test_raw_parser_requires_task3_anchored_grammar(
         fixture.module.verify(fixture.index)
 
 
-def test_detailed_policy_name_allows_only_numeric_generated_suffix(
+def test_detailed_policy_name_uses_exact_bounded_generated_suffix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = valid_retained_substrate(tmp_path, monkeypatch)
     matches = fixture.module._detailed_policy_matches
     assert matches("S3FIFO", "S3FIFO") is True
     assert matches("S3FIFO-0.1000-2", "S3FIFO") is True
-    assert matches("S3FIFO-other", "S3FIFO") is False
+    assert matches("WTinyLFU-w0.01-S3FIFO", "WTinyLFU") is True
+    assert matches("S3FIFO-other", "S3FIFO") is True
     assert matches("S3FIFO2-0.1", "S3FIFO") is False
+    assert matches("S3FIFO-", "S3FIFO") is False
+    assert matches("S3FIFO-has space", "S3FIFO") is False
+    bounded = "S3FIFO-" + "x" * (256 - len("S3FIFO-"))
+    assert len(bounded) == 256
+    assert matches(bounded, "S3FIFO") is True
+    assert matches(bounded + "x", "S3FIFO") is False
 
 
 def test_verifier_rebases_common_prepublication_stage_paths(

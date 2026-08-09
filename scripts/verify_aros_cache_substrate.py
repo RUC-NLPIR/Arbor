@@ -1949,6 +1949,8 @@ def _bounded_unsigned_decimal(raw, label, integer_digits, fraction_digits):
 
 
 def _detailed_policy_matches(detailed, policy):
+    if type(detailed) is not str or type(policy) is not str or len(detailed) > 256:
+        return False
     if detailed == policy:
         return True
     prefix = policy + "-"
@@ -1957,8 +1959,11 @@ def _detailed_policy_matches(detailed, policy):
     suffix = detailed[len(prefix) :]
     return (
         bool(suffix)
-        and any(character.isdigit() for character in suffix)
-        and all(character in "0123456789_.:+-" for character in suffix)
+        and all(
+            character
+            in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:+-"
+            for character in suffix
+        )
     )
 
 

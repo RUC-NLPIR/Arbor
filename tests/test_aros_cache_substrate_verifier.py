@@ -340,40 +340,109 @@ def r0_receipt(
     policy: str,
 ) -> Path:
     output = root / f"r0-{policy}"
-    command_root = output / "commands/00-metadata-run"
-    command_root.mkdir(parents=True)
-    stdout = command_root / "stdout.raw"
-    stderr = command_root / "stderr.raw"
-    stdout.write_bytes(b"metadata fixture\n")
-    stderr.write_bytes(b"")
-    command: dict[str, object] = {
-        "index": 0,
-        "label": "metadata-run",
-        "argv": ["metadata-probe", policy],
-        "cwd": str(output),
-        "timeout_seconds": 10,
-        "max_output_bytes": 1024,
-        "returncode": 0,
-        "wall_ns": 10,
-        "cpu_ns": 5,
-        "stdout": {
-            "path": stdout.relative_to(output).as_posix(),
-            "size_bytes": stdout.stat().st_size,
-            "sha256": sha256_file(stdout),
-            "binding_intact": True,
-        },
-        "stderr": {
-            "path": stderr.relative_to(output).as_posix(),
-            "size_bytes": 0,
-            "sha256": sha256_file(stderr),
-            "binding_intact": True,
-        },
-    }
-    command["command_sha256"] = record_sha256(command, "command_sha256")
+    output.mkdir(parents=True)
+    synthetic_path = output / "synthetic.oracleGeneral.bin"
+    state = 0xA205_2026
+    objects = []
+    for _index in range(10_000):
+        state = (1_664_525 * state + 1_013_904_223) & 0xFFFF_FFFF
+        objects.append(1 + ((state >> 8) % 512))
+    next_access = [-1] * 10_000
+    following: dict[int, int] = {}
+    for index in range(9_999, -1, -1):
+        object_id = objects[index]
+        next_access[index] = following.get(object_id, -1)
+        following[object_id] = index + 1
+    sizes: dict[int, int] = {}
+    synthetic_raw = bytearray()
+    for index, object_id in enumerate(objects):
+        size = 64 * (1 + object_id % 4)
+        sizes[object_id] = size
+        synthetic_raw.extend(index.to_bytes(4, "little"))
+        synthetic_raw.extend(object_id.to_bytes(8, "little"))
+        synthetic_raw.extend(size.to_bytes(4, "little"))
+        synthetic_raw.extend(next_access[index].to_bytes(8, "little", signed=True))
+    synthetic_path.write_bytes(synthetic_raw)
+    cache_bytes = sum(sizes.values()) // 10
+
+    commands = []
+
+    def add_command(label: str, stdout_raw: bytes = b"") -> dict[str, object]:
+        command_root = output / f"commands/{len(commands):02d}-{label}"
+        command_root.mkdir(parents=True)
+        stdout = command_root / "stdout.raw"
+        stderr = command_root / "stderr.raw"
+        stdout.write_bytes(stdout_raw)
+        stderr.write_bytes(b"")
+        command: dict[str, object] = {
+            "index": len(commands),
+            "label": label,
+            "argv": [label, policy],
+            "cwd": str(output),
+            "timeout_seconds": 10,
+            "max_output_bytes": 1024 * 1024,
+            "returncode": 0,
+            "wall_ns": 10,
+            "cpu_ns": 5,
+            "stdout": {
+                "path": stdout.relative_to(output).as_posix(),
+                "size_bytes": stdout.stat().st_size,
+                "sha256": sha256_file(stdout),
+                "binding_intact": True,
+            },
+            "stderr": {
+                "path": stderr.relative_to(output).as_posix(),
+                "size_bytes": 0,
+                "sha256": sha256_file(stderr),
+                "binding_intact": True,
+            },
+        }
+        command["command_sha256"] = record_sha256(command, "command_sha256")
+        commands.append(command)
+        return command
+
+    for label in ("release-configure", "release-build", "release-full-tests"):
+        add_command(label)
+    if candidate != base:
+        add_command("candidate-test")
+    for label in (
+        "sanitize-configure",
+        "sanitize-build",
+        "sanitize-full-tests",
+        "fixed-time-compile",
+    ):
+        add_command(label)
+    simulation_raw = (
+        f"{synthetic_path.resolve()} {policy} cache size  1.00KiB, 9999 req, "
+        "miss ratio 0.5000, byte miss ratio 0.5000, throughput 20.00 MQPS\n"
+    ).encode()
+    add_command("determinism-run-1", simulation_raw)
+    add_command("determinism-run-2", simulation_raw)
+    add_command("capacity-compile")
+    capacity_raw = (
+        "capacity_conserved=1\nrequests=10000\n"
+        f"max_occupied_bytes={cache_bytes}\ncache_size_bytes={cache_bytes}\n"
+    ).encode()
+    add_command("capacity-run", capacity_raw)
+    add_command("metadata-interposer-compile")
+    add_command("metadata-compile")
+    metadata_raw = (
+        "global_metadata_bytes=24\n"
+        "sample=1000 live_bytes=3024 resident_objects=1000\n"
+        "sample=5000 live_bytes=15024 resident_objects=5000\n"
+        "sample=10000 live_bytes=30024 resident_objects=10000\n"
+        "status=ok\n"
+    ).encode()
+    metadata_command = add_command("metadata-run", metadata_raw)
+    simulator_result_path = output / "simulator-results.cachesim"
+    simulator_result_path.write_bytes(simulation_raw + simulation_raw)
     artifacts = {
         "release_cachesim": artifact_record(output, "release_cachesim", b"binary"),
         "release_archive": artifact_record(output, "release_archive", b"archive"),
         "release_cmake_cache": artifact_record(output, "release_cmake_cache", b"cache"),
+        "synthetic_trace": artifact_record(
+            output, "synthetic_trace", bytes(synthetic_raw)
+        ),
     }
     probe_files: dict[str, dict[str, object]] = {}
     for name, raw in {
@@ -474,40 +543,57 @@ def r0_receipt(
             "changed_paths": changed_paths,
             "diff_sha256": empty_diff,
         },
-        "declared_metadata": None if baseline else json.loads(contract.read_text()),
+        "declared_metadata": (
+            None
+            if baseline
+            else {
+                key: value
+                for key, value in json.loads(contract.read_text()).items()
+                if key != "schema_version"
+            }
+        ),
         "measured_metadata": {
             "bytes_per_object": "3",
             "global_bytes": 24,
-            "measurement_sha256": sha256_file(stdout),
+            "measurement_sha256": metadata_command["stdout"]["sha256"],
             "within_budget": None,
         },
         "complexity_audit": "pending_independent_review",
         "synthetic_trace": {
-            "generator": "fixture",
-            "path": "synthetic.oracleGeneral",
-            "sha256": hashlib.sha256(b"synthetic").hexdigest(),
+            "classification": "pre_registered_synthetic_unit_data",
+            "record_layout": "<IQIq",
+            "request_count": 10_000,
+            "seed": 0xA205_2026,
+            "generator": "lcg32-numerical-recipes",
+            "distribution": "object_id=1+((state>>8)%512); size=64*(1+object_id%4)",
+            "next_access_vtime": "one_based_future_request_or_minus_one",
+            "working_set_bytes": sum(sizes.values()),
+            "size_bytes": len(synthetic_raw),
+            "sha256": hashlib.sha256(synthetic_raw).hexdigest(),
+            "path": synthetic_path.relative_to(output).as_posix(),
             "cache_fraction": "0.1",
-            "cache_size_bytes": 100,
+            "cache_size_bytes": cache_bytes,
         },
         "simulations": [
             {
-                "request_count": 32,
+                "request_count": 9_999,
                 "object_miss_ratio": "0.5",
                 "byte_miss_ratio": "0.5",
-                "simulator_throughput_mqps": "20.0",
+                "simulator_throughput_mqps": "20.00",
             }
         ] * 2,
         "simulator_result": {
-            "path": command["stdout"]["path"],
-            "size_bytes": command["stdout"]["size_bytes"],
-            "sha256": command["stdout"]["sha256"],
+            "path": simulator_result_path.relative_to(output).as_posix(),
+            "size_bytes": simulator_result_path.stat().st_size,
+            "sha256": sha256_file(simulator_result_path),
         },
         "capacity_measurement": {
-            "cache_size_bytes": 100,
-            "maximum_occupied_bytes": 100,
+            "cache_size_bytes": cache_bytes,
+            "max_occupied_bytes": cache_bytes,
+            "requests": 10_000,
             "capacity_conserved": True,
         },
-        "commands": [command],
+        "commands": commands,
         "artifact_snapshots": artifacts,
         "probes": probes,
         "evaluator": evaluator,
@@ -906,7 +992,9 @@ def calibration_record(
         reference: dict[str, object] | None = None
         if policy in REFERENCES:
             r0 = loaded_r0[policy]
-            command = r0["commands"][0]
+            command = next(
+                item for item in r0["commands"] if item["label"] == "metadata-run"
+            )
             probe = r0["probes"]["metadata"]
             reference = {
                 "metadata": {
@@ -1337,8 +1425,25 @@ def valid_retained_substrate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
                 "cell_index": summary["index"],
                 "measurement_sha256": summary["measurement_sha256"],
                 "facts": {
+                    "reference_policy": "Sieve",
+                    "cache_fraction": measurement["cache_fraction"],
+                    "transfer_constraint": calibration_value[
+                        "transfer_constraints"
+                    ]["Sieve"][measurement["cache_fraction"]],
+                    "reference_metadata": calibration_value[
+                        "transfer_constraints"
+                    ]["Sieve"]["metadata"],
                     "throughput": True,
-                    "metadata_independent_audit": "pending_independent_review",
+                    "object_metadata": None,
+                    "global_metadata": None,
+                    "declared_metadata_consistency": None,
+                    "complexity": None,
+                    "capacity": True,
+                    "determinism": True,
+                    "sanitizer": True,
+                    "object_miss_gaps": None,
+                    "byte_miss_gaps": None,
+                    "phase_gaps": None,
                 },
             }
         )
@@ -1411,6 +1516,10 @@ def valid_retained_substrate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         "candidate_diff": package_path,
         "ledger": ledger_path,
         "r3_receipt": final_path,
+        "r1_receipt": r1,
+        "r0_sieve": r0s["Sieve"],
+        "checkout": checkout,
+        "source": source,
     }
     return fixture
 
@@ -1443,6 +1552,139 @@ def mutate(fixture: RetainedFixture, target: str) -> None:
         raise AssertionError(target)
     path.chmod(0o600)
     path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
+
+
+def refresh_inventory_entry(root: Path, relative: str, *, r0: bool) -> None:
+    receipt_path = root / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    path = root / relative
+    metadata = path.stat()
+    digest = sha256_file(path)
+    item = next(
+        entry for entry in receipt["evidence_inventory"] if entry["path"] == relative
+    )
+    item["size_bytes"] = metadata.st_size
+    item["sha256"] = digest
+    if r0:
+        item["observed_size_bytes"] = metadata.st_size
+        item["observed_sha256"] = digest
+    write_record(receipt_path, receipt, "receipt_sha256")
+
+
+def rewrite_portfolio_measurement(receipt_path: Path, field: str, value: object) -> None:
+    root = receipt_path.parent
+    receipt = json.loads(receipt_path.read_text())
+    summary = receipt["measurements"][0]
+    measurement_path = root / summary["path"]
+    measurement = json.loads(measurement_path.read_text())
+    measurement[field] = value
+    write_record(measurement_path, measurement, "measurement_sha256")
+    summary["measurement_sha256"] = measurement["measurement_sha256"]
+    receipt["measurement_hashes"][0] = measurement["measurement_sha256"]
+    metadata = measurement_path.stat()
+    inventory_item = next(
+        item
+        for item in receipt["evidence_inventory"]
+        if item["path"] == summary["path"]
+    )
+    inventory_item["size_bytes"] = metadata.st_size
+    inventory_item["sha256"] = sha256_file(measurement_path)
+    write_record(receipt_path, receipt, "receipt_sha256")
+
+
+def rewrite_r0_receipt(path: Path, receipt: dict[str, object]) -> None:
+    write_record(path, receipt, "receipt_sha256")
+
+
+def verified_calibration_inputs(fixture: RetainedFixture) -> tuple[object, ...]:
+    module = fixture.module
+    index = json.loads(fixture.index.read_text())
+    checkout = Path(index["checkout"])
+    task_root = Path(index["task_root"])
+    source, _state = module._verify_source(Path(index["source_receipt"]), checkout)
+    task, _host, _public, _private, _data = module._verify_manifests(
+        Path(index["task_manifest"]),
+        Path(index["host_r3_manifest"]),
+        task_root,
+    )
+    r0s = [
+        module._verify_r0(Path(raw), checkout, source, expected_policy=policy)
+        for raw, policy in zip(index["r0_receipts"], POLICIES)
+    ]
+    by_hash = {item["receipt_sha256"]: item for item in r0s}
+    r2s = [
+        module._verify_portfolio(
+            Path(raw), "r2", task_root, task, source, by_hash, checkout
+        )
+        for raw in index["r2_receipts"]
+    ]
+    return index, checkout, task_root, source, task, r0s, r2s
+
+
+def update_r0_file_fact(
+    receipt: dict[str, object], root: Path, path: Path
+) -> None:
+    relative = path.relative_to(root).as_posix()
+    metadata = path.stat()
+    digest = sha256_file(path)
+    item = next(
+        entry for entry in receipt["evidence_inventory"] if entry["path"] == relative
+    )
+    item["size_bytes"] = metadata.st_size
+    item["sha256"] = digest
+    item["observed_size_bytes"] = metadata.st_size
+    item["observed_sha256"] = digest
+
+
+def tamper_r0_semantic(path: Path, target: str) -> None:
+    root = path.parent
+    receipt = json.loads(path.read_text())
+    commands = {item["label"]: item for item in receipt["commands"]}
+    if target == "command_outcome":
+        command = commands["release-build"]
+        command["returncode"] = 1
+        command["command_sha256"] = record_sha256(command, "command_sha256")
+    elif target == "sanitizer":
+        command = commands["sanitize-full-tests"]
+        stdout = root / command["stdout"]["path"]
+        stdout.write_bytes(b"ERROR: AddressSanitizer: fixture\n")
+        command["stdout"]["size_bytes"] = stdout.stat().st_size
+        command["stdout"]["sha256"] = sha256_file(stdout)
+        command["command_sha256"] = record_sha256(command, "command_sha256")
+        update_r0_file_fact(receipt, root, stdout)
+    elif target == "synthetic":
+        synthetic = root / receipt["synthetic_trace"]["path"]
+        raw = bytearray(synthetic.read_bytes())
+        raw[16:24] = (0).to_bytes(8, "little", signed=True)
+        synthetic.write_bytes(raw)
+        artifact = receipt["artifact_snapshots"]["synthetic_trace"]
+        source = Path(artifact["source_path"])
+        snapshot = root / artifact["snapshot_path"]
+        source.write_bytes(raw)
+        snapshot.chmod(0o600)
+        snapshot.write_bytes(raw)
+        snapshot.chmod(0o400)
+        digest = sha256_file(synthetic)
+        receipt["synthetic_trace"]["sha256"] = digest
+        artifact["sha256"] = digest
+        artifact["size_bytes"] = len(raw)
+        for changed in (synthetic, source, snapshot):
+            update_r0_file_fact(receipt, root, changed)
+    elif target == "simulation":
+        receipt["simulations"][0]["request_count"] = 1
+    elif target == "simulator_result":
+        result = root / receipt["simulator_result"]["path"]
+        result.write_bytes(result.read_bytes() + b"tamper")
+        receipt["simulator_result"]["size_bytes"] = result.stat().st_size
+        receipt["simulator_result"]["sha256"] = sha256_file(result)
+        update_r0_file_fact(receipt, root, result)
+    elif target == "capacity":
+        receipt["capacity_measurement"]["max_occupied_bytes"] = (
+            receipt["capacity_measurement"]["cache_size_bytes"] + 1
+        )
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(target)
+    rewrite_r0_receipt(path, receipt)
 
 
 def forbidden_outcome_key(value: object) -> str | None:
@@ -1518,6 +1760,91 @@ def test_verifier_rejects_each_broken_binding(
     fixture = valid_retained_substrate(tmp_path, monkeypatch)
     mutate(fixture, target)
     with pytest.raises(fixture.module.VerificationError):
+        fixture.module.verify(fixture.index)
+
+
+def test_verifier_recomputes_cpu_per_request_from_process_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    rewrite_portfolio_measurement(fixture.paths["r1_receipt"], "cpu_ns_per_request", "101")
+    with pytest.raises(fixture.module.VerificationError, match="CPU"):
+        fixture.module.verify(fixture.index)
+
+
+def test_verifier_recomputes_r3_transfer_constraint_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    path = fixture.paths["r3_receipt"]
+    receipt = json.loads(path.read_text())
+    receipt["constraints"][0]["facts"]["throughput"] = False
+    write_record(path, receipt, "receipt_sha256")
+    with pytest.raises(fixture.module.VerificationError, match="constraint"):
+        fixture.module.verify(fixture.index)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "command_outcome",
+        "sanitizer",
+        "synthetic",
+        "simulation",
+        "simulator_result",
+        "capacity",
+    ],
+)
+def test_verifier_recomputes_r0_operational_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    tamper_r0_semantic(fixture.paths["r0_sieve"], target)
+    index = json.loads(fixture.index.read_text())
+    source, _state = fixture.module._verify_source(
+        Path(index["source_receipt"]), Path(index["checkout"])
+    )
+    with pytest.raises(fixture.module.VerificationError):
+        fixture.module._verify_r0(
+            fixture.paths["r0_sieve"],
+            Path(index["checkout"]),
+            source,
+            expected_policy="Sieve",
+        )
+
+
+def test_calibration_rejects_mixed_nonfirst_input_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    index, _checkout, _task_root, source, task, r0s, r2s = (
+        verified_calibration_inputs(fixture)
+    )
+    r2s[1]["record"]["host"] = {
+        "platform": "mixed-host",
+        "machine": "x86_64",
+        "python": "3.10",
+    }
+    with pytest.raises(fixture.module.VerificationError, match="mixed"):
+        fixture.module._verify_calibration(
+            Path(index["calibration"]),
+            index["calibration_sha256"],
+            task,
+            source,
+            r0s,
+            r2s,
+        )
+
+
+def test_verifier_rejects_checkout_head_after_active_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    checkout = fixture.paths["checkout"]
+    (checkout / "post-candidate.txt").write_text("later\n")
+    git(checkout, "add", "post-candidate.txt")
+    git(checkout, "commit", "-qm", "post candidate")
+    with pytest.raises(fixture.module.VerificationError, match="HEAD"):
         fixture.module.verify(fixture.index)
 
 

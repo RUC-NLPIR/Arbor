@@ -2650,10 +2650,7 @@ def test_phase0a_aros_source_budget_after_task_carrier_deletion() -> None:
     assert lines <= 17_700, f"Phase 0A AROS source budget exceeded: {lines}"
 
 
-def test_cache_campaign_tasks_do_not_change_aros_product_source() -> None:
-    """The commissioning-only cache substrate must remain outside src/aros."""
-    repository = Path(__file__).resolve().parents[1]
-    baseline = "a49632b581578d0e026ae10772df391b3b2ab465"
+def _cache_campaign_changed_paths(repository: Path, baseline: str) -> set[str]:
     result = subprocess.run(
         [
             "git",
@@ -2663,8 +2660,8 @@ def test_cache_campaign_tasks_do_not_change_aros_product_source() -> None:
             "core.untrackedCache=false",
             "diff",
             "--name-only",
-            "--diff-filter=ACMRTUXB",
-            f"{baseline}...HEAD",
+            "--diff-filter=ACDMRTUXB",
+            baseline,
             "--",
         ],
         cwd=repository,
@@ -2681,4 +2678,31 @@ def test_cache_campaign_tasks_do_not_change_aros_product_source() -> None:
         text=True,
     )
     changed.update(untracked.stdout.splitlines())
+    return changed
+
+
+def test_cache_campaign_tasks_do_not_change_aros_product_source() -> None:
+    """The commissioning-only cache substrate must remain outside src/aros."""
+    repository = Path(__file__).resolve().parents[1]
+    baseline = "a49632b581578d0e026ae10772df391b3b2ab465"
+    changed = _cache_campaign_changed_paths(repository, baseline)
     assert not sorted(path for path in changed if path.startswith("src/aros/"))
+
+
+def test_cache_campaign_boundary_detects_deleted_aros_source(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "boundary@example.invalid")
+    _git(repository, "config", "user.name", "Boundary Test")
+    source = repository / "src/aros/deleted.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("value = 1\n")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "baseline")
+    baseline = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    source.unlink()
+
+    assert "src/aros/deleted.py" in _cache_campaign_changed_paths(
+        repository, baseline
+    )

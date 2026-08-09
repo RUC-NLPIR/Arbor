@@ -597,6 +597,51 @@ def _times_nine_tenths(value):
     return _normalized_decimal(raw, "throughput floor")
 
 
+def _scaled_decimal(coefficient, exponent):
+    digits = str(coefficient)
+    if exponent >= 0:
+        return _normalized_decimal(digits + "0" * exponent, "decimal ratio")
+    point = len(digits) + exponent
+    if point > 0:
+        raw = digits[:point] + "." + digits[point:]
+    else:
+        raw = "0." + "0" * (-point) + digits
+    return _normalized_decimal(raw, "decimal ratio")
+
+
+def _decimal_ratio(numerator, denominator):
+    numerator = _integer(numerator, "ratio numerator")
+    denominator = _integer(denominator, "ratio denominator", 1)
+    if numerator == 0:
+        return "0"
+    if numerator >= denominator:
+        decimal_exponent = len(str(numerator // denominator)) - 1
+    else:
+        shift = 0
+        scaled = numerator
+        while scaled < denominator:
+            scaled *= 10
+            shift += 1
+        decimal_exponent = -shift
+    quantum = decimal_exponent - 127
+    if quantum >= 0:
+        rounding_numerator = numerator
+        rounding_denominator = denominator * 10**quantum
+    else:
+        rounding_numerator = numerator * 10 ** (-quantum)
+        rounding_denominator = denominator
+    coefficient, remainder = divmod(rounding_numerator, rounding_denominator)
+    doubled = remainder * 2
+    if doubled > rounding_denominator or (
+        doubled == rounding_denominator and coefficient % 2 == 1
+    ):
+        coefficient += 1
+    if len(str(coefficient)) > 128:
+        coefficient //= 10
+        quantum += 1
+    return _scaled_decimal(coefficient, quantum)
+
+
 def _git(repository, *arguments, binary=False, allowed=(0,)):
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
@@ -1144,6 +1189,119 @@ def _verify_artifact(root, value, label):
     return snapshot
 
 
+def _synthetic_trace_bytes():
+    state = 0xA205_2026
+    objects = []
+    for _index in range(10_000):
+        state = (1_664_525 * state + 1_013_904_223) & 0xFFFF_FFFF
+        objects.append(1 + ((state >> 8) % 512))
+    next_access = [-1] * 10_000
+    following = {}
+    for index in range(9_999, -1, -1):
+        object_id = objects[index]
+        next_access[index] = following.get(object_id, -1)
+        following[object_id] = index + 1
+    raw = bytearray()
+    sizes = {}
+    for index, object_id in enumerate(objects):
+        size = 64 * (1 + object_id % 4)
+        sizes[object_id] = size
+        raw.extend(index.to_bytes(4, "little"))
+        raw.extend(object_id.to_bytes(8, "little"))
+        raw.extend(size.to_bytes(4, "little"))
+        raw.extend(next_access[index].to_bytes(8, "little", signed=True))
+    return bytes(raw), sum(sizes.values())
+
+
+def _key_value_lines(raw, label):
+    try:
+        text = raw.decode("ascii")
+    except UnicodeError as error:
+        raise VerificationError(f"{label} output is not ASCII") from error
+    values = {}
+    for line in text.splitlines():
+        if line.count("=") != 1:
+            raise VerificationError(f"{label} output is malformed")
+        key, value = line.split("=", 1)
+        if not key or key in values:
+            raise VerificationError(f"{label} output has duplicate fields")
+        values[key] = value
+    return values
+
+
+def _capacity_facts(raw):
+    values = _key_value_lines(raw, "capacity probe")
+    expected = {
+        "capacity_conserved",
+        "requests",
+        "max_occupied_bytes",
+        "cache_size_bytes",
+    }
+    if set(values) != expected or any(not value.isdigit() for value in values.values()):
+        raise VerificationError("capacity probe fields mismatch")
+    parsed = {key: int(value) for key, value in values.items()}
+    if (
+        parsed["capacity_conserved"] != 1
+        or parsed["requests"] != 10_000
+        or parsed["cache_size_bytes"] <= 0
+        or not 0 <= parsed["max_occupied_bytes"] <= parsed["cache_size_bytes"]
+    ):
+        raise VerificationError("capacity probe reports a violation")
+    return {
+        "capacity_conserved": True,
+        "requests": parsed["requests"],
+        "max_occupied_bytes": parsed["max_occupied_bytes"],
+        "cache_size_bytes": parsed["cache_size_bytes"],
+    }
+
+
+def _metadata_facts(raw):
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeError as error:
+        raise VerificationError("metadata probe output is not ASCII") from error
+    if len(lines) != 5 or lines[-1] != "status=ok":
+        raise VerificationError("metadata probe did not report status=ok")
+    if not lines[0].startswith("global_metadata_bytes="):
+        raise VerificationError("metadata global measurement is malformed")
+    global_raw = lines[0].split("=", 1)[1]
+    if not global_raw.isdigit():
+        raise VerificationError("metadata global measurement is malformed")
+    global_bytes = int(global_raw)
+    values = []
+    for line, expected_sample in zip(lines[1:4], (1_000, 5_000, 10_000)):
+        fields = line.split(" ")
+        if len(fields) != 3:
+            raise VerificationError("metadata sample is malformed")
+        parsed = {}
+        for field in fields:
+            if field.count("=") != 1:
+                raise VerificationError("metadata sample is malformed")
+            key, value = field.split("=", 1)
+            if not value.isdigit() or key in parsed:
+                raise VerificationError("metadata sample is malformed")
+            parsed[key] = int(value)
+        if set(parsed) != {"sample", "live_bytes", "resident_objects"}:
+            raise VerificationError("metadata sample fields mismatch")
+        if (
+            parsed["sample"] != expected_sample
+            or parsed["live_bytes"] < global_bytes
+            or parsed["resident_objects"] <= 0
+        ):
+            raise VerificationError("metadata sample values are invalid")
+        values.append(
+            _decimal_ratio(
+                parsed["live_bytes"] - global_bytes,
+                parsed["resident_objects"],
+            )
+        )
+    maximum = values[0]
+    for value in values[1:]:
+        if _decimal_compare(value, maximum) > 0:
+            maximum = value
+    return maximum, global_bytes
+
+
 def _verify_r0(path, checkout, source, *, expected_policy=None):
     root = Path(path).resolve(strict=True).parent
     receipt = _exact(_load_object(path), R0_KEYS, "R0 receipt")
@@ -1204,7 +1362,11 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
     if hashlib.sha256(source_blob).hexdigest() != receipt["policy_source_sha256"]:
         raise VerificationError("R0 policy source hash mismatch")
     if baseline:
-        if receipt["contract_sha256"] is not None or receipt["candidate_test_sha256"] is not None:
+        if (
+            receipt["contract_sha256"] is not None
+            or receipt["candidate_test_sha256"] is not None
+            or receipt["declared_metadata"] is not None
+        ):
             raise VerificationError("baseline R0 unexpectedly binds candidate files")
     else:
         contract = _git_blob(checkout, candidate, "commissioning/cache_policy_contract.json")
@@ -1214,6 +1376,22 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
             or hashlib.sha256(test).hexdigest() != receipt["candidate_test_sha256"]
         ):
             raise VerificationError("candidate contract/test binding mismatch")
+        try:
+            contract_record = json.loads(
+                contract,
+                object_pairs_hook=_unique_object,
+                parse_constant=_invalid_constant,
+                parse_float=_finite_float,
+            )
+        except (UnicodeError, json.JSONDecodeError, VerificationError) as error:
+            raise VerificationError("candidate policy contract Git blob is invalid") from error
+        if not isinstance(contract_record, dict) or contract_record.get("schema_version") != 1:
+            raise VerificationError("candidate policy contract schema mismatch")
+        declared_projection = {
+            key: value for key, value in contract_record.items() if key != "schema_version"
+        }
+        if receipt["declared_metadata"] != declared_projection:
+            raise VerificationError("R0 declared metadata differs from candidate Git contract")
     checks = _exact(
         receipt["checks"],
         {
@@ -1246,9 +1424,35 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
     if not isinstance(commands, list) or not commands:
         raise VerificationError("R0 command receipts are missing")
     metadata_commands = []
+    command_by_label = {}
+    command_raw = {}
     for command in commands:
-        if not isinstance(command, dict) or command.get("command_sha256") != _record_sha256(command, "command_sha256"):
+        _exact(
+            command,
+            {
+                "index", "label", "argv", "cwd", "timeout_seconds",
+                "max_output_bytes", "returncode", "wall_ns", "cpu_ns",
+                "stdout", "stderr", "command_sha256",
+            },
+            "R0 command",
+        )
+        if command.get("command_sha256") != _record_sha256(command, "command_sha256"):
             raise VerificationError("R0 command receipt hash mismatch")
+        label = _string(command["label"], "R0 command label")
+        if label in command_by_label or command["index"] != len(command_by_label):
+            raise VerificationError("R0 command labels or indices are duplicated")
+        if (
+            not isinstance(command["argv"], list)
+            or not command["argv"]
+            or any(type(item) is not str or not item for item in command["argv"])
+            or command["returncode"] != 0
+            or type(command["timeout_seconds"]) not in {int, float}
+            or command["timeout_seconds"] <= 0
+            or type(command["max_output_bytes"]) is not int
+            or command["max_output_bytes"] <= 0
+        ):
+            raise VerificationError("R0 command outcome is not successful")
+        command_by_label[label] = command
         for field in ("stdout", "stderr"):
             raw = command.get(field)
             if not isinstance(raw, dict) or set(raw) != {
@@ -1261,10 +1465,35 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
                 raw_path = _relative(root, raw["path"], "R0 command raw path")
                 if raw_path.stat().st_size != raw["size_bytes"] or _sha256_file(raw_path) != raw["sha256"]:
                     raise VerificationError("R0 command raw bytes mismatch")
+                command_raw[(label, field)] = raw_path.read_bytes()
             elif raw["sha256"] is not None or raw["binding_intact"] is not False:
                 raise VerificationError("R0 absent command raw facts are inconsistent")
-        if command.get("label") == "metadata-run":
+        if label == "metadata-run":
             metadata_commands.append(command)
+    expected_labels = [
+        "release-configure",
+        "release-build",
+        "release-full-tests",
+    ]
+    if not baseline:
+        expected_labels.append("candidate-test")
+    expected_labels.extend(
+        [
+            "sanitize-configure",
+            "sanitize-build",
+            "sanitize-full-tests",
+            "fixed-time-compile",
+            "determinism-run-1",
+            "determinism-run-2",
+            "capacity-compile",
+            "capacity-run",
+            "metadata-interposer-compile",
+            "metadata-compile",
+            "metadata-run",
+        ]
+    )
+    if list(command_by_label) != expected_labels:
+        raise VerificationError("R0 command sequence mismatch")
     if len(metadata_commands) != 1:
         raise VerificationError("R0 must contain one metadata-run command")
     if metadata_commands[0]["stdout"]["sha256"] != metadata["measurement_sha256"]:
@@ -1279,6 +1508,132 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
     binary_hash = _sha256_file(bound_artifacts["release_cachesim"])
     if receipt["binary_sha256"] != binary_hash or receipt["binary_post_run_sha256"] != binary_hash:
         raise VerificationError("R0 binary snapshot binding mismatch")
+    synthetic = _exact(
+        receipt["synthetic_trace"],
+        {
+            "classification", "record_layout", "request_count", "seed",
+            "generator", "distribution", "next_access_vtime",
+            "working_set_bytes", "size_bytes", "sha256", "path",
+            "cache_fraction", "cache_size_bytes",
+        },
+        "R0 synthetic trace",
+    )
+    expected_synthetic, working_set_bytes = _synthetic_trace_bytes()
+    synthetic_path = _relative(root, synthetic["path"], "R0 synthetic trace")
+    expected_synthetic_facts = {
+        "classification": "pre_registered_synthetic_unit_data",
+        "record_layout": "<IQIq",
+        "request_count": 10_000,
+        "seed": 0xA205_2026,
+        "generator": "lcg32-numerical-recipes",
+        "distribution": "object_id=1+((state>>8)%512); size=64*(1+object_id%4)",
+        "next_access_vtime": "one_based_future_request_or_minus_one",
+        "working_set_bytes": working_set_bytes,
+        "size_bytes": len(expected_synthetic),
+        "sha256": hashlib.sha256(expected_synthetic).hexdigest(),
+        "path": synthetic["path"],
+        "cache_fraction": "0.1",
+        "cache_size_bytes": working_set_bytes // 10,
+    }
+    if synthetic != expected_synthetic_facts or synthetic_path.read_bytes() != expected_synthetic:
+        raise VerificationError("R0 synthetic trace semantics mismatch")
+    synthetic_artifact = _verify_artifact(
+        root, artifacts["synthetic_trace"], "R0 synthetic trace artifact"
+    )
+    if synthetic_artifact.read_bytes() != expected_synthetic:
+        raise VerificationError("R0 synthetic artifact bytes mismatch")
+    sanitizer_tokens = (
+        b"addresssanitizer",
+        b"undefinedbehaviorsanitizer",
+        b"leaksanitizer",
+        b"runtime error:",
+    )
+    for label in ("sanitize-configure", "sanitize-build", "sanitize-full-tests"):
+        combined = command_raw[(label, "stdout")] + command_raw[(label, "stderr")]
+        lowered = combined.lower()
+        if any(token in lowered for token in sanitizer_tokens) or (
+            b"summary:" in lowered and b"sanitizer" in lowered
+        ):
+            raise VerificationError("R0 sanitizer evidence contains a diagnostic")
+    parsed_simulations = [
+        _parse_result(command_raw[(label, "stdout")])
+        for label in ("determinism-run-1", "determinism-run-2")
+    ]
+    if (
+        any(item["request_count"] != 9_999 for item in parsed_simulations)
+        or any(
+            item[field] != parsed_simulations[0][field]
+            for item in parsed_simulations[1:]
+            for field in ("request_count", "object_miss_ratio", "byte_miss_ratio")
+        )
+    ):
+        raise VerificationError("R0 deterministic simulation facts mismatch")
+    simulation_records = receipt["simulations"]
+    if not isinstance(simulation_records, list) or len(simulation_records) != 2:
+        raise VerificationError("R0 simulation projection count mismatch")
+    for record, parsed in zip(simulation_records, parsed_simulations):
+        _exact(
+            record,
+            {
+                "request_count", "object_miss_ratio", "byte_miss_ratio",
+                "simulator_throughput_mqps",
+            },
+            "R0 simulation",
+        )
+        if (
+            record["request_count"] != parsed["request_count"]
+            or _normalized_decimal(record["object_miss_ratio"], "R0 simulation object ratio")
+            != parsed["object_miss_ratio"]
+            or _normalized_decimal(record["byte_miss_ratio"], "R0 simulation byte ratio")
+            != parsed["byte_miss_ratio"]
+            or _normalized_decimal(record["simulator_throughput_mqps"], "R0 simulation throughput")
+            != parsed["simulator_throughput_mqps"]
+        ):
+            raise VerificationError("R0 simulation receipt differs from raw stdout")
+    simulator_result = _exact(
+        receipt["simulator_result"],
+        {"path", "size_bytes", "sha256"},
+        "R0 simulator result",
+    )
+    simulator_result_path = _relative(
+        root, simulator_result["path"], "R0 simulator result"
+    )
+    expected_result = (
+        command_raw[("determinism-run-1", "stdout")]
+        + command_raw[("determinism-run-2", "stdout")]
+    )
+    if (
+        simulator_result_path.read_bytes() != expected_result
+        or simulator_result["size_bytes"] != len(expected_result)
+        or simulator_result["sha256"] != hashlib.sha256(expected_result).hexdigest()
+    ):
+        raise VerificationError("R0 simulator result differs from raw simulations")
+    capacity = _capacity_facts(command_raw[("capacity-run", "stdout")])
+    if receipt["capacity_measurement"] != capacity:
+        raise VerificationError("R0 capacity measurement differs from raw probe")
+    if capacity["cache_size_bytes"] != synthetic["cache_size_bytes"]:
+        raise VerificationError("R0 capacity probe cache size differs from synthetic input")
+    metadata_bytes, global_bytes = _metadata_facts(
+        command_raw[("metadata-run", "stdout")]
+    )
+    if (
+        metadata["bytes_per_object"] != metadata_bytes
+        or metadata["global_bytes"] != global_bytes
+    ):
+        raise VerificationError("R0 metadata measurement differs from raw probe")
+    recomputed_checks = {
+        "source_binding": True,
+        "evidence_binding": True,
+        "build": True,
+        "full_tests": True,
+        "candidate_test": None if baseline else True,
+        "sanitizer": True,
+        "deterministic": True,
+        "capacity": True,
+        "metadata_probe": True,
+    }
+    if checks != recomputed_checks:
+        raise VerificationError("R0 check projection differs from retained evidence")
     probes = _exact(
         receipt["probes"],
         {"fixed_time", "release_cmake_cache_sha256", "include_flags", "link_flags", "capacity", "metadata"},
@@ -1330,6 +1685,7 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
         "receipt_sha256": digest,
         "file_sha256": _sha256_file(Path(path)),
         "artifacts": artifacts,
+        "operational_facts": recomputed_checks,
     }
 
 
@@ -1491,6 +1847,9 @@ def _verify_measurement(root, summary, receipt, r0, trace):
             observed = _normalized_decimal(observed, field)
         if observed != expected:
             raise VerificationError(f"raw simulator {field} differs from measurement")
+    expected_cpu = _decimal_ratio(process["cpu_ns"], measurement["request_count"])
+    if measurement["cpu_ns_per_request"] != expected_cpu:
+        raise VerificationError("measurement CPU nanoseconds per request mismatch")
     simulator = _exact(
         measurement["simulator_output"],
         {"requested_path", "path", "identity", "size_bytes", "sha256"},
@@ -1754,6 +2113,42 @@ def _verify_calibration(path, expected_digest, task, source, r0s, r2s):
     r0_by_policy = {item["record"]["policy"]: item for item in r0s}
     if set(r0_by_policy) != set(POLICIES) or set(record["r0_receipt_sha256s"]) != set(POLICIES):
         raise VerificationError("calibration R0 policy map mismatch")
+    if (
+        len({item["path"] for item in r0s}) != len(r0s)
+        or len({item["receipt_sha256"] for item in r0s}) != len(r0s)
+        or len({item["file_sha256"] for item in r0s}) != len(r0s)
+        or len({item["path"] for item in r2s}) != len(r2s)
+        or len({item["receipt_sha256"] for item in r2s}) != len(r2s)
+        or len({item["file_sha256"] for item in r2s}) != len(r2s)
+    ):
+        raise VerificationError("calibration input paths or receipt hashes are duplicated")
+    first_r0 = r0s[0]["record"]
+    r0_signature = (
+        first_r0["source_receipt_sha256"],
+        first_r0["candidate_commit"],
+        first_r0["candidate_tree"],
+        first_r0["binary_sha256"],
+        canonical_bytes(first_r0["host"]),
+        canonical_bytes(first_r0["evaluator"]),
+        first_r0["artifact_snapshots"]["release_archive"]["sha256"],
+        first_r0["artifact_snapshots"]["release_cmake_cache"]["sha256"],
+        first_r0["probes"]["fixed_time"]["binary"]["sha256"],
+    )
+    for item in r0s[1:]:
+        candidate_r0 = item["record"]
+        observed = (
+            candidate_r0["source_receipt_sha256"],
+            candidate_r0["candidate_commit"],
+            candidate_r0["candidate_tree"],
+            candidate_r0["binary_sha256"],
+            canonical_bytes(candidate_r0["host"]),
+            canonical_bytes(candidate_r0["evaluator"]),
+            candidate_r0["artifact_snapshots"]["release_archive"]["sha256"],
+            candidate_r0["artifact_snapshots"]["release_cmake_cache"]["sha256"],
+            candidate_r0["probes"]["fixed_time"]["binary"]["sha256"],
+        )
+        if observed != r0_signature:
+            raise VerificationError("calibration R0 inputs are mixed")
     for policy in POLICIES:
         if record["r0_receipt_sha256s"][policy] != r0_by_policy[policy]["receipt_sha256"]:
             raise VerificationError("calibration R0 receipt projection mismatch")
@@ -1779,6 +2174,43 @@ def _verify_calibration(path, expected_digest, task, source, r0s, r2s):
         or record["host_fingerprint"] != first["host"]
     ):
         raise VerificationError("calibration apparatus projection mismatch")
+    r2_signature = (
+        first["task_manifest_sha256"],
+        first["source_receipt_sha256"],
+        first["candidate_commit"],
+        first["candidate_tree"],
+        first["binary_snapshot_sha256"],
+        canonical_bytes(first["evaluator"]),
+        canonical_bytes(r2s[0]["scientific"]),
+        canonical_bytes(first["host"]),
+    )
+    measurement_hashes = set()
+    for item in r2s:
+        candidate_r2 = item["record"]
+        observed = (
+            candidate_r2["task_manifest_sha256"],
+            candidate_r2["source_receipt_sha256"],
+            candidate_r2["candidate_commit"],
+            candidate_r2["candidate_tree"],
+            candidate_r2["binary_snapshot_sha256"],
+            canonical_bytes(candidate_r2["evaluator"]),
+            canonical_bytes(item["scientific"]),
+            canonical_bytes(candidate_r2["host"]),
+        )
+        policy_r0 = r0_by_policy.get(candidate_r2["policy"])
+        if (
+            observed != r2_signature
+            or policy_r0 is None
+            or candidate_r2["r0_receipt_sha256"] != policy_r0["receipt_sha256"]
+            or candidate_r2["binary_snapshot_sha256"]
+            != policy_r0["record"]["binary_sha256"]
+        ):
+            raise VerificationError("calibration R2 inputs are mixed")
+        for measurement in item["measurements"]:
+            digest_value = measurement["measurement_sha256"]
+            if digest_value in measurement_hashes:
+                raise VerificationError("calibration measurement hashes are duplicated")
+            measurement_hashes.add(digest_value)
     grouped = {}
     for receipt in r2s:
         policy = receipt["record"]["policy"]
@@ -1929,6 +2361,88 @@ def _project_blobs(project, commit):
     return blobs
 
 
+def _transfer_constraint_facts(measurement, candidate_r0, calibration):
+    declared = _exact(
+        candidate_r0["record"]["declared_metadata"],
+        {
+            "policy", "reference_policy", "policy_source",
+            "object_metadata_bytes", "global_metadata_bytes",
+            "global_metadata_evidence", "update_complexity",
+        },
+        "candidate policy contract",
+    )
+    if (
+        declared["policy"] != measurement["policy"]
+        or declared["reference_policy"] not in REFERENCES
+        or declared["update_complexity"] != "amortized O(1)"
+    ):
+        raise VerificationError("candidate policy contract binding mismatch")
+    reference = declared["reference_policy"]
+    fraction = measurement["cache_fraction"]
+    try:
+        transfer_policy = calibration["transfer_constraints"][reference]
+        transfer_cell = transfer_policy[fraction]
+        reference_metadata = transfer_policy["metadata"]
+    except (KeyError, TypeError) as error:
+        raise VerificationError("R3 transfer calibration cell is missing") from error
+    throughput = _normalized_decimal(
+        measurement["simulator_throughput_mqps"], "R3 throughput"
+    )
+    floor = _normalized_decimal(
+        transfer_cell["throughput_floor_mqps"], "R3 throughput floor"
+    )
+    candidate_object = _normalized_decimal(
+        measurement["metadata_bytes_per_object"], "R3 object metadata"
+    )
+    reference_object = _normalized_decimal(
+        reference_metadata["bytes_per_object"], "R3 reference object metadata"
+    )
+    candidate_global = _integer(
+        measurement["global_metadata_bytes"], "R3 global metadata"
+    )
+    reference_global = _integer(
+        reference_metadata["global_bytes"], "R3 reference global metadata"
+    )
+    declared_consistent = (
+        candidate_r0["record"]["declared_metadata"] == declared
+        and _decimal_compare(candidate_object, str(declared["object_metadata_bytes"])) <= 0
+        and candidate_global <= declared["global_metadata_bytes"]
+    )
+    if (
+        measurement["rung"] != "r3"
+        or _decimal_compare(throughput, "0") <= 0
+        or _decimal_compare(floor, "0") <= 0
+        or _decimal_compare(candidate_object, "0") < 0
+        or _decimal_compare(reference_object, "0") < 0
+        or measurement["metadata_measurement_sha256"]
+        != candidate_r0["record"]["measured_metadata"]["measurement_sha256"]
+        or measurement["metadata_bytes_per_object"]
+        != candidate_r0["record"]["measured_metadata"]["bytes_per_object"]
+        or candidate_global
+        != candidate_r0["record"]["measured_metadata"]["global_bytes"]
+    ):
+        raise VerificationError("R3 measurement metadata binding mismatch")
+    operational = candidate_r0["operational_facts"]
+    del declared_consistent, reference_global
+    return {
+        "reference_policy": reference,
+        "cache_fraction": fraction,
+        "transfer_constraint": transfer_cell,
+        "reference_metadata": reference_metadata,
+        "throughput": _decimal_compare(throughput, floor) >= 0,
+        "object_metadata": None,
+        "global_metadata": None,
+        "declared_metadata_consistency": None,
+        "complexity": None,
+        "capacity": operational["capacity"],
+        "determinism": operational["deterministic"],
+        "sanitizer": operational["sanitizer"],
+        "object_miss_gaps": None,
+        "byte_miss_gaps": None,
+        "phase_gaps": None,
+    }
+
+
 def _verify_r3(
     index,
     task_root,
@@ -1955,6 +2469,12 @@ def _verify_r3(
         raise VerificationError("task project HEAD differs from frozen commit")
     if _git(task_root, "status", "--porcelain=v1", "--untracked-files=all"):
         raise VerificationError("task project is dirty after freeze")
+    if (
+        _git(checkout, "rev-parse", "HEAD") != candidate
+        or _git(checkout, "rev-parse", "HEAD^{tree}")
+        != _git(checkout, "rev-parse", f"{candidate}^{{tree}}")
+    ):
+        raise VerificationError("checkout HEAD/tree differs from R3 candidate")
     frozen_tree = _git(task_root, "rev-parse", f"{frozen}^{{tree}}")
     raw_refs = {}
     ref_hashes = {}
@@ -2191,6 +2711,13 @@ def _verify_r3(
             or not isinstance(constraint["facts"], dict)
         ):
             raise VerificationError("R3 constraint binding mismatch")
+        expected_constraint = _transfer_constraint_facts(
+            r3_portfolio["measurements"][index_value],
+            candidate_r0,
+            calibration,
+        )
+        if constraint["facts"] != expected_constraint:
+            raise VerificationError("R3 constraint facts differ from pinned inputs")
     return {
         "state": "verified",
         "execution_state": "measured",
@@ -2234,6 +2761,27 @@ def verify(index_path):
     r0_by_hash = {item["receipt_sha256"]: item for item in r0s}
     if len(r0_by_hash) != 6:
         raise VerificationError("R0 receipt hashes are not unique")
+    if index["r3"] is not None:
+        r3_index = _exact(index["r3"], R3_INDEX_KEYS, "R3 index")
+        active_package = _exact(
+            _load_object(_path(r3_index["frozen_package"], "frozen package")),
+            PACKAGE_KEYS,
+            "frozen package",
+        )
+        active_candidate = _hash(
+            active_package["candidate_commit"], "active candidate", 40
+        )
+    else:
+        candidates = {item["record"]["candidate_commit"] for item in r0s}
+        if len(candidates) != 1:
+            raise VerificationError("calibration candidate commits are mixed")
+        active_candidate = next(iter(candidates))
+    active_tree = _git(checkout, "rev-parse", f"{active_candidate}^{{tree}}")
+    if (
+        source_state["checkout_head"] != active_candidate
+        or source_state["checkout_tree"] != active_tree
+    ):
+        raise VerificationError("checkout HEAD/tree differs from active candidate")
     raw_r1 = index["r1_receipts"]
     if not isinstance(raw_r1, list) or not raw_r1:
         raise VerificationError("retained index requires at least one R1 receipt")

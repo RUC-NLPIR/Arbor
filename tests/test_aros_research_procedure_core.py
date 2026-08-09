@@ -5,9 +5,12 @@ import importlib
 import json
 import os
 import re
+import signal
 import subprocess
+import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 
 import pytest
 
@@ -599,6 +602,39 @@ def test_contract_results_are_recursively_immutable() -> None:
         contracts.artifacts["ResearchQuestion"][0] = "other"
 
 
+def test_contract_dataclasses_are_slotted_and_forced_mutation_is_isolated() -> None:
+    module = _contract_module()
+    contracts = module.load_contracts(CONTRACTS_PATH)
+    independent = module.load_contracts(CONTRACTS_PATH)
+    procedure = contracts.procedures["aros-source-research"]
+
+    assert not hasattr(contracts, "__dict__")
+    assert not hasattr(procedure, "__dict__")
+    assert isinstance(contracts.artifacts, MappingProxyType)
+    assert isinstance(contracts.procedures, MappingProxyType)
+    assert all(type(fields) is tuple for fields in contracts.artifacts.values())
+    assert all(
+        type(item.tools) is tuple for item in contracts.procedures.values()
+    )
+
+    for target, field, replacement in (
+        (contracts, "artifacts", {"Injected": ["mutable"]}),
+        (procedure, "tools", ["Injected.tool"]),
+    ):
+        try:
+            object.__setattr__(target, field, replacement)
+        except (AttributeError, TypeError):
+            pass
+
+    fresh = module.load_contracts(CONTRACTS_PATH)
+    for untouched in (independent, fresh):
+        assert dict(untouched.artifacts) == EXPECTED_ARTIFACTS
+        assert untouched.procedures["aros-source-research"].tools == (
+            "Source.read",
+            "Source.search",
+        )
+
+
 def test_contract_loader_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     module = _contract_module()
     raw = CONTRACTS_PATH.read_text(encoding="utf-8")
@@ -800,6 +836,37 @@ def test_contract_loader_binds_single_read_to_lstat_identity(
 
     with pytest.raises(ValueError, match="identity"):
         module.load_contracts(path)
+
+
+def test_contract_loader_fifo_swap_is_prompt_and_leaks_no_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, value, path = _contract_candidate(tmp_path)
+    _write_contract_candidate(path, value)
+    real_open = os.open
+    before_descriptors = set(os.listdir("/proc/self/fd"))
+
+    def replacing_open(candidate: object, flags: int) -> int:
+        path.unlink()
+        os.mkfifo(path)
+        return real_open(candidate, flags)
+
+    def interrupt_blocked_open(_signum: int, _frame: object) -> None:
+        raise TimeoutError("contract FIFO open blocked")
+
+    monkeypatch.setattr(module.os, "open", replacing_open)
+    previous_handler = signal.signal(signal.SIGALRM, interrupt_blocked_open)
+    started = time.monotonic()
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0.25)
+        with pytest.raises(ValueError, match="regular file"):
+            module.load_contracts(path)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+    assert time.monotonic() - started < 1.0
+    assert set(os.listdir("/proc/self/fd")) == before_descriptors
 
 
 def test_contract_loader_uses_only_standard_library_imports() -> None:

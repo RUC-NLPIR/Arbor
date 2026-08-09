@@ -174,14 +174,14 @@ _PROCEDURES = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ProcedureContract:
     input: str
     output: str
     tools: tuple[str, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ContractSet:
     schema_version: int
     allowed_tools: tuple[str, ...]
@@ -239,7 +239,7 @@ def _read_contract(path: Path) -> str:
 
     descriptor = os.open(
         candidate,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK,
     )
     try:
         opened = os.fstat(descriptor)

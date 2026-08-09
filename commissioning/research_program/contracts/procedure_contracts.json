@@ -96,10 +96,17 @@
     "FrozenEvidencePacket": [
       "task_brief_ref",
       "preregistration_ref",
-      "commit",
+      "candidate_commit",
       "source_refs",
       "raw_refs",
-      "reproduction_ref"
+      "reproduction_ref",
+      "root_question_ref",
+      "claim_draft_ref",
+      "researcher_model_id",
+      "researcher_model_family",
+      "researcher_session_refs",
+      "researcher_worktree_ref",
+      "packet_sha256"
     ],
     "ReviewerReport": [
       "reproduction_refs",
@@ -108,13 +115,26 @@
       "statistical_findings",
       "scope_objections",
       "fatal_objections",
-      "unresolved_objections"
+      "unresolved_objections",
+      "reviewer_model_id",
+      "reviewer_model_family",
+      "independence_evidence_ref",
+      "packet_sha256",
+      "claim_draft_ref",
+      "candidate_commit"
     ],
     "AdjudicatedEvidence": [
       "claim_draft_ref",
       "evidence_refs",
       "review_ref",
-      "principal_response_ref"
+      "principal_response_ref",
+      "root_question_ref",
+      "candidate_commit",
+      "preregistration_ref",
+      "reproduction_ref",
+      "principal_actor_ref",
+      "principal_checkpoint_ref",
+      "disposition"
     ],
     "ClaimPackage": [
       "claim",
@@ -124,7 +144,16 @@
       "reproduction_commands",
       "limitations",
       "remaining_uncertainty",
-      "review_objections"
+      "review_objections",
+      "disposition",
+      "root_question_ref",
+      "candidate_commit",
+      "preregistration_ref",
+      "review_ref",
+      "principal_response_ref",
+      "reproduction_ref",
+      "environment_ref",
+      "checkpoint_ref"
     ]
   },
   "procedures": {
@@ -175,7 +204,8 @@
         "Run.status",
         "Eval.run",
         "Receipt.read",
-        "Git.read"
+        "Git.read",
+        "Research.petition"
       ]
     },
     "aros-claim-package": {

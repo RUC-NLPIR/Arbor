@@ -429,18 +429,30 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
         "`raw_refs`; bind each read to its reference before interpretation."
     ),
     (
-        "Classify each evidence item as exactly one of: operationally unavailable "
-        "because of process or transport failure or a missing measurement; an "
-        "executed negative result; or a counterexample to a stated prediction."
+        "For every evidence item, record exactly one `operational_state`: "
+        "`unavailable`, `failed`, or `executed`; determine it only from the exact "
+        "process, transport, evaluator, and measurement receipts."
     ),
     (
-        "Never classify operational unavailability, process failure, transport "
-        "failure, or a missing measurement as a negative scientific result."
+        "Only an item whose `operational_state` is `executed` may carry "
+        "`scientific_relations`; assign zero or more of `supports`, `weakens`, "
+        "`eliminates`, `counterexample`, and `negative_result` from the scientific "
+        "evidence."
     ),
     (
-        "Update `strengthened`, `weakened`, and `eliminated` only from classified "
-        "evidence, and attach the exact supporting evidence reference to every "
-        "update."
+        "Allow one executed item to carry both `negative_result` and "
+        "`counterexample` when both apply; scientific relations are not mutually "
+        "exclusive."
+    ),
+    (
+        "An item whose `operational_state` is `unavailable` or `failed` must have "
+        "empty `scientific_relations` and must never be recorded as a "
+        "`negative_result`."
+    ),
+    (
+        "Map `supports` to `strengthened`, `weakens` to `weakened`, and "
+        "`eliminates` to `eliminated`; attach the exact evidence reference to "
+        "every update."
     ),
     (
         "Preserve every negative result, counterexample, preregistration "
@@ -475,8 +487,8 @@ EXPECTED_EVIDENCE_COMPLETION_RULES = (
 )
 EXPECTED_EVIDENCE_FORBIDDEN_RULES = (
     (
-        "Do not treat an unavailable process, transport, evaluator, or measurement "
-        "as a negative scientific result."
+        "Do not attach a scientific relation, including `negative_result`, to "
+        "evidence whose `operational_state` is `unavailable` or `failed`."
     ),
     (
         "Do not request, retry, restart, rerun, or resubmit an experiment, and do "
@@ -1549,7 +1561,7 @@ def test_experiment_design_method_rejects_order_and_polarity_mutations(
         )
 
 
-def test_evidence_update_reads_exact_evidence_and_classifies_outcomes() -> None:
+def test_evidence_update_reads_exact_evidence_and_classifies_independent_axes() -> None:
     _, body = _parse_procedure_frontmatter(
         PROCEDURES_ROOT / "aros-evidence-update.md"
     )
@@ -1569,6 +1581,15 @@ def test_evidence_update_reads_exact_evidence_and_classifies_outcomes() -> None:
         EXPECTED_EVIDENCE_METHOD_RULES,
         numbered=True,
     )
+    method = _procedure_rules(_procedure_section(body, "Method"), numbered=True)
+    assert "`supports`" in method[2]
+    assert "assign zero or more" in method[2]
+    assert "both `negative_result` and `counterexample`" in method[3]
+    assert "empty `scientific_relations`" in method[4]
+    assert not any(
+        rule.startswith("Classify each evidence item as exactly one of")
+        for rule in method
+    )
 
 
 def test_evidence_update_returns_exact_fields_then_checkpoints_and_exits() -> None:
@@ -1583,7 +1604,8 @@ def test_evidence_update_returns_exact_fields_then_checkpoints_and_exits() -> No
     assert output[2] == (
         "Evidence binding: Cite an exact input receipt or raw reference for every "
         "strengthened, weakened, eliminated, counterexample, and negative-result "
-        "entry."
+        "entry; preserve the same reference in both lists when one executed item "
+        "has both relations."
     )
     assert output[3] == (
         "Budget accounting: Include the exact input `budget_used` in "
@@ -1622,8 +1644,18 @@ def test_evidence_update_forbids_retry_overwrite_scores_and_claim_admission() ->
     ("old", "new"),
     [
         (
-            "Never classify operational unavailability",
-            "Always classify operational unavailability",
+            "Only an item whose `operational_state` is `executed` may carry",
+            "An item whose `operational_state` is `unavailable` may carry",
+        ),
+        (
+            "Allow one executed item to carry both `negative_result` and",
+            "Forbid one executed item from carrying both `negative_result` and",
+        ),
+        (
+            "5. An item whose `operational_state` is `unavailable` or `failed` "
+            "must have empty",
+            "5. An item whose `operational_state` is `unavailable` or `failed` "
+            "may carry relations",
         ),
         ("Preserve every negative result", "Discard every negative result"),
         (

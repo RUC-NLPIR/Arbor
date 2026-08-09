@@ -41,6 +41,33 @@ REFERENCE_POLICIES = ("Sieve", "S3FIFO")
 _AUDIT_STATES = {"accepted", "rejected", "pending_independent_review"}
 _FRACTIONS = (Decimal("0.01"), Decimal("0.05"), Decimal("0.10"))
 _FORBIDDEN_KEYS = {"score", "reward", "objective", "aggregate", "pass"}
+_R0_EVALUATOR_KEYS = {
+    "evaluate_sha256",
+    "scope_sha256",
+    "evidence_sha256",
+    "r0_probes_sha256",
+    "cachesim_sha256",
+    "linux_subreaper_sha256",
+}
+_R2_EVALUATOR_KEYS = {
+    *_R0_EVALUATOR_KEYS,
+    "portfolio_sha256",
+    "portfolio_evidence_sha256",
+    "oracle_sha256",
+    "records_sha256",
+    "diagnostics_sha256",
+    "source_lock_sha256",
+    "run_aros_cache_eval_sha256",
+}
+_R0_SCIENTIFIC_INPUT_KEYS = {
+    "fixed_time_interposer",
+    "release_archive",
+    "release_cmake_cache",
+}
+_REQUIRED_SCIENTIFIC_HEADERS = {
+    "header:libCacheSim/include/libCacheSim.h",
+    "header:libCacheSim/bin/cachesim/cache_init.h",
+}
 _R2_KEYS = {
     "schema_version",
     "receipt_version",
@@ -174,6 +201,7 @@ class _R0Input:
     source: dict[str, object]
     artifacts: dict[str, FileBinding]
     retained: dict[str, FileBinding]
+    scientific_input_sha256s: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -224,14 +252,44 @@ def _host(value: object, label: str) -> dict[str, str]:
     return {key: value[key] for key in ("machine", "platform", "python")}
 
 
-def _hash_mapping(value: object, label: str) -> dict[str, str]:
+def _hash_mapping(
+    value: object,
+    label: str,
+    *,
+    expected_keys: set[str] | None = None,
+) -> dict[str, str]:
     if not isinstance(value, dict) or not value:
         raise CalibrationError(f"{label} hash mapping is missing")
+    if expected_keys is not None and set(value) != expected_keys:
+        raise CalibrationError(f"{label} hash mapping keys mismatch")
     result: dict[str, str] = {}
     for key, item in sorted(value.items()):
         if type(key) is not str or not key:
             raise CalibrationError(f"{label} hash mapping key is invalid")
         result[key] = _hash(item, f"{label} {key}")
+    return result
+
+
+def _flat_scientific_hashes(value: object, label: str) -> dict[str, str]:
+    result = _hash_mapping(value, label)
+    if not _R0_SCIENTIFIC_INPUT_KEYS < set(result):
+        raise CalibrationError(f"{label} hash mapping is incomplete")
+    header_keys = set(result) - _R0_SCIENTIFIC_INPUT_KEYS
+    if not _REQUIRED_SCIENTIFIC_HEADERS <= header_keys:
+        raise CalibrationError(f"{label} required header hashes are missing")
+    for key in header_keys:
+        relative = key.removeprefix("header:")
+        pure = PurePosixPath(relative)
+        if (
+            not key.startswith("header:")
+            or pure.is_absolute()
+            or ".." in pure.parts
+            or not (
+                relative.startswith("libCacheSim/include/")
+                or relative == "libCacheSim/bin/cachesim/cache_init.h"
+            )
+        ):
+            raise CalibrationError(f"{label} header key is invalid")
     return result
 
 
@@ -265,7 +323,25 @@ def _scientific_hashes(value: object) -> dict[str, str]:
         result[f"header:{name}"] = _hash(
             item["sha256"], f"R2 scientific header {name}"
         )
-    return dict(sorted(result.items()))
+    return _flat_scientific_hashes(
+        dict(sorted(result.items())), "R2 scientific input"
+    )
+
+
+def _r0_scientific_hashes(
+    artifacts: Mapping[str, FileBinding],
+) -> dict[str, str]:
+    names = {
+        "fixed_time_interposer": "fixed_time_interposer_binary",
+        "release_archive": "release_archive",
+        "release_cmake_cache": "release_cmake_cache",
+    }
+    if not set(names.values()) <= set(artifacts):
+        raise CalibrationError("R0 scientific input hash mapping is incomplete")
+    return {
+        name: artifacts[artifact].sha256
+        for name, artifact in sorted(names.items())
+    }
 
 
 def _validate_r0(path: Path) -> _R0Input:
@@ -378,6 +454,7 @@ def _validate_r0(path: Path) -> _R0Input:
             name: _artifact_binding(binding.path.parent, artifacts, name)
             for name in sorted(artifacts)
         }
+        scientific = _r0_scientific_hashes(bindings)
         validated_evidence = validate_r0_metadata_evidence(
             receipt,
             binding.path.parent,
@@ -392,7 +469,11 @@ def _validate_r0(path: Path) -> _R0Input:
             or receipt.get("binary_post_run_sha256") != release.sha256
         ):
             raise CalibrationError("R0 binary snapshot binding mismatch")
-        evaluator = _hash_mapping(receipt.get("evaluator"), "R0 evaluator")
+        evaluator = _hash_mapping(
+            receipt.get("evaluator"),
+            "R0 evaluator",
+            expected_keys=_R0_EVALUATOR_KEYS,
+        )
         for name, digest in evaluator.items():
             artifact = bindings.get(f"evaluator_{name.removesuffix('_sha256')}")
             if artifact is None or artifact.sha256 != digest:
@@ -423,7 +504,15 @@ def _validate_r0(path: Path) -> _R0Input:
                 raise CalibrationError("duplicate validated R0 evidence name")
             retained[retained_name] = observed
         _forbid_campaign_scalars(receipt)
-        return _R0Input(binding.path, receipt, binding, source, bindings, retained)
+        return _R0Input(
+            binding.path,
+            receipt,
+            binding,
+            source,
+            bindings,
+            retained,
+            scientific,
+        )
     except CalibrationError:
         raise
     except (OSError, ValueError) as error:
@@ -730,7 +819,11 @@ def _validate_r2(
         ):
             raise CalibrationError("R2 task/source/candidate binding or failure state is invalid")
         _host(receipt.get("host"), "R2")
-        evaluator = _hash_mapping(receipt.get("evaluator"), "R2 evaluator")
+        evaluator = _hash_mapping(
+            receipt.get("evaluator"),
+            "R2 evaluator",
+            expected_keys=_R2_EVALUATOR_KEYS,
+        )
         snapshots = receipt.get("evaluator_snapshots")
         if not isinstance(snapshots, dict) or set(snapshots) != set(evaluator):
             raise CalibrationError("R2 evaluator snapshot mapping is incomplete")
@@ -1126,8 +1219,15 @@ def _load_inputs(
             for item in r0_inputs
         }
         r0_evaluators = [
-            _hash_mapping(item.receipt["evaluator"], "R0 evaluator")
+            _hash_mapping(
+                item.receipt["evaluator"],
+                "R0 evaluator",
+                expected_keys=_R0_EVALUATOR_KEYS,
+            )
             for item in r0_inputs
+        ]
+        r0_scientific = [
+            item.scientific_input_sha256s for item in r0_inputs
         ]
         if (
             len(source_hashes) != 1
@@ -1135,8 +1235,11 @@ def _load_inputs(
             or len(binaries) != 1
             or len(r0_hosts) != 1
             or any(value != r0_evaluators[0] for value in r0_evaluators[1:])
+            or any(value != r0_scientific[0] for value in r0_scientific[1:])
         ):
-            raise CalibrationError("R0 source, candidate, binary, host, or evaluator is mixed")
+            raise CalibrationError(
+                "R0 source, candidate, binary, host, evaluator, or scientific input is mixed"
+            )
         resolved_r2 = [Path(path).resolve(strict=True) for path in receipts]
         if len(set(resolved_r2)) != len(resolved_r2):
             raise CalibrationError("duplicate R2 receipt paths are forbidden")
@@ -1174,7 +1277,11 @@ def _load_inputs(
         ):
             raise CalibrationError("each non-reference policy requires one R2 receipt")
         first = r2_inputs[0]
-        evaluator = _hash_mapping(first.receipt["evaluator"], "R2 evaluator")
+        evaluator = _hash_mapping(
+            first.receipt["evaluator"],
+            "R2 evaluator",
+            expected_keys=_R2_EVALUATOR_KEYS,
+        )
         scientific = first.scientific_input_sha256s
         host = _host(first.receipt["host"], "R2")
         apparatus = first.apparatus
@@ -1187,7 +1294,11 @@ def _load_inputs(
                 raise CalibrationError("R2 candidate binding is mixed")
             if item.receipt.get("binary_snapshot_sha256") not in binaries:
                 raise CalibrationError("R2 binary apparatus is mixed")
-            if _hash_mapping(item.receipt["evaluator"], "R2 evaluator") != evaluator:
+            if _hash_mapping(
+                item.receipt["evaluator"],
+                "R2 evaluator",
+                expected_keys=_R2_EVALUATOR_KEYS,
+            ) != evaluator:
                 raise CalibrationError("R2 evaluator version is mixed")
             if item.scientific_input_sha256s != scientific:
                 raise CalibrationError("R2 scientific input hashes are mixed")
@@ -1197,9 +1308,17 @@ def _load_inputs(
                 raise CalibrationError("R2 host fingerprint is mixed")
         if canonical_bytes(host) not in r0_hosts:
             raise CalibrationError("R0 and R2 host fingerprints differ")
-        for name, digest in r0_evaluators[0].items():
-            if evaluator.get(name) != digest:
-                raise CalibrationError("R0 and R2 evaluator dependency hashes differ")
+        evaluator_projection = {
+            name: evaluator[name] for name in sorted(_R0_EVALUATOR_KEYS)
+        }
+        if any(value != evaluator_projection for value in r0_evaluators):
+            raise CalibrationError("R0 and R2 evaluator dependency maps differ")
+        scientific_projection = {
+            name: scientific[name]
+            for name in sorted(_R0_SCIENTIFIC_INPUT_KEYS)
+        }
+        if any(value != scientific_projection for value in r0_scientific):
+            raise CalibrationError("R0 and R2 scientific input maps differ")
         return _Inputs(
             manifest,
             manifest_binding,
@@ -1455,7 +1574,9 @@ def _freeze(inputs: _Inputs) -> dict[str, object]:
         "source_commit": inputs.manifest["source_commit"],
         "binary_sha256": first.receipt["binary_snapshot_sha256"],
         "evaluator_sha256s": _hash_mapping(
-            first.receipt["evaluator"], "R2 evaluator"
+            first.receipt["evaluator"],
+            "R2 evaluator",
+            expected_keys=_R2_EVALUATOR_KEYS,
         ),
         "scientific_input_sha256s": first.scientific_input_sha256s,
         "host_fingerprint": _host(first.receipt["host"], "R2"),
@@ -1803,8 +1924,12 @@ def _validated_calibration_cell(
         or any(character not in "0123456789abcdef" for character in source_commit)
     ):
         raise CalibrationError("calibration source commit is invalid")
-    _hash_mapping(calibration.get("evaluator_sha256s"), "calibration evaluator")
     _hash_mapping(
+        calibration.get("evaluator_sha256s"),
+        "calibration evaluator",
+        expected_keys=_R2_EVALUATOR_KEYS,
+    )
+    _flat_scientific_hashes(
         calibration.get("scientific_input_sha256s"),
         "calibration scientific input",
     )

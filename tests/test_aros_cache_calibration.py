@@ -365,8 +365,31 @@ def calibration() -> dict[str, object]:
         "source_receipt_sha256": "2" * 64,
         "source_commit": "3" * 40,
         "binary_sha256": "4" * 64,
-        "evaluator_sha256s": {"portfolio_sha256": "5" * 64},
-        "scientific_input_sha256s": {"release_archive": "6" * 64},
+        "evaluator_sha256s": {
+            name: "5" * 64
+            for name in (
+                "cachesim_sha256",
+                "diagnostics_sha256",
+                "evaluate_sha256",
+                "evidence_sha256",
+                "linux_subreaper_sha256",
+                "oracle_sha256",
+                "portfolio_evidence_sha256",
+                "portfolio_sha256",
+                "r0_probes_sha256",
+                "records_sha256",
+                "run_aros_cache_eval_sha256",
+                "scope_sha256",
+                "source_lock_sha256",
+            )
+        },
+        "scientific_input_sha256s": {
+            "fixed_time_interposer": "6" * 64,
+            "release_archive": "6" * 64,
+            "release_cmake_cache": "6" * 64,
+            "header:libCacheSim/include/libCacheSim.h": "6" * 64,
+            "header:libCacheSim/bin/cachesim/cache_init.h": "6" * 64,
+        },
         "host_fingerprint": {
             "machine": "test",
             "platform": "test",
@@ -701,8 +724,12 @@ def test_calibration_freezes_all_policy_evidence_and_exact_medians(
         ("duplicate", "duplicate"),
         ("missing", "five"),
         ("host", "host"),
-        ("evaluator", "evaluator"),
-        ("scientific", "scientific"),
+        ("evaluator_extra", "evaluator"),
+        ("evaluator_missing", "evaluator"),
+        ("evaluator_changed", "evaluator"),
+        ("scientific_extra", "scientific"),
+        ("scientific_missing", "scientific"),
+        ("scientific_changed", "scientific"),
         ("r0map", "R0 evidence"),
         ("candidate", "candidate"),
         ("failure", "failure"),
@@ -730,10 +757,21 @@ def test_calibration_rejects_invalid_or_mixed_evidence(
         changed = json.loads(original)
         if kind == "host":
             changed["host"]["machine"] = "different-host"
-        elif kind == "evaluator":
+        elif kind == "evaluator_extra":
+            changed["evaluator"]["extra_sha256"] = "0" * 64
+        elif kind == "evaluator_missing":
+            changed["evaluator"].pop("portfolio_sha256")
+        elif kind == "evaluator_changed":
             changed["evaluator"]["portfolio_sha256"] = "0" * 64
-        elif kind == "scientific":
+        elif kind == "scientific_extra":
+            changed["scientific_inputs"]["extra"] = {
+                "path": "scientific-inputs/extra",
+                "sha256": "0" * 64,
+            }
+        elif kind == "scientific_missing":
             changed["scientific_inputs"].pop("release_archive")
+        elif kind == "scientific_changed":
+            changed["scientific_inputs"]["release_archive"]["sha256"] = "0" * 64
         elif kind == "r0map":
             name, value = changed["r0_artifact_snapshots"].popitem()
             changed["r0_artifact_snapshots"][f"arbitrary-{name}"] = value
@@ -797,6 +835,50 @@ def test_calibration_rejects_r0_failure_and_output_collision(
             output,
         )
     assert output.read_bytes() == b"foreign\n"
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "evaluator_extra",
+        "evaluator_missing",
+        "evaluator_changed",
+        "scientific_extra",
+        "scientific_missing",
+        "scientific_changed",
+    ],
+)
+def test_calibration_rejects_r0_map_mutations(
+    campaign_evidence: CampaignEvidence, tmp_path: Path, kind: str
+) -> None:
+    path = campaign_evidence.r0_receipts["LRU"]
+    original = path.read_bytes()
+    changed = json.loads(original)
+    if kind == "evaluator_extra":
+        changed["evaluator"]["extra_sha256"] = "0" * 64
+    elif kind == "evaluator_missing":
+        changed["evaluator"].pop("evaluate_sha256")
+    elif kind == "evaluator_changed":
+        changed["evaluator"]["evaluate_sha256"] = "0" * 64
+    elif kind == "scientific_extra":
+        changed["artifact_snapshots"]["scientific_extra"] = dict(
+            changed["artifact_snapshots"]["release_archive"]
+        )
+    elif kind == "scientific_missing":
+        changed["artifact_snapshots"].pop("release_archive")
+    elif kind == "scientific_changed":
+        changed["artifact_snapshots"]["release_archive"]["sha256"] = "0" * 64
+    write_record(path, changed, "receipt_sha256")
+    try:
+        with pytest.raises(CalibrationError, match="R0|evaluator|scientific"):
+            calibrate(
+                campaign_evidence.manifest,
+                list(campaign_evidence.r0_receipts.values()),
+                campaign_evidence.receipts,
+                tmp_path / f"r0-{kind}.json",
+            )
+    finally:
+        path.write_bytes(original)
 
 
 @pytest.mark.parametrize("kind", ["process", "side_effect"])

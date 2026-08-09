@@ -330,6 +330,172 @@ EXPECTED_RIVAL_COMPLETION_RULES = (
     ),
     "Exit incomplete after those calls; never complete this procedure.",
 )
+EXPECTED_EXPERIMENT_INPUT_RULES = (
+    "Artifact: Read exactly one `RivalMechanismSet`.",
+    (
+        "Required fields: `root_question_ref`, `mechanisms`, `predictions`, "
+        "`falsifiers`, `conflicts`, `remaining_uncertainty`."
+    ),
+    (
+        "Evidence binding: Use `Receipt.read` to inspect the bound evidence for "
+        "the surviving rivals before designing a proposal."
+    ),
+)
+EXPECTED_EXPERIMENT_METHOD_RULES = (
+    (
+        "Begin from first principles: compress each rival into the smallest "
+        "causal mechanism that explains its bound evidence before proposing an "
+        "intervention."
+    ),
+    (
+        "Identify one explicit `decision_uncertainty` that separates the "
+        "surviving rivals or determines that they require revision."
+    ),
+    (
+        "For each candidate, state one discriminating prediction, its falsifier, "
+        "controls, primary comparisons, transfer test, stopping rules, rerun "
+        "plan, cache-isolation plan, and exact evaluator binding in the proposed "
+        "`run_request`."
+    ),
+    (
+        "Apply the gates lexicographically and in this exact order: essentiality "
+        "first, falsifiability second, and decision relevance third. Reject every "
+        "candidate that fails any gate before comparing expected information "
+        "gain, cost, or concurrency."
+    ),
+    (
+        "Among candidates that pass all three gates, maximize expected "
+        "information gain per cost, with every estimate bound to cited evidence "
+        "and uncertainty."
+    ),
+    (
+        "Consider concurrency only after all three gates pass and only when "
+        "parallel proposals improve coverage; concurrency must not change the "
+        "lexicographic choice."
+    ),
+)
+EXPECTED_EXPERIMENT_COMPLETION_RULES = (
+    (
+        "Complete only with one proposal that passes all three gates, maximizes "
+        "expected information gain per cost among the passing candidates, and "
+        "contains every required design binding."
+    ),
+    "If no candidate passes every gate, do not emit an `ExperimentProposal`.",
+    (
+        "Call `Research.observe` with the unresolved gate failure and missing "
+        "evidence, then call `Research.petition` to request the new evidence "
+        "needed to form a valid proposal."
+    ),
+    "Exit incomplete after those calls; never complete this procedure.",
+)
+EXPECTED_EXPERIMENT_FORBIDDEN_RULES = (
+    (
+        "Do not execute an experiment or emit an executable command; return only "
+        "an `ExperimentProposal`."
+    ),
+    (
+        "Do not call `Run.request`, `Run.status`, `Eval.run`, any `Task.*` tool, "
+        "or any direct process tool."
+    ),
+    (
+        "Do not use a shell, subprocess, SSH, remote execution, job queue, upload, "
+        "or notification service."
+    ),
+    (
+        "Do not rank proposals by pilot score, aggregate score, or a score "
+        "threshold."
+    ),
+    "Do not use a fixed experiment count or fixed-round stopping rule.",
+    (
+        "Do not select the top positive result, prefer positive outcomes, or "
+        "choose a winner from pilot results."
+    ),
+)
+EXPECTED_EVIDENCE_INPUT_RULES = (
+    "Artifact: Read exactly one `RunEvidence`.",
+    (
+        "Required fields: `run_ref`, `eval_refs`, `raw_refs`, `process_state`, "
+        "`budget_used`."
+    ),
+    (
+        "Immutability: Treat `run_ref`, every `eval_ref`, and every `raw_ref` as "
+        "an immutable exact reference."
+    ),
+)
+EXPECTED_EVIDENCE_METHOD_RULES = (
+    (
+        "Read the exact immutable receipts identified by `run_ref` and "
+        "`eval_refs` and the exact immutable raw references identified by "
+        "`raw_refs`; bind each read to its reference before interpretation."
+    ),
+    (
+        "Classify each evidence item as exactly one of: operationally unavailable "
+        "because of process or transport failure or a missing measurement; an "
+        "executed negative result; or a counterexample to a stated prediction."
+    ),
+    (
+        "Never classify operational unavailability, process failure, transport "
+        "failure, or a missing measurement as a negative scientific result."
+    ),
+    (
+        "Update `strengthened`, `weakened`, and `eliminated` only from classified "
+        "evidence, and attach the exact supporting evidence reference to every "
+        "update."
+    ),
+    (
+        "Preserve every negative result, counterexample, preregistration "
+        "deviation, protocol deviation, and unexpected condition with its exact "
+        "evidence reference."
+    ),
+    (
+        "If the next action changes, cite the specific prior observation that "
+        "caused the change in `next_action_rationale`; otherwise state why the "
+        "current action remains justified."
+    ),
+    (
+        "Record the most important remaining uncertainty, the next-action "
+        "rationale, and the exact input `budget_used` without discarding achieved "
+        "evidence."
+    ),
+)
+EXPECTED_EVIDENCE_COMPLETION_RULES = (
+    (
+        "Complete only after every declared receipt and raw reference has been "
+        "read, classified, preserved, and bound into one `ObservationUpdate`."
+    ),
+    "Call `Research.observe` with the complete `ObservationUpdate`.",
+    (
+        "Call `Research.checkpoint` with the observation update and its exact "
+        "immutable evidence references."
+    ),
+    (
+        "Exit immediately after the successful checkpoint; do not continue the "
+        "research session."
+    ),
+)
+EXPECTED_EVIDENCE_FORBIDDEN_RULES = (
+    (
+        "Do not treat an unavailable process, transport, evaluator, or measurement "
+        "as a negative scientific result."
+    ),
+    (
+        "Do not request, retry, restart, rerun, or resubmit an experiment, and do "
+        "not call `Run.request`."
+    ),
+    (
+        "Do not overwrite or mutate a receipt, raw reference, prior observation, "
+        "negative result, counterexample, or deviation."
+    ),
+    (
+        "Do not use a shell, subprocess, SSH, remote execution, job queue, upload, "
+        "or notification service."
+    ),
+    (
+        "Do not use a score, score threshold, fixed-round rule, or preference for "
+        "the top positive result to interpret evidence or decide whether to stop."
+    ),
+    "Do not admit, accept, or reject a `Claim`; Claim admission is outside this procedure.",
+)
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1239,6 +1405,248 @@ def test_rival_forbidden_rules_reject_opposite_ranking_polarity() -> None:
             "Forbidden",
             EXPECTED_RIVAL_FORBIDDEN_RULES,
             numbered=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["aros-experiment-design", "aros-evidence-update"],
+)
+def test_experiment_design_and_evidence_update_frontmatter_and_headings_match_contract(
+    name: str,
+) -> None:
+    path = PROCEDURES_ROOT / f"{name}.md"
+    metadata, body = _parse_procedure_frontmatter(path)
+    contracts = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    contract = contracts["procedures"][name]
+    raw = path.read_bytes().lower()
+
+    assert metadata == {
+        "name": name,
+        "source_ids": ["source-1", "source-2"],
+        "input": contract["input"],
+        "output": contract["output"],
+        "tools": contract["tools"],
+    }
+    assert tuple(re.findall(r"(?m)^## ([^\n]+)$", body)) == (
+        EXPECTED_PROCEDURE_HEADINGS
+    )
+    assert all(body.count(f"## {heading}\n") == 1 for heading in EXPECTED_PROCEDURE_HEADINGS)
+    assert not any(upstream.encode() in raw for upstream in UPSTREAM_PRODUCT_NAMES)
+    assert b"repository:" not in raw
+    assert b"commit:" not in raw
+    assert b"license:" not in raw
+    assert b"/workspace/" not in raw
+
+
+def test_experiment_design_reads_rivals_and_applies_exact_lexicographic_method() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-experiment-design.md"
+    )
+
+    _assert_procedure_rules(
+        body,
+        "Inputs",
+        EXPECTED_EXPERIMENT_INPUT_RULES,
+        numbered=False,
+    )
+    assert _required_fields(EXPECTED_EXPERIMENT_INPUT_RULES[1]) == EXPECTED_ARTIFACTS[
+        "RivalMechanismSet"
+    ]
+    _assert_procedure_rules(
+        body,
+        "Method",
+        EXPECTED_EXPERIMENT_METHOD_RULES,
+        numbered=True,
+    )
+
+
+def test_experiment_design_returns_exact_proposal_and_petitions_if_none_valid() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-experiment-design.md"
+    )
+    output = _procedure_rules(_procedure_section(body, "Output"), numbered=False)
+
+    assert len(output) == 4
+    assert output[0] == "Artifact: Return exactly one `ExperimentProposal`."
+    assert _required_fields(output[1]) == EXPECTED_ARTIFACTS["ExperimentProposal"]
+    assert output[2] == (
+        "Lineage: Restrict `mechanism_refs` to mechanisms in the input "
+        "`RivalMechanismSet` and preserve their evidence bindings."
+    )
+    assert output[3] == (
+        "Authority: Treat `run_request` as a future AROS request descriptor, not "
+        "an execution command or authorization."
+    )
+    _assert_procedure_rules(
+        body,
+        "Completion",
+        EXPECTED_EXPERIMENT_COMPLETION_RULES,
+        numbered=False,
+    )
+
+
+def test_experiment_design_forbids_direct_actions_scores_and_fixed_rounds() -> None:
+    metadata, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-experiment-design.md"
+    )
+
+    assert metadata["tools"] == [
+        "Receipt.read",
+        "Research.observe",
+        "Research.petition",
+    ]
+    _assert_procedure_rules(
+        body,
+        "Forbidden",
+        EXPECTED_EXPERIMENT_FORBIDDEN_RULES,
+        numbered=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "4. Apply the gates lexicographically and in this exact order: "
+            "essentiality first,",
+            "4. Apply the gates lexicographically and in this exact order: "
+            "falsifiability first,",
+        ),
+        (
+            "falsifiability second, and decision relevance third. Reject every "
+            "candidate",
+            "falsifiability second, and decision relevance third. Retain every "
+            "candidate",
+        ),
+        (
+            "5. Among candidates that pass all three gates, maximize expected "
+            "information gain",
+            "5. Among candidates that pass all three gates, minimize expected "
+            "information gain",
+        ),
+        (
+            "6. Consider concurrency only after all three gates pass",
+            "6. Consider concurrency before all three gates pass",
+        ),
+    ],
+)
+def test_experiment_design_method_rejects_order_and_polarity_mutations(
+    old: str, new: str
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-experiment-design.md"
+    )
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            "Method",
+            EXPECTED_EXPERIMENT_METHOD_RULES,
+            numbered=True,
+        )
+
+
+def test_evidence_update_reads_exact_evidence_and_classifies_outcomes() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+
+    _assert_procedure_rules(
+        body,
+        "Inputs",
+        EXPECTED_EVIDENCE_INPUT_RULES,
+        numbered=False,
+    )
+    assert _required_fields(EXPECTED_EVIDENCE_INPUT_RULES[1]) == EXPECTED_ARTIFACTS[
+        "RunEvidence"
+    ]
+    _assert_procedure_rules(
+        body,
+        "Method",
+        EXPECTED_EVIDENCE_METHOD_RULES,
+        numbered=True,
+    )
+
+
+def test_evidence_update_returns_exact_fields_then_checkpoints_and_exits() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    output = _procedure_rules(_procedure_section(body, "Output"), numbered=False)
+
+    assert len(output) == 4
+    assert output[0] == "Artifact: Return exactly one `ObservationUpdate`."
+    assert _required_fields(output[1]) == EXPECTED_ARTIFACTS["ObservationUpdate"]
+    assert output[2] == (
+        "Evidence binding: Cite an exact input receipt or raw reference for every "
+        "strengthened, weakened, eliminated, counterexample, and negative-result "
+        "entry."
+    )
+    assert output[3] == (
+        "Budget accounting: Include the exact input `budget_used` in "
+        "`next_action_rationale`; do not add an output field outside the central "
+        "contract."
+    )
+    _assert_procedure_rules(
+        body,
+        "Completion",
+        EXPECTED_EVIDENCE_COMPLETION_RULES,
+        numbered=False,
+    )
+
+
+def test_evidence_update_forbids_retry_overwrite_scores_and_claim_admission() -> None:
+    metadata, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+
+    assert metadata["tools"] == [
+        "Run.status",
+        "Eval.run",
+        "Receipt.read",
+        "Research.observe",
+        "Research.checkpoint",
+    ]
+    _assert_procedure_rules(
+        body,
+        "Forbidden",
+        EXPECTED_EVIDENCE_FORBIDDEN_RULES,
+        numbered=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "Never classify operational unavailability",
+            "Always classify operational unavailability",
+        ),
+        ("Preserve every negative result", "Discard every negative result"),
+        (
+            "cite the specific prior observation that caused the",
+            "do not cite the specific prior observation that caused the",
+        ),
+    ],
+)
+def test_evidence_update_method_rejects_opposite_evidence_polarity(
+    old: str, new: str
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            "Method",
+            EXPECTED_EVIDENCE_METHOD_RULES,
+            numbered=True,
         )
 
 

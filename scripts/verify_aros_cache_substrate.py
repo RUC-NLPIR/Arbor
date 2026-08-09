@@ -1967,23 +1967,65 @@ def _parse_result(raw):
         text = raw.decode("ascii")
     except UnicodeError as error:
         raise VerificationError("simulator stdout is not ASCII") from error
+    if any(
+        character != "\n" and not 0x20 <= ord(character) <= 0x7E
+        for character in text
+    ):
+        raise VerificationError("simulator stdout contains non-printable ASCII")
     matches = []
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if not line:
             continue
-        marker = " cache size "
-        if marker not in line:
-            raise VerificationError("simulator stdout contains an unknown line")
-        prefix, remainder = line.split(marker, 1)
+        if not line.endswith(" MQPS"):
+            raise VerificationError("simulator stdout is missing literal MQPS")
+        head, separator, throughput = line[: -len(" MQPS")].rpartition(
+            ", throughput "
+        )
+        if not separator:
+            raise VerificationError("simulator stdout is missing literal throughput")
+        head, separator, byte_ratio = head.rpartition(", byte miss ratio ")
+        if not separator:
+            raise VerificationError("simulator stdout is missing literal byte miss ratio")
+        head, separator, object_ratio = head.rpartition(", miss ratio ")
+        if not separator:
+            raise VerificationError("simulator stdout is missing literal miss ratio")
         try:
-            trace_path, detailed_policy = prefix.rsplit(" ", 1)
+            identity_and_cache, request_segment = head.rsplit(",", 1)
+        except ValueError as error:
+            raise VerificationError("simulator request field is malformed") from error
+        request_spaces = len(request_segment) - len(request_segment.lstrip(" "))
+        request_value = request_segment[request_spaces:]
+        if not 1 <= request_spaces <= 32 or not request_value.endswith(" req"):
+            raise VerificationError("simulator request spacing is malformed")
+        requests = request_value[: -len(" req")]
+        if not requests.isdigit() or not 1 <= len(requests) <= 20:
+            raise VerificationError("simulator request count is malformed")
+        identity, separator, cache_segment = identity_and_cache.rpartition(
+            " cache size"
+        )
+        if not separator:
+            raise VerificationError("simulator stdout is missing literal cache size")
+        cache_spaces = len(cache_segment) - len(cache_segment.lstrip(" "))
+        cache_size = cache_segment[cache_spaces:]
+        if (
+            not 1 <= cache_spaces <= 16
+            or not 1 <= len(cache_size) <= 64
+            or " " in cache_size
+            or "," in cache_size
+        ):
+            raise VerificationError("simulator cache size field is malformed")
+        try:
+            trace_path, detailed_policy = identity.rsplit(" ", 1)
         except ValueError as error:
             raise VerificationError("simulator result identity is malformed") from error
-        if not trace_path.startswith("/") or not detailed_policy:
-            raise VerificationError("simulator result trace path is not absolute")
         if (
-            len(trace_path) > 1792
-            or len(detailed_policy) > 256
+            not trace_path.startswith("/")
+            or not 1 <= len(trace_path[1:]) <= 1792
+            or "," in trace_path
+        ):
+            raise VerificationError("simulator result trace path is invalid")
+        if (
+            not 1 <= len(detailed_policy) <= 256
             or detailed_policy[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
             or any(
                 character
@@ -1992,25 +2034,6 @@ def _parse_result(raw):
             )
         ):
             raise VerificationError("simulator detailed policy name is invalid")
-        fields = remainder.split(",")
-        if len(fields) != 5:
-            raise VerificationError("simulator result field count mismatch")
-        requests = fields[1].strip().split(" ")
-        cache_size = fields[0].strip()
-        if not 1 <= len(cache_size) <= 64 or any(
-            character.isspace() for character in cache_size
-        ):
-            raise VerificationError("simulator cache size text is invalid")
-        object_ratio = fields[2].strip().removeprefix("miss ratio ")
-        byte_ratio = fields[3].strip().removeprefix("byte miss ratio ")
-        throughput = fields[4].strip().removeprefix("throughput ").removesuffix(" MQPS")
-        if (
-            len(requests) != 2
-            or requests[1] != "req"
-            or not requests[0].isdigit()
-            or not 1 <= len(requests[0]) <= 20
-        ):
-            raise VerificationError("simulator request count is malformed")
         parsed_object = _bounded_unsigned_decimal(
             object_ratio, "object miss ratio", 3, 12
         )
@@ -2019,7 +2042,7 @@ def _parse_result(raw):
             throughput, "throughput", 12, 12
         )
         if (
-            int(requests[0]) <= 0
+            int(requests) <= 0
             or _decimal_compare(parsed_object, "0") < 0
             or _decimal_compare(parsed_object, "1") > 0
             or _decimal_compare(parsed_byte, "0") < 0
@@ -2029,7 +2052,7 @@ def _parse_result(raw):
             raise VerificationError("simulator result values are out of range")
         matches.append(
             {
-                "request_count": int(requests[0]),
+                "request_count": int(requests),
                 "trace_path": trace_path,
                 "detailed_policy": detailed_policy,
                 "cache_size": cache_size,

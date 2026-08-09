@@ -1803,6 +1803,18 @@ def rewrite_first_raw_result(receipt_path: Path, defect: str) -> None:
             f" cache size  {cell_bytes + 1}B,",
             1,
         )
+    elif defect == "miss_label":
+        raw = raw.replace(", miss ratio ", ", ", 1)
+    elif defect == "byte_label":
+        raw = raw.replace(", byte miss ratio ", ", ", 1)
+    elif defect == "throughput_label":
+        raw = raw.replace(", throughput ", ", ", 1)
+    elif defect == "mqps_label":
+        raw = raw.replace(" MQPS\n", "\n", 1)
+    elif defect == "tab":
+        raw = raw.replace(", 32 req", ",\t32 req", 1)
+    elif defect == "duplicate":
+        raw = raw + raw
     else:  # pragma: no cover - parametrization is exhaustive
         raise AssertionError(defect)
     stdout.write_text(raw)
@@ -1826,7 +1838,7 @@ def rewrite_first_raw_result(receipt_path: Path, defect: str) -> None:
 
 def rewrite_first_cell_to_stage_prefix(receipt_path: Path) -> None:
     root = receipt_path.parent
-    stage = root.parent / f".{root.name}-stage-before-rename"
+    stage = root.parent / f".{root.name} cache size stage-before-rename"
     receipt = json.loads(receipt_path.read_text())
     summary = receipt["measurements"][0]
     measurement_path = root / summary["path"]
@@ -2140,6 +2152,26 @@ def test_verifier_binds_raw_result_to_requested_cell(
     fixture = valid_retained_substrate(tmp_path, monkeypatch)
     rewrite_first_raw_result(fixture.paths["r1_receipt"], defect)
     with pytest.raises(fixture.module.VerificationError, match=defect.replace("_", " ")):
+        fixture.module.verify(fixture.index)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "miss_label",
+        "byte_label",
+        "throughput_label",
+        "mqps_label",
+        "tab",
+        "duplicate",
+    ],
+)
+def test_raw_parser_requires_task3_anchored_grammar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    rewrite_first_raw_result(fixture.paths["r1_receipt"], defect)
+    with pytest.raises(fixture.module.VerificationError):
         fixture.module.verify(fixture.index)
 
 

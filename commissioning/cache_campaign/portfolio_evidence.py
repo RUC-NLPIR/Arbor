@@ -539,13 +539,32 @@ def publish_and_verify(
             stage, stage_identity, inventory, root_receipt
         )
         revalidate_publication(stage, snapshot)
-        publish_stage_in_parent(parent, stage, stage_identity)
+        held_output = publish_stage_in_parent(parent, stage, stage_identity)
         renamed = True
-        revalidate_publication(output, snapshot)
+        revalidate_publication(held_output, snapshot)
         revalidate_owned_record(
-            output / "receipt.json", root_receipt, "published root receipt"
+            held_output / "receipt.json", root_receipt, "published root receipt"
         )
-        revalidate_publication(output, snapshot)
+        revalidate_publication(held_output, snapshot)
+        parent_metadata = parent.path.lstat()
+        public_metadata = output.lstat()
+        root_identity = next(
+            item.identity
+            for item in snapshot.directories
+            if item.relative_path == "."
+        )
+        if (
+            parent.path.is_symlink()
+            or not stat.S_ISDIR(parent_metadata.st_mode)
+            or (parent_metadata.st_dev, parent_metadata.st_ino) != parent.identity
+            or output.is_symlink()
+            or not stat.S_ISDIR(public_metadata.st_mode)
+            or (public_metadata.st_dev, public_metadata.st_ino) != root_identity
+            or output.resolve(strict=True) != parent.path / parent.output_name
+        ):
+            raise BindingMutationError(
+                "public output path differs from retained publication authority"
+            )
     except (OSError, ValueError) as error:
         raise PublicationBindingError(
             f"publication binding verification failed: {bounded_error(error)}",

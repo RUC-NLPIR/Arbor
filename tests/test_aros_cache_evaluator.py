@@ -1732,6 +1732,49 @@ def test_output_parent_swap_cannot_redirect_descriptor_relative_publication(
     assert not list(moved.glob(".r2-output-stage-*"))
 
 
+@pytest.mark.parametrize("flow", ["success", "preflight_failure"])
+def test_post_rename_parent_and_tree_move_cannot_authorize_public_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flow: str,
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    host = tmp_path / "publication-host"
+    host.mkdir()
+    output = host / "r2-output"
+    inputs["output"] = output
+    if flow == "preflight_failure":
+        binary = (
+            inputs["r0_receipt"].parent
+            / "artifact_snapshots/release_cachesim"
+        )
+        binary.chmod(0o600)
+        binary.write_bytes(b"invalid binary\n")
+        binary.chmod(0o400)
+    moved = tmp_path / "publication-host-moved"
+    real_publish = portfolio_evidence_module.publish_stage_in_parent
+
+    def move_parent_and_published_tree(
+        parent: object, stage: Path, identity: tuple[int, int]
+    ) -> Path:
+        held = real_publish(parent, stage, identity)  # type: ignore[arg-type]
+        host.rename(moved)
+        host.mkdir()
+        (host / "foreign-marker").write_text("preserve\n")
+        (moved / "r2-output").rename(host / "r2-output")
+        return held
+
+    monkeypatch.setattr(
+        portfolio_evidence_module,
+        "publish_stage_in_parent",
+        move_parent_and_published_tree,
+    )
+    with pytest.raises(ValueError, match="publication|parent"):
+        evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert (host / "foreign-marker").read_text() == "preserve\n"
+    assert (host / "r2-output/receipt.json").exists()
+
+
 def test_root_receipt_replacement_after_verification_blocks_publish_and_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1766,12 +1809,13 @@ def test_root_receipt_replacement_after_publish_blocks_return_and_is_preserved(
 
     def replace_after_publish(
         parent: object, stage: Path, identity: tuple[int, int]
-    ) -> None:
-        real_publish(parent, stage, identity)  # type: ignore[arg-type]
+    ) -> Path:
+        held = real_publish(parent, stage, identity)  # type: ignore[arg-type]
         output = parent.path / parent.output_name  # type: ignore[attr-defined]
         path = output / "receipt.json"
         path.unlink()
         path.write_bytes(foreign)
+        return held
 
     monkeypatch.setattr(
         portfolio_evidence_module, "publish_stage_in_parent", replace_after_publish
@@ -1795,12 +1839,13 @@ def test_success_publication_revalidates_every_file_after_rename(
 
     def replace_during_publish(
         parent: object, stage: Path, identity: tuple[int, int]
-    ) -> None:
-        real_publish(parent, stage, identity)  # type: ignore[arg-type]
+    ) -> Path:
+        held = real_publish(parent, stage, identity)  # type: ignore[arg-type]
         output = parent.path / parent.output_name  # type: ignore[attr-defined]
         path = output / "measurements/0000" / relative
         path.unlink()
         path.write_bytes(foreign)
+        return held
 
     monkeypatch.setattr(
         portfolio_evidence_module, "publish_stage_in_parent", replace_during_publish
@@ -1847,12 +1892,13 @@ def test_preflight_failure_publication_revalidates_all_owned_evidence(
 
         def replace_during_publish(
             parent: object, stage: Path, identity: tuple[int, int]
-        ) -> None:
-            real_publish(parent, stage, identity)  # type: ignore[arg-type]
+        ) -> Path:
+            held = real_publish(parent, stage, identity)  # type: ignore[arg-type]
             final = parent.path / parent.output_name  # type: ignore[attr-defined]
             path = final / "failures/preflight.json"
             path.unlink()
             path.write_bytes(foreign)
+            return held
 
         monkeypatch.setattr(
             portfolio_evidence_module, "publish_stage_in_parent", replace_during_publish
@@ -1864,7 +1910,7 @@ def test_preflight_failure_publication_revalidates_all_owned_evidence(
             path: Path, receipt: object, label: str
         ) -> None:
             real_revalidate(path, receipt, label)  # type: ignore[arg-type]
-            if path == output / "receipt.json":
+            if label == "published root receipt":
                 target = output / "failures/preflight.json"
                 target.unlink()
                 target.write_bytes(foreign)

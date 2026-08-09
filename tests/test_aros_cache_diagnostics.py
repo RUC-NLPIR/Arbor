@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 import subprocess
 from dataclasses import FrozenInstanceError
-from decimal import Decimal
+from decimal import Decimal, Inexact, ROUND_DOWN, ROUND_UP, Subnormal, localcontext
 from pathlib import Path
 
 import pytest
@@ -85,6 +85,53 @@ def test_phase_parser_balances_nondivisible_totals_across_all_sixteen_bins() -> 
         )
 
 
+def test_phase_ratio_validation_ignores_ambient_rounding_and_traps() -> None:
+    lines = []
+    for index in range(16):
+        lines.append(
+            f"phase={index} requests=3 object_misses=1 "
+            "request_bytes=3 byte_misses=1"
+        )
+    output = "\n".join(lines) + "\n"
+    results = []
+    for rounding in (ROUND_DOWN, ROUND_UP):
+        with localcontext() as context:
+            context.prec = 5
+            context.rounding = rounding
+            context.traps[Inexact] = True
+            results.append(
+                parse_phase_probe_output(
+                    output,
+                    expected_request_count=48,
+                    expected_request_bytes=48,
+                    expected_object_miss_ratio=Decimal("0.3333"),
+                    expected_byte_miss_ratio=Decimal("0.3333"),
+                )
+            )
+    assert results[0] == results[1]
+
+
+def test_phase_ratio_quantum_ignores_ambient_exponent_traps() -> None:
+    lines = []
+    for index in range(16):
+        misses = 1 if index == 0 else 0
+        lines.append(
+            f"phase={index} requests=10 object_misses={misses} "
+            f"request_bytes=10 byte_misses={misses}"
+        )
+    with localcontext() as context:
+        context.Emin = 0
+        context.traps[Subnormal] = True
+        bins = parse_phase_probe_output(
+            "\n".join(lines) + "\n",
+            expected_request_count=160,
+            expected_request_bytes=160,
+            expected_object_miss_ratio=Decimal("0.0062"),
+            expected_byte_miss_ratio=Decimal("0.0062"),
+        )
+    assert sum(item.object_misses for item in bins) == 1
+
+
 def sidecar_record() -> dict[str, object]:
     value: dict[str, object] = {
         "evidence_class": "exploratory",
@@ -141,6 +188,60 @@ def test_exploratory_sidecar_rejects_self_hash_mutation() -> None:
     value["counters"] = {"queue_hits": 4}
     with pytest.raises(DiagnosticError, match="self-hash"):
         ExploratorySidecar.from_record(value)
+
+
+def test_exploratory_sidecar_direct_constructor_enforces_and_round_trips() -> None:
+    value = sidecar_record()
+    direct = ExploratorySidecar(
+        evidence_class="exploratory",
+        candidate_commit="a" * 40,
+        run_sha256="b" * 64,
+        trace_sha256="c" * 64,
+        counters=(("ghost_ratio", Decimal("0.125")), ("queue_hits", 3)),
+        sidecar_sha256=str(value["sidecar_sha256"]),
+    )
+    assert ExploratorySidecar.from_record(direct.to_record()) == direct
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("evidence_class", "confirmation"),
+        ("candidate_commit", "A" * 40),
+        ("run_sha256", "b" * 63),
+        ("trace_sha256", "c" * 65),
+        ("counters", ()),
+        ("counters", (("Bad", 1),)),
+        ("counters", (("confirmation", 1),)),
+        ("counters", (("queue_hits", True),)),
+        ("counters", (("queue_hits", Decimal("NaN")),)),
+        ("counters", (("queue_hits", Decimal("1.00")),)),
+        ("counters", (("queue_hits", 1), ("queue_hits", 2))),
+        ("sidecar_sha256", "d" * 64),
+    ],
+)
+def test_exploratory_sidecar_direct_constructor_rejects_bypass(
+    field: str, invalid: object
+) -> None:
+    values: dict[str, object] = {
+        "evidence_class": "exploratory",
+        "candidate_commit": "a" * 40,
+        "run_sha256": "b" * 64,
+        "trace_sha256": "c" * 64,
+        "counters": (("queue_hits", 3),),
+        "sidecar_sha256": ExploratorySidecar.hash_record(
+            {
+                "evidence_class": "exploratory",
+                "candidate_commit": "a" * 40,
+                "run_sha256": "b" * 64,
+                "trace_sha256": "c" * 64,
+                "counters": {"queue_hits": 3},
+            }
+        ),
+    }
+    values[field] = invalid
+    with pytest.raises(DiagnosticError):
+        ExploratorySidecar(**values)  # type: ignore[arg-type]
 
 
 FAKE_CACHE_INIT = r'''

@@ -10,9 +10,9 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict
-from decimal import Decimal
-from pathlib import Path
+from dataclasses import asdict, dataclass
+from decimal import Decimal, localcontext
+from pathlib import Path, PurePosixPath
 
 from .cachesim import ChildResult, parse_cachesim_output, run_child
 from .portfolio import evaluate_portfolio
@@ -45,8 +45,10 @@ from .evidence import (
     verify_final_stage as _verify_final_stage,
 )
 from .records import (
+    canonical_decimal,
     load_object,
     record_sha256,
+    scientific_decimal_context,
     sha256_file,
     write_new_record,
 )
@@ -67,7 +69,7 @@ from .scope import PolicyContract, ScopeFacts, evaluate_scope
 from .source import validate_source
 
 
-__all__ = ["evaluate_portfolio", "evaluate_r0"]
+__all__ = ["evaluate_portfolio", "evaluate_r0", "validate_r0_metadata_evidence"]
 
 
 SOURCE_LOCK = load_object(Path(__file__).with_name("source.lock.json"))
@@ -114,6 +116,67 @@ _GIT_CONFIG = [
 
 
 EvaluationError = EvidenceError
+
+
+@dataclass(frozen=True)
+class ValidatedR0File:
+    name: str
+    path: Path
+    identity: tuple[int, int]
+    mode: int
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ValidatedR0MetadataEvidence:
+    files: tuple[ValidatedR0File, ...]
+    stdout: ValidatedR0File
+
+
+def _capture_r0_file(name: str, path: Path) -> tuple[ValidatedR0File, bytes]:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    digest = hashlib.sha256()
+    raw = bytearray()
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise EvaluationError(f"R0 retained evidence is not regular: {name}")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+                raw.extend(block)
+        after = path.stat(follow_symlinks=False)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+        or len(raw) != before.st_size
+    ):
+        raise EvaluationError(f"R0 retained evidence changed while reading: {name}")
+    return (
+        ValidatedR0File(
+            name=name,
+            path=path.resolve(strict=True),
+            identity=(before.st_dev, before.st_ino),
+            mode=stat.S_IMODE(before.st_mode),
+            size_bytes=len(raw),
+            sha256=digest.hexdigest(),
+        ),
+        bytes(raw),
+    )
+
+
+def _revalidate_r0_file(expected: ValidatedR0File) -> None:
+    observed, _raw = _capture_r0_file(expected.name, expected.path)
+    if observed != expected:
+        raise EvaluationError(f"R0 retained evidence binding changed: {expected.name}")
 
 def _command_outcome(invocation: _Invocation) -> bool | None:
     if invocation.result is None:
@@ -239,9 +302,284 @@ def parse_capacity_probe(output: str) -> dict[str, int | bool]:
 
 def parse_metadata_probe(output: str) -> tuple[Decimal, int]:
     try:
-        return _parse_metadata_probe(output)
+        with localcontext(scientific_decimal_context()):
+            return _parse_metadata_probe(output)
     except ProbeError as error:
         raise EvaluationError(str(error)) from error
+
+
+def _retained_r0_artifact(
+    receipt: Mapping[str, object], r0_root: Path, name: str
+) -> tuple[dict[str, object], ValidatedR0File, bytes]:
+    artifacts = receipt.get("artifact_snapshots")
+    record = artifacts.get(name) if isinstance(artifacts, dict) else None
+    expected_keys = {
+        "source_path",
+        "source_identity",
+        "size_bytes",
+        "sha256",
+        "snapshot_path",
+        "snapshot_identity",
+        "binding_intact",
+    }
+    if not isinstance(record, dict) or set(record) != expected_keys:
+        raise EvaluationError(f"R0 artifact receipt is invalid: {name}")
+    relative = record.get("snapshot_path")
+    if type(relative) is not str:
+        raise EvaluationError(f"R0 artifact path is invalid: {name}")
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or ".." in pure.parts:
+        raise EvaluationError(f"R0 artifact path escapes its receipt: {name}")
+    path = r0_root.joinpath(*pure.parts)
+    file_receipt, raw = _capture_r0_file(name, path)
+    recorded_identity = record.get("snapshot_identity")
+    if (
+        record.get("binding_intact") is not True
+        or not isinstance(recorded_identity, dict)
+        or set(recorded_identity) != {"device", "inode"}
+        or recorded_identity.get("device") != file_receipt.identity[0]
+        or recorded_identity.get("inode") != file_receipt.identity[1]
+        or record.get("size_bytes") != file_receipt.size_bytes
+        or record.get("sha256") != file_receipt.sha256
+    ):
+        raise EvaluationError(f"R0 artifact snapshot binding mismatch: {name}")
+    _revalidate_r0_file(file_receipt)
+    return record, file_receipt, raw
+
+
+def _retained_r0_raw_evidence(
+    receipt: Mapping[str, object],
+    r0_root: Path,
+    raw_record: object,
+    expected_path: str,
+) -> tuple[bytes, ValidatedR0File]:
+    if not isinstance(raw_record, dict) or set(raw_record) != {
+        "path",
+        "size_bytes",
+        "sha256",
+        "binding_intact",
+    }:
+        raise EvaluationError("R0 metadata command raw receipt is invalid")
+    if raw_record.get("path") != expected_path or raw_record.get("binding_intact") is not True:
+        raise EvaluationError("R0 metadata command raw path binding mismatch")
+    pure = PurePosixPath(expected_path)
+    if pure.is_absolute() or ".." in pure.parts:
+        raise EvaluationError("R0 metadata command raw path escapes its receipt")
+    path = r0_root.joinpath(*pure.parts)
+    file_receipt, raw = _capture_r0_file(expected_path, path)
+    identity = file_receipt.identity
+    digest = file_receipt.sha256
+    if raw_record.get("size_bytes") != len(raw) or raw_record.get("sha256") != digest:
+        raise EvaluationError("R0 metadata command raw hash mismatch")
+    inventory = receipt.get("evidence_inventory")
+    matches = [
+        item
+        for item in inventory
+        if isinstance(item, dict) and item.get("path") == expected_path
+    ] if isinstance(inventory, list) else []
+    if len(matches) != 1:
+        raise EvaluationError("R0 metadata command inventory entry is missing")
+    item = matches[0]
+    expected_identity = {"device": identity[0], "inode": identity[1]}
+    if (
+        set(item) != {
+            "path",
+            "identity",
+            "size_bytes",
+            "sha256",
+            "present",
+            "observed_identity",
+            "observed_size_bytes",
+            "observed_sha256",
+            "binding_intact",
+        }
+        or item.get("identity") != expected_identity
+        or item.get("observed_identity") != expected_identity
+        or item.get("size_bytes") != len(raw)
+        or item.get("observed_size_bytes") != len(raw)
+        or item.get("sha256") != digest
+        or item.get("observed_sha256") != digest
+        or item.get("present") is not True
+        or item.get("binding_intact") is not True
+    ):
+        raise EvaluationError("R0 metadata command inventory binding mismatch")
+    _revalidate_r0_file(file_receipt)
+    return raw, file_receipt
+
+
+def validate_r0_metadata_evidence(
+    receipt: Mapping[str, object],
+    r0_root: Path,
+    *,
+    candidate: str,
+    policy: str,
+    source_receipt_sha256: str,
+) -> ValidatedR0MetadataEvidence:
+    """Validate and return every retained Task 4 metadata dependency."""
+    validated_files: list[ValidatedR0File] = []
+    if (
+        receipt.get("candidate_commit") != candidate
+        or receipt.get("policy") != policy
+        or receipt.get("source_receipt_sha256") != source_receipt_sha256
+    ):
+        raise EvaluationError("R0 metadata command candidate/source binding mismatch")
+    evaluator = receipt.get("evaluator")
+    expected_evaluator_names = (
+        "evaluate",
+        "scope",
+        "evidence",
+        "r0_probes",
+        "cachesim",
+        "linux_subreaper",
+    )
+    if not isinstance(evaluator, dict) or set(evaluator) != {
+        f"{name}_sha256" for name in expected_evaluator_names
+    }:
+        raise EvaluationError("R0 evaluator dependency binding is invalid")
+    for name in expected_evaluator_names:
+        artifact, file_receipt, _raw = _retained_r0_artifact(
+            receipt, r0_root, f"evaluator_{name}"
+        )
+        validated_files.append(file_receipt)
+        if evaluator.get(f"{name}_sha256") != artifact.get("sha256"):
+            raise EvaluationError("R0 evaluator dependency hash mismatch")
+
+    metadata_probe, metadata_probe_file, _probe_raw = _retained_r0_artifact(
+        receipt, r0_root, "metadata_probe_binary"
+    )
+    interposer, interposer_file, _interposer_raw = _retained_r0_artifact(
+        receipt, r0_root, "metadata_interposer_binary"
+    )
+    metadata_source, metadata_source_file, _metadata_source_raw = _retained_r0_artifact(
+        receipt, r0_root, "metadata_probe_source"
+    )
+    interposer_source, interposer_source_file, _interposer_source_raw = (
+        _retained_r0_artifact(receipt, r0_root, "metadata_interposer_source")
+    )
+    synthetic, synthetic_file, _synthetic_raw = _retained_r0_artifact(
+        receipt, r0_root, "synthetic_trace"
+    )
+    validated_files.extend(
+        (
+            metadata_probe_file,
+            interposer_file,
+            metadata_source_file,
+            interposer_source_file,
+            synthetic_file,
+        )
+    )
+    probes = receipt.get("probes")
+    metadata_probe_record = probes.get("metadata") if isinstance(probes, dict) else None
+    if (
+        not isinstance(metadata_probe_record, dict)
+        or metadata_probe_record.get("accounting_scope") != "process_wide_ld_preload"
+        or metadata_probe_record.get("source_sha256") != metadata_source.get("sha256")
+        or not isinstance(metadata_probe_record.get("binary"), dict)
+        or metadata_probe_record["binary"].get("sha256") != metadata_probe.get("sha256")
+        or metadata_probe_record.get("interposer_source_sha256")
+        != interposer_source.get("sha256")
+        or not isinstance(metadata_probe_record.get("interposer_binary"), dict)
+        or metadata_probe_record["interposer_binary"].get("sha256")
+        != interposer.get("sha256")
+    ):
+        raise EvaluationError("R0 metadata probe artifact binding is invalid")
+    synthetic_record = receipt.get("synthetic_trace")
+    if not isinstance(synthetic_record, dict):
+        raise EvaluationError("R0 synthetic trace binding is invalid")
+    cache_size = synthetic_record.get("cache_size_bytes")
+    if type(cache_size) is not int or cache_size <= 0:
+        raise EvaluationError("R0 synthetic cache size binding is invalid")
+
+    commands = receipt.get("commands")
+    matches = [
+        item
+        for item in commands
+        if isinstance(item, dict) and item.get("label") == "metadata-run"
+    ] if isinstance(commands, list) else []
+    if len(matches) != 1:
+        raise EvaluationError("R0 metadata command receipt is missing")
+    command = matches[0]
+    expected_index = 13 if candidate == receipt.get("base_commit") else 14
+    expected_command_keys = {
+        "index",
+        "label",
+        "argv",
+        "cwd",
+        "timeout_seconds",
+        "max_output_bytes",
+        "returncode",
+        "wall_ns",
+        "cpu_ns",
+        "stdout",
+        "stderr",
+        "command_sha256",
+    }
+    command_hash = command.get("command_sha256")
+    if (
+        set(command) != expected_command_keys
+        or type(command_hash) is not str
+        or _HEX64.fullmatch(command_hash) is None
+        or command_hash != record_sha256(command, "command_sha256")
+    ):
+        raise EvaluationError("R0 metadata command self-hash mismatch")
+    source_paths = [
+        interposer.get("source_path"),
+        metadata_probe.get("source_path"),
+        synthetic.get("source_path"),
+    ]
+    if any(type(item) is not str or not Path(item).is_absolute() for item in source_paths):
+        raise EvaluationError("R0 metadata command artifact source path is invalid")
+    expected_cwd = str(Path(str(metadata_probe["source_path"])).parent)
+    if any(str(Path(str(item)).parent) != expected_cwd for item in source_paths):
+        raise EvaluationError("R0 metadata command artifact roots differ")
+    expected_argv = [
+        "/usr/bin/env",
+        f"LD_PRELOAD={interposer['source_path']}",
+        metadata_probe["source_path"],
+        synthetic["source_path"],
+        policy,
+        str(cache_size),
+    ]
+    if (
+        command.get("index") != expected_index
+        or command.get("argv") != expected_argv
+        or command.get("cwd") != expected_cwd
+        or command.get("timeout_seconds") != _COMMAND_LIMITS["metadata-run"][0]
+        or command.get("max_output_bytes") != _COMMAND_LIMITS["metadata-run"][1]
+        or command.get("returncode") != 0
+        or type(command.get("wall_ns")) is not int
+        or command["wall_ns"] < 0
+        or type(command.get("cpu_ns")) is not int
+        or command["cpu_ns"] < 0
+    ):
+        raise EvaluationError("R0 metadata command process binding mismatch")
+    prefix = f"commands/{expected_index:02d}-metadata-run"
+    stdout_raw, stdout_file = _retained_r0_raw_evidence(
+        receipt, r0_root, command.get("stdout"), f"{prefix}/stdout.raw"
+    )
+    stderr_raw, stderr_file = _retained_r0_raw_evidence(
+        receipt, r0_root, command.get("stderr"), f"{prefix}/stderr.raw"
+    )
+    validated_files.extend((stdout_file, stderr_file))
+    if stderr_raw:
+        raise EvaluationError("R0 metadata command stderr is not empty")
+    measured = receipt.get("measured_metadata")
+    if not isinstance(measured, dict):
+        raise EvaluationError("R0 measured metadata is missing")
+    try:
+        measured_bytes, measured_global = parse_metadata_probe(stdout_raw.decode("ascii"))
+    except (UnicodeError, ValueError) as error:
+        raise EvaluationError("R0 metadata command stdout is invalid") from error
+    if (
+        canonical_decimal(measured_bytes) != measured.get("bytes_per_object")
+        or measured_global != measured.get("global_bytes")
+        or measured.get("measurement_sha256") != hashlib.sha256(stdout_raw).hexdigest()
+    ):
+        raise EvaluationError("R0 metadata facts differ from exact process evidence")
+    for file_receipt in validated_files:
+        _revalidate_r0_file(file_receipt)
+    ordered = tuple(sorted(validated_files, key=lambda item: item.name))
+    return ValidatedR0MetadataEvidence(ordered, stdout_file)
 
 
 def _candidate_ctest_passed(invocation: _Invocation, policy: str) -> bool:
@@ -1257,7 +1595,7 @@ def evaluate_r0(
 
         measured_receipt = (
             {
-                "bytes_per_object": str(measured[0]),
+                "bytes_per_object": canonical_decimal(measured[0]),
                 "global_bytes": measured[1],
                 "measurement_sha256": metadata_run.result.stdout_sha256,
                 "within_budget": None,
@@ -1268,6 +1606,10 @@ def evaluate_r0(
         synthetic["path"] = str(trace_path.relative_to(stage))
         synthetic["cache_fraction"] = "0.10"
         synthetic["cache_size_bytes"] = cache_bytes
+        for invocation in commands:
+            invocation.record["command_sha256"] = record_sha256(
+                invocation.record, "command_sha256"
+            )
         receipt: dict[str, object] = {
             "schema_version": 1,
             "receipt_version": 1,

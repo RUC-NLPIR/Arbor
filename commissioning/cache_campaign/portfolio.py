@@ -4,6 +4,7 @@ import hashlib
 import os
 import platform
 import re
+import secrets
 import stat
 import struct
 import subprocess
@@ -11,7 +12,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_FLOOR, localcontext
+from decimal import Decimal
 from pathlib import Path, PurePosixPath
 
 from .cachesim import ChildResult, parse_cachesim_output, run_child
@@ -30,8 +31,10 @@ from .evidence import (
 )
 from .records import (
     HEX64,
+    NewRecordReceipt,
     ParetoMeasurement,
     canonical_decimal,
+    deterministic_decimal_ratio,
     load_candidate_object,
     load_object,
     quarantine_unlink,
@@ -39,7 +42,7 @@ from .records import (
     sha256_file,
     write_new_record,
 )
-from .r0_probes import parse_metadata_probe, probe_build_flags
+from .r0_probes import probe_build_flags
 from .scope import evaluate_scope
 
 
@@ -126,10 +129,22 @@ class PortfolioError(ValueError):
     pass
 
 
+class RecordCollision(PortfolioError):
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"exclusive record collision: {path.name}")
+        self.path = path
+
+
 class PhaseRunError(PortfolioError):
-    def __init__(self, message: str, process_sha256: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        process_sha256: str | None,
+        bindings: tuple[FileBinding, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.process_sha256 = process_sha256
+        self.bindings = bindings
 
 
 @dataclass(frozen=True)
@@ -180,6 +195,12 @@ class PhaseApparatus:
     cmake_cache_sha256: str
     compiler_path: Path
     compiler: FileBinding
+
+
+@dataclass(frozen=True)
+class PhaseRecordEvidence:
+    record: dict[str, object]
+    bindings: tuple[FileBinding, ...]
 
 
 def _bounded(value: object, limit: int = 512) -> str:
@@ -448,92 +469,6 @@ def _artifact_binding(
     return binding
 
 
-def _validate_metadata_evidence(
-    receipt: Mapping[str, object], r0_root: Path, metadata: Mapping[str, object]
-) -> FileBinding:
-    commands = receipt.get("commands")
-    if not isinstance(commands, list):
-        raise PortfolioError("R0 metadata process evidence is missing")
-    matches = [
-        item
-        for item in commands
-        if isinstance(item, dict) and item.get("label") == "metadata-run"
-    ]
-    if len(matches) != 1:
-        raise PortfolioError("R0 metadata process evidence is missing")
-    command = matches[0]
-    stdout = command.get("stdout")
-    if (
-        command.get("returncode") != 0
-        or not isinstance(stdout, dict)
-        or set(stdout) != {"path", "size_bytes", "sha256", "binding_intact"}
-        or stdout.get("binding_intact") is not True
-    ):
-        raise PortfolioError("R0 metadata process evidence is invalid")
-    raw_relative = stdout.get("path")
-    if type(raw_relative) is not str:
-        raise PortfolioError("R0 metadata process evidence path is invalid")
-    pure = PurePosixPath(raw_relative)
-    if pure.is_absolute() or ".." in pure.parts:
-        raise PortfolioError("R0 metadata process evidence path escapes its receipt")
-    stdout_binding = _file_binding(r0_root.joinpath(*pure.parts))
-    if (
-        stdout.get("size_bytes") != stdout_binding.size_bytes
-        or stdout.get("sha256") != stdout_binding.sha256
-        or metadata.get("measurement_sha256") != stdout_binding.sha256
-    ):
-        raise PortfolioError("R0 metadata process evidence hash mismatch")
-    inventory = receipt.get("evidence_inventory")
-    inventory_matches = [
-        item
-        for item in inventory
-        if isinstance(item, dict) and item.get("path") == raw_relative
-    ] if isinstance(inventory, list) else []
-    if len(inventory_matches) != 1:
-        raise PortfolioError("R0 metadata evidence inventory is missing")
-    item = inventory_matches[0]
-    expected_inventory_keys = {
-        "path",
-        "identity",
-        "size_bytes",
-        "sha256",
-        "present",
-        "observed_identity",
-        "observed_size_bytes",
-        "observed_sha256",
-        "binding_intact",
-    }
-    expected_identity = {
-        "device": stdout_binding.identity[0],
-        "inode": stdout_binding.identity[1],
-    }
-    if (
-        set(item) != expected_inventory_keys
-        or item.get("identity") != expected_identity
-        or item.get("observed_identity") != expected_identity
-        or item.get("size_bytes") != stdout_binding.size_bytes
-        or item.get("observed_size_bytes") != stdout_binding.size_bytes
-        or item.get("sha256") != stdout_binding.sha256
-        or item.get("observed_sha256") != stdout_binding.sha256
-        or item.get("present") is not True
-        or item.get("binding_intact") is not True
-    ):
-        raise PortfolioError("R0 metadata evidence inventory binding mismatch")
-    try:
-        measured_bytes, measured_global = parse_metadata_probe(
-            regular_bytes(stdout_binding.path).decode("ascii")
-        )
-    except (UnicodeError, ValueError) as error:
-        raise PortfolioError("R0 metadata raw evidence is invalid") from error
-    if (
-        canonical_decimal(measured_bytes) != metadata.get("bytes_per_object")
-        or measured_global != metadata.get("global_bytes")
-    ):
-        raise PortfolioError("R0 metadata facts differ from raw evidence")
-    _revalidate_file(stdout_binding)
-    return stdout_binding
-
-
 def _validate_r0(
     path: Path,
     *,
@@ -673,7 +608,15 @@ def _validate_r0(
     if sha256_file(policy_source) != receipt.get("policy_source_sha256"):
         raise PortfolioError("R0 policy source binding mismatch")
     r0_root = binding.path.parent
-    metadata_evidence = _validate_metadata_evidence(receipt, r0_root, metadata)
+    from .evaluate import validate_r0_metadata_evidence
+
+    validated_evidence = validate_r0_metadata_evidence(
+        receipt,
+        r0_root,
+        candidate=candidate,
+        policy=policy,
+        source_receipt_sha256=str(source["receipt_sha256"]),
+    )
     artifacts = receipt.get("artifact_snapshots")
     if not isinstance(artifacts, dict):
         raise PortfolioError("R0 artifact snapshots are missing")
@@ -685,7 +628,24 @@ def _validate_r0(
             "release_cmake_cache",
         )
     }
-    bound["metadata_measurement_stdout"] = metadata_evidence
+    for validated in validated_evidence.files:
+        observed = _file_binding(validated.path, expected_mode=validated.mode)
+        if (
+            observed.identity != validated.identity
+            or observed.size_bytes != validated.size_bytes
+            or observed.sha256 != validated.sha256
+        ):
+            raise PortfolioError(
+                f"validated R0 evidence changed before binding: {validated.name}"
+            )
+        name = (
+            "metadata_measurement_stdout"
+            if validated == validated_evidence.stdout
+            else "validated_" + validated.name.replace("/", "_")
+        )
+        if name in bound:
+            raise PortfolioError("duplicate validated R0 evidence binding")
+        bound[name] = observed
     if (
         receipt.get("binary_sha256") != bound["release_cachesim"].sha256
         or receipt.get("binary_post_run_sha256") != bound["release_cachesim"].sha256
@@ -776,8 +736,10 @@ def _preflight(
     final = output_path(Path(output), root)
     if _paths_overlap(final, resolved_task_root):
         raise PortfolioError("portfolio output must be outside task_root")
-    if _paths_overlap(final, r0_root):
-        raise PortfolioError("portfolio output must be outside the R0 receipt")
+    if _paths_overlap(final, r0_root.parent):
+        raise PortfolioError(
+            "portfolio output must be outside the R0 evidence root and parent"
+        )
     if any(_paths_overlap(final, item.binding.path) for item in traces):
         raise PortfolioError("portfolio output must not overlap trace inputs")
     evaluator = _evaluator_bindings()
@@ -864,6 +826,62 @@ def _write_raw(path: Path, raw: bytes, mode: int) -> FileBinding:
     return _file_binding(path, expected_mode=mode)
 
 
+def _write_owned_record(
+    path: Path, value: dict[str, object], hash_field: str
+) -> FileBinding:
+    if os.path.lexists(path):
+        raise RecordCollision(path)
+    try:
+        receipt = write_new_record(path, value, hash_field)
+    except (OSError, ValueError) as error:
+        if os.path.lexists(path):
+            raise RecordCollision(path) from error
+        raise
+    if not isinstance(receipt, NewRecordReceipt):
+        raise PortfolioError("record publisher did not return an ownership receipt")
+    try:
+        observed = _file_binding(path, expected_mode=receipt.mode)
+    except (OSError, ValueError) as error:
+        if os.path.lexists(path):
+            raise RecordCollision(path) from error
+        raise PortfolioError("published record disappeared before binding") from error
+    if (
+        observed.identity != receipt.identity
+        or observed.size_bytes != receipt.size_bytes
+        or observed.sha256 != receipt.sha256
+    ):
+        raise RecordCollision(path)
+    return observed
+
+
+def _write_failure_record(
+    stage: Path,
+    preferred: Path,
+    failure: dict[str, object],
+) -> tuple[Path, FileBinding, dict[str, object]]:
+    try:
+        binding = _write_owned_record(preferred, failure, "failure_sha256")
+        return preferred, binding, failure
+    except RecordCollision:
+        fallback_failure = {
+            key: item for key, item in failure.items() if key != "failure_sha256"
+        }
+        fallback_failure["record_collision"] = {
+            "path": str(preferred.relative_to(stage)),
+            "state": "foreign_preserved",
+        }
+        for _attempt in range(16):
+            path = stage / f"failure-{secrets.token_hex(16)}.json"
+            try:
+                binding = _write_owned_record(
+                    path, fallback_failure, "failure_sha256"
+                )
+                return path, binding, fallback_failure
+            except RecordCollision:
+                continue
+        raise PortfolioError("cannot allocate a private failure receipt")
+
+
 def _compiler_binding(path: Path) -> FileBinding:
     raw = Path(path)
     if not raw.is_absolute():
@@ -924,6 +942,7 @@ def _compile_phase_probe(
     _revalidate_compiler(compiler_path, compiler_snapshot)
     process_output = stage / "phase-compile-process"
     result: ChildResult | None = None
+    process_binding: FileBinding | None = None
     try:
         result = run(
             argv,
@@ -945,7 +964,9 @@ def _compile_phase_probe(
             timeout_seconds=300.0,
             max_output_bytes=16 * 1024 * 1024,
         )
-        write_new_record(process_output / "process.json", process, "process_sha256")
+        process_binding = _write_owned_record(
+            process_output / "process.json", process, "process_sha256"
+        )
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         if not process_output.exists():
             process_output.mkdir(mode=0o700)
@@ -957,10 +978,14 @@ def _compile_phase_probe(
             timeout_seconds=300.0,
             max_output_bytes=16 * 1024 * 1024,
         )
-        if not (process_output / "process.json").exists():
-            write_new_record(
-                process_output / "process.json", process, "process_sha256"
-            )
+        process_path = process_output / "process.json"
+        if process_binding is None and not (
+            isinstance(error, RecordCollision) and error.path == process_path
+        ):
+            try:
+                _write_owned_record(process_path, process, "process_sha256")
+            except RecordCollision:
+                pass
         raise
     if result.returncode != 0:
         raise PortfolioError("phase probe compilation failed")
@@ -997,7 +1022,7 @@ def _phase_record(
     apparatus: PhaseApparatus,
     run: Run,
     guard: Callable[[], None],
-) -> dict[str, object]:
+) -> PhaseRecordEvidence:
     argv = [
         str(apparatus.binary.path),
         str(trace.binding.path),
@@ -1012,6 +1037,8 @@ def _phase_record(
     _revalidate_file(apparatus.binary)
     output = cell_directory / "phase-process"
     result: ChildResult | None = None
+    process_binding: FileBinding | None = None
+    owned_bindings: list[FileBinding] = []
     try:
         result = run(
             argv,
@@ -1031,7 +1058,13 @@ def _phase_record(
             timeout_seconds=_TIMEOUT_SECONDS,
             max_output_bytes=_MAX_OUTPUT_BYTES,
         )
-        write_new_record(output / "process.json", process, "process_sha256")
+        owned_bindings.extend(
+            (_file_binding(result.stdout_path), _file_binding(result.stderr_path))
+        )
+        process_binding = _write_owned_record(
+            output / "process.json", process, "process_sha256"
+        )
+        owned_bindings.append(process_binding)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         if not output.exists():
             output.mkdir(mode=0o700)
@@ -1043,12 +1076,30 @@ def _phase_record(
             timeout_seconds=_TIMEOUT_SECONDS,
             max_output_bytes=_MAX_OUTPUT_BYTES,
         )
-        if not (output / "process.json").exists():
-            write_new_record(output / "process.json", process, "process_sha256")
-        raise PhaseRunError(_bounded(error), str(process["process_sha256"])) from error
+        process_path = output / "process.json"
+        if process_binding is None and not (
+            isinstance(error, RecordCollision) and error.path == process_path
+        ):
+            try:
+                process_binding = _write_owned_record(
+                    process_path, process, "process_sha256"
+                )
+                owned_bindings.append(process_binding)
+            except RecordCollision:
+                process_binding = None
+        process_sha256 = (
+            str(process["process_sha256"])
+            if process_binding is not None and "process_sha256" in process
+            else None
+        )
+        raise PhaseRunError(
+            _bounded(error), process_sha256, tuple(owned_bindings)
+        ) from error
     if result.returncode != 0:
         raise PhaseRunError(
-            "phase probe process failed", str(process["process_sha256"])
+            "phase probe process failed",
+            str(process["process_sha256"]),
+            tuple(owned_bindings),
         )
     try:
         bins = parse_phase_probe_output(
@@ -1060,7 +1111,9 @@ def _phase_record(
         )
     except (UnicodeError, ValueError) as error:
         raise PhaseRunError(
-            _bounded(error), str(process["process_sha256"])
+            _bounded(error),
+            str(process["process_sha256"]),
+            tuple(owned_bindings),
         ) from error
     guard()
     _revalidate_file(apparatus.source)
@@ -1080,8 +1133,18 @@ def _phase_record(
         "bins": [item.to_record() for item in bins],
         "process": process,
     }
-    write_new_record(cell_directory / "phase.json", record, "phase_sha256")
-    return record
+    try:
+        phase_binding = _write_owned_record(
+            cell_directory / "phase.json", record, "phase_sha256"
+        )
+    except RecordCollision as error:
+        raise PhaseRunError(
+            _bounded(error),
+            str(process["process_sha256"]),
+            tuple(owned_bindings),
+        ) from error
+    owned_bindings.append(phase_binding)
+    return PhaseRecordEvidence(record, tuple(owned_bindings))
 
 
 def _selected_traces(rung: str, traces: Sequence[TraceFacts]) -> tuple[TraceFacts, ...]:
@@ -1094,17 +1157,27 @@ def _selected_traces(rung: str, traces: Sequence[TraceFacts]) -> tuple[TraceFact
 
 
 def _cache_size(working_set_bytes: int, fraction: Decimal) -> int:
-    value = (Decimal(working_set_bytes) * fraction).to_integral_value(
-        rounding=ROUND_FLOOR
-    )
-    size = int(value)
+    if type(working_set_bytes) is not int or working_set_bytes <= 0:
+        raise PortfolioError("working set must be a positive integer")
+    if type(fraction) is not Decimal or not fraction.is_finite() or fraction <= 0:
+        raise PortfolioError("cache fraction must be a positive finite Decimal")
+    numerator, denominator = fraction.as_integer_ratio()
+    size = working_set_bytes * numerator // denominator
     if size <= 0:
         raise PortfolioError("cache fraction produces a nonpositive cache size")
     return size
 
 
-def _write_request(path: Path, request: dict[str, object]) -> None:
-    write_new_record(path, request, "request_sha256")
+def _cpu_ns_per_request(cpu_ns: int, request_count: int) -> Decimal:
+    if type(cpu_ns) is not int or cpu_ns <= 0:
+        raise PortfolioError("CPU nanoseconds must be a positive integer")
+    if type(request_count) is not int or request_count <= 0:
+        raise PortfolioError("request count must be a positive integer")
+    return deterministic_decimal_ratio(cpu_ns, request_count)
+
+
+def _write_request(path: Path, request: dict[str, object]) -> FileBinding:
+    return _write_owned_record(path, request, "request_sha256")
 
 
 def _retain_side_effect(
@@ -1312,6 +1385,9 @@ def _publish_preflight_failure(
         resolved_task = Path(task_root).resolve(strict=True)
         if _paths_overlap(final, resolved_task):
             return
+        r0_path = Path(r0_receipt).resolve(strict=True)
+        if _paths_overlap(final, r0_path.parent.parent):
+            return
         stage, stage_identity = stage_directory(final)
     except (OSError, ValueError):
         return
@@ -1440,7 +1516,9 @@ def evaluate_portfolio(
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                 phase_compile_failed = True
                 compile_integrity_failure = (
-                    "binding" in str(error).lower()
+                    isinstance(error, RecordCollision)
+                    or "collision" in str(error).lower()
+                    or "binding" in str(error).lower()
                     or "changed" in str(error).lower()
                     or "mismatch" in str(error).lower()
                     or "differs" in str(error).lower()
@@ -1448,7 +1526,11 @@ def evaluate_portfolio(
                 if compile_integrity_failure:
                     provenance_intact = False
                 process_path = stage / "phase-compile-process/process.json"
-                process = load_object(process_path) if process_path.exists() else None
+                process = (
+                    load_object(process_path)
+                    if process_path.exists() and not isinstance(error, RecordCollision)
+                    else None
+                )
                 failure = {
                     "schema_version": 1,
                     "kind": (
@@ -1457,22 +1539,20 @@ def evaluate_portfolio(
                         else "process_failure"
                     ),
                     "label": "phase-compile",
-                    "process_sha256": (
-                        process.get("process_sha256")
-                        if isinstance(process, dict)
-                        else None
-                    ),
                     "error": _bounded(error),
                     "remaining_cell_indices": list(range(len(selected_cells))),
                 }
-                failure_root = stage / "failures"
-                failure_root.mkdir(mode=0o700)
-                failure_path = failure_root / "phase-compile.json"
-                write_new_record(failure_path, failure, "failure_sha256")
+                if isinstance(process, dict) and type(process.get("process_sha256")) is str:
+                    failure["process_sha256"] = process["process_sha256"]
+                failure_path, _failure_binding, retained_failure = _write_failure_record(
+                    stage,
+                    stage / "phase-compile-failure.json",
+                    failure,
+                )
                 failures.append(
                     {
                         "path": str(failure_path.relative_to(stage)),
-                        "failure_sha256": failure["failure_sha256"],
+                        "failure_sha256": retained_failure["failure_sha256"],
                     }
                 )
         metadata = preflight.r0["measured_metadata"]
@@ -1488,6 +1568,7 @@ def evaluate_portfolio(
             if phase_apparatus is not None
             else []
         )
+        invalid_retained: set[tuple[Path, tuple[int, int]]] = set()
 
         def guard() -> None:
             _revalidate_preflight(preflight, execution)
@@ -1496,7 +1577,27 @@ def evaluate_portfolio(
                     phase_apparatus.compiler_path, phase_apparatus.compiler
                 )
             for retained in retained_bindings:
-                _revalidate_file(retained)
+                try:
+                    _revalidate_file(retained)
+                except (OSError, ValueError):
+                    invalid_retained.add((retained.path, retained.identity))
+                    raise
+
+        def retain_owned(bindings: Sequence[FileBinding]) -> bool:
+            intact = True
+            known = {(item.path, item.identity) for item in retained_bindings}
+            for owned in bindings:
+                try:
+                    _revalidate_file(owned)
+                except (OSError, ValueError):
+                    intact = False
+                    invalid_retained.add((owned.path, owned.identity))
+                    continue
+                key = (owned.path, owned.identity)
+                if key not in known:
+                    retained_bindings.append(owned)
+                    known.add(key)
+            return intact
 
         for cell in (() if phase_compile_failed else selected_cells):
             trace = next(
@@ -1538,6 +1639,9 @@ def evaluate_portfolio(
             attempted = False
             result: ChildResult | None = None
             process: dict[str, object] | None = None
+            request_binding: FileBinding | None = None
+            process_binding: FileBinding | None = None
+            current_owned: list[FileBinding] = []
             try:
                 guard()
                 attempted = True
@@ -1559,10 +1663,17 @@ def evaluate_portfolio(
                     timeout_seconds=_TIMEOUT_SECONDS,
                     max_output_bytes=_MAX_OUTPUT_BYTES,
                 )
-                _write_request(cell_directory / "request.json", request)
-                write_new_record(
+                current_owned.extend(
+                    (_file_binding(result.stdout_path), _file_binding(result.stderr_path))
+                )
+                request_binding = _write_request(
+                    cell_directory / "request.json", request
+                )
+                current_owned.append(request_binding)
+                process_binding = _write_owned_record(
                     cell_directory / "process.json", process, "process_sha256"
                 )
+                current_owned.append(process_binding)
                 stdout = regular_bytes(result.stdout_path)
                 side_binding = (
                     _retain_side_effect(
@@ -1573,6 +1684,8 @@ def evaluate_portfolio(
                     if private_side_effect.exists()
                     else None
                 )
+                if side_binding is not None:
+                    current_owned.append(side_binding)
                 if result.returncode != 0:
                     failure: dict[str, object] = {
                         "schema_version": 1,
@@ -1581,18 +1694,28 @@ def evaluate_portfolio(
                         "process_sha256": process["process_sha256"],
                         "returncode": result.returncode,
                     }
-                    write_new_record(
-                        cell_directory / "failure.json", failure, "failure_sha256"
+                    (
+                        failure_path,
+                        _failure_binding,
+                        retained_failure,
+                    ) = _write_failure_record(
+                        stage,
+                        cell_directory / "failure.json",
+                        failure,
                     )
+                    current_owned.append(_failure_binding)
                     failures.append(
                         {
                             "cell_index": cell["index"],
-                            "path": str((cell_directory / "failure.json").relative_to(stage)),
-                            "failure_sha256": failure["failure_sha256"],
+                            "path": str(failure_path.relative_to(stage)),
+                            "failure_sha256": retained_failure["failure_sha256"],
                         }
                     )
                     guard()
-                    retained_bindings.extend(_tree_bindings(cell_directory))
+                    if not retain_owned(current_owned):
+                        raise PortfolioError(
+                            "current-cell owned evidence changed before retention"
+                        )
                     continue
                 if side_binding is None:
                     raise PortfolioError("simulator side-effect output is missing")
@@ -1605,7 +1728,7 @@ def evaluate_portfolio(
                         "simulator request count does not match the warmup convention"
                     )
                 guard()
-                phase = (
+                phase_evidence = (
                     _phase_record(
                         stage=stage,
                         cell_directory=cell_directory,
@@ -1621,11 +1744,12 @@ def evaluate_portfolio(
                     if phase_apparatus is not None
                     else None
                 )
-                with localcontext() as context:
-                    context.prec = 50
-                    cpu_per_request = Decimal(result.cpu_ns) / Decimal(
-                        parsed.request_count
-                    )
+                phase = phase_evidence.record if phase_evidence is not None else None
+                if phase_evidence is not None:
+                    current_owned.extend(phase_evidence.bindings)
+                cpu_per_request = _cpu_ns_per_request(
+                    result.cpu_ns, parsed.request_count
+                )
                 pareto = ParetoMeasurement(
                     rung=rung,  # type: ignore[arg-type]
                     split=str(cell["split"]),  # type: ignore[arg-type]
@@ -1676,11 +1800,16 @@ def evaluate_portfolio(
                         "diagnostics"
                     ]
                 _assert_no_forbidden_keys(measurement)
-                write_new_record(
+                measurement_binding = _write_owned_record(
                     cell_directory / "measurement.json",
                     measurement,
                     "measurement_sha256",
                 )
+                current_owned.append(measurement_binding)
+                if not retain_owned(current_owned):
+                    raise PortfolioError(
+                        "current-cell owned evidence changed before retention"
+                    )
                 measurements.append(
                     {
                         **cell,
@@ -1691,12 +1820,21 @@ def evaluate_portfolio(
                     }
                 )
                 guard()
-                retained_bindings.extend(_tree_bindings(cell_directory))
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                if isinstance(error, PhaseRunError):
+                    current_owned.extend(error.bindings)
                 if not cell_directory.exists():
                     cell_directory.mkdir(parents=True, mode=0o700)
-                if not (cell_directory / "request.json").exists():
-                    _write_request(cell_directory / "request.json", request)
+                collision = error if isinstance(error, RecordCollision) else None
+                request_path = cell_directory / "request.json"
+                if request_binding is None and (
+                    collision is None or collision.path != request_path
+                ):
+                    try:
+                        request_binding = _write_request(request_path, request)
+                        current_owned.append(request_binding)
+                    except RecordCollision as record_error:
+                        collision = record_error
                 process_path = cell_directory / "process.json"
                 if process is None:
                     process = _failed_process_record(
@@ -1707,10 +1845,21 @@ def evaluate_portfolio(
                         timeout_seconds=_TIMEOUT_SECONDS,
                         max_output_bytes=_MAX_OUTPUT_BYTES,
                     )
-                if not process_path.exists():
-                    write_new_record(process_path, process, "process_sha256")
+                if process_binding is None and (
+                    collision is None or collision.path != process_path
+                ):
+                    try:
+                        process_binding = _write_owned_record(
+                            process_path, process, "process_sha256"
+                        )
+                        current_owned.append(process_binding)
+                    except RecordCollision as record_error:
+                        collision = record_error
                 integrity_failure = (
-                    not attempted
+                    collision is not None
+                    or isinstance(error, RecordCollision)
+                    or not attempted
+                    or "collision" in str(error).lower()
                     or "binding" in str(error).lower()
                     or "changed" in str(error).lower()
                     or "mismatch" in str(error).lower()
@@ -1720,31 +1869,39 @@ def evaluate_portfolio(
                     "schema_version": 1,
                     "cell_index": cell["index"],
                     "kind": "binding_failure" if integrity_failure else "launch_failure",
-                    "process_sha256": (
-                        error.process_sha256
-                        if isinstance(error, PhaseRunError)
-                        else process["process_sha256"]
-                    ),
-                    "error": _bounded(error),
+                    "error": _bounded(collision or error),
                 }
+                if isinstance(error, PhaseRunError):
+                    if error.process_sha256 is not None:
+                        failure["process_sha256"] = error.process_sha256
+                elif process_binding is not None and "process_sha256" in process:
+                    failure["process_sha256"] = process["process_sha256"]
                 if integrity_failure:
                     failure["remaining_cell_indices"] = list(
                         range(int(cell["index"]) + 1, len(selected_cells))
                     )
-                write_new_record(
-                    cell_directory / "failure.json", failure, "failure_sha256"
+                (
+                    failure_path,
+                    _failure_binding,
+                    retained_failure,
+                ) = _write_failure_record(
+                    stage,
+                    cell_directory / "failure.json",
+                    failure,
                 )
+                current_owned.append(_failure_binding)
+                if not retain_owned(current_owned):
+                    integrity_failure = True
                 failures.append(
                     {
                         "cell_index": cell["index"],
-                        "path": str((cell_directory / "failure.json").relative_to(stage)),
-                        "failure_sha256": failure["failure_sha256"],
+                        "path": str(failure_path.relative_to(stage)),
+                        "failure_sha256": retained_failure["failure_sha256"],
                     }
                 )
                 if integrity_failure:
                     provenance_intact = False
                     break
-                retained_bindings.extend(_tree_bindings(cell_directory))
         if not any(side_effect_root.iterdir()):
             side_effect_root.rmdir()
         if provenance_intact:
@@ -1752,6 +1909,10 @@ def evaluate_portfolio(
             if phase_apparatus is not None:
                 _revalidate_file(phase_apparatus.source)
                 _revalidate_file(phase_apparatus.binary)
+        else:
+            for retained in retained_bindings:
+                if (retained.path, retained.identity) not in invalid_retained:
+                    _revalidate_file(retained)
         inventory = _inventory(stage)
         receipt: dict[str, object] = {
             "schema_version": 1,

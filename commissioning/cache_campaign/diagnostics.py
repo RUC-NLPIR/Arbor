@@ -4,10 +4,16 @@ import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Literal
 
-from .records import HEX64, canonical_bytes, canonical_decimal
+from .records import (
+    HEX64,
+    canonical_bytes,
+    canonical_decimal,
+    deterministic_decimal_ratio,
+    scientific_decimal_context,
+)
 
 
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
@@ -15,16 +21,31 @@ _COUNTER_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _PRIMARY_OR_INTERPRETIVE_NAMES = {
     "aggregate",
     "byte_miss_ratio",
+    "cache_fraction",
+    "cache_size_bytes",
+    "candidate_commit",
+    "confirmation",
+    "confirmatory",
     "cpu_ns_per_request",
+    "evidence_class",
     "global_metadata_bytes",
     "metadata_bytes_per_object",
+    "metadata_measurement_sha256",
     "object_miss_ratio",
     "objective",
     "pass",
+    "policy",
+    "primary",
     "request_count",
     "reward",
+    "run_sha256",
+    "rung",
     "score",
+    "sidecar_sha256",
     "simulator_throughput_mqps",
+    "split",
+    "trace_id",
+    "trace_sha256",
 }
 _PHASE_LINE = re.compile(
     r"phase=(?P<index>[0-9]{1,2}) requests=(?P<requests>[0-9]+) "
@@ -185,14 +206,15 @@ class PhaseBin:
 def _ratio(numerator: int, denominator: int) -> Decimal:
     if denominator <= 0:
         raise DiagnosticError("phase ratio denominator must be positive")
-    return Decimal(numerator) / Decimal(denominator)
+    return deterministic_decimal_ratio(numerator, denominator)
 
 
 def _matches_reported_ratio(observed: Decimal, reported: Decimal) -> bool:
     if type(reported) is not Decimal or not reported.is_finite():
         raise DiagnosticError("primary miss ratio must be a finite Decimal")
-    quantum = Decimal(1).scaleb(reported.as_tuple().exponent)
-    return observed.quantize(quantum) == reported
+    with localcontext(scientific_decimal_context()):
+        quantum = Decimal((0, (1,), reported.as_tuple().exponent))
+        return observed.quantize(quantum) == reported
 
 
 def parse_phase_probe_output(
@@ -274,6 +296,56 @@ class ExploratorySidecar:
     trace_sha256: str
     counters: tuple[tuple[str, int | Decimal], ...]
     sidecar_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.evidence_class) is not str or self.evidence_class != "exploratory":
+            raise DiagnosticError("sidecar evidence_class must be exploratory")
+        if type(self.candidate_commit) is not str or _HEX40.fullmatch(
+            self.candidate_commit
+        ) is None:
+            raise DiagnosticError("sidecar candidate commit is invalid")
+        for label, value in (
+            ("run", self.run_sha256),
+            ("trace", self.trace_sha256),
+        ):
+            if type(value) is not str or HEX64.fullmatch(value) is None:
+                raise DiagnosticError(f"sidecar {label} SHA-256 is invalid")
+        if type(self.counters) is not tuple or not self.counters:
+            raise DiagnosticError("sidecar counters must be a nonempty tuple")
+        names: list[str] = []
+        for pair in self.counters:
+            if type(pair) is not tuple or len(pair) != 2:
+                raise DiagnosticError("sidecar counter entry is invalid")
+            name, value = pair
+            if type(name) is not str or _COUNTER_NAME.fullmatch(name) is None:
+                raise DiagnosticError("sidecar counter name is invalid")
+            if name in _PRIMARY_OR_INTERPRETIVE_NAMES:
+                raise DiagnosticError(
+                    "exploratory counter cannot duplicate a primary or interpretive field"
+                )
+            if type(value) is int:
+                pass
+            elif type(value) is Decimal and value.is_finite():
+                if canonical_decimal(value) != str(value):
+                    raise DiagnosticError("sidecar Decimal counter is not canonical")
+            else:
+                raise DiagnosticError("sidecar counter must be a finite int or Decimal")
+            names.append(name)
+        if names != sorted(names) or len(names) != len(set(names)):
+            raise DiagnosticError("sidecar counter names must be unique and sorted")
+        if type(self.sidecar_sha256) is not str or HEX64.fullmatch(
+            self.sidecar_sha256
+        ) is None:
+            raise DiagnosticError("sidecar self-hash is invalid")
+        material = {
+            "evidence_class": self.evidence_class,
+            "candidate_commit": self.candidate_commit,
+            "run_sha256": self.run_sha256,
+            "trace_sha256": self.trace_sha256,
+            "counters": dict(self.counters),
+        }
+        if self.sidecar_sha256 != self.hash_record(material):
+            raise DiagnosticError("sidecar self-hash mismatch")
 
     @staticmethod
     def hash_record(value: Mapping[str, object]) -> str:

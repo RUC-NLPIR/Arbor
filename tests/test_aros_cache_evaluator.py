@@ -6,13 +6,15 @@ import stat
 import struct
 import subprocess
 from dataclasses import FrozenInstanceError
-from decimal import Decimal
+from decimal import Decimal, Inexact, ROUND_DOWN, ROUND_UP, localcontext
 from pathlib import Path
 
 import pytest
 
 from commissioning.cache_campaign.cachesim import ChildResult
-from commissioning.cache_campaign.evaluate import evaluate_portfolio
+from commissioning.cache_campaign import portfolio as portfolio_module
+from commissioning.cache_campaign.evaluate import evaluate_portfolio, parse_metadata_probe
+from commissioning.cache_campaign.portfolio import _cache_size, _cpu_ns_per_request
 from commissioning.cache_campaign.records import ContractError, ParetoMeasurement
 from commissioning.cache_campaign.records import record_sha256, sha256_file
 from scripts import run_aros_cache_eval as eval_cli
@@ -105,6 +107,75 @@ def test_pareto_measurement_rejects_noncanonical_decimal_strings() -> None:
         ParetoMeasurement.from_record(value)
 
 
+def test_long_decimal_serialization_and_hash_ignore_ambient_context() -> None:
+    fraction = Decimal(
+        "0.12345678901234567890123456789012345678901234567890123456789"
+    )
+    cpu = Decimal(
+        "12345678901234567890123456789012345678901234567890123456789."
+        "98765432109876543210987654321098765432109876543210987654321"
+    )
+    metadata = Decimal(
+        "98765432109876543210987654321098765432109876543210987654321."
+        "12345678901234567890123456789012345678901234567890123456789"
+    )
+    value = measurement(
+        cache_fraction=fraction,
+        cpu_ns_per_request=cpu,
+        metadata_bytes_per_object=metadata,
+    )
+    with localcontext() as context:
+        context.prec = 6
+        low = value.to_record()
+        low_hash = record_sha256(low, "measurement_sha256")
+        low_cache_size = _cache_size(10**80 + 123456789, fraction)
+    with localcontext() as context:
+        context.prec = 200
+        high = value.to_record()
+        high_hash = record_sha256(high, "measurement_sha256")
+        high_cache_size = _cache_size(10**80 + 123456789, fraction)
+    assert low == high
+    assert low_hash == high_hash
+    assert low_cache_size == high_cache_size
+    assert low["cache_fraction"] == str(fraction)
+    assert low["cpu_ns_per_request"] == str(cpu)
+    assert low["metadata_bytes_per_object"] == str(metadata)
+
+
+@pytest.mark.parametrize("raw", ["1E+5000", "1E-5000"])
+def test_canonical_decimal_rejects_unbounded_expansion(raw: str) -> None:
+    with pytest.raises(ContractError, match="bounded"):
+        measurement(cpu_ns_per_request=Decimal(raw)).to_record()
+
+
+def test_derived_cpu_and_r0_metadata_ignore_rounding_traps_and_hash_context() -> None:
+    metadata_output = (
+        "global_metadata_bytes=0\n"
+        "sample=1000 live_bytes=1 resident_objects=3\n"
+        "sample=5000 live_bytes=1 resident_objects=3\n"
+        "sample=10000 live_bytes=1 resident_objects=3\n"
+        "status=ok\n"
+    )
+    observed: list[tuple[Decimal, tuple[Decimal, int], str]] = []
+    for rounding in (ROUND_DOWN, ROUND_UP):
+        with localcontext() as context:
+            context.prec = 6
+            context.rounding = rounding
+            context.traps[Inexact] = True
+            cpu = _cpu_ns_per_request(1, 3)
+            metadata = parse_metadata_probe(metadata_output)
+            record = measurement(
+                cpu_ns_per_request=cpu,
+                metadata_bytes_per_object=metadata[0],
+            ).to_record()
+            observed.append(
+                (cpu, metadata, record_sha256(record, "measurement_sha256"))
+            )
+    assert observed[0] == observed[1]
+    assert len(str(observed[0][0]).removeprefix("0.")) == 128
+    assert observed[0][0] == observed[0][1][0]
+
+
 def git(path: Path, *argv: str) -> str:
     result = subprocess.run(
         ["git", *argv], cwd=path, capture_output=True, check=True, text=True
@@ -189,14 +260,16 @@ def portfolio_source_receipt(
     return write_record(path, value, "receipt_sha256")
 
 
-def artifact_record(root: Path, name: str, raw: bytes) -> dict[str, object]:
+def artifact_record(
+    root: Path, name: str, raw: bytes, *, source_path: str | None = None
+) -> dict[str, object]:
     path = root / "artifact_snapshots" / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
     path.chmod(0o400)
     metadata = path.stat()
     return {
-        "source_path": f"/deleted/{name}",
+        "source_path": source_path or f"/deleted/{name}",
         "source_identity": {"device": 1, "inode": 1},
         "size_bytes": len(raw),
         "sha256": hashlib.sha256(raw).hexdigest(),
@@ -243,6 +316,48 @@ sys.stdout.write(line)
             b"GLib_LIBRARIES:STRING=glib-2.0\n"
         ),
     )
+    old_stage = Path("/deleted/r0-stage")
+    metadata_probe_binary = artifact_record(
+        root,
+        "metadata_probe_binary",
+        b"fake metadata probe\n",
+        source_path=str(old_stage / "metadata-probe"),
+    )
+    metadata_interposer_binary = artifact_record(
+        root,
+        "metadata_interposer_binary",
+        b"fake interposer\n",
+        source_path=str(old_stage / "allocator-interposer.so"),
+    )
+    metadata_probe_source = artifact_record(
+        root,
+        "metadata_probe_source",
+        b"fake metadata probe source\n",
+        source_path=str(old_stage / "metadata_probe.c"),
+    )
+    metadata_interposer_source = artifact_record(
+        root,
+        "metadata_interposer_source",
+        b"fake interposer source\n",
+        source_path=str(old_stage / "allocator_interposer.c"),
+    )
+    synthetic_artifact = artifact_record(
+        root,
+        "synthetic_trace",
+        b"synthetic trace\n",
+        source_path=str(old_stage / "synthetic.oracleGeneral.bin"),
+    )
+    evaluator_artifacts = {
+        name: artifact_record(root, f"evaluator_{name}", f"{name}\n".encode())
+        for name in (
+            "evaluate",
+            "scope",
+            "evidence",
+            "r0_probes",
+            "cachesim",
+            "linux_subreaper",
+        )
+    }
     metadata_stdout = (
         b"global_metadata_bytes=24\n"
         b"sample=1000 live_bytes=3024 resident_objects=1000\n"
@@ -250,7 +365,7 @@ sys.stdout.write(line)
         b"sample=10000 live_bytes=30024 resident_objects=10000\n"
         b"status=ok\n"
     )
-    metadata_dir = root / "commands/14-metadata-run"
+    metadata_dir = root / "commands/13-metadata-run"
     metadata_dir.mkdir(parents=True)
     metadata_stdout_path = metadata_dir / "stdout.raw"
     metadata_stderr_path = metadata_dir / "stderr.raw"
@@ -268,6 +383,30 @@ sys.stdout.write(line)
 
     stdout_receipt = raw_receipt(metadata_stdout_path)
     stderr_receipt = raw_receipt(metadata_stderr_path)
+
+    metadata_command: dict[str, object] = {
+        "index": 13,
+        "label": "metadata-run",
+        "argv": [
+            "/usr/bin/env",
+            f"LD_PRELOAD={metadata_interposer_binary['source_path']}",
+            metadata_probe_binary["source_path"],
+            synthetic_artifact["source_path"],
+            "Sieve",
+            "64",
+        ],
+        "cwd": str(old_stage),
+        "timeout_seconds": 120.0,
+        "max_output_bytes": 16 * 1024 * 1024,
+        "returncode": 0,
+        "wall_ns": 1,
+        "cpu_ns": 1,
+        "stdout": stdout_receipt,
+        "stderr": stderr_receipt,
+    }
+    metadata_command["command_sha256"] = record_sha256(
+        metadata_command, "command_sha256"
+    )
 
     def inventory_item(receipt: dict[str, object]) -> dict[str, object]:
         metadata = (root / str(receipt["path"])).stat()
@@ -335,32 +474,43 @@ sys.stdout.write(line)
             "within_budget": None,
         },
         "complexity_audit": "pending_independent_review",
-        "synthetic_trace": {},
+        "synthetic_trace": {
+            "path": "synthetic.oracleGeneral.bin",
+            "cache_size_bytes": 64,
+        },
         "simulations": [],
         "simulator_result": {},
         "capacity_measurement": {},
-        "commands": [
-            {
-                "index": 14,
-                "label": "metadata-run",
-                "argv": ["/usr/bin/env", "LD_PRELOAD=/retained", "/metadata-probe"],
-                "cwd": str(root),
-                "timeout_seconds": 120.0,
-                "max_output_bytes": 16 * 1024 * 1024,
-                "returncode": 0,
-                "wall_ns": 1,
-                "cpu_ns": 1,
-                "stdout": stdout_receipt,
-                "stderr": stderr_receipt,
-            }
-        ],
+        "commands": [metadata_command],
         "artifact_snapshots": {
             "release_cachesim": binary,
             "release_archive": archive,
             "release_cmake_cache": cmake_cache,
+            "metadata_probe_binary": metadata_probe_binary,
+            "metadata_interposer_binary": metadata_interposer_binary,
+            "metadata_probe_source": metadata_probe_source,
+            "metadata_interposer_source": metadata_interposer_source,
+            "synthetic_trace": synthetic_artifact,
+            **{
+                f"evaluator_{name}": artifact
+                for name, artifact in evaluator_artifacts.items()
+            },
         },
-        "probes": {},
-        "evaluator": {},
+        "probes": {
+            "metadata": {
+                "source_sha256": metadata_probe_source["sha256"],
+                "binary": {"sha256": metadata_probe_binary["sha256"]},
+                "interposer_source_sha256": metadata_interposer_source["sha256"],
+                "interposer_binary": {
+                    "sha256": metadata_interposer_binary["sha256"]
+                },
+                "accounting_scope": "process_wide_ld_preload",
+            }
+        },
+        "evaluator": {
+            f"{name}_sha256": artifact["sha256"]
+            for name, artifact in evaluator_artifacts.items()
+        },
         "host": {"platform": "test", "machine": "test", "python": "test"},
         "timings": {},
         "errors": [],
@@ -519,7 +669,7 @@ def portfolio_inputs(
     monkeypatch.setattr("commissioning.cache_campaign.portfolio.SOURCE_LOCK", lock)
     source = portfolio_source_receipt(tmp_path / "source.json", lock)
     r0 = portfolio_r0_receipt(
-        tmp_path / "r0", source, candidate, tree, checkout
+        tmp_path / "r0-parent/r0", source, candidate, tree, checkout
     )
     task_root = tmp_path / "task"
     task_root.mkdir()
@@ -766,6 +916,37 @@ def test_trace_mutation_after_child_aborts_before_next_launch_and_is_retained(
     assert base_runner.argv == []
 
 
+def test_r0_dependency_mutation_cannot_wait_for_next_cell_to_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    dependency = (
+        inputs["r0_receipt"].parent
+        / "artifact_snapshots/evaluator_evaluate"
+    )
+    original = dependency.read_bytes()
+
+    class RestoreOnSecondCell(PortfolioRun):
+        def __call__(self, *args: object, **kwargs: object) -> ChildResult:
+            argv = args[0]
+            assert isinstance(argv, list)
+            if Path(argv[0]).name == "cachesim" and any(
+                Path(item[0]).name == "cachesim" for item in self.argv
+            ):
+                dependency.write_bytes(original)
+            result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
+            if Path(argv[0]).name == "cachesim":
+                dependency.write_bytes(b"temporary evaluator replacement\n")
+            return result
+
+    runner = RestoreOnSecondCell()
+    inputs["run"] = runner
+    receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert len(runner.argv) == 1
+    assert receipt["measurements"] == []
+    assert receipt["provenance"]["final_binding_intact"] is False
+
+
 def test_nonzero_process_has_process_and_failure_receipts_but_no_measurement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -811,6 +992,35 @@ def test_preflight_r0_binary_mutation_publishes_failure_before_launch(
     assert root["provenance"]["final_binding_intact"] is False
 
 
+@pytest.mark.parametrize("layout", ["direct", "nested", "alias"])
+def test_output_cannot_overlap_r0_evidence_root_or_parent_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    inputs, runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    r0_root = inputs["r0_receipt"].parent
+    r0_parent = r0_root.parent
+    if layout == "direct":
+        output = r0_root / "forbidden-output"
+    elif layout == "nested":
+        parent = r0_parent / "nested"
+        parent.mkdir()
+        output = parent / "forbidden-output"
+    else:
+        nested = r0_parent / "alias-nested"
+        nested.mkdir()
+        alias = tmp_path / "r0-alias"
+        alias.symlink_to(r0_parent, target_is_directory=True)
+        output = alias / "alias-nested/forbidden-output"
+    inputs["output"] = output
+    with pytest.raises(ValueError, match="R0 evidence"):
+        evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert runner.argv == []
+    assert not output.exists()
+    assert not list(output.parent.glob(f".{output.name}-stage-*"))
+
+
 def test_rehashed_r0_metadata_forgery_is_rejected_against_raw_probe_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -822,6 +1032,50 @@ def test_rehashed_r0_metadata_forgery_is_rejected_against_raw_probe_evidence(
     value["receipt_sha256"] = record_sha256(value, "receipt_sha256")
     r0_path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
     with pytest.raises(ValueError, match="metadata.*evidence"):
+        evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert runner.argv == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["argv", "cwd", "timeout", "output_limit", "stderr", "evaluator"],
+)
+def test_rehashed_r0_metadata_process_forgery_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    inputs, runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    r0_path = inputs["r0_receipt"]
+    value = json.loads(r0_path.read_text())
+    command = value["commands"][0]
+    if mutation == "argv":
+        command["argv"][1] = "LD_PRELOAD=/foreign/interposer.so"
+    elif mutation == "cwd":
+        command["cwd"] = "/foreign/cwd"
+    elif mutation == "timeout":
+        command["timeout_seconds"] = 121.0
+    elif mutation == "output_limit":
+        command["max_output_bytes"] += 1
+    elif mutation == "stderr":
+        stderr_path = r0_path.parent / command["stderr"]["path"]
+        stderr_path.write_bytes(b"forged stderr\n")
+        digest = sha256_file(stderr_path)
+        command["stderr"]["size_bytes"] = stderr_path.stat().st_size
+        command["stderr"]["sha256"] = digest
+        inventory = next(
+            item
+            for item in value["evidence_inventory"]
+            if item["path"] == command["stderr"]["path"]
+        )
+        inventory["size_bytes"] = stderr_path.stat().st_size
+        inventory["sha256"] = digest
+        inventory["observed_size_bytes"] = stderr_path.stat().st_size
+        inventory["observed_sha256"] = digest
+    else:
+        value["evaluator"]["evaluate_sha256"] = "a" * 64
+    command["command_sha256"] = record_sha256(command, "command_sha256")
+    value["receipt_sha256"] = record_sha256(value, "receipt_sha256")
+    r0_path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
+    with pytest.raises(ValueError, match="R0 metadata|R0 evaluator"):
         evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     assert runner.argv == []
 
@@ -1008,3 +1262,129 @@ def test_foreign_cell_inventory_aborts_before_next_launch(
     assert receipt["measurements"] == []
     assert receipt["provenance"]["final_binding_intact"] is False
     assert len(receipt["failures"]) == 1
+
+
+def test_foreign_request_collision_is_preserved_and_never_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    real_write = portfolio_module.write_new_record
+    foreign = b"foreign request bytes\n"
+    collided = False
+
+    def collide(
+        path: Path, value: dict[str, object], hash_field: str
+    ) -> object:
+        nonlocal collided
+        if path.name == "request.json" and not collided:
+            collided = True
+            path.write_bytes(foreign)
+        return real_write(path, value, hash_field)
+
+    monkeypatch.setattr(portfolio_module, "write_new_record", collide)
+    receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert len(runner.argv) == 1
+    assert receipt["measurements"] == []
+    assert (inputs["output"] / "measurements/0000/request.json").read_bytes() == foreign
+    failure = json.loads(
+        (inputs["output"] / receipt["failures"][0]["path"]).read_text()
+    )
+    assert failure["kind"] == "binding_failure"
+    assert "request_sha256" not in failure
+
+
+def test_foreign_process_collision_on_failed_child_is_not_referenced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+
+    class NonzeroFirstRun(PortfolioRun):
+        def __call__(self, *args: object, **kwargs: object) -> ChildResult:
+            result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
+            return ChildResult(**{**result.__dict__, "returncode": 7})
+
+    runner = NonzeroFirstRun()
+    inputs["run"] = runner
+    real_write = portfolio_module.write_new_record
+    foreign = b"foreign process bytes\n"
+    collided = False
+
+    def collide(
+        path: Path, value: dict[str, object], hash_field: str
+    ) -> object:
+        nonlocal collided
+        if path.name == "process.json" and not collided:
+            collided = True
+            path.write_bytes(foreign)
+        return real_write(path, value, hash_field)
+
+    monkeypatch.setattr(portfolio_module, "write_new_record", collide)
+    receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert len(runner.argv) == 1
+    process_path = inputs["output"] / "measurements/0000/process.json"
+    assert process_path.read_bytes() == foreign
+    failure = json.loads(
+        (inputs["output"] / receipt["failures"][0]["path"]).read_text()
+    )
+    assert failure["kind"] == "binding_failure"
+    assert "process_sha256" not in failure
+
+
+def test_post_publication_request_replacement_is_not_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    real_write = portfolio_module.write_new_record
+    foreign = b"post-publication foreign request\n"
+    replaced = False
+
+    def replace_after_publish(
+        path: Path, value: dict[str, object], hash_field: str
+    ) -> object:
+        nonlocal replaced
+        receipt = real_write(path, value, hash_field)
+        if path.name == "request.json" and not replaced:
+            replaced = True
+            path.unlink()
+            path.write_bytes(foreign)
+        return receipt
+
+    monkeypatch.setattr(portfolio_module, "write_new_record", replace_after_publish)
+    receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert len(runner.argv) == 1
+    request_path = inputs["output"] / "measurements/0000/request.json"
+    assert request_path.read_bytes() == foreign
+    assert receipt["measurements"] == []
+    failure = json.loads(
+        (inputs["output"] / receipt["failures"][0]["path"]).read_text()
+    )
+    assert failure["kind"] == "binding_failure"
+    assert "request_sha256" not in failure
+
+
+def test_measurement_replacement_before_cell_retention_blocks_root_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    real_owned_write = portfolio_module._write_owned_record
+    foreign = b"foreign measurement after owned write\n"
+    replaced = False
+
+    def replace_before_return(
+        path: Path, value: dict[str, object], hash_field: str
+    ) -> object:
+        nonlocal replaced
+        binding = real_owned_write(path, value, hash_field)
+        if path.name == "measurement.json" and not replaced:
+            replaced = True
+            path.unlink()
+            path.write_bytes(foreign)
+        return binding
+
+    monkeypatch.setattr(portfolio_module, "_write_owned_record", replace_before_return)
+    receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert len(runner.argv) == 1
+    assert receipt["measurements"] == []
+    path = inputs["output"] / "measurements/0000/measurement.json"
+    assert path.read_bytes() == foreign
+    assert receipt["provenance"]["final_binding_intact"] is False

@@ -11,13 +11,15 @@ import stat
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Context, Decimal, ROUND_HALF_EVEN, localcontext
 from pathlib import Path
 from typing import Literal
 
 
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 SOURCE_COMMIT = "da022c2945146e9577d91375a48d53850d7041a3"
+_MAX_CANONICAL_DECIMAL_CHARS = 4096
+_SCIENTIFIC_DECIMAL_PRECISION = 128
 _TRACE_KEYS = {
     "trace_id",
     "split",
@@ -39,6 +41,14 @@ _PORTFOLIO_KEYS = {"schema_version", "source_commit", "cache_fractions", "traces
 
 class ContractError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class NewRecordReceipt:
+    identity: tuple[int, int]
+    mode: int
+    size_bytes: int
+    sha256: str
 
 
 def quarantine_unlink(
@@ -145,9 +155,57 @@ def _integer(value: object, label: str, *, minimum: int) -> int:
 def canonical_decimal(value: Decimal) -> str:
     if type(value) is not Decimal or not value.is_finite():
         raise ContractError("canonical decimal must be finite")
-    if value.is_zero():
+    sign, raw_digits, raw_exponent = value.as_tuple()
+    if not any(raw_digits):
         return "0"
-    return format(value.normalize(), "f")
+    if type(raw_exponent) is not int:
+        raise ContractError("canonical decimal exponent is invalid")
+    digits = list(raw_digits)
+    exponent = raw_exponent
+    while digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    coefficient = "".join(str(digit) for digit in digits)
+    sign_chars = 1 if sign else 0
+    if exponent >= 0:
+        required = sign_chars + len(coefficient) + exponent
+        if required > _MAX_CANONICAL_DECIMAL_CHARS:
+            raise ContractError("canonical decimal expansion must be bounded")
+        result = coefficient + "0" * exponent
+    else:
+        point = len(coefficient) + exponent
+        if point > 0:
+            required = sign_chars + len(coefficient) + 1
+            if required > _MAX_CANONICAL_DECIMAL_CHARS:
+                raise ContractError("canonical decimal expansion must be bounded")
+            result = coefficient[:point] + "." + coefficient[point:]
+        else:
+            zero_count = -point
+            required = sign_chars + 2 + zero_count + len(coefficient)
+            if required > _MAX_CANONICAL_DECIMAL_CHARS:
+                raise ContractError("canonical decimal expansion must be bounded")
+            result = "0." + "0" * zero_count + coefficient
+    return "-" + result if sign else result
+
+
+def scientific_decimal_context() -> Context:
+    """Return the apparatus context: 128 significant digits, ties-to-even."""
+    return Context(
+        prec=_SCIENTIFIC_DECIMAL_PRECISION,
+        rounding=ROUND_HALF_EVEN,
+        Emin=-999_999,
+        Emax=999_999,
+        capitals=1,
+        clamp=0,
+    )
+
+
+def deterministic_decimal_ratio(numerator: int, denominator: int) -> Decimal:
+    """Divide integers under the fixed apparatus context, never the caller's."""
+    if type(numerator) is not int or type(denominator) is not int or denominator <= 0:
+        raise ContractError("decimal ratio requires integer numerator and positive denominator")
+    with localcontext(scientific_decimal_context()):
+        return Decimal(numerator) / Decimal(denominator)
 
 
 def _decimal(
@@ -527,10 +585,14 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def write_new_record(path: Path, value: dict[str, object], hash_field: str) -> None:
+def write_new_record(
+    path: Path, value: dict[str, object], hash_field: str
+) -> NewRecordReceipt:
     value[hash_field] = record_sha256(value, hash_field)
     path.parent.mkdir(parents=True, exist_ok=True)
-    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    serialized = (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -538,22 +600,52 @@ def write_new_record(path: Path, value: dict[str, object], hash_field: str) -> N
     )
     temporary = Path(temporary_name)
     published = False
+    owned_identity: tuple[int, int] | None = None
     try:
-        stream = os.fdopen(descriptor, "w", encoding="utf-8")
+        stream = os.fdopen(descriptor, "wb")
         descriptor = -1
         with stream:
             stream.write(serialized)
             stream.flush()
             os.fsync(stream.fileno())
+        temporary_metadata = temporary.stat(follow_symlinks=False)
+        owned_identity = (temporary_metadata.st_dev, temporary_metadata.st_ino)
         try:
             os.link(temporary, path)
         except FileExistsError as error:
             raise ContractError(f"refusing to replace immutable record: {path}") from error
         published = True
         _fsync_directory(path.parent)
+        output_descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            output_metadata = os.fstat(output_descriptor)
+            with os.fdopen(output_descriptor, "rb") as output_stream:
+                output_descriptor = -1
+                observed = output_stream.read()
+        finally:
+            if output_descriptor >= 0:
+                os.close(output_descriptor)
+        if (
+            (output_metadata.st_dev, output_metadata.st_ino) != owned_identity
+            or observed != serialized
+        ):
+            raise ContractError(f"immutable record changed during publication: {path}")
+        return NewRecordReceipt(
+            identity=owned_identity,
+            mode=stat.S_IMODE(output_metadata.st_mode),
+            size_bytes=len(serialized),
+            sha256=hashlib.sha256(serialized).hexdigest(),
+        )
     except BaseException:
-        if published:
-            path.unlink(missing_ok=True)
+        if published and owned_identity is not None:
+            try:
+                metadata = path.lstat()
+                if (metadata.st_dev, metadata.st_ino) == owned_identity:
+                    path.unlink()
+            except OSError:
+                pass
         raise
     finally:
         if descriptor >= 0:

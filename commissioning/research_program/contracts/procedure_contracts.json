@@ -24,6 +24,7 @@
     ],
     "SourcePacket": [
       "query",
+      "question_ref",
       "sources",
       "retrieved_at",
       "content_refs",

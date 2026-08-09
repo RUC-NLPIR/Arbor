@@ -108,6 +108,7 @@ EXPECTED_ARTIFACTS = {
     "ResearchQuestion": ("question_ref", "scope", "decision_context"),
     "SourcePacket": (
         "query",
+        "question_ref",
         "sources",
         "retrieved_at",
         "content_refs",
@@ -246,6 +247,86 @@ EXPECTED_PROCEDURE_HEADINGS = (
     "Completion",
     "Forbidden",
 )
+EXPECTED_SOURCE_METHOD_RULES = (
+    (
+        "Prefer primary sources; use secondary sources only to locate or "
+        "contextualize primary evidence, and label them as secondary."
+    ),
+    (
+        "Query multiple independent sources and preserve the exact query log, "
+        "including every query formulation and retrieval result."
+    ),
+    (
+        "Retain dead ends and contradictions, including unsuccessful queries and "
+        "evidence that disagrees with another source."
+    ),
+    (
+        "For every source used, bind its opaque source id, retrieval time, content "
+        "reference, and SHA-256 content hash; keep citations traceable to those "
+        "bindings."
+    ),
+    (
+        "Treat novelty findings as evidence only, never as a scientific verdict; "
+        "report what the search did and did not establish."
+    ),
+    "State search, access, coverage, and source-quality limitations explicitly.",
+)
+EXPECTED_SOURCE_FORBIDDEN_RULES = (
+    "Do not download experimental data.",
+    "Do not fabricate citations.",
+    "Do not write to external systems or perform any external write.",
+    "Do not make scientific acceptance decisions.",
+    "Do not issue scientific verdicts.",
+    "Do not execute experiments; experimental execution is outside this procedure.",
+)
+EXPECTED_SOURCE_COMPLETION_RULES = (
+    (
+        "Complete only when a bound `SourcePacket` preserves the input "
+        "`question_ref` unchanged, the exact query log, retained dead ends and "
+        "contradictions, content bindings, and explicit limitations needed for "
+        "later inspection."
+    ),
+)
+EXPECTED_RIVAL_METHOD_RULES = (
+    (
+        "Produce at least two independently formed falsifiable causal mechanisms; "
+        "derive each alternative on its own terms before comparing it with the "
+        "others."
+    ),
+    (
+        "Apply this priority: mechanism compression before literature novelty, and "
+        "literature novelty before impact."
+    ),
+    (
+        "For each mechanism, state its prediction, distinguishing observation, "
+        "falsifier, scope, and conflicts with bound evidence or other mechanisms."
+    ),
+    (
+        "Record explicit remaining uncertainty, including uncertainty shared by "
+        "every rival, after comparing the alternatives against the same evidence."
+    ),
+    (
+        "Identify observations that could discriminate between rivals; this "
+        "procedure does not choose an experiment yet."
+    ),
+)
+EXPECTED_RIVAL_FORBIDDEN_RULES = (
+    "Do not rank mechanisms by pilot score or use pilot-score ranking.",
+    "Do not select a top winner.",
+    "Do not retain unfalsifiable mechanisms.",
+    "Do not choose an experiment yet.",
+)
+EXPECTED_RIVAL_COMPLETION_RULES = (
+    "Complete only with at least two surviving rivals.",
+    (
+        "Every surviving rival must have at least one discriminating observation "
+        "and a stated falsifier."
+    ),
+    (
+        "If fewer than two rivals survive, return unresolved and seek additional "
+        "sources; never complete this procedure."
+    ),
+)
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -306,6 +387,52 @@ def _procedure_section(body: str, heading: str) -> str:
     )
     assert match is not None, f"missing procedure section: {heading}"
     return match.group("section")
+
+
+def _procedure_rules(section: str, *, numbered: bool) -> tuple[str, ...]:
+    marker = r"([0-9]+)\. (.+)" if numbered else r"- (.+)"
+    rules: list[str] = []
+    current: list[str] | None = None
+    ordinals: list[int] = []
+
+    for line in section.strip().splitlines():
+        match = re.fullmatch(marker, line)
+        if match is not None:
+            if current is not None:
+                rules.append(" ".join(current))
+            if numbered:
+                ordinals.append(int(match.group(1)))
+                current = [match.group(2)]
+            else:
+                current = [match.group(1)]
+            continue
+
+        assert current is not None and line.startswith("  "), (
+            f"invalid normative rule line: {line!r}"
+        )
+        current.append(line.strip())
+
+    assert current is not None, "normative rule list must not be empty"
+    rules.append(" ".join(current))
+    if numbered:
+        assert ordinals == list(range(1, len(rules) + 1))
+    return tuple(rules)
+
+
+def _assert_procedure_rules(
+    body: str,
+    heading: str,
+    expected: tuple[str, ...],
+    *,
+    numbered: bool,
+) -> None:
+    section = _procedure_section(body, heading)
+    assert _procedure_rules(section, numbered=numbered) == expected
+
+
+def _required_fields(rule: str) -> tuple[str, ...]:
+    assert rule.startswith("Required fields: ") and rule.endswith(".")
+    return tuple(re.findall(r"`([A-Za-z0-9_]+)`", rule))
 
 
 def _assert_approved_source_record(record: dict[str, object]) -> None:
@@ -630,6 +757,7 @@ def test_contract_json_has_exact_container_shapes() -> None:
     assert list(value["artifacts"]) == list(EXPECTED_ARTIFACTS)
     for name, required_fields in value["artifacts"].items():
         assert isinstance(required_fields, list), name
+        assert required_fields == list(EXPECTED_ARTIFACTS[name])
     assert list(value["procedures"]) == list(EXPECTED_PROCEDURES)
     for procedure in value["procedures"].values():
         assert list(procedure) == ["input", "output", "tools"]
@@ -934,97 +1062,159 @@ def test_wave_one_procedures_have_exact_sections_and_opaque_provenance(
     assert b"/workspace/" not in raw
 
 
-def test_source_procedure_preserves_a_bound_auditable_source_packet() -> None:
+def test_source_procedure_has_exact_normative_method_rules() -> None:
     _, body = _parse_procedure_frontmatter(
         PROCEDURES_ROOT / "aros-source-research.md"
     )
-    normalized = body.lower()
 
-    for required in (
-        "prefer primary sources",
-        "multiple independent sources",
-        "exact query log",
-        "retain dead ends and contradictions",
-        "opaque source id",
-        "retrieval time",
-        "content reference",
-        "sha-256 content hash",
-        "novelty findings as evidence only",
-        "never as a scientific verdict",
-        "limitations",
-    ):
-        assert required in normalized
+    _assert_procedure_rules(
+        body,
+        "Method",
+        EXPECTED_SOURCE_METHOD_RULES,
+        numbered=True,
+    )
 
-    output = _procedure_section(body, "Output")
-    for field in (
-        "query",
-        "sources",
-        "retrieved_at",
-        "content_refs",
-        "content_sha256s",
-        "limitations",
-    ):
-        assert f"`{field}`" in output
-    assert "bound `SourcePacket`" in _procedure_section(body, "Completion")
+
+def test_source_procedure_has_exact_output_fields_and_question_lineage() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-source-research.md"
+    )
+    output = _procedure_rules(_procedure_section(body, "Output"), numbered=False)
+
+    assert len(output) == 4
+    assert output[0] == "Artifact: Return exactly one `SourcePacket`."
+    assert _required_fields(output[1]) == EXPECTED_ARTIFACTS["SourcePacket"]
+    assert output[2] == (
+        "Lineage: Copy input `question_ref` unchanged to output `question_ref`."
+    )
+    assert output[3] == (
+        "Evidence binding: Bind every factual statement to a cited content "
+        "reference or mark it as unresolved."
+    )
+    _assert_procedure_rules(
+        body,
+        "Completion",
+        EXPECTED_SOURCE_COMPLETION_RULES,
+        numbered=False,
+    )
 
 
 def test_source_procedure_forbids_direct_actions_and_scientific_verdicts() -> None:
     _, body = _parse_procedure_frontmatter(
         PROCEDURES_ROOT / "aros-source-research.md"
     )
-    forbidden = _procedure_section(body, "Forbidden").lower()
 
-    for prohibited in (
-        "do not download experimental data",
-        "do not fabricate citations",
-        "do not write to external systems",
-        "do not make scientific acceptance decisions",
-        "do not issue scientific verdicts",
-        "do not execute experiments",
-    ):
-        assert prohibited in forbidden
+    _assert_procedure_rules(
+        body,
+        "Forbidden",
+        EXPECTED_SOURCE_FORBIDDEN_RULES,
+        numbered=False,
+    )
+
+
+def test_source_method_rejects_opposite_primary_source_polarity() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-source-research.md"
+    )
+    mutated = body.replace(
+        "1. Prefer primary sources;",
+        "1. Do not prefer primary sources;",
+        1,
+    )
+    assert mutated != body
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            "Method",
+            EXPECTED_SOURCE_METHOD_RULES,
+            numbered=True,
+        )
 
 
 def test_rival_procedure_forms_independent_falsifiable_causal_alternatives() -> None:
     _, body = _parse_procedure_frontmatter(
         PROCEDURES_ROOT / "aros-rival-mechanisms.md"
     )
-    method = _procedure_section(body, "Method").lower()
 
-    for required in (
-        "at least two",
-        "independently formed",
-        "falsifiable causal mechanisms",
-        "mechanism compression before literature novelty",
-        "literature novelty before impact",
-        "prediction",
-        "distinguishing observation",
-        "falsifier",
-        "scope",
-        "conflicts",
-        "remaining uncertainty",
-        "does not choose an experiment yet",
-    ):
-        assert required in method
+    inputs = _procedure_rules(_procedure_section(body, "Inputs"), numbered=False)
+    assert len(inputs) == 3
+    assert inputs[0] == "Artifact: Read exactly one `SourcePacket`."
+    assert _required_fields(inputs[1]) == EXPECTED_ARTIFACTS["SourcePacket"]
+    assert inputs[2] == (
+        "Lineage: Treat input `question_ref` as the immutable root question "
+        "reference."
+    )
+    _assert_procedure_rules(
+        body,
+        "Method",
+        EXPECTED_RIVAL_METHOD_RULES,
+        numbered=True,
+    )
 
-    completion = _procedure_section(body, "Completion").lower()
-    assert "every surviving rival" in completion
-    assert "discriminating observation" in completion
+
+def test_rival_procedure_has_exact_output_fields_and_question_lineage() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-rival-mechanisms.md"
+    )
+    output = _procedure_rules(_procedure_section(body, "Output"), numbered=False)
+
+    assert len(output) == 4
+    assert output[0] == "Artifact: Return exactly one `RivalMechanismSet`."
+    assert _required_fields(output[1]) == EXPECTED_ARTIFACTS["RivalMechanismSet"]
+    assert output[2] == (
+        "Lineage: Set `root_question_ref` exactly to input `question_ref`."
+    )
+    assert output[3] == (
+        "Evidence binding: Preserve the evidence reference supporting or "
+        "challenging every mechanism."
+    )
+
+
+def test_rival_completion_requires_two_surviving_discriminable_rivals() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-rival-mechanisms.md"
+    )
+
+    _assert_procedure_rules(
+        body,
+        "Completion",
+        EXPECTED_RIVAL_COMPLETION_RULES,
+        numbered=False,
+    )
 
 
 def test_rival_procedure_rejects_score_winners_and_unfalsifiable_rivals() -> None:
     _, body = _parse_procedure_frontmatter(
         PROCEDURES_ROOT / "aros-rival-mechanisms.md"
     )
-    forbidden = _procedure_section(body, "Forbidden").lower()
 
-    for prohibited in (
-        "do not rank mechanisms by pilot score",
-        "do not select a top winner",
-        "do not retain unfalsifiable mechanisms",
-        "do not choose an experiment yet",
-    ):
-        assert prohibited in forbidden
+    _assert_procedure_rules(
+        body,
+        "Forbidden",
+        EXPECTED_RIVAL_FORBIDDEN_RULES,
+        numbered=False,
+    )
+
+
+def test_rival_forbidden_rules_reject_opposite_ranking_polarity() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-rival-mechanisms.md"
+    )
+    mutated = body.replace(
+        "- Do not rank mechanisms by pilot score or use pilot-score ranking.",
+        "- May rank by pilot score.",
+        1,
+    )
+    assert mutated != body
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            "Forbidden",
+            EXPECTED_RIVAL_FORBIDDEN_RULES,
+            numbered=False,
+        )
 
 
 def test_contract_loader_fifo_swap_is_prompt_and_leaks_no_descriptor(

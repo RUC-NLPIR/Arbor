@@ -42,6 +42,7 @@ _ARTIFACTS = {
     "ResearchQuestion": ("question_ref", "scope", "decision_context"),
     "SourcePacket": (
         "query",
+        "question_ref",
         "sources",
         "retrieved_at",
         "content_refs",

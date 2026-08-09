@@ -28,6 +28,12 @@ from commissioning.cache_campaign.records import (
     record_sha256,
     sha256_file,
 )
+from commissioning.cache_campaign.r0_probes import (
+    FIXED_TIME_EPOCH,
+    fixed_time_compile_argv,
+    fixed_time_interposer_source,
+    fixed_time_run_argv,
+)
 from commissioning.cache_campaign.scope import (
     ConstraintFacts,
     PolicyContract,
@@ -39,6 +45,7 @@ from scripts import run_aros_cache_eval as eval_cli
 
 
 POLICY = "CandidatePolicy"
+COMPARISON_POLICIES = ["LRU", "ARC", "WTinyLFU", "Sieve", "S3FIFO", "BeladySize"]
 SOURCE = f"libCacheSim/cache/eviction/{POLICY}.c"
 CONTRACT_PATH = "commissioning/cache_policy_contract.json"
 WIRING = {
@@ -74,6 +81,36 @@ POLICY_CONTRACT = {
 }
 
 
+def test_fixed_time_interposer_controls_delayed_process_time(tmp_path: Path) -> None:
+    source = tmp_path / "fixed_time.c"
+    source.write_bytes(fixed_time_interposer_source())
+    interposer = tmp_path / "fixed-time.so"
+    subprocess.run(
+        fixed_time_compile_argv("/usr/bin/cc", interposer, source),
+        check=True,
+        capture_output=True,
+    )
+    harness_source = tmp_path / "time_harness.c"
+    harness_source.write_text(
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <time.h>\n#include <unistd.h>\n"
+        "int main(void) { time_t a=time(NULL); srand((unsigned)a); int r1=rand(); "
+        "sleep(1); time_t b=time(NULL); srand((unsigned)b); int r2=rand(); "
+        'printf("%lld %lld %d %d\\n", (long long)a, (long long)b, r1, r2); '
+        "return 0; }\n"
+    )
+    harness = tmp_path / "time-harness"
+    subprocess.run(
+        ["/usr/bin/cc", "-O2", "-o", str(harness), str(harness_source)],
+        check=True,
+        capture_output=True,
+    )
+    argv = fixed_time_run_argv(interposer, [str(harness)])
+    result = subprocess.run(argv, check=True, capture_output=True, text=True)
+    fields = result.stdout.split()
+    assert fields[:2] == [str(FIXED_TIME_EPOCH), str(FIXED_TIME_EPOCH)]
+    assert fields[2] == fields[3]
+
+
 def git(checkout: Path, *argv: str, check: bool = True) -> str:
     result = subprocess.run(
         ["git", "-C", str(checkout), *argv],
@@ -100,6 +137,12 @@ def repository(tmp_path: Path) -> tuple[Path, str, str, dict[str, object]]:
     write(checkout, ".gitignore", "_build-*\n")
     write(checkout, "libCacheSim/cache/eviction/Sieve.c", "/* sieve */\n")
     write(checkout, "libCacheSim/cache/eviction/S3FIFO.c", "/* s3fifo */\n")
+    for policy in ("LRU", "ARC", "WTinyLFU", "BeladySize"):
+        write(
+            checkout,
+            f"libCacheSim/cache/eviction/{policy}.c",
+            f"/* {policy} */\n",
+        )
     write(checkout, "libCacheSim/bin/cachesim/main.c", "/* simulator */\n")
     write(checkout, "libCacheSim/traceReader/generalReader.c", "/* reader */\n")
     for relative in WIRING:
@@ -142,7 +185,7 @@ def repository(tmp_path: Path) -> tuple[Path, str, str, dict[str, object]]:
         "test_argv": ["ctest", "--test-dir", "_build", "--output-on-failure"],
         "binary": "_build/bin/cachesim",
         "baseline_policies": ["Sieve", "S3FIFO"],
-        "comparison_policies": ["Sieve", "S3FIFO"],
+        "comparison_policies": COMPARISON_POLICIES,
     }
     return checkout, base, candidate, lock
 
@@ -363,7 +406,7 @@ def test_scope_rejects_symlink_candidate_artifact(tmp_path: Path) -> None:
     assert facts.allowed_paths is False
 
 
-@pytest.mark.parametrize("policy", ["Sieve", "S3FIFO"])
+@pytest.mark.parametrize("policy", COMPARISON_POLICIES)
 def test_scope_baseline_mode(policy: str, tmp_path: Path) -> None:
     checkout, base, _candidate, _lock = repository(tmp_path)
     facts, contract = evaluate_scope(checkout, base=base, candidate=base, policy=policy)
@@ -815,8 +858,9 @@ class FakeRun:
             self.simulation_count += 1
             ratio = "0.3000" if self.mismatch and self.simulation_count == 2 else "0.2000"
             throughput = "2.0" if self.simulation_count == 1 else "9.0"
+            simulation = command[2:] if command[0] == "/usr/bin/env" else command
             stdout = (
-                f"{command[1]} {command[3]} cache size  16.00KiB, "
+                f"{simulation[1]} {simulation[3]} cache size  16.00KiB, "
                 f"          {self.request_count} req, miss ratio {ratio}, "
                 f"byte miss ratio 0.2500, throughput {throughput} MQPS\n"
             ).encode()
@@ -898,15 +942,16 @@ def test_r0_exact_command_order_flags_and_separate_facts(
         "cmake",
         "cmake",
         "ctest",
-        str(checkout / "_build-release/bin/cachesim"),
-        str(checkout / "_build-release/bin/cachesim"),
         "/usr/bin/cc",
+        "/usr/bin/env",
+        "/usr/bin/env",
     ]
-    assert len(names) == 14
-    assert names[10].endswith("/capacity-probe")
-    assert names[11] == "/usr/bin/cc"
+    assert len(names) == 15
+    assert names[10] == "/usr/bin/cc"
+    assert names[11].endswith("/capacity-probe")
     assert names[12] == "/usr/bin/cc"
-    assert names[13] == "/usr/bin/env"
+    assert names[13] == "/usr/bin/cc"
+    assert names[14] == "/usr/bin/env"
     assert [item["label"] for item in receipt["commands"]] == [
         "release-configure",
         "release-build",
@@ -915,6 +960,7 @@ def test_r0_exact_command_order_flags_and_separate_facts(
         "sanitize-configure",
         "sanitize-build",
         "sanitize-full-tests",
+        "fixed-time-compile",
         "determinism-run-1",
         "determinism-run-2",
         "capacity-compile",
@@ -959,26 +1005,28 @@ def test_r0_exact_command_order_flags_and_separate_facts(
         "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer",
         "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined",
     ]
-    assert runner.commands[7] == runner.commands[8]
-    assert runner.cwds[7] == runner.cwds[8]
-    assert runner.cwds[7] != checkout
-    assert runner.cwds[7].name.startswith(".r0-output-stage-")
-    assert "--num-thread=1" in runner.commands[7]
-    assert "--consider-obj-metadata=true" in runner.commands[7]
-    assert "--print-head-req=false" in runner.commands[7]
+    assert runner.commands[8] == runner.commands[9]
+    assert runner.cwds[8] == runner.cwds[9]
+    assert runner.cwds[8] != checkout
+    assert runner.cwds[8].name.startswith(".r0-output-stage-")
+    assert runner.commands[8][0] == "/usr/bin/env"
+    assert runner.commands[8][1].startswith("LD_PRELOAD=")
+    assert "--num-thread=1" in runner.commands[8]
+    assert "--consider-obj-metadata=true" in runner.commands[8]
+    assert "--print-head-req=false" in runner.commands[8]
     simulation_output = next(
-        item for item in runner.commands[7] if item.startswith("--output=")
+        item for item in runner.commands[8] if item.startswith("--output=")
     )
-    assert Path(simulation_output.split("=", 1)[1]).parent == runner.cwds[7]
-    capacity_compile = runner.commands[9]
+    assert Path(simulation_output.split("=", 1)[1]).parent == runner.cwds[8]
+    capacity_compile = runner.commands[10]
     assert ["-I", "/usr/include/glib-2.0"] == capacity_compile[5:7]
     assert "-lglib-2.0" in capacity_compile
     assert "/usr/lib/test/libzstd.so" in capacity_compile
     assert "/usr/lib/test/libtcmalloc_minimal.so" in capacity_compile
     assert "-lstdc++" in capacity_compile
-    metadata_compile = runner.commands[12]
+    metadata_compile = runner.commands[13]
     assert not any(item.startswith("-Wl,--wrap=") for item in metadata_compile)
-    assert runner.commands[13][1].startswith("LD_PRELOAD=")
+    assert runner.commands[14][1].startswith("LD_PRELOAD=")
     assert receipt["checks"] == {
         "source_binding": True,
         "evidence_binding": True,
@@ -1162,9 +1210,10 @@ def test_release_archive_or_cache_mutation_stops_probe_linking(
             self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
         ) -> ChildResult:
             result = super().__call__(argv, output_dir, cwd=cwd)
-            if argv[0].endswith("cachesim") and self.simulation_count == 2:
+            if invoked_program(argv).endswith("cachesim") and self.simulation_count == 2:
                 assert cwd is not None
-                checkout = Path(argv[0]).parents[2]
+                binary = Path(argv[2] if argv[0] == "/usr/bin/env" else argv[0])
+                checkout = binary.parents[2]
                 (checkout / "_build-release/liblibCacheSim.a").write_bytes(
                     b"replacement archive"
                 )
@@ -1182,7 +1231,7 @@ def test_release_archive_or_cache_mutation_stops_probe_linking(
         for item in receipt["commands"]
         if item["returncode"] is not None
     }
-    assert not any(command and command[0] == "/usr/bin/cc" for command in runner.commands)
+    assert sum(command and command[0] == "/usr/bin/cc" for command in runner.commands) == 1
     assert receipt["artifact_snapshots"]["release_archive"]["binding_intact"] is False
     assert receipt["artifact_snapshots"]["release_cmake_cache"]["binding_intact"] is False
     output = tmp_path / "r0-output"
@@ -1204,7 +1253,9 @@ def test_interposer_mutation_stops_metadata_launch(
             self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
         ) -> ChildResult:
             result = super().__call__(argv, output_dir, cwd=cwd)
-            if argv[0] == "/usr/bin/cc" and "-shared" in argv:
+            if argv[0] == "/usr/bin/cc" and any(
+                item.endswith("allocator_interposer.c") for item in argv
+            ):
                 self.interposer = Path(argv[argv.index("-o") + 1])
             if argv[0] == "/usr/bin/cc" and any(
                 item.endswith("metadata_probe.c") for item in argv
@@ -1218,7 +1269,10 @@ def test_interposer_mutation_stops_metadata_launch(
     )
     assert receipt["checks"]["evidence_binding"] is False
     assert receipt["checks"]["metadata_probe"] is None
-    assert not any(command and command[0] == "/usr/bin/env" for command in runner.commands)
+    assert not any(
+        invoked_program(command).endswith("metadata-probe")
+        for command in runner.commands
+    )
     assert receipt["artifact_snapshots"]["metadata_interposer_binary"][
         "binding_intact"
     ] is False
@@ -1256,7 +1310,72 @@ def test_baseline_skips_contract_and_candidate_ctest_but_runs_probes(
     assert receipt["scope"]["changed_paths"] == []
     assert receipt["scope"]["contract_bound"] is None
     assert receipt["checks"]["candidate_test"] is None
-    assert len(runner.commands) == 13
+    assert len(runner.commands) == 14
+
+
+@pytest.mark.parametrize("policy", COMPARISON_POLICIES)
+def test_comparison_policy_baseline_runs_exact_policy_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+) -> None:
+    checkout, base, _candidate, lock = repository(tmp_path)
+    monkeypatch.setattr("commissioning.cache_campaign.evaluate.SOURCE_LOCK", lock)
+    git(checkout, "checkout", "-q", base)
+    source = source_receipt(tmp_path / "source.json", lock)
+    runner = FakeRun()
+    receipt = evaluate_r0(
+        checkout=checkout,
+        base=base,
+        candidate=base,
+        policy=policy,
+        source_receipt=source,
+        output=tmp_path / "r0-output",
+        run=runner,
+    )
+    assert receipt["policy"] == policy
+    assert receipt["scope"]["contract_bound"] is None
+    simulations = [
+        command
+        for command in runner.commands
+        if invoked_program(command).endswith("cachesim")
+    ]
+    assert len(simulations) == 2
+    assert all(command[5] == policy for command in simulations)
+    capacity = next(
+        command for command in runner.commands if command[0].endswith("capacity-probe")
+    )
+    metadata = next(
+        command for command in runner.commands if invoked_program(command).endswith("metadata-probe")
+    )
+    assert capacity[-2] == policy
+    assert metadata[-2] == policy
+    metadata_source = receipt["artifact_snapshots"]["metadata_probe_source"]
+    retained_source = (
+        tmp_path / "r0-output" / metadata_source["snapshot_path"]
+    ).read_bytes()
+    assert f"{policy}_init".encode() in retained_source
+    if policy == "BeladySize":
+        assert "oracleGeneral" in simulations[0][3]
+
+
+def test_unchanged_base_rejects_policy_not_in_comparison_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout, base, _candidate, lock = repository(tmp_path)
+    monkeypatch.setattr("commissioning.cache_campaign.evaluate.SOURCE_LOCK", lock)
+    git(checkout, "checkout", "-q", base)
+    source = source_receipt(tmp_path / "source.json", lock)
+    with pytest.raises(EvaluationError, match="comparison"):
+        evaluate_r0(
+            checkout=checkout,
+            base=base,
+            candidate=base,
+            policy="Random",
+            source_receipt=source,
+            output=tmp_path / "r0-output",
+            run=FakeRun(),
+        )
 
 
 def test_candidate_ctest_must_run_exact_registered_test(
@@ -1499,7 +1618,7 @@ def test_timeout_is_an_explicit_command_failure_with_retained_receipt(
         def __call__(
             self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
         ) -> ChildResult:
-            if not self.thrown and argv[0].endswith("cachesim"):
+            if not self.thrown and invoked_program(argv).endswith("cachesim"):
                 self.thrown = True
                 self.commands.append(list(argv))
                 raise subprocess.TimeoutExpired(argv, timeout=1)
@@ -1524,7 +1643,7 @@ def test_output_limit_is_an_explicit_operational_failure_record(
         def __call__(
             self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
         ) -> ChildResult:
-            if not self.raised and argv[0].endswith("cachesim"):
+            if not self.raised and invoked_program(argv).endswith("cachesim"):
                 self.raised = True
                 self.commands.append(list(argv))
                 raise ChildRunError("child output limit exceeded")
@@ -1632,7 +1751,7 @@ def test_synthetic_trace_mutation_invalidates_dependent_measurements(
         ) -> ChildResult:
             result = super().__call__(argv, output_dir, cwd=cwd)
             if self.simulation_count == 1:
-                trace = Path(argv[1])
+                trace = Path(argv[3] if argv[0] == "/usr/bin/env" else argv[1])
                 trace.write_bytes(trace.read_bytes() + b"mutation")
                 self.simulation_count += 1
             return result
@@ -1649,7 +1768,7 @@ def test_synthetic_trace_mutation_invalidates_dependent_measurements(
         if item["returncode"] is not None
     }
     assert "determinism-run-2" not in executed
-    assert not any(command and command[0] == "/usr/bin/cc" for command in runner.commands)
+    assert sum(command and command[0] == "/usr/bin/cc" for command in runner.commands) == 1
     assert receipt["artifact_snapshots"]["synthetic_trace"][
         "binding_intact"
     ] is False
@@ -1666,7 +1785,7 @@ def test_late_evidence_mutation_is_recorded_and_invalidates_every_fact(
             if invoked_program(argv).endswith("metadata-probe"):
                 assert cwd is not None
                 stage = Path(cwd)
-                (stage / "commands/08-determinism-run-1/stdout.raw").write_bytes(
+                (stage / "commands/09-determinism-run-1/stdout.raw").write_bytes(
                     b"late mutation\n"
                 )
                 (stage / "simulator-results.cachesim").write_bytes(b"late mutation\n")
@@ -1682,8 +1801,8 @@ def test_late_evidence_mutation_is_recorded_and_invalidates_every_fact(
         if key not in {"source_binding", "evidence_binding"}
     )
     assert receipt["measured_metadata"] is None
-    raw = tmp_path / "r0-output/commands/08-determinism-run-1/stdout.raw"
-    process = receipt["commands"][7]["stdout"]
+    raw = tmp_path / "r0-output/commands/09-determinism-run-1/stdout.raw"
+    process = receipt["commands"][8]["stdout"]
     assert process["binding_intact"] is False
     assert process["sha256"] == sha256_file(raw)
     assert process["initial_sha256"] != process["sha256"]
@@ -1724,10 +1843,10 @@ def test_unregistered_stage_output_is_removed_and_invalidates_every_fact(
 @pytest.mark.parametrize(
     ("relative", "delete"),
     [
-        ("commands/08-determinism-run-1/stdout.raw", True),
+        ("commands/09-determinism-run-1/stdout.raw", True),
         ("simulator-results.cachesim", False),
         ("capacity-probe", True),
-        ("commands/11-capacity-run/stdout.raw", False),
+        ("commands/12-capacity-run/stdout.raw", False),
     ],
 )
 def test_final_inventory_records_missing_and_late_mutated_evidence(
@@ -2144,6 +2263,90 @@ def test_cli_supports_only_r0_and_prints_individual_checks(
     error = capsys.readouterr().err
     assert error.startswith("error:")
     assert len(error.splitlines()) == 1
+
+
+@pytest.mark.parametrize("policy", COMPARISON_POLICIES)
+def test_cli_routes_every_locked_comparison_policy_to_r0(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    policy: str,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    source = tmp_path / "source.json"
+    source.write_text("{}")
+    output = tmp_path / "output"
+    observed: dict[str, object] = {}
+
+    def fake_evaluate(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        output.mkdir()
+        return {
+            "receipt_sha256": "a" * 64,
+            "checks": {"metadata_probe": True},
+        }
+
+    monkeypatch.setattr(eval_cli, "evaluate_r0", fake_evaluate)
+    assert eval_cli.main(
+        [
+            "--rung",
+            "r0",
+            "--checkout",
+            str(checkout),
+            "--candidate",
+            "a" * 40,
+            "--base",
+            "a" * 40,
+            "--policy",
+            policy,
+            "--source-receipt",
+            str(source),
+            "--output",
+            str(output),
+        ]
+    ) == 0
+    assert observed["policy"] == policy
+    capsys.readouterr()
+
+
+def test_cli_rejects_unlocked_unchanged_base_policy_before_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    source = tmp_path / "source.json"
+    source.write_text("{}")
+    called = False
+
+    def fake_evaluate(**kwargs: object) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(eval_cli, "evaluate_r0", fake_evaluate)
+    assert eval_cli.main(
+        [
+            "--rung",
+            "r0",
+            "--checkout",
+            str(checkout),
+            "--candidate",
+            "a" * 40,
+            "--base",
+            "a" * 40,
+            "--policy",
+            "Random",
+            "--source-receipt",
+            str(source),
+            "--output",
+            str(tmp_path / "output"),
+        ]
+    ) == 2
+    assert called is False
+    assert capsys.readouterr().err == "error: invalid command line\n"
 
 
 @pytest.mark.parametrize(

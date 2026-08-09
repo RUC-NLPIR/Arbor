@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from commissioning.cache_campaign.evaluate import (  # noqa: E402
+    SOURCE_LOCK,
     evaluate_portfolio,
     evaluate_r0,
 )
@@ -63,6 +64,15 @@ def main(argv: list[str] | None = None) -> int:
                 or args.r0_receipt is not None
             ):
                 parser.error("invalid R0 arguments")
+            comparison = SOURCE_LOCK.get("comparison_policies")
+            if (
+                args.candidate == args.base
+                and (
+                    not isinstance(comparison, list)
+                    or args.policy not in comparison
+                )
+            ):
+                parser.error("invalid unchanged-base comparison policy")
         elif (
             args.base is not None
             or args.task_root is None

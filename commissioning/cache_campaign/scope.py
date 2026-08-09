@@ -15,7 +15,15 @@ from .records import ContractError
 
 
 _POLICY = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
-_BASELINE_POLICIES = {"Sieve", "S3FIFO"}
+_COMPARISON_POLICIES = {
+    "LRU",
+    "ARC",
+    "WTinyLFU",
+    "Sieve",
+    "S3FIFO",
+    "BeladySize",
+}
+_REFERENCE_POLICIES = {"Sieve", "S3FIFO"}
 _CONTRACT_PATH = "commissioning/cache_policy_contract.json"
 _CONTRACT_KEYS = {
     "schema_version",
@@ -151,7 +159,7 @@ def _validate_contract(
     if candidate["policy"] != policy:
         raise ContractError("policy contract policy does not match the candidate policy")
     reference = candidate["reference_policy"]
-    if type(reference) is not str or reference not in _BASELINE_POLICIES:
+    if type(reference) is not str or reference not in _REFERENCE_POLICIES:
         raise ContractError("reference_policy must be Sieve or S3FIFO")
     source = f"libCacheSim/cache/eviction/{policy}.c"
     if candidate["policy_source"] != source:
@@ -360,8 +368,10 @@ def evaluate_scope(
     )
     diff_sha256 = hashlib.sha256(raw_diff).hexdigest()
     if candidate == base:
-        if policy not in _BASELINE_POLICIES:
-            raise ContractError("unchanged baseline policy must be Sieve or S3FIFO")
+        if policy not in _COMPARISON_POLICIES:
+            raise ContractError(
+                "unchanged baseline policy must be in the locked comparison policies"
+            )
         status = _name_status(
             _git_bytes(
                 checkout,

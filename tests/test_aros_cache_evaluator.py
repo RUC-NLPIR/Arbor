@@ -5,6 +5,7 @@ import json
 import stat
 import struct
 import subprocess
+import tracemalloc
 from dataclasses import FrozenInstanceError
 from decimal import Decimal, Inexact, ROUND_DOWN, ROUND_UP, localcontext
 from pathlib import Path
@@ -13,14 +14,57 @@ import pytest
 
 from commissioning.cache_campaign.cachesim import ChildResult
 from commissioning.cache_campaign import portfolio as portfolio_module
+from commissioning.cache_campaign import portfolio_evidence as portfolio_evidence_module
+from commissioning.cache_campaign import evidence as cache_evidence
+from commissioning.cache_campaign.evidence import EvidenceError, read_bound_json_object
 from commissioning.cache_campaign.evaluate import evaluate_portfolio, parse_metadata_probe
-from commissioning.cache_campaign.portfolio import _cache_size, _cpu_ns_per_request
+from commissioning.cache_campaign.portfolio import (
+    TraceSpec,
+    _cache_size,
+    _cpu_ns_per_request,
+    _snapshot_trace,
+)
 from commissioning.cache_campaign.records import ContractError, ParetoMeasurement
 from commissioning.cache_campaign.records import record_sha256, sha256_file
 from scripts import run_aros_cache_eval as eval_cli
 
 
 ORACLE = struct.Struct("<IQIq")
+
+
+@pytest.mark.parametrize("restore", [False, True])
+def test_bound_json_parses_the_same_inode_bytes_it_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restore: bool,
+) -> None:
+    path = tmp_path / "bound.json"
+    original = b'{"value":"original"}\n'
+    path.write_bytes(original)
+    held = tmp_path / "held.json"
+    real_parse = cache_evidence._strict_parse_json_bytes
+
+    def replace_while_parsing(raw: bytes, *, decimal_numbers: bool) -> dict[str, object]:
+        path.rename(held)
+        path.write_bytes(b'{"value":"foreign"}\n')
+        parsed = real_parse(raw, decimal_numbers=decimal_numbers)
+        if restore:
+            path.unlink()
+            held.rename(path)
+        return parsed
+
+    monkeypatch.setattr(
+        cache_evidence, "_strict_parse_json_bytes", replace_while_parsing
+    )
+    if not restore:
+        with pytest.raises(EvidenceError, match="binding changed"):
+            read_bound_json_object(path, max_bytes=1024)
+        assert path.read_bytes() == b'{"value":"foreign"}\n'
+    else:
+        bound = read_bound_json_object(path, max_bytes=1024)
+        assert bound.value == {"value": "original"}
+        assert bound.raw == original
+        assert bound.sha256 == hashlib.sha256(original).hexdigest()
 
 
 def measurement(**changes: object) -> ParetoMeasurement:
@@ -347,6 +391,18 @@ sys.stdout.write(line)
         b"synthetic trace\n",
         source_path=str(old_stage / "synthetic.oracleGeneral.bin"),
     )
+    fixed_time_source = artifact_record(
+        root,
+        "fixed_time_interposer_source",
+        b"fake fixed time source\n",
+        source_path=str(old_stage / "fixed_time_interposer.c"),
+    )
+    fixed_time_binary = artifact_record(
+        root,
+        "fixed_time_interposer_binary",
+        b"fake fixed time binary\n",
+        source_path=str(old_stage / "fixed-time-interposer.so"),
+    )
     evaluator_artifacts = {
         name: artifact_record(root, f"evaluator_{name}", f"{name}\n".encode())
         for name in (
@@ -365,7 +421,7 @@ sys.stdout.write(line)
         b"sample=10000 live_bytes=30024 resident_objects=10000\n"
         b"status=ok\n"
     )
-    metadata_dir = root / "commands/13-metadata-run"
+    metadata_dir = root / "commands/14-metadata-run"
     metadata_dir.mkdir(parents=True)
     metadata_stdout_path = metadata_dir / "stdout.raw"
     metadata_stderr_path = metadata_dir / "stderr.raw"
@@ -385,7 +441,7 @@ sys.stdout.write(line)
     stderr_receipt = raw_receipt(metadata_stderr_path)
 
     metadata_command: dict[str, object] = {
-        "index": 13,
+        "index": 14,
         "label": "metadata-run",
         "argv": [
             "/usr/bin/env",
@@ -491,12 +547,19 @@ sys.stdout.write(line)
             "metadata_probe_source": metadata_probe_source,
             "metadata_interposer_source": metadata_interposer_source,
             "synthetic_trace": synthetic_artifact,
+            "fixed_time_interposer_source": fixed_time_source,
+            "fixed_time_interposer_binary": fixed_time_binary,
             **{
                 f"evaluator_{name}": artifact
                 for name, artifact in evaluator_artifacts.items()
             },
         },
         "probes": {
+            "fixed_time": {
+                "source_sha256": fixed_time_source["sha256"],
+                "binary": {"sha256": fixed_time_binary["sha256"]},
+                "environment": f"LD_PRELOAD={fixed_time_binary['source_path']}",
+            },
             "metadata": {
                 "source_sha256": metadata_probe_source["sha256"],
                 "binary": {"sha256": metadata_probe_binary["sha256"]},
@@ -535,6 +598,71 @@ def oracle_trace(path: Path, seed: int) -> tuple[int, int]:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
     return sum(sizes.values()), len(raw)
+
+
+def test_trace_snapshot_streams_large_input_with_bounded_memory(tmp_path: Path) -> None:
+    request_count = 200_000
+    path = tmp_path / "large.oracleGeneral"
+    digest = hashlib.sha256()
+    with path.open("wb") as stream:
+        for start in range(0, request_count, 4096):
+            block = bytearray()
+            for index in range(start, min(request_count, start + 4096)):
+                block.extend(ORACLE.pack(index, index, 64, -1))
+            stream.write(block)
+            digest.update(block)
+    diagnostic: dict[str, object] = {
+        "schema_version": 1,
+        "trace_id": "large",
+        "request_count": request_count,
+        "unique_object_count": request_count,
+        "working_set_bytes": request_count * 64,
+        "one_hit_object_fraction": {
+            "numerator": request_count,
+            "denominator": request_count,
+        },
+        "one_hit_request_fraction": {
+            "numerator": request_count,
+            "denominator": request_count,
+        },
+        "reuse_distance": {
+            "bin_convention": "fixture",
+            "counts": {},
+            "no_next_count": request_count,
+        },
+    }
+    diagnostic["diagnostic_sha256"] = record_sha256(
+        diagnostic, "diagnostic_sha256"
+    )
+    record: dict[str, object] = {
+        "trace_id": "large",
+        "split": "dev",
+        "organization": "org",
+        "application": "app",
+        "dataset": "data",
+        "provenance_url": "https://example.invalid/large",
+        "license_ref": "fixture",
+        "path": str(path),
+        "trace_type": "oracleGeneral",
+        "origin_sha256": "a" * 64,
+        "start_request": 0,
+        "warmup_seconds": 1,
+        "max_requests": request_count,
+        "working_set_bytes": request_count * 64,
+        "sha256": digest.hexdigest(),
+        "size_bytes": path.stat().st_size,
+        "diagnostic_sha256": diagnostic["diagnostic_sha256"],
+        "diagnostics": diagnostic,
+    }
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    tracemalloc.start()
+    facts = _snapshot_trace(stage, 0, TraceSpec(record, path))
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert facts.measured_requests == request_count - 2
+    assert facts.binding.sha256 == digest.hexdigest()
+    assert peak < 6 * 1024 * 1024
 
 
 def portfolio_manifest(path: Path, trace_root: Path, commit: str) -> tuple[Path, list[str]]:
@@ -611,10 +739,11 @@ class PortfolioRun:
     ) -> ChildResult:
         del cwd
         self.argv.append(list(argv))
-        self.modes.append(stat.S_IMODE(Path(argv[0]).stat().st_mode))
+        actual = argv[2:] if argv[0] == "/usr/bin/env" else argv
+        self.modes.append(stat.S_IMODE(Path(actual[0]).stat().st_mode))
         self.limits.append((timeout_seconds, max_output_bytes))
         output_dir.mkdir(mode=0o700)
-        program = Path(argv[0]).name
+        program = Path(actual[0]).name
         if argv[0] == "/usr/bin/cc":
             compiled = Path(argv[argv.index("-o") + 1])
             compiled.write_bytes(b"fake phase probe\n")
@@ -628,11 +757,15 @@ class PortfolioRun:
                     f"phase={index} requests=10 object_misses={misses} "
                     f"request_bytes=640 byte_misses={misses * 64}"
                 )
+            lines.append(
+                "total requests=160 object_misses=10 object_miss_ratio=0.0625 "
+                "request_bytes=10240 byte_misses=640 byte_miss_ratio=0.0625"
+            )
             stdout = ("\n".join(lines) + "\n").encode()
         else:
             request_count = 160
             stdout = (
-                f"{argv[1]} Sieve cache size 6B, {request_count} req, "
+                f"{actual[1]} Sieve cache size 6B, {request_count} req, "
                 "miss ratio 0.0625, byte miss ratio 0.0625, throughput 1.25 MQPS\n"
             ).encode()
         stderr = b""
@@ -659,6 +792,10 @@ class PortfolioRun:
             stderr_bytes=0,
             stderr_sha256=hashlib.sha256(stderr).hexdigest(),
         )
+
+
+def portfolio_program(argv: list[str] | tuple[str, ...]) -> str:
+    return Path(argv[2] if argv[0] == "/usr/bin/env" else argv[0]).name
 
 
 def portfolio_inputs(
@@ -709,17 +846,19 @@ def test_r1_is_first_three_dev_windows_by_three_exact_integer_sizes(
     ]
     assert len(runner.argv) == 9
     for argv in runner.argv:
-        assert argv[2:4] == ["oracleGeneral", "Sieve"]
-        assert argv[4] in {"6", "32", "64"}
-        assert argv[4] not in {"auto", "0.01", "0.05", "0.10"}
-        assert argv[5:10] == [
+        assert argv[0] == "/usr/bin/env"
+        assert argv[1].startswith("LD_PRELOAD=")
+        assert argv[4:6] == ["oracleGeneral", "Sieve"]
+        assert argv[6] in {"6", "32", "64"}
+        assert argv[6] not in {"auto", "0.01", "0.05", "0.10"}
+        assert argv[7:12] == [
             "--num-thread=1",
             "--num-req=162",
             "--warmup-sec=1",
             "--consider-obj-metadata=true",
             "--print-head-req=false",
         ]
-        assert argv[10].startswith("--output=")
+        assert argv[12].startswith("--output=")
     assert runner.modes == [0o500] * 9
     assert runner.limits == [(3600.0, 64 * 1024 * 1024)] * 9
     assert receipt["failures"] == []
@@ -781,9 +920,17 @@ def test_r2_covers_all_frozen_traces_and_binds_continuous_phase_facts(
     assert runner.argv[0][0] == "/usr/bin/cc"
     assert "-std=c11" in runner.argv[0]
     assert len(runner.argv) == 1 + len(trace_ids) * 6
-    assert [Path(argv[0]).name for argv in runner.argv[1:]] == [
+    assert [portfolio_program(argv) for argv in runner.argv[1:]] == [
         name for _cell in range(len(trace_ids) * 3) for name in ("cachesim", "phase-probe")
     ]
+    timed_runs = [
+        argv
+        for argv in runner.argv
+        if portfolio_program(argv) in {"cachesim", "phase-probe"}
+    ]
+    assert all(argv[0] == "/usr/bin/env" for argv in timed_runs)
+    assert len({argv[1] for argv in timed_runs}) == 1
+    assert timed_runs[0][1].startswith("LD_PRELOAD=")
     first_path = inputs["output"] / receipt["measurements"][0]["path"]
     measurement = json.loads(first_path.read_text())
     phase = measurement["phase_diagnostic"]
@@ -886,34 +1033,36 @@ def test_cli_rejects_r3_and_cross_rung_arguments(
     assert captured.err == "error: invalid command line\n"
 
 
-def test_trace_mutation_after_child_aborts_before_next_launch_and_is_retained(
+def test_original_trace_replacement_restore_cannot_affect_private_snapshot_launches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    inputs, base_runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    inputs, _base_runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    manifest = json.loads(inputs["task_manifest"].read_text())
+    original_path = Path(manifest["traces"][0]["path"])
+    original = original_path.read_bytes()
 
     class TraceMutatingRun(PortfolioRun):
         def __call__(self, *args: object, **kwargs: object) -> ChildResult:
-            result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
             argv = args[0]
             assert isinstance(argv, list)
-            if Path(argv[0]).name == "cachesim" and len(self.argv) == 1:
-                with Path(argv[1]).open("ab") as stream:
-                    stream.write(b"mutation")
+            prior = sum(portfolio_program(item) == "cachesim" for item in self.argv)
+            if portfolio_program(argv) == "cachesim" and prior == 1:
+                original_path.write_bytes(original)
+            result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
+            if portfolio_program(argv) == "cachesim" and prior == 0:
+                original_path.write_bytes(b"temporary caller trace replacement\n")
             return result
 
     runner = TraceMutatingRun()
     inputs["run"] = runner
     receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
-    assert len(runner.argv) == 1
-    assert receipt["measurements"] == []
-    assert len(receipt["failures"]) == 1
-    assert receipt["provenance"]["final_binding_intact"] is False
-    failure_path = inputs["output"] / receipt["failures"][0]["path"]
-    failure = json.loads(failure_path.read_text())
-    assert failure["kind"] == "binding_failure"
-    assert failure["remaining_cell_indices"] == list(range(1, 9))
-    assert (failure_path.parent / "process.json").exists()
-    assert base_runner.argv == []
+    assert len(receipt["measurements"]) == 9
+    assert receipt["failures"] == []
+    assert original_path.read_bytes() == original
+    for argv in runner.argv:
+        if portfolio_program(argv) == "cachesim":
+            assert Path(argv[3]) != original_path
+            assert "trace-snapshots" in Path(argv[3]).parts
 
 
 def test_r0_dependency_mutation_cannot_wait_for_next_cell_to_restore(
@@ -930,12 +1079,12 @@ def test_r0_dependency_mutation_cannot_wait_for_next_cell_to_restore(
         def __call__(self, *args: object, **kwargs: object) -> ChildResult:
             argv = args[0]
             assert isinstance(argv, list)
-            if Path(argv[0]).name == "cachesim" and any(
-                Path(item[0]).name == "cachesim" for item in self.argv
+            if portfolio_program(argv) == "cachesim" and any(
+                portfolio_program(item) == "cachesim" for item in self.argv
             ):
                 dependency.write_bytes(original)
             result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
-            if Path(argv[0]).name == "cachesim":
+            if portfolio_program(argv) == "cachesim":
                 dependency.write_bytes(b"temporary evaluator replacement\n")
             return result
 
@@ -957,8 +1106,8 @@ def test_nonzero_process_has_process_and_failure_receipts_but_no_measurement(
             result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
             argv = args[0]
             assert isinstance(argv, list)
-            if Path(argv[0]).name == "cachesim" and not any(
-                Path(item[0]).name == "cachesim" for item in self.argv[:-1]
+            if portfolio_program(argv) == "cachesim" and not any(
+                portfolio_program(item) == "cachesim" for item in self.argv[:-1]
             ):
                 return ChildResult(**{**result.__dict__, "returncode": 7})
             return result
@@ -1154,7 +1303,7 @@ def test_r2_unavailable_phase_run_retains_phase_process_without_measurement(
         def __call__(self, *args: object, **kwargs: object) -> ChildResult:
             argv = args[0]
             assert isinstance(argv, list)
-            if Path(argv[0]).name == "phase-probe":
+            if portfolio_program(argv) == "phase-probe":
                 self.argv.append(argv)
                 raise subprocess.TimeoutExpired(argv, 1)
             return super().__call__(*args, **kwargs)  # type: ignore[arg-type]
@@ -1198,10 +1347,10 @@ def test_retained_raw_mutation_aborts_before_following_launch(
 
         def __call__(self, *args: object, **kwargs: object) -> ChildResult:
             result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
-            if Path(result.argv[0]).name == "cachesim":
+            if portfolio_program(result.argv) == "cachesim":
                 self.retained_stdout.append(result.stdout_path)
             cachesim_runs = [
-                item for item in self.argv if Path(item[0]).name == "cachesim"
+                item for item in self.argv if portfolio_program(item) == "cachesim"
             ]
             if len(cachesim_runs) == 2:
                 self.retained_stdout[0].write_bytes(b"mutated retained raw\n")
@@ -1251,11 +1400,38 @@ def test_foreign_output_race_is_preserved_and_stage_is_not_published(
     assert not (output / "receipt.json").exists()
 
 
+def test_output_parent_swap_cannot_redirect_descriptor_relative_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    host = tmp_path / "publication-host"
+    host.mkdir()
+    output = host / "r2-output"
+    inputs["output"] = output
+    moved = tmp_path / "publication-host-moved"
+    real_publish = portfolio_evidence_module.publish_stage_in_parent
+
+    def swap_parent_then_publish(
+        parent: object, stage: Path, identity: tuple[int, int]
+    ) -> None:
+        host.rename(moved)
+        host.mkdir()
+        real_publish(parent, stage, identity)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        portfolio_evidence_module, "publish_stage_in_parent", swap_parent_then_publish
+    )
+    with pytest.raises(ValueError, match="parent|publication"):
+        evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert not output.exists()
+    assert (moved / "r2-output/receipt.json").exists()
+
+
 def test_root_receipt_replacement_after_verification_blocks_publish_and_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
-    real_verify = portfolio_module._verify_publication
+    real_verify = portfolio_evidence_module.verify_root
     foreign = b"foreign root before publish\n"
 
     def replace_after_verify(
@@ -1266,7 +1442,7 @@ def test_root_receipt_replacement_after_verification_blocks_publish_and_is_prese
         path.unlink()
         path.write_bytes(foreign)
 
-    monkeypatch.setattr(portfolio_module, "_verify_publication", replace_after_verify)
+    monkeypatch.setattr(portfolio_evidence_module, "verify_root", replace_after_verify)
     with pytest.raises(ValueError, match="publication|root receipt|record collision"):
         evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     output = inputs["output"]
@@ -1280,18 +1456,21 @@ def test_root_receipt_replacement_after_publish_blocks_return_and_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
-    real_publish = portfolio_module.publish_stage
+    real_publish = portfolio_evidence_module.publish_stage_in_parent
     foreign = b"foreign root after publish\n"
 
     def replace_after_publish(
-        stage: Path, identity: tuple[int, int], output: Path
+        parent: object, stage: Path, identity: tuple[int, int]
     ) -> None:
-        real_publish(stage, identity, output)
+        real_publish(parent, stage, identity)  # type: ignore[arg-type]
+        output = parent.path / parent.output_name  # type: ignore[attr-defined]
         path = output / "receipt.json"
         path.unlink()
         path.write_bytes(foreign)
 
-    monkeypatch.setattr(portfolio_module, "publish_stage", replace_after_publish)
+    monkeypatch.setattr(
+        portfolio_evidence_module, "publish_stage_in_parent", replace_after_publish
+    )
     with pytest.raises(ValueError, match="publication|root receipt|record collision"):
         evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     output = inputs["output"]
@@ -1306,18 +1485,21 @@ def test_success_publication_revalidates_every_file_after_rename(
     relative: str,
 ) -> None:
     inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
-    real_publish = portfolio_module.publish_stage
+    real_publish = portfolio_evidence_module.publish_stage_in_parent
     foreign = f"foreign {relative}\n".encode()
 
     def replace_during_publish(
-        stage: Path, identity: tuple[int, int], output: Path
+        parent: object, stage: Path, identity: tuple[int, int]
     ) -> None:
-        real_publish(stage, identity, output)
+        real_publish(parent, stage, identity)  # type: ignore[arg-type]
+        output = parent.path / parent.output_name  # type: ignore[attr-defined]
         path = output / "measurements/0000" / relative
         path.unlink()
         path.write_bytes(foreign)
 
-    monkeypatch.setattr(portfolio_module, "publish_stage", replace_during_publish)
+    monkeypatch.setattr(
+        portfolio_evidence_module, "publish_stage_in_parent", replace_during_publish
+    )
     with pytest.raises(ValueError, match="publication|collision|changed"):
         evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     output = inputs["output"]
@@ -1342,7 +1524,7 @@ def test_preflight_failure_publication_revalidates_all_owned_evidence(
     foreign = f"foreign preflight {boundary}\n".encode()
 
     if boundary == "before":
-        real_verify = portfolio_module._verify_publication
+        real_verify = portfolio_evidence_module.verify_root
 
         def replace_before_publish(
             stage: Path, receipt: dict[str, object]
@@ -1353,22 +1535,25 @@ def test_preflight_failure_publication_revalidates_all_owned_evidence(
             path.write_bytes(foreign)
 
         monkeypatch.setattr(
-            portfolio_module, "_verify_publication", replace_before_publish
+            portfolio_evidence_module, "verify_root", replace_before_publish
         )
     elif boundary == "during":
-        real_publish = portfolio_module.publish_stage
+        real_publish = portfolio_evidence_module.publish_stage_in_parent
 
         def replace_during_publish(
-            stage: Path, identity: tuple[int, int], final: Path
+            parent: object, stage: Path, identity: tuple[int, int]
         ) -> None:
-            real_publish(stage, identity, final)
+            real_publish(parent, stage, identity)  # type: ignore[arg-type]
+            final = parent.path / parent.output_name  # type: ignore[attr-defined]
             path = final / "failures/preflight.json"
             path.unlink()
             path.write_bytes(foreign)
 
-        monkeypatch.setattr(portfolio_module, "publish_stage", replace_during_publish)
+        monkeypatch.setattr(
+            portfolio_evidence_module, "publish_stage_in_parent", replace_during_publish
+        )
     else:
-        real_revalidate = portfolio_module._revalidate_owned_record
+        real_revalidate = portfolio_evidence_module.revalidate_owned_record
 
         def replace_after_first_final_check(
             path: Path, receipt: object, label: str
@@ -1380,8 +1565,8 @@ def test_preflight_failure_publication_revalidates_all_owned_evidence(
                 target.write_bytes(foreign)
 
         monkeypatch.setattr(
-            portfolio_module,
-            "_revalidate_owned_record",
+            portfolio_evidence_module,
+            "revalidate_owned_record",
             replace_after_first_final_check,
         )
 
@@ -1406,7 +1591,7 @@ def test_foreign_cell_inventory_aborts_before_next_launch(
             result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
             argv = args[0]
             assert isinstance(argv, list)
-            if Path(argv[0]).name == "cachesim":
+            if portfolio_program(argv) == "cachesim":
                 result.stdout_path.parent.joinpath("foreign").write_text("foreign\n")
             return result
 
@@ -1423,7 +1608,7 @@ def test_foreign_request_collision_is_preserved_and_never_adopted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs, runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
-    real_write = portfolio_module.write_new_record
+    real_write = portfolio_evidence_module.write_new_record
     foreign = b"foreign request bytes\n"
     collided = False
 
@@ -1436,7 +1621,7 @@ def test_foreign_request_collision_is_preserved_and_never_adopted(
             path.write_bytes(foreign)
         return real_write(path, value, hash_field)
 
-    monkeypatch.setattr(portfolio_module, "write_new_record", collide)
+    monkeypatch.setattr(portfolio_evidence_module, "write_new_record", collide)
     receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     assert len(runner.argv) == 1
     assert receipt["measurements"] == []
@@ -1444,7 +1629,8 @@ def test_foreign_request_collision_is_preserved_and_never_adopted(
     failure = json.loads(
         (inputs["output"] / receipt["failures"][0]["path"]).read_text()
     )
-    assert failure["kind"] == "binding_failure"
+    assert failure["kind"] == "integrity_failure"
+    assert failure["state"] == "integrity_failure"
     assert "request_sha256" not in failure
 
 
@@ -1460,7 +1646,7 @@ def test_foreign_process_collision_on_failed_child_is_not_referenced(
 
     runner = NonzeroFirstRun()
     inputs["run"] = runner
-    real_write = portfolio_module.write_new_record
+    real_write = portfolio_evidence_module.write_new_record
     foreign = b"foreign process bytes\n"
     collided = False
 
@@ -1473,7 +1659,7 @@ def test_foreign_process_collision_on_failed_child_is_not_referenced(
             path.write_bytes(foreign)
         return real_write(path, value, hash_field)
 
-    monkeypatch.setattr(portfolio_module, "write_new_record", collide)
+    monkeypatch.setattr(portfolio_evidence_module, "write_new_record", collide)
     receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     assert len(runner.argv) == 1
     process_path = inputs["output"] / "measurements/0000/process.json"
@@ -1481,7 +1667,8 @@ def test_foreign_process_collision_on_failed_child_is_not_referenced(
     failure = json.loads(
         (inputs["output"] / receipt["failures"][0]["path"]).read_text()
     )
-    assert failure["kind"] == "binding_failure"
+    assert failure["kind"] == "integrity_failure"
+    assert failure["state"] == "integrity_failure"
     assert "process_sha256" not in failure
 
 
@@ -1489,7 +1676,7 @@ def test_post_publication_request_replacement_is_not_adopted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs, runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
-    real_write = portfolio_module.write_new_record
+    real_write = portfolio_evidence_module.write_new_record
     foreign = b"post-publication foreign request\n"
     replaced = False
 
@@ -1504,7 +1691,9 @@ def test_post_publication_request_replacement_is_not_adopted(
             path.write_bytes(foreign)
         return receipt
 
-    monkeypatch.setattr(portfolio_module, "write_new_record", replace_after_publish)
+    monkeypatch.setattr(
+        portfolio_evidence_module, "write_new_record", replace_after_publish
+    )
     receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     assert len(runner.argv) == 1
     request_path = inputs["output"] / "measurements/0000/request.json"
@@ -1513,7 +1702,8 @@ def test_post_publication_request_replacement_is_not_adopted(
     failure = json.loads(
         (inputs["output"] / receipt["failures"][0]["path"]).read_text()
     )
-    assert failure["kind"] == "binding_failure"
+    assert failure["kind"] == "integrity_failure"
+    assert failure["state"] == "integrity_failure"
     assert "request_sha256" not in failure
 
 
@@ -1543,3 +1733,9 @@ def test_measurement_replacement_before_cell_retention_blocks_root_summary(
     path = inputs["output"] / "measurements/0000/measurement.json"
     assert path.read_bytes() == foreign
     assert receipt["provenance"]["final_binding_intact"] is False
+    failure = json.loads(
+        (inputs["output"] / receipt["failures"][0]["path"]).read_text()
+    )
+    assert failure["kind"] == "integrity_failure"
+    assert failure["state"] == "integrity_failure"
+    assert failure["remaining_cell_indices"] == list(range(1, 9))

@@ -4,15 +4,13 @@ import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, localcontext
+from decimal import Decimal
 from typing import Literal
 
 from .records import (
     HEX64,
     canonical_bytes,
     canonical_decimal,
-    deterministic_decimal_ratio,
-    scientific_decimal_context,
 )
 
 
@@ -53,6 +51,14 @@ _PHASE_LINE = re.compile(
     r"request_bytes=(?P<request_bytes>[0-9]+) "
     r"byte_misses=(?P<byte_misses>[0-9]+)\Z"
 )
+_PHASE_TOTAL = re.compile(
+    r"total requests=(?P<requests>[0-9]+) "
+    r"object_misses=(?P<object_misses>[0-9]+) "
+    r"object_miss_ratio=(?P<object_ratio>[0-9]+\.[0-9]{4}) "
+    r"request_bytes=(?P<request_bytes>[0-9]+) "
+    r"byte_misses=(?P<byte_misses>[0-9]+) "
+    r"byte_miss_ratio=(?P<byte_ratio>[0-9]+\.[0-9]{4})\Z"
+)
 
 _PHASE_PROBE = r'''#include <inttypes.h>
 #include <stdbool.h>
@@ -60,6 +66,7 @@ _PHASE_PROBE = r'''#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "libCacheSim.h"
 #include "cache_init.h"
 
@@ -87,10 +94,14 @@ int main(int argc, char **argv) {
   cache_t *cache = create_cache(argv[1], argv[2], cache_size, NULL, true);
   request_t *request = new_request();
   if (!reader || !cache || !request) return 2;
+  srand((unsigned int)time(NULL));
+  set_rand_seed(rand());
 
   uint64_t bin_index = 0, bin_requests = 0, bin_object_misses = 0;
   uint64_t bin_request_bytes = 0, bin_byte_misses = 0;
   uint64_t measured = 0, consumed = 0;
+  uint64_t total_object_misses = 0, total_request_bytes = 0;
+  uint64_t total_byte_misses = 0;
   int read_state = read_one_req(reader, request);
   if (read_state != 0 || !request->valid) return 3;
   int64_t start_timestamp = request->clock_time;
@@ -103,9 +114,12 @@ int main(int argc, char **argv) {
       measured++;
       bin_requests++;
       bin_request_bytes += request->obj_size;
+      total_request_bytes += request->obj_size;
       if (!hit) {
         bin_object_misses++;
         bin_byte_misses += request->obj_size;
+        total_object_misses++;
+        total_byte_misses += request->obj_size;
       }
       uint64_t quotient = expected_measured / 16;
       uint64_t remainder = expected_measured % 16;
@@ -131,6 +145,15 @@ int main(int argc, char **argv) {
   int status = 0;
   if (consumed != max_requests || measured != expected_measured ||
       bin_index != 16 || bin_requests != 0) status = 4;
+  if (status == 0) {
+    printf("total requests=%" PRIu64 " object_misses=%" PRIu64
+           " object_miss_ratio=%.4lf request_bytes=%" PRIu64
+           " byte_misses=%" PRIu64 " byte_miss_ratio=%.4lf\n",
+           measured, total_object_misses,
+           (double)total_object_misses / (double)measured,
+           total_request_bytes, total_byte_misses,
+           (double)total_byte_misses / (double)total_request_bytes);
+  }
   free_request(request);
   close_reader(reader);
   cache->cache_free(cache);
@@ -203,20 +226,6 @@ class PhaseBin:
         )
 
 
-def _ratio(numerator: int, denominator: int) -> Decimal:
-    if denominator <= 0:
-        raise DiagnosticError("phase ratio denominator must be positive")
-    return deterministic_decimal_ratio(numerator, denominator)
-
-
-def _matches_reported_ratio(observed: Decimal, reported: Decimal) -> bool:
-    if type(reported) is not Decimal or not reported.is_finite():
-        raise DiagnosticError("primary miss ratio must be a finite Decimal")
-    with localcontext(scientific_decimal_context()):
-        quantum = Decimal((0, (1,), reported.as_tuple().exponent))
-        return observed.quantize(quantum) == reported
-
-
 def parse_phase_probe_output(
     output: str,
     *,
@@ -231,10 +240,13 @@ def parse_phase_probe_output(
     ):
         raise DiagnosticError("phase probe output must be printable ASCII and LF")
     lines = output.splitlines()
-    if len(lines) != 16:
-        raise DiagnosticError("phase probe must emit exactly sixteen bins")
+    if len(lines) != 17:
+        raise DiagnosticError("phase probe must emit sixteen bins and one total")
+    total_match = _PHASE_TOTAL.fullmatch(lines[-1])
+    if total_match is None:
+        raise DiagnosticError("malformed phase probe total output")
     bins: list[PhaseBin] = []
-    for expected_index, line in enumerate(lines):
+    for expected_index, line in enumerate(lines[:16]):
         match = _PHASE_LINE.fullmatch(line)
         if match is None:
             raise DiagnosticError("malformed phase probe output")
@@ -267,13 +279,21 @@ def parse_phase_probe_output(
         raise DiagnosticError("phase byte total does not match primary trace facts")
     object_misses = sum(item.object_misses for item in bins)
     byte_misses = sum(item.byte_misses for item in bins)
-    if not _matches_reported_ratio(
-        _ratio(object_misses, request_count), expected_object_miss_ratio
+    total = total_match.groupdict()
+    if (
+        int(total["requests"]) != request_count
+        or int(total["object_misses"]) != object_misses
+        or int(total["request_bytes"]) != request_bytes
+        or int(total["byte_misses"]) != byte_misses
     ):
+        raise DiagnosticError("phase total counters do not match bins")
+    if type(expected_object_miss_ratio) is not Decimal or not expected_object_miss_ratio.is_finite():
+        raise DiagnosticError("primary object miss ratio must be a finite Decimal")
+    if type(expected_byte_miss_ratio) is not Decimal or not expected_byte_miss_ratio.is_finite():
+        raise DiagnosticError("primary byte miss ratio must be a finite Decimal")
+    if total["object_ratio"] != format(expected_object_miss_ratio, "f"):
         raise DiagnosticError("phase object miss ratio does not match primary measurement")
-    if not _matches_reported_ratio(
-        _ratio(byte_misses, request_bytes), expected_byte_miss_ratio
-    ):
+    if total["byte_ratio"] != format(expected_byte_miss_ratio, "f"):
         raise DiagnosticError("phase byte miss ratio does not match primary measurement")
     return tuple(bins)
 

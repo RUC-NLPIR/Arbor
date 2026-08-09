@@ -4,7 +4,6 @@ import hashlib
 import os
 import platform
 import re
-import secrets
 import stat
 import struct
 import subprocess
@@ -23,11 +22,12 @@ from .evidence import (
     checkout_path,
     cleanup_owned,
     output_path,
-    publish_stage,
     regular_bytes,
-    regular_identity,
+    read_bound_json_object,
     revalidate_checkout,
-    stage_directory,
+    stage_directory_in_parent,
+    retain_output_parent,
+    _strict_parse_json_bytes,
 )
 from .records import (
     HEX64,
@@ -35,15 +35,32 @@ from .records import (
     ParetoMeasurement,
     canonical_decimal,
     deterministic_decimal_ratio,
-    load_candidate_object,
     load_object,
-    quarantine_unlink,
     record_sha256,
     sha256_file,
     write_new_record,
 )
-from .r0_probes import probe_build_flags
+from .r0_probes import fixed_time_run_argv, probe_build_flags
 from .scope import evaluate_scope
+from .portfolio_evidence import (
+    BindingMutationError,
+    FileBinding,
+    PortfolioEvidenceError,
+    PortfolioIntegrityError,
+    PublicationBindingError,
+    RecordCollision,
+    failed_process_record as _failed_process_record,
+    file_binding as _file_binding,
+    inventory as _inventory,
+    inventory_record as _inventory_record,
+    process_record as _process_record,
+    publish_and_verify as _publish_and_verify,
+    retain_side_effect as _retain_side_effect,
+    revalidate_file as _revalidate_file,
+    tree_bindings as _tree_bindings,
+    write_failure_record as _write_failure_record,
+    write_owned_record as _write_owned_record,
+)
 
 
 SOURCE_LOCK = load_object(Path(__file__).with_name("source.lock.json"))
@@ -125,20 +142,8 @@ _R0_KEYS = {
 _FORBIDDEN_KEYS = {"score", "reward", "objective", "aggregate", "pass"}
 
 
-class PortfolioError(ValueError):
+class PortfolioError(PortfolioEvidenceError):
     pass
-
-
-class RecordCollision(PortfolioError):
-    def __init__(self, path: Path) -> None:
-        super().__init__(f"exclusive record collision: {path.name}")
-        self.path = path
-
-
-class PublicationBindingError(PortfolioError):
-    def __init__(self, message: str, *, renamed: bool) -> None:
-        super().__init__(message)
-        self.renamed = renamed
 
 
 class PhaseRunError(PortfolioError):
@@ -147,49 +152,29 @@ class PhaseRunError(PortfolioError):
         message: str,
         process_sha256: str | None,
         bindings: tuple[FileBinding, ...] = (),
+        integrity_failure: bool = False,
     ) -> None:
         super().__init__(message)
         self.process_sha256 = process_sha256
         self.bindings = bindings
+        self.integrity_failure = integrity_failure
 
 
 @dataclass(frozen=True)
-class FileBinding:
+class TraceSpec:
+    record: Mapping[str, object]
     path: Path
-    identity: tuple[int, int]
-    size_bytes: int
-    sha256: str
-    mode: int
-
-
-@dataclass(frozen=True)
-class PublicationFileBinding:
-    relative_path: str
-    identity: tuple[int, int]
-    mode: int
-    size_bytes: int
-    sha256: str
-
-
-@dataclass(frozen=True)
-class PublicationDirectoryBinding:
-    relative_path: str
-    identity: tuple[int, int]
-    mode: int
-
-
-@dataclass(frozen=True)
-class PublicationSnapshot:
-    files: tuple[PublicationFileBinding, ...]
-    directories: tuple[PublicationDirectoryBinding, ...]
 
 
 @dataclass(frozen=True)
 class TraceFacts:
     record: Mapping[str, object]
     binding: FileBinding
+    source_binding: FileBinding
     measured_requests: int
     measured_request_bytes: int
+    snapshot_mtime_ns: int
+    snapshot_ctime_ns: int
 
 
 @dataclass(frozen=True)
@@ -208,7 +193,7 @@ class Preflight:
     r0_binding: FileBinding
     r0_root: Path
     artifact_bindings: dict[str, FileBinding]
-    traces: tuple[TraceFacts, ...]
+    traces: tuple[TraceSpec, ...]
     evaluator_bindings: dict[str, FileBinding]
     output: Path
 
@@ -240,59 +225,13 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
-def _file_binding(path: Path, *, expected_mode: int | None = None) -> FileBinding:
-    raw_path = Path(path).absolute()
-    descriptor = os.open(raw_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    digest = hashlib.sha256()
-    size = 0
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise PortfolioError(f"expected a regular file: {raw_path}")
-        mode = stat.S_IMODE(before.st_mode)
-        if expected_mode is not None and mode != expected_mode:
-            raise PortfolioError(f"file mode binding mismatch: {raw_path.name}")
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-                size += len(block)
-        after = raw_path.stat(follow_symlinks=False)
-    except BaseException:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise
-    if (
-        stat.S_ISLNK(after.st_mode)
-        or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
-        or before.st_size != after.st_size
-        or before.st_mtime_ns != after.st_mtime_ns
-        or before.st_ctime_ns != after.st_ctime_ns
-        or size != before.st_size
-    ):
-        raise PortfolioError(f"file changed while hashing: {raw_path.name}")
-    return FileBinding(
-        raw_path.resolve(strict=True),
-        (before.st_dev, before.st_ino),
-        size,
-        digest.hexdigest(),
-        mode,
-    )
-
-
-def _revalidate_file(expected: FileBinding) -> None:
-    observed = _file_binding(expected.path, expected_mode=expected.mode)
-    if observed != expected:
-        raise PortfolioError(f"bound file changed: {expected.path.name}")
-
-
 def _require_process_output_inventory(path: Path) -> None:
     try:
         entries = set(os.listdir(path))
     except OSError as error:
-        raise PortfolioError("process output directory is unavailable") from error
+        raise BindingMutationError("process output directory is unavailable") from error
     if entries != {"stdout.raw", "stderr.raw"}:
-        raise PortfolioError("process output inventory mismatch")
+        raise BindingMutationError("process output inventory mismatch")
 
 
 def _exact_string(value: object, label: str) -> str:
@@ -314,9 +253,18 @@ def _hash(value: object, label: str, *, sha1: bool = False) -> str:
     return value
 
 
-def _strict_object(path: Path, hash_field: str) -> tuple[dict[str, object], FileBinding]:
-    binding = _file_binding(path)
-    value = load_object(binding.path)
+def _strict_object(
+    path: Path, hash_field: str
+) -> tuple[dict[str, object], FileBinding, bytes]:
+    bound = read_bound_json_object(path, max_bytes=64 * 1024 * 1024)
+    binding = FileBinding(
+        bound.path,
+        bound.identity,
+        bound.size_bytes,
+        bound.sha256,
+        bound.mode,
+    )
+    value = bound.value
     digest = value.get(hash_field)
     if (
         type(digest) is not str
@@ -325,10 +273,10 @@ def _strict_object(path: Path, hash_field: str) -> tuple[dict[str, object], File
     ):
         raise PortfolioError(f"{path.name} self-hash mismatch")
     _revalidate_file(binding)
-    return value, binding
+    return value, binding, bound.raw
 
 
-def _validate_trace_record(value: object, source_commit: str) -> TraceFacts:
+def _validate_trace_record(value: object, source_commit: str) -> TraceSpec:
     del source_commit
     if not isinstance(value, dict) or set(value) != _TRACE_KEYS:
         raise PortfolioError("task trace record keys mismatch")
@@ -377,89 +325,175 @@ def _validate_trace_record(value: object, source_commit: str) -> TraceFacts:
     ):
         raise PortfolioError("trace diagnostic self-hash mismatch")
     if (
-        diagnostics.get("trace_id") != value.get("trace_id")
+        diagnostics.get("schema_version") != 1
+        or diagnostics.get("trace_id") != value.get("trace_id")
         or diagnostics.get("request_count") != maximum
         or diagnostics.get("working_set_bytes") != working_set
+        or type(diagnostics.get("unique_object_count")) is not int
+        or diagnostics["unique_object_count"] <= 0
     ):
         raise PortfolioError("trace diagnostic facts mismatch")
     raw_path = Path(_exact_string(value.get("path"), "trace path"))
     if not raw_path.is_absolute():
         raise PortfolioError("trace path must be absolute")
-    binding = _file_binding(raw_path)
-    if binding.size_bytes != size_bytes or binding.sha256 != value.get("sha256"):
-        raise PortfolioError("trace byte binding mismatch")
     if size_bytes != maximum * _ORACLE.size:
         raise PortfolioError("trace size does not equal max_requests records")
-    raw = regular_bytes(binding.path)
-    first_timestamp: int | None = None
-    previous_timestamp: int | None = None
-    measured_requests = 0
-    measured_request_bytes = 0
-    objects: dict[int, tuple[int, int]] = {}
-    reuse_counts: dict[str, int] = {}
-    no_next_count = 0
-    start_request = int(value["start_request"])
-    for index, offset in enumerate(range(0, len(raw), _ORACLE.size)):
-        timestamp, object_id, object_size, next_access = _ORACLE.unpack_from(raw, offset)
-        if object_size <= 0:
-            raise PortfolioError("trace contains a nonpositive object size")
-        if previous_timestamp is not None and timestamp < previous_timestamp:
-            raise PortfolioError("trace timestamps are not monotonic")
-        if first_timestamp is None:
-            first_timestamp = timestamp
-        previous_timestamp = timestamp
-        count, first_size = objects.get(object_id, (0, object_size))
-        if first_size != object_size:
-            raise PortfolioError("trace changes an object's size inside a window")
-        objects[object_id] = (count + 1, first_size)
-        current_vtime = start_request + index + 1
-        if next_access in {-1, (1 << 63) - 1}:
-            no_next_count += 1
-        else:
-            if next_access <= current_vtime:
-                raise PortfolioError("trace contains a backward next-access vtime")
-            bucket = str((next_access - current_vtime).bit_length() - 1)
-            reuse_counts[bucket] = reuse_counts.get(bucket, 0) + 1
-        if timestamp - first_timestamp > warmup:
-            measured_requests += 1
-            measured_request_bytes += object_size
-    if measured_requests <= 0 or measured_request_bytes <= 0:
-        raise PortfolioError("trace warmup leaves no measured requests")
-    observed_working_set = sum(item[1] for item in objects.values())
-    one_hit = sum(item[0] == 1 for item in objects.values())
-    if (
-        len(objects) != diagnostics.get("unique_object_count")
-        or observed_working_set != working_set
-    ):
-        raise PortfolioError("trace working-set diagnostics do not match bytes")
     object_fraction = diagnostics.get("one_hit_object_fraction")
     request_fraction = diagnostics.get("one_hit_request_fraction")
     if (
         not isinstance(object_fraction, dict)
         or set(object_fraction) != {"numerator", "denominator"}
-        or object_fraction.get("numerator") != one_hit
-        or object_fraction.get("denominator") != len(objects)
+        or type(object_fraction.get("numerator")) is not int
+        or type(object_fraction.get("denominator")) is not int
+        or object_fraction["denominator"] != diagnostics.get("unique_object_count")
+        or not 0 <= object_fraction["numerator"] <= object_fraction["denominator"]
         or not isinstance(request_fraction, dict)
         or set(request_fraction) != {"numerator", "denominator"}
-        or request_fraction.get("numerator") != one_hit
+        or request_fraction.get("numerator") != object_fraction["numerator"]
         or request_fraction.get("denominator") != maximum
     ):
-        raise PortfolioError("trace one-hit diagnostics do not match bytes")
+        raise PortfolioError("trace one-hit diagnostics are invalid")
     reuse = diagnostics.get("reuse_distance")
     if (
         not isinstance(reuse, dict)
         or set(reuse) != {"bin_convention", "counts", "no_next_count"}
         or type(reuse.get("bin_convention")) is not str
         or not reuse["bin_convention"]
-        or reuse.get("counts") != {
-            key: reuse_counts[key]
-            for key in sorted(reuse_counts, key=int)
-        }
-        or reuse.get("no_next_count") != no_next_count
+        or not isinstance(reuse.get("counts"), dict)
+        or any(
+            re.fullmatch(r"0|[1-9][0-9]*", key) is None
+            or type(count) is not int
+            or count < 0
+            for key, count in reuse["counts"].items()
+        )
+        or type(reuse.get("no_next_count")) is not int
+        or reuse["no_next_count"] < 0
+        or sum(reuse["counts"].values()) + reuse["no_next_count"] != maximum
     ):
-        raise PortfolioError("trace reuse-distance diagnostics do not match bytes")
-    _revalidate_file(binding)
-    return TraceFacts(value, binding, measured_requests, measured_request_bytes)
+        raise PortfolioError("trace reuse-distance diagnostics are invalid")
+    return TraceSpec(value, raw_path)
+
+
+def _snapshot_trace(stage: Path, index: int, trace: TraceSpec) -> TraceFacts:
+    snapshot_root = stage / "trace-snapshots"
+    snapshot_root.mkdir(mode=0o700, exist_ok=True)
+    destination = snapshot_root / f"{index:04d}.oracleGeneral"
+    source_descriptor = os.open(
+        trace.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    output_descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o400,
+    )
+    digest = hashlib.sha256()
+    size = 0
+    buffer = b""
+    request_count = 0
+    measured_requests = 0
+    measured_request_bytes = 0
+    first_timestamp: int | None = None
+    previous_timestamp: int | None = None
+    try:
+        before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise PortfolioError("trace source is not a regular file")
+        with os.fdopen(source_descriptor, "rb") as source_stream, os.fdopen(
+            output_descriptor, "wb"
+        ) as output_stream:
+            source_descriptor = -1
+            output_descriptor = -1
+            for block in iter(lambda: source_stream.read(1024 * 1024), b""):
+                digest.update(block)
+                size += len(block)
+                output_stream.write(block)
+                buffer += block
+                complete = len(buffer) // _ORACLE.size * _ORACLE.size
+                for offset in range(0, complete, _ORACLE.size):
+                    timestamp, _object_id, object_size, _next_access = _ORACLE.unpack_from(
+                        buffer, offset
+                    )
+                    if object_size <= 0:
+                        raise PortfolioError("trace contains a nonpositive object size")
+                    if previous_timestamp is not None and timestamp < previous_timestamp:
+                        raise PortfolioError("trace timestamps are not monotonic")
+                    if first_timestamp is None:
+                        first_timestamp = timestamp
+                    previous_timestamp = timestamp
+                    if timestamp - first_timestamp > int(
+                        trace.record["warmup_seconds"]
+                    ):
+                        measured_requests += 1
+                        measured_request_bytes += object_size
+                    request_count += 1
+                buffer = buffer[complete:]
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+            after_descriptor = source_stream.fileno()
+            after = os.fstat(after_descriptor)
+        path_after = trace.path.stat(follow_symlinks=False)
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        if output_descriptor >= 0:
+            os.close(output_descriptor)
+    expected_size = int(trace.record["size_bytes"])
+    expected_requests = int(trace.record["max_requests"])
+    if (
+        buffer
+        or size != expected_size
+        or request_count != expected_requests
+        or digest.hexdigest() != trace.record["sha256"]
+    ):
+        raise PortfolioError("trace snapshot bytes do not match the frozen manifest")
+    if (
+        stat.S_ISLNK(path_after.st_mode)
+        or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        or (before.st_dev, before.st_ino)
+        != (path_after.st_dev, path_after.st_ino)
+        or before.st_size != after.st_size
+        or before.st_size != path_after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_mtime_ns != path_after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+        or before.st_ctime_ns != path_after.st_ctime_ns
+    ):
+        raise PortfolioError("trace source binding changed during snapshot")
+    if measured_requests <= 0 or measured_request_bytes <= 0:
+        raise PortfolioError("trace warmup leaves no measured requests")
+    destination.chmod(0o400)
+    snapshot_binding = _file_binding(destination, expected_mode=0o400)
+    snapshot_metadata = destination.stat(follow_symlinks=False)
+    source_binding = FileBinding(
+        trace.path.resolve(strict=True),
+        (before.st_dev, before.st_ino),
+        before.st_size,
+        digest.hexdigest(),
+        stat.S_IMODE(before.st_mode),
+    )
+    return TraceFacts(
+        trace.record,
+        snapshot_binding,
+        source_binding,
+        measured_requests,
+        measured_request_bytes,
+        snapshot_metadata.st_mtime_ns,
+        snapshot_metadata.st_ctime_ns,
+    )
+
+
+def _revalidate_trace_snapshot(trace: TraceFacts) -> None:
+    metadata = trace.binding.path.stat(follow_symlinks=False)
+    if (
+        trace.binding.path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != trace.binding.identity
+        or metadata.st_size != trace.binding.size_bytes
+        or stat.S_IMODE(metadata.st_mode) != trace.binding.mode
+        or metadata.st_mtime_ns != trace.snapshot_mtime_ns
+        or metadata.st_ctime_ns != trace.snapshot_ctime_ns
+    ):
+        raise BindingMutationError("private trace snapshot binding changed")
 
 
 def _artifact_binding(
@@ -506,7 +540,7 @@ def _validate_r0(
     candidate: str,
     policy: str,
 ) -> tuple[dict[str, object], FileBinding, Path, dict[str, FileBinding]]:
-    receipt, binding = _strict_object(path, "receipt_sha256")
+    receipt, binding, _receipt_raw = _strict_object(path, "receipt_sha256")
     if set(receipt) != _R0_KEYS:
         raise PortfolioError("R0 receipt keys mismatch")
     if (
@@ -716,7 +750,9 @@ def _preflight(
     if raw_task_root.is_symlink() or not stat.S_ISDIR(task_metadata.st_mode):
         raise PortfolioError("task_root must be a real directory")
     resolved_task_root = raw_task_root.resolve(strict=True)
-    manifest, manifest_binding = _strict_object(task_manifest, "manifest_sha256")
+    manifest, manifest_binding, manifest_raw = _strict_object(
+        task_manifest, "manifest_sha256"
+    )
     if set(manifest) != _MANIFEST_KEYS:
         raise PortfolioError("task manifest keys mismatch")
     if resolved_task_root not in manifest_binding.path.parents:
@@ -724,7 +760,9 @@ def _preflight(
     if manifest.get("schema_version") != 1 or manifest.get("source_commit") != SOURCE_LOCK.get("commit"):
         raise PortfolioError("task manifest source binding mismatch")
     _hash(manifest.get("r3_commitment_sha256"), "R3 commitment")
-    decimal_manifest = load_candidate_object(manifest_binding.path)
+    decimal_manifest = _strict_parse_json_bytes(
+        manifest_raw, decimal_numbers=True
+    )
     _revalidate_file(manifest_binding)
     fractions = decimal_manifest.get("cache_fractions")
     if not isinstance(fractions, list) or tuple(fractions) != _FRACTIONS:
@@ -750,7 +788,13 @@ def _preflight(
     from .evaluate import _source_receipt
 
     source = _source_receipt(Path(source_receipt), SOURCE_LOCK)
-    source_binding = _file_binding(Path(str(source["_resolved_path"])))
+    source_binding = FileBinding(
+        Path(str(source["_resolved_path"])),
+        tuple(source["_file_identity"]),  # type: ignore[arg-type]
+        int(source["_file_size_bytes"]),
+        str(source["_file_sha256"]),
+        int(source["_file_mode"]),
+    )
     if source_binding.sha256 != source.get("_file_sha256"):
         raise PortfolioError("source receipt file binding mismatch")
     r0, r0_binding, r0_root, artifacts = _validate_r0(
@@ -766,7 +810,7 @@ def _preflight(
         raise PortfolioError("portfolio output must be outside task_root")
     if _paths_overlap(final, r0_root):
         raise PortfolioError("portfolio output must be outside the R0 evidence root")
-    if any(_paths_overlap(final, item.binding.path) for item in traces):
+    if any(_paths_overlap(final, item.path) for item in traces):
         raise PortfolioError("portfolio output must not overlap trace inputs")
     evaluator = _evaluator_bindings()
     return Preflight(
@@ -791,20 +835,25 @@ def _preflight(
 
 
 def _revalidate_preflight(preflight: Preflight, execution: FileBinding | None) -> None:
-    revalidate_checkout(preflight.checkout, preflight.checkout_binding)
-    _revalidate_file(preflight.manifest_binding)
-    _revalidate_file(preflight.source_binding)
-    _revalidate_file(preflight.r0_binding)
-    for binding in preflight.artifact_bindings.values():
-        _revalidate_file(binding)
-    for binding in preflight.evaluator_bindings.values():
-        _revalidate_file(binding)
-    for trace in preflight.traces:
-        _revalidate_file(trace.binding)
-    if execution is not None:
-        _revalidate_file(execution)
-        if execution.sha256 != preflight.artifact_bindings["release_cachesim"].sha256:
-            raise PortfolioError("execution copy differs from the R0 binary snapshot")
+    try:
+        revalidate_checkout(preflight.checkout, preflight.checkout_binding)
+        _revalidate_file(preflight.manifest_binding)
+        _revalidate_file(preflight.source_binding)
+        _revalidate_file(preflight.r0_binding)
+        for binding in preflight.artifact_bindings.values():
+            _revalidate_file(binding)
+        for binding in preflight.evaluator_bindings.values():
+            _revalidate_file(binding)
+        if execution is not None:
+            _revalidate_file(execution)
+            if execution.sha256 != preflight.artifact_bindings["release_cachesim"].sha256:
+                raise BindingMutationError(
+                    "execution copy differs from the R0 binary snapshot"
+                )
+    except BindingMutationError:
+        raise
+    except (OSError, ValueError) as error:
+        raise BindingMutationError(_bounded(error)) from error
 
 
 def _copy_execution(stage: Path, source: FileBinding) -> FileBinding:
@@ -852,79 +901,6 @@ def _write_raw(path: Path, raw: bytes, mode: int) -> FileBinding:
     return _file_binding(path, expected_mode=mode)
 
 
-def _write_owned_record(
-    path: Path, value: dict[str, object], hash_field: str
-) -> FileBinding:
-    if os.path.lexists(path):
-        raise RecordCollision(path)
-    try:
-        receipt = write_new_record(path, value, hash_field)
-    except (OSError, ValueError) as error:
-        if os.path.lexists(path):
-            raise RecordCollision(path) from error
-        raise
-    if not isinstance(receipt, NewRecordReceipt):
-        raise PortfolioError("record publisher did not return an ownership receipt")
-    try:
-        observed = _file_binding(path, expected_mode=receipt.mode)
-    except (OSError, ValueError) as error:
-        if os.path.lexists(path):
-            raise RecordCollision(path) from error
-        raise PortfolioError("published record disappeared before binding") from error
-    if (
-        observed.identity != receipt.identity
-        or observed.size_bytes != receipt.size_bytes
-        or observed.sha256 != receipt.sha256
-    ):
-        raise RecordCollision(path)
-    return observed
-
-
-def _revalidate_owned_record(
-    path: Path, receipt: NewRecordReceipt, label: str
-) -> None:
-    try:
-        observed = _file_binding(path, expected_mode=receipt.mode)
-    except (OSError, ValueError) as error:
-        if os.path.lexists(path):
-            raise RecordCollision(path) from error
-        raise PortfolioError(f"{label} disappeared before publication") from error
-    if (
-        observed.identity != receipt.identity
-        or observed.size_bytes != receipt.size_bytes
-        or observed.sha256 != receipt.sha256
-    ):
-        raise RecordCollision(path)
-
-
-def _write_failure_record(
-    stage: Path,
-    preferred: Path,
-    failure: dict[str, object],
-) -> tuple[Path, FileBinding, dict[str, object]]:
-    try:
-        binding = _write_owned_record(preferred, failure, "failure_sha256")
-        return preferred, binding, failure
-    except RecordCollision:
-        fallback_failure = {
-            key: item for key, item in failure.items() if key != "failure_sha256"
-        }
-        fallback_failure["record_collision"] = {
-            "path": str(preferred.relative_to(stage)),
-            "state": "foreign_preserved",
-        }
-        for _attempt in range(16):
-            path = stage / f"failure-{secrets.token_hex(16)}.json"
-            try:
-                binding = _write_owned_record(
-                    path, fallback_failure, "failure_sha256"
-                )
-                return path, binding, fallback_failure
-            except RecordCollision:
-                continue
-        raise PortfolioError("cannot allocate a private failure receipt")
-
-
 def _compiler_binding(path: Path) -> FileBinding:
     raw = Path(path)
     if not raw.is_absolute():
@@ -940,9 +916,9 @@ def _revalidate_compiler(path: Path, binding: FileBinding) -> None:
     try:
         resolved = path.resolve(strict=True)
     except OSError as error:
-        raise PortfolioError("compiler path changed") from error
+        raise BindingMutationError("compiler path changed") from error
     if resolved != binding.path:
-        raise PortfolioError("compiler path binding changed")
+        raise BindingMutationError("compiler path binding changed")
     _revalidate_file(binding)
 
 
@@ -1063,18 +1039,22 @@ def _phase_record(
     parsed_object_miss_ratio: Decimal,
     parsed_byte_miss_ratio: Decimal,
     apparatus: PhaseApparatus,
+    fixed_time_interposer: Path,
     run: Run,
     guard: Callable[[], None],
 ) -> PhaseRecordEvidence:
-    argv = [
-        str(apparatus.binary.path),
-        str(trace.binding.path),
-        policy,
-        str(cell["cache_size_bytes"]),
-        str(trace.record["max_requests"]),
-        str(trace.record["warmup_seconds"]),
-        str(trace.measured_requests),
-    ]
+    argv = fixed_time_run_argv(
+        fixed_time_interposer,
+        [
+            str(apparatus.binary.path),
+            str(trace.binding.path),
+            policy,
+            str(cell["cache_size_bytes"]),
+            str(trace.record["max_requests"]),
+            str(trace.record["warmup_seconds"]),
+            str(trace.measured_requests),
+        ],
+    )
     guard()
     _revalidate_file(apparatus.source)
     _revalidate_file(apparatus.binary)
@@ -1136,7 +1116,10 @@ def _phase_record(
             else None
         )
         raise PhaseRunError(
-            _bounded(error), process_sha256, tuple(owned_bindings)
+            _bounded(error),
+            process_sha256,
+            tuple(owned_bindings),
+            integrity_failure=isinstance(error, PortfolioIntegrityError),
         ) from error
     if result.returncode != 0:
         raise PhaseRunError(
@@ -1185,12 +1168,13 @@ def _phase_record(
             _bounded(error),
             str(process["process_sha256"]),
             tuple(owned_bindings),
+            integrity_failure=True,
         ) from error
     owned_bindings.append(phase_binding)
     return PhaseRecordEvidence(record, tuple(owned_bindings))
 
 
-def _selected_traces(rung: str, traces: Sequence[TraceFacts]) -> tuple[TraceFacts, ...]:
+def _selected_traces(rung: str, traces: Sequence[TraceSpec]) -> tuple[TraceSpec, ...]:
     if rung == "r1":
         dev = tuple(item for item in traces if item.record["split"] == "dev")
         if len(dev) < 3:
@@ -1223,130 +1207,6 @@ def _write_request(path: Path, request: dict[str, object]) -> FileBinding:
     return _write_owned_record(path, request, "request_sha256")
 
 
-def _retain_side_effect(
-    source: Path, destination: Path, expected_raw: bytes
-) -> FileBinding:
-    source_binding = _file_binding(source)
-    if regular_bytes(source) != expected_raw:
-        raise PortfolioError("simulator side-effect output differs from stdout")
-    try:
-        os.link(source, destination, follow_symlinks=False)
-    except FileExistsError as error:
-        raise PortfolioError("refusing to replace simulator side-effect evidence") from error
-    destination_binding = _file_binding(destination)
-    if destination_binding != FileBinding(
-        destination_binding.path,
-        source_binding.identity,
-        source_binding.size_bytes,
-        source_binding.sha256,
-        source_binding.mode,
-    ):
-        raise PortfolioError("simulator side-effect publication binding mismatch")
-    directory = os.open(
-        source.parent,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-    )
-    try:
-        quarantine_unlink(
-            directory,
-            source.name,
-            source_binding.identity,
-            sha256=source_binding.sha256,
-        )
-    finally:
-        os.close(directory)
-    _revalidate_file(destination_binding)
-    return destination_binding
-
-
-def _process_record(
-    result: ChildResult,
-    *,
-    stage: Path,
-    label: str,
-    timeout_seconds: float,
-    max_output_bytes: int,
-) -> dict[str, object]:
-    stdout = regular_bytes(result.stdout_path)
-    stderr = regular_bytes(result.stderr_path)
-    if (
-        result.stdout_path != result.stderr_path.parent / "stdout.raw"
-        or result.stderr_path.name != "stderr.raw"
-        or len(stdout) != result.stdout_bytes
-        or len(stderr) != result.stderr_bytes
-        or hashlib.sha256(stdout).hexdigest() != result.stdout_sha256
-        or hashlib.sha256(stderr).hexdigest() != result.stderr_sha256
-    ):
-        raise PortfolioError("child process raw evidence receipt mismatch")
-    return {
-        "label": label,
-        "argv": list(result.argv),
-        "timeout_seconds": timeout_seconds,
-        "max_output_bytes": max_output_bytes,
-        "returncode": result.returncode,
-        "wall_ns": result.wall_ns,
-        "cpu_ns": result.cpu_ns,
-        "stdout": {
-            "path": str(result.stdout_path.relative_to(stage)),
-            "size_bytes": result.stdout_bytes,
-            "sha256": result.stdout_sha256,
-            "identity": {
-                "device": regular_identity(result.stdout_path)[0],
-                "inode": regular_identity(result.stdout_path)[1],
-            },
-        },
-        "stderr": {
-            "path": str(result.stderr_path.relative_to(stage)),
-            "size_bytes": result.stderr_bytes,
-            "sha256": result.stderr_sha256,
-            "identity": {
-                "device": regular_identity(result.stderr_path)[0],
-                "inode": regular_identity(result.stderr_path)[1],
-            },
-        },
-    }
-
-
-def _failed_process_record(
-    *,
-    label: str,
-    argv: Sequence[str],
-    result: ChildResult | None,
-    error: BaseException,
-    timeout_seconds: float,
-    max_output_bytes: int,
-) -> dict[str, object]:
-    def raw_record(path: Path | None) -> dict[str, object]:
-        if path is None:
-            return {"path": None, "size_bytes": None, "sha256": None}
-        try:
-            binding = _file_binding(path)
-        except (OSError, ValueError):
-            return {"path": str(path), "size_bytes": None, "sha256": None}
-        return {
-            "path": str(path),
-            "size_bytes": binding.size_bytes,
-            "sha256": binding.sha256,
-            "identity": {
-                "device": binding.identity[0],
-                "inode": binding.identity[1],
-            },
-        }
-
-    return {
-        "label": label,
-        "argv": list(argv),
-        "timeout_seconds": timeout_seconds,
-        "max_output_bytes": max_output_bytes,
-        "returncode": result.returncode if result is not None else None,
-        "wall_ns": result.wall_ns if result is not None else None,
-        "cpu_ns": result.cpu_ns if result is not None else None,
-        "error": _bounded(error),
-        "stdout": raw_record(result.stdout_path if result is not None else None),
-        "stderr": raw_record(result.stderr_path if result is not None else None),
-    }
-
-
 def _assert_no_forbidden_keys(value: object) -> None:
     if isinstance(value, dict):
         forbidden = set(value) & _FORBIDDEN_KEYS
@@ -1357,233 +1217,6 @@ def _assert_no_forbidden_keys(value: object) -> None:
     elif isinstance(value, list):
         for item in value:
             _assert_no_forbidden_keys(item)
-
-
-def _inventory(stage: Path) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
-    for path in sorted(stage.rglob("*")):
-        relative = path.relative_to(stage).as_posix()
-        metadata = path.lstat()
-        if stat.S_ISDIR(metadata.st_mode):
-            continue
-        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-            raise PortfolioError(f"unexpected non-regular evidence entry: {relative}")
-        if relative == "receipt.json":
-            continue
-        binding = _file_binding(path)
-        records.append(
-            {
-                "path": relative,
-                "identity": {
-                    "device": binding.identity[0],
-                    "inode": binding.identity[1],
-                },
-                "mode": binding.mode,
-                "size_bytes": binding.size_bytes,
-                "sha256": binding.sha256,
-            }
-        )
-    return records
-
-
-def _inventory_record(stage: Path, binding: FileBinding) -> dict[str, object]:
-    return {
-        "path": binding.path.relative_to(stage).as_posix(),
-        "identity": {
-            "device": binding.identity[0],
-            "inode": binding.identity[1],
-        },
-        "mode": binding.mode,
-        "size_bytes": binding.size_bytes,
-        "sha256": binding.sha256,
-    }
-
-
-def _tree_bindings(root: Path) -> list[FileBinding]:
-    bindings: list[FileBinding] = []
-    for path in sorted(root.rglob("*")):
-        metadata = path.lstat()
-        if stat.S_ISDIR(metadata.st_mode):
-            continue
-        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-            raise PortfolioError("retained evidence contains a non-regular entry")
-        bindings.append(_file_binding(path))
-    return bindings
-
-
-def _verify_publication(stage: Path, receipt: dict[str, object]) -> None:
-    if _inventory(stage) != receipt["evidence_inventory"]:
-        raise PortfolioError("portfolio evidence inventory changed before publication")
-    observed = load_object(stage / "receipt.json")
-    if observed != receipt or receipt.get("receipt_sha256") != record_sha256(
-        receipt, "receipt_sha256"
-    ):
-        raise PortfolioError("portfolio root receipt changed before publication")
-
-
-def _publication_snapshot(
-    stage: Path,
-    stage_identity: tuple[int, int],
-    inventory: Sequence[Mapping[str, object]],
-    root_receipt: NewRecordReceipt,
-) -> PublicationSnapshot:
-    files: list[PublicationFileBinding] = []
-    for item in inventory:
-        if set(item) != {"path", "identity", "mode", "size_bytes", "sha256"}:
-            raise PortfolioError("publication inventory record is invalid")
-        relative = item.get("path")
-        identity = item.get("identity")
-        if (
-            type(relative) is not str
-            or not isinstance(identity, dict)
-            or set(identity) != {"device", "inode"}
-            or type(identity.get("device")) is not int
-            or type(identity.get("inode")) is not int
-            or type(item.get("mode")) is not int
-            or type(item.get("size_bytes")) is not int
-            or type(item.get("sha256")) is not str
-            or HEX64.fullmatch(str(item["sha256"])) is None
-        ):
-            raise PortfolioError("publication inventory binding is invalid")
-        pure = PurePosixPath(relative)
-        if pure.is_absolute() or ".." in pure.parts or relative == "receipt.json":
-            raise PortfolioError("publication inventory path is invalid")
-        files.append(
-            PublicationFileBinding(
-                relative,
-                (int(identity["device"]), int(identity["inode"])),
-                int(item["mode"]),
-                int(item["size_bytes"]),
-                str(item["sha256"]),
-            )
-        )
-    files.append(
-        PublicationFileBinding(
-            "receipt.json",
-            root_receipt.identity,
-            root_receipt.mode,
-            root_receipt.size_bytes,
-            root_receipt.sha256,
-        )
-    )
-    if len({item.relative_path for item in files}) != len(files):
-        raise PortfolioError("publication inventory contains duplicate files")
-
-    root_metadata = stage.lstat()
-    if (
-        stage.is_symlink()
-        or not stat.S_ISDIR(root_metadata.st_mode)
-        or (root_metadata.st_dev, root_metadata.st_ino) != stage_identity
-    ):
-        raise PortfolioError("publication root directory binding changed")
-    directories = [
-        PublicationDirectoryBinding(
-            ".",
-            stage_identity,
-            stat.S_IMODE(root_metadata.st_mode),
-        )
-    ]
-    for path in sorted(stage.rglob("*")):
-        metadata = path.lstat()
-        if stat.S_ISLNK(metadata.st_mode):
-            raise PortfolioError("publication contains a symlink")
-        if stat.S_ISDIR(metadata.st_mode):
-            directories.append(
-                PublicationDirectoryBinding(
-                    path.relative_to(stage).as_posix(),
-                    (metadata.st_dev, metadata.st_ino),
-                    stat.S_IMODE(metadata.st_mode),
-                )
-            )
-    return PublicationSnapshot(
-        tuple(sorted(files, key=lambda item: item.relative_path)),
-        tuple(sorted(directories, key=lambda item: item.relative_path)),
-    )
-
-
-def _revalidate_publication_snapshot(
-    root: Path, snapshot: PublicationSnapshot
-) -> None:
-    observed_files: set[str] = set()
-    observed_directories = {"."}
-    root_metadata = root.lstat()
-    if root.is_symlink() or not stat.S_ISDIR(root_metadata.st_mode):
-        raise PortfolioError("publication root is not a real directory")
-    for path in sorted(root.rglob("*")):
-        metadata = path.lstat()
-        relative = path.relative_to(root).as_posix()
-        if stat.S_ISLNK(metadata.st_mode):
-            raise PortfolioError("publication gained a symlink")
-        if stat.S_ISDIR(metadata.st_mode):
-            observed_directories.add(relative)
-        elif stat.S_ISREG(metadata.st_mode):
-            observed_files.add(relative)
-        else:
-            raise PortfolioError("publication gained a non-regular entry")
-    if observed_files != {item.relative_path for item in snapshot.files}:
-        raise PortfolioError("publication file inventory changed")
-    if observed_directories != {
-        item.relative_path for item in snapshot.directories
-    }:
-        raise PortfolioError("publication directory inventory changed")
-    for expected in snapshot.files:
-        observed = _file_binding(
-            root.joinpath(*PurePosixPath(expected.relative_path).parts),
-            expected_mode=expected.mode,
-        )
-        if (
-            observed.identity != expected.identity
-            or observed.size_bytes != expected.size_bytes
-            or observed.sha256 != expected.sha256
-        ):
-            raise PortfolioError(
-                f"publication file binding changed: {expected.relative_path}"
-            )
-    for expected in snapshot.directories:
-        path = root if expected.relative_path == "." else root.joinpath(
-            *PurePosixPath(expected.relative_path).parts
-        )
-        metadata = path.lstat()
-        if (
-            path.is_symlink()
-            or not stat.S_ISDIR(metadata.st_mode)
-            or (metadata.st_dev, metadata.st_ino) != expected.identity
-            or stat.S_IMODE(metadata.st_mode) != expected.mode
-        ):
-            raise PortfolioError(
-                f"publication directory binding changed: {expected.relative_path}"
-            )
-
-
-def _publish_and_verify(
-    *,
-    stage: Path,
-    stage_identity: tuple[int, int],
-    output: Path,
-    receipt: dict[str, object],
-    inventory: Sequence[Mapping[str, object]],
-    root_receipt: NewRecordReceipt,
-) -> None:
-    renamed = False
-    try:
-        _verify_publication(stage, receipt)
-        _revalidate_owned_record(stage / "receipt.json", root_receipt, "root receipt")
-        snapshot = _publication_snapshot(
-            stage, stage_identity, inventory, root_receipt
-        )
-        _revalidate_publication_snapshot(stage, snapshot)
-        publish_stage(stage, stage_identity, output)
-        renamed = True
-        _revalidate_publication_snapshot(output, snapshot)
-        _revalidate_owned_record(
-            output / "receipt.json", root_receipt, "published root receipt"
-        )
-        _revalidate_publication_snapshot(output, snapshot)
-    except (OSError, ValueError) as error:
-        raise PublicationBindingError(
-            f"publication binding verification failed: {_bounded(error)}",
-            renamed=renamed,
-        ) from error
 
 
 def _publish_preflight_failure(
@@ -1609,7 +1242,8 @@ def _publish_preflight_failure(
         r0_path = Path(r0_receipt).resolve(strict=True)
         if _paths_overlap(final, r0_path.parent):
             return
-        stage, stage_identity = stage_directory(final)
+        output_parent = retain_output_parent(final)
+        stage, stage_identity = stage_directory_in_parent(output_parent)
     except (OSError, ValueError):
         return
     published = False
@@ -1618,6 +1252,7 @@ def _publish_preflight_failure(
         failure: dict[str, object] = {
             "schema_version": 1,
             "kind": "preflight_failure",
+            "state": "preflight_failure",
             "error": _bounded(error),
         }
         failures = stage / "failures"
@@ -1661,6 +1296,7 @@ def _publish_preflight_failure(
             )
         try:
             _publish_and_verify(
+                parent=output_parent,
                 stage=stage,
                 stage_identity=stage_identity,
                 output=final,
@@ -1673,8 +1309,11 @@ def _publish_preflight_failure(
             raise
         published = True
     finally:
-        if not published and not preserve_stage and os.path.lexists(stage):
-            cleanup_owned(stage, stage_identity)
+        try:
+            if not published and not preserve_stage and os.path.lexists(stage):
+                cleanup_owned(stage, stage_identity)
+        finally:
+            os.close(output_parent.descriptor)
 
 
 def evaluate_portfolio(
@@ -1734,13 +1373,21 @@ def evaluate_portfolio(
             (item, fraction) for item in selected_traces for fraction in _FRACTIONS
         )
     ]
-    stage, stage_identity = stage_directory(preflight.output)
+    output_parent = retain_output_parent(preflight.output)
+    stage, stage_identity = stage_directory_in_parent(output_parent)
     published = False
     preserve_stage = False
     try:
+        selected_traces = tuple(
+            _snapshot_trace(stage, index, trace)
+            for index, trace in enumerate(selected_traces)
+        )
         execution = _copy_execution(
             stage, preflight.artifact_bindings["release_cachesim"]
         )
+        fixed_time_interposer = preflight.artifact_bindings[
+            "validated_fixed_time_interposer_binary"
+        ].path
         _revalidate_preflight(preflight, execution)
         measurements: list[dict[str, object]] = []
         failures: list[dict[str, object]] = []
@@ -1757,26 +1404,28 @@ def evaluate_portfolio(
                 )
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                 phase_compile_failed = True
-                compile_integrity_failure = (
-                    isinstance(error, RecordCollision)
-                    or "collision" in str(error).lower()
-                    or "binding" in str(error).lower()
-                    or "changed" in str(error).lower()
-                    or "mismatch" in str(error).lower()
-                    or "differs" in str(error).lower()
+                compile_integrity_failure = isinstance(
+                    error, PortfolioIntegrityError
                 )
                 if compile_integrity_failure:
                     provenance_intact = False
                 process_path = stage / "phase-compile-process/process.json"
                 process = (
-                    load_object(process_path)
+                    read_bound_json_object(
+                        process_path, max_bytes=4 * 1024 * 1024
+                    ).value
                     if process_path.exists() and not isinstance(error, RecordCollision)
                     else None
                 )
                 failure = {
                     "schema_version": 1,
                     "kind": (
-                        "binding_failure"
+                        "integrity_failure"
+                        if compile_integrity_failure
+                        else "process_failure"
+                    ),
+                    "state": (
+                        "integrity_failure"
                         if compile_integrity_failure
                         else "process_failure"
                     ),
@@ -1814,6 +1463,8 @@ def evaluate_portfolio(
 
         def guard() -> None:
             _revalidate_preflight(preflight, execution)
+            for trace in selected_traces:
+                _revalidate_trace_snapshot(trace)
             if phase_apparatus is not None:
                 _revalidate_compiler(
                     phase_apparatus.compiler_path, phase_apparatus.compiler
@@ -1850,19 +1501,22 @@ def evaluate_portfolio(
             cell_directory = stage / "measurements" / f"{cell['index']:04d}"
             private_side_effect = side_effect_root / f"{cell['index']:04d}.cachesim"
             retained_side_effect = cell_directory / "simulator.cachesim"
-            argv = [
-                str(execution.path),
-                str(trace.binding.path),
-                "oracleGeneral",
-                policy,
-                str(cell["cache_size_bytes"]),
-                "--num-thread=1",
-                f"--num-req={trace.record['max_requests']}",
-                f"--warmup-sec={trace.record['warmup_seconds']}",
-                "--consider-obj-metadata=true",
-                "--print-head-req=false",
-                f"--output={private_side_effect}",
-            ]
+            argv = fixed_time_run_argv(
+                fixed_time_interposer,
+                [
+                    str(execution.path),
+                    str(trace.binding.path),
+                    "oracleGeneral",
+                    policy,
+                    str(cell["cache_size_bytes"]),
+                    "--num-thread=1",
+                    f"--num-req={trace.record['max_requests']}",
+                    f"--warmup-sec={trace.record['warmup_seconds']}",
+                    "--consider-obj-metadata=true",
+                    "--print-head-req=false",
+                    f"--output={private_side_effect}",
+                ],
+            )
             request: dict[str, object] = {
                 "schema_version": 1,
                 "rung": rung,
@@ -1933,6 +1587,7 @@ def evaluate_portfolio(
                         "schema_version": 1,
                         "cell_index": cell["index"],
                         "kind": "process_failure",
+                        "state": "process_failure",
                         "process_sha256": process["process_sha256"],
                         "returncode": result.returncode,
                     }
@@ -1955,7 +1610,7 @@ def evaluate_portfolio(
                     )
                     guard()
                     if not retain_owned(current_owned):
-                        raise PortfolioError(
+                        raise BindingMutationError(
                             "current-cell owned evidence changed before retention"
                         )
                     continue
@@ -1966,7 +1621,7 @@ def evaluate_portfolio(
                 except (UnicodeError, ValueError) as error:
                     raise PortfolioError(_bounded(error)) from error
                 if parsed.request_count != trace.measured_requests:
-                    raise PortfolioError(
+                    raise BindingMutationError(
                         "simulator request count does not match the warmup convention"
                     )
                 guard()
@@ -1980,6 +1635,7 @@ def evaluate_portfolio(
                         parsed_object_miss_ratio=parsed.object_miss_ratio,
                         parsed_byte_miss_ratio=parsed.byte_miss_ratio,
                         apparatus=phase_apparatus,
+                        fixed_time_interposer=fixed_time_interposer,
                         run=run,
                         guard=guard,
                     )
@@ -2049,7 +1705,7 @@ def evaluate_portfolio(
                 )
                 current_owned.append(measurement_binding)
                 if not retain_owned(current_owned):
-                    raise PortfolioError(
+                    raise BindingMutationError(
                         "current-cell owned evidence changed before retention"
                     )
                 measurements.append(
@@ -2099,18 +1755,22 @@ def evaluate_portfolio(
                         collision = record_error
                 integrity_failure = (
                     collision is not None
-                    or isinstance(error, RecordCollision)
+                    or isinstance(error, PortfolioIntegrityError)
+                    or (
+                        isinstance(error, PhaseRunError)
+                        and error.integrity_failure
+                    )
                     or not attempted
-                    or "collision" in str(error).lower()
-                    or "binding" in str(error).lower()
-                    or "changed" in str(error).lower()
-                    or "mismatch" in str(error).lower()
-                    or "differs" in str(error).lower()
                 )
                 failure = {
                     "schema_version": 1,
                     "cell_index": cell["index"],
-                    "kind": "binding_failure" if integrity_failure else "launch_failure",
+                    "kind": (
+                        "integrity_failure" if integrity_failure else "launch_failure"
+                    ),
+                    "state": (
+                        "integrity_failure" if integrity_failure else "launch_failure"
+                    ),
                     "error": _bounded(collision or error),
                 }
                 if isinstance(error, PhaseRunError):
@@ -2234,6 +1894,26 @@ def evaluate_portfolio(
                 if rung == "r2"
                 else []
             ),
+            "trace_snapshots": [
+                {
+                    "trace_id": trace.record["trace_id"],
+                    "source_path": str(trace.source_binding.path),
+                    "source_identity": {
+                        "device": trace.source_binding.identity[0],
+                        "inode": trace.source_binding.identity[1],
+                    },
+                    "source_size_bytes": trace.source_binding.size_bytes,
+                    "source_sha256": trace.source_binding.sha256,
+                    "snapshot_path": str(trace.binding.path.relative_to(stage)),
+                    "snapshot_identity": {
+                        "device": trace.binding.identity[0],
+                        "inode": trace.binding.identity[1],
+                    },
+                    "snapshot_size_bytes": trace.binding.size_bytes,
+                    "snapshot_sha256": trace.binding.sha256,
+                }
+                for trace in selected_traces
+            ],
             "evaluator": {
                 name: binding.sha256
                 for name, binding in sorted(preflight.evaluator_bindings.items())
@@ -2265,6 +1945,7 @@ def evaluate_portfolio(
             guard()
         try:
             _publish_and_verify(
+                parent=output_parent,
                 stage=stage,
                 stage_identity=stage_identity,
                 output=preflight.output,
@@ -2278,5 +1959,8 @@ def evaluate_portfolio(
         published = True
         return receipt
     finally:
-        if not published and not preserve_stage and os.path.lexists(stage):
-            cleanup_owned(stage, stage_identity)
+        try:
+            if not published and not preserve_stage and os.path.lexists(stage):
+                cleanup_owned(stage, stage_identity)
+        finally:
+            os.close(output_parent.descriptor)

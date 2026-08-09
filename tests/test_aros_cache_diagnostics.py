@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import struct
 import subprocess
 from dataclasses import FrozenInstanceError
@@ -15,6 +16,13 @@ from commissioning.cache_campaign.diagnostics import (
     parse_phase_probe_output,
     phase_probe_source,
 )
+from commissioning.cache_campaign.cachesim import parse_cachesim_output
+from commissioning.cache_campaign.r0_probes import (
+    fixed_time_compile_argv,
+    fixed_time_interposer_source,
+    fixed_time_run_argv,
+    probe_build_flags,
+)
 
 
 def phase_output(*, reset: bool = False) -> str:
@@ -26,6 +34,13 @@ def phase_output(*, reset: bool = False) -> str:
             f"phase={index} requests=10 object_misses={object_misses} "
             f"request_bytes=640 byte_misses={byte_misses}"
         )
+    total_misses = 160 if reset else 10
+    lines.append(
+        f"total requests=160 object_misses={total_misses} "
+        f"object_miss_ratio={total_misses / 160:.4f} request_bytes=10240 "
+        f"byte_misses={total_misses * 64} "
+        f"byte_miss_ratio={total_misses / 160:.4f}"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -67,6 +82,10 @@ def test_phase_parser_balances_nondivisible_totals_across_all_sixteen_bins() -> 
             f"phase={index} requests={requests} object_misses=0 "
             f"request_bytes={requests * 64} byte_misses=0"
         )
+    lines.append(
+        "total requests=161 object_misses=0 object_miss_ratio=0.0000 "
+        "request_bytes=10304 byte_misses=0 byte_miss_ratio=0.0000"
+    )
     bins = parse_phase_probe_output(
         "\n".join(lines) + "\n",
         expected_request_count=161,
@@ -92,6 +111,10 @@ def test_phase_ratio_validation_ignores_ambient_rounding_and_traps() -> None:
             f"phase={index} requests=3 object_misses=1 "
             "request_bytes=3 byte_misses=1"
         )
+    lines.append(
+        "total requests=48 object_misses=16 object_miss_ratio=0.3333 "
+        "request_bytes=48 byte_misses=16 byte_miss_ratio=0.3333"
+    )
     output = "\n".join(lines) + "\n"
     results = []
     for rounding in (ROUND_DOWN, ROUND_UP):
@@ -119,6 +142,10 @@ def test_phase_ratio_quantum_ignores_ambient_exponent_traps() -> None:
             f"phase={index} requests=10 object_misses={misses} "
             f"request_bytes=10 byte_misses={misses}"
         )
+    lines.append(
+        "total requests=160 object_misses=1 object_miss_ratio=0.0063 "
+        "request_bytes=160 byte_misses=1 byte_miss_ratio=0.0063"
+    )
     with localcontext() as context:
         context.Emin = 0
         context.traps[Subnormal] = True
@@ -126,8 +153,8 @@ def test_phase_ratio_quantum_ignores_ambient_exponent_traps() -> None:
             "\n".join(lines) + "\n",
             expected_request_count=160,
             expected_request_bytes=160,
-            expected_object_miss_ratio=Decimal("0.0062"),
-            expected_byte_miss_ratio=Decimal("0.0062"),
+            expected_object_miss_ratio=Decimal("0.0063"),
+            expected_byte_miss_ratio=Decimal("0.0063"),
         )
     assert sum(item.object_misses for item in bins) == 1
 
@@ -268,6 +295,7 @@ struct cache {
 };
 typedef struct { uint64_t cache_size; } common_cache_params_t;
 #define ORACLE_GENERAL_TRACE 1
+static void set_rand_seed(unsigned int seed) { (void)seed; }
 static reader_init_param_t default_reader_init_params(void) {
   reader_init_param_t value = { .cap_at_n_req = -1 }; return value;
 }
@@ -390,3 +418,150 @@ def test_generated_phase_probe_compiles_and_preserves_state_across_sixteen_bins(
         0,
         0,
     ]
+
+    rounding_trace = tmp_path / "rounding.oracleGeneral"
+    rounding_raw = bytearray()
+    rounding_raw.extend(oracle.pack(2000, 1000, 1, -1))
+    rounding_raw.extend(oracle.pack(2001, 1001, 1, -1))
+    for index in range(160):
+        rounding_raw.extend(oracle.pack(index + 2002, 0, 1, -1))
+    rounding_trace.write_bytes(rounding_raw)
+    rounding = subprocess.run(
+        [
+            str(binary),
+            str(rounding_trace),
+            "Sieve",
+            "64",
+            "162",
+            "1",
+            "160",
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    rounded_bins = parse_phase_probe_output(
+        rounding.stdout,
+        expected_request_count=160,
+        expected_request_bytes=160,
+        expected_object_miss_ratio=Decimal("0.0063"),
+        expected_byte_miss_ratio=Decimal("0.0063"),
+    )
+    assert sum(item.object_misses for item in rounded_bins) == 1
+
+
+@pytest.mark.parametrize("policy", ["Sieve", "S3FIFO"])
+def test_pinned_cachesim_and_phase_probe_totals_match(
+    tmp_path: Path, policy: str
+) -> None:
+    raw_checkout = os.environ.get("AROS_PINNED_LIBCACHESIM_CHECKOUT")
+    if raw_checkout is None:
+        pytest.skip("set AROS_PINNED_LIBCACHESIM_CHECKOUT for pinned integration")
+    checkout = Path(raw_checkout).resolve(strict=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert commit == "da022c2945146e9577d91375a48d53850d7041a3"
+    build = checkout / "_build"
+    cachesim = build / "bin/cachesim"
+    archive = build / "liblibCacheSim.a"
+    source_receipt = {
+        "compilers": {
+            "c": {"path": "/usr/bin/cc"},
+            "cxx": {"path": "/usr/bin/c++"},
+        }
+    }
+    include_flags, link_flags, _cache_hash = probe_build_flags(
+        build / "CMakeCache.txt", source_receipt
+    )
+    phase_source = tmp_path / "phase.c"
+    phase_source.write_bytes(phase_probe_source())
+    phase_binary = tmp_path / "phase-probe"
+    subprocess.run(
+        [
+            "/usr/bin/cc",
+            "-std=c11",
+            "-O2",
+            "-I",
+            str(checkout / "libCacheSim/include"),
+            "-I",
+            str(checkout / "libCacheSim/bin/cachesim"),
+            *include_flags,
+            "-o",
+            str(phase_binary),
+            str(phase_source),
+            str(archive),
+            *link_flags,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    fixed_source = tmp_path / "fixed.c"
+    fixed_source.write_bytes(fixed_time_interposer_source())
+    fixed_binary = tmp_path / "fixed.so"
+    subprocess.run(
+        fixed_time_compile_argv("/usr/bin/cc", fixed_binary, fixed_source),
+        check=True,
+        capture_output=True,
+    )
+    trace = tmp_path / "rounding.oracleGeneral"
+    oracle = struct.Struct("<IQIq")
+    raw = bytearray()
+    raw.extend(oracle.pack(1000, 1000, 1, -1))
+    raw.extend(oracle.pack(1001, 1001, 1, -1))
+    for index in range(160):
+        raw.extend(oracle.pack(index + 1002, 0, 1, -1))
+    trace.write_bytes(raw)
+    side_effect = tmp_path / f"{policy}.cachesim"
+    cli = subprocess.run(
+        fixed_time_run_argv(
+            fixed_binary,
+            [
+                str(cachesim),
+                str(trace),
+                "oracleGeneral",
+                policy,
+                "64",
+                "--num-thread=1",
+                "--num-req=162",
+                "--warmup-sec=1",
+                "--consider-obj-metadata=true",
+                "--print-head-req=false",
+                f"--output={side_effect}",
+            ],
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    parsed = parse_cachesim_output(cli.stdout)
+    phase = subprocess.run(
+        fixed_time_run_argv(
+            fixed_binary,
+            [
+                str(phase_binary),
+                str(trace),
+                policy,
+                "64",
+                "162",
+                "1",
+                "160",
+            ],
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    bins = parse_phase_probe_output(
+        phase.stdout,
+        expected_request_count=parsed.request_count,
+        expected_request_bytes=160,
+        expected_object_miss_ratio=parsed.object_miss_ratio,
+        expected_byte_miss_ratio=parsed.byte_miss_ratio,
+    )
+    assert sum(item.object_misses for item in bins) == 1
+    assert parsed.object_miss_ratio == Decimal("0.0063")

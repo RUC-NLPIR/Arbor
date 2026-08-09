@@ -4,13 +4,16 @@ import ctypes
 import errno
 import hashlib
 import json
+import math
 import os
+import secrets
 import shutil
 import stat
 import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path, PurePosixPath
 
 from .cachesim import ChildResult
@@ -34,6 +37,128 @@ Run = Callable[..., ChildResult]
 
 class EvidenceError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class BoundJSONObject:
+    value: dict[str, object]
+    raw: bytes
+    path: Path
+    identity: tuple[int, int]
+    mode: int
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class OutputParentBinding:
+    path: Path
+    descriptor: int
+    identity: tuple[int, int]
+    output_name: str
+
+    @property
+    def descriptor_path(self) -> Path:
+        return Path(f"/proc/self/fd/{self.descriptor}")
+
+
+def _strict_json_pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in items:
+        if key in value:
+            raise EvidenceError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _invalid_json_constant(value: str) -> object:
+    raise EvidenceError(f"non-finite JSON constant is forbidden: {value}")
+
+
+def _finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise EvidenceError(f"non-finite JSON number is forbidden: {value}")
+    return parsed
+
+
+def _finite_json_decimal(value: str) -> Decimal:
+    parsed = Decimal(value)
+    if not parsed.is_finite():
+        raise EvidenceError(f"non-finite JSON number is forbidden: {value}")
+    return parsed
+
+
+def _strict_parse_json_bytes(
+    raw: bytes, *, decimal_numbers: bool
+) -> dict[str, object]:
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_strict_json_pairs,
+            parse_constant=_invalid_json_constant,
+            parse_float=(
+                _finite_json_decimal if decimal_numbers else _finite_json_float
+            ),
+        )
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise EvidenceError("bound JSON is not strict UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise EvidenceError("bound JSON must contain an object")
+    return value
+
+
+def read_bound_json_object(
+    path: Path,
+    *,
+    max_bytes: int,
+    decimal_numbers: bool = False,
+) -> BoundJSONObject:
+    if type(max_bytes) is not int or not 1 <= max_bytes <= 64 * 1024 * 1024:
+        raise EvidenceError("bound JSON byte limit is invalid")
+    candidate = Path(path).absolute()
+    descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    digest = hashlib.sha256()
+    raw = bytearray()
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise EvidenceError("bound JSON path is not a regular file")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            while True:
+                block = stream.read(min(1024 * 1024, max_bytes + 1 - len(raw)))
+                if not block:
+                    break
+                raw.extend(block)
+                digest.update(block)
+                if len(raw) > max_bytes:
+                    raise EvidenceError("bound JSON exceeds its byte limit")
+        value = _strict_parse_json_bytes(
+            bytes(raw), decimal_numbers=decimal_numbers
+        )
+        after = candidate.stat(follow_symlinks=False)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+        or len(raw) != before.st_size
+    ):
+        raise EvidenceError("bound JSON path binding changed while reading")
+    return BoundJSONObject(
+        value=value,
+        raw=bytes(raw),
+        path=candidate.resolve(strict=True),
+        identity=(before.st_dev, before.st_ino),
+        mode=stat.S_IMODE(before.st_mode),
+        size_bytes=len(raw),
+        sha256=digest.hexdigest(),
+    )
 
 
 @dataclass(frozen=True)
@@ -411,6 +536,96 @@ def stage_directory(output: Path) -> tuple[Path, tuple[int, int]]:
     stage.chmod(0o700)
     metadata = stage.lstat()
     return stage, (metadata.st_dev, metadata.st_ino)
+
+
+def retain_output_parent(output: Path) -> OutputParentBinding:
+    parent = Path(output).parent
+    descriptor = os.open(
+        parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        path_metadata = parent.lstat()
+        identity = (metadata.st_dev, metadata.st_ino)
+        if (
+            parent.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (path_metadata.st_dev, path_metadata.st_ino) != identity
+        ):
+            raise EvidenceError("output parent binding is invalid")
+        return OutputParentBinding(parent.resolve(strict=True), descriptor, identity, output.name)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def stage_directory_in_parent(
+    parent: OutputParentBinding,
+) -> tuple[Path, tuple[int, int]]:
+    for _attempt in range(16):
+        name = f".{parent.output_name}-stage-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent.descriptor)
+        except FileExistsError:
+            continue
+        path = parent.path / name
+        metadata = path.lstat()
+        return path, (metadata.st_dev, metadata.st_ino)
+    raise EvidenceError("cannot allocate descriptor-relative stage directory")
+
+
+def publish_stage_in_parent(
+    parent: OutputParentBinding,
+    stage: Path,
+    identity: tuple[int, int],
+) -> Path:
+    stage_name = stage.name
+    metadata = os.stat(stage_name, dir_fd=parent.descriptor, follow_symlinks=False)
+    if not stat.S_ISDIR(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != identity:
+        raise EvidenceError("evaluation stage changed before publication")
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise EvidenceError("atomic no-replace publication is unavailable") from error
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        parent.descriptor,
+        os.fsencode(stage_name),
+        parent.descriptor,
+        os.fsencode(parent.output_name),
+        1,
+    )
+    if result != 0:
+        number = ctypes.get_errno()
+        if number == errno.EEXIST:
+            raise EvidenceError("refusing to replace output directory")
+        raise OSError(number, os.strerror(number), parent.output_name)
+    os.fsync(parent.descriptor)
+    held = parent.descriptor_path / parent.output_name
+    held_metadata = held.lstat()
+    try:
+        path_parent = parent.path.lstat()
+        public = parent.path / parent.output_name
+        public_metadata = public.lstat()
+    except OSError as error:
+        raise EvidenceError("output parent path changed during publication") from error
+    if (
+        (os.fstat(parent.descriptor).st_dev, os.fstat(parent.descriptor).st_ino)
+        != parent.identity
+        or (path_parent.st_dev, path_parent.st_ino) != parent.identity
+        or (held_metadata.st_dev, held_metadata.st_ino) != identity
+        or (public_metadata.st_dev, public_metadata.st_ino) != identity
+    ):
+        raise EvidenceError("output parent path binding changed during publication")
+    return held
 
 
 def directory_identity(path: Path) -> tuple[int, int]:
@@ -900,6 +1115,8 @@ def unexpected_stage_entries(
         "allocator-interposer.so",
         "metadata_probe.c",
         "metadata-probe",
+        "fixed_time_interposer.c",
+        "fixed-time-interposer.so",
     }
     expected_directories = {"commands"}
     for path in extra_expected_files:

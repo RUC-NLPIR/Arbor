@@ -37,6 +37,7 @@ from .evidence import (
     refresh_file_record as _refresh_file_record,
     regular_bytes as _regular_bytes,
     regular_identity as _regular_identity,
+    read_bound_json_object,
     revalidate_checkout as _post_binding,
     revalidate_command_evidence as _revalidate_command_evidence,
     skipped_command_record as _skipped_command_record,
@@ -58,6 +59,9 @@ from .r0_probes import (
     allocator_interposer_source,
     capacity_compile_argv,
     capacity_probe_source,
+    fixed_time_compile_argv,
+    fixed_time_interposer_source,
+    fixed_time_run_argv,
     metadata_compile_argv,
     metadata_probe_source,
     metadata_run_argv,
@@ -93,6 +97,7 @@ _COMMAND_LIMITS: dict[str, tuple[float, int]] = {
     "sanitize-configure": (600.0, 16 * _MIB),
     "sanitize-build": (1800.0, 64 * _MIB),
     "sanitize-full-tests": (1800.0, 64 * _MIB),
+    "fixed-time-compile": (300.0, 16 * _MIB),
     "determinism-run-1": (120.0, 16 * _MIB),
     "determinism-run-2": (120.0, 16 * _MIB),
     "capacity-compile": (300.0, 16 * _MIB),
@@ -459,6 +464,12 @@ def validate_r0_metadata_evidence(
     synthetic, synthetic_file, _synthetic_raw = _retained_r0_artifact(
         receipt, r0_root, "synthetic_trace"
     )
+    fixed_time_source, fixed_time_source_file, _fixed_time_source_raw = (
+        _retained_r0_artifact(receipt, r0_root, "fixed_time_interposer_source")
+    )
+    fixed_time_binary, fixed_time_binary_file, _fixed_time_binary_raw = (
+        _retained_r0_artifact(receipt, r0_root, "fixed_time_interposer_binary")
+    )
     validated_files.extend(
         (
             metadata_probe_file,
@@ -466,9 +477,22 @@ def validate_r0_metadata_evidence(
             metadata_source_file,
             interposer_source_file,
             synthetic_file,
+            fixed_time_source_file,
+            fixed_time_binary_file,
         )
     )
     probes = receipt.get("probes")
+    fixed_time_record = probes.get("fixed_time") if isinstance(probes, dict) else None
+    if (
+        not isinstance(fixed_time_record, dict)
+        or fixed_time_record.get("source_sha256") != fixed_time_source.get("sha256")
+        or not isinstance(fixed_time_record.get("binary"), dict)
+        or fixed_time_record["binary"].get("sha256")
+        != fixed_time_binary.get("sha256")
+        or fixed_time_record.get("environment")
+        != f"LD_PRELOAD={fixed_time_binary['source_path']}"
+    ):
+        raise EvaluationError("R0 fixed-time artifact binding is invalid")
     metadata_probe_record = probes.get("metadata") if isinstance(probes, dict) else None
     if (
         not isinstance(metadata_probe_record, dict)
@@ -499,7 +523,7 @@ def validate_r0_metadata_evidence(
     if len(matches) != 1:
         raise EvaluationError("R0 metadata command receipt is missing")
     command = matches[0]
-    expected_index = 13 if candidate == receipt.get("base_commit") else 14
+    expected_index = 14 if candidate == receipt.get("base_commit") else 15
     expected_command_keys = {
         "index",
         "label",
@@ -604,17 +628,11 @@ def _candidate_ctest_passed(invocation: _Invocation, policy: str) -> bool:
 
 
 def _source_receipt(path: Path, lock: Mapping[str, object]) -> dict[str, object]:
-    raw_path = Path(path)
     try:
-        metadata = raw_path.lstat()
-        if raw_path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-            raise EvaluationError("source receipt must be a regular non-symlink file")
-        resolved = raw_path.resolve(strict=True)
-    except EvaluationError:
-        raise
-    except OSError as error:
+        bound = read_bound_json_object(path, max_bytes=4 * 1024 * 1024)
+    except (OSError, ValueError) as error:
         raise EvaluationError("source receipt is missing") from error
-    receipt = load_object(resolved)
+    receipt = bound.value
     expected_keys = {
         "schema_version",
         "repository_url",
@@ -704,8 +722,11 @@ def _source_receipt(path: Path, lock: Mapping[str, object]) -> dict[str, object]
         or not receipt["platform"]
     ):
         raise EvaluationError("source receipt tool binding is invalid")
-    receipt["_resolved_path"] = str(resolved)
-    receipt["_file_sha256"] = sha256_file(resolved)
+    receipt["_resolved_path"] = str(bound.path)
+    receipt["_file_sha256"] = bound.sha256
+    receipt["_file_identity"] = bound.identity
+    receipt["_file_mode"] = bound.mode
+    receipt["_file_size_bytes"] = bound.size_bytes
     return receipt
 
 
@@ -1151,6 +1172,31 @@ def evaluate_r0(
             ["ctest", "--test-dir", "_build-sanitize", "--output-on-failure"],
         )
 
+        compiler = source["compilers"]["c"]["path"]
+        fixed_time_source = stage / "fixed_time_interposer.c"
+        fixed_time_source_raw = fixed_time_interposer_source()
+        _write_private(fixed_time_source, fixed_time_source_raw)
+        capture_artifact("fixed_time_interposer_source", fixed_time_source)
+        fixed_time_source_evidence = _capture_expected_evidence(
+            fixed_time_source, stage
+        )
+        fixed_time_binary = stage / "fixed-time-interposer.so"
+        fixed_time_compile = invoke(
+            "fixed-time-compile",
+            fixed_time_compile_argv(
+                compiler, fixed_time_binary, fixed_time_source
+            ),
+            command_cwd=stage,
+        )
+        fixed_time_binary_receipt, fixed_time_binary_identity = _capture_executable(
+            fixed_time_binary, stage
+        )
+        if fixed_time_compile.ok:
+            capture_artifact("fixed_time_interposer_binary", fixed_time_binary)
+        fixed_time_binary_evidence = _capture_expected_evidence(
+            fixed_time_binary, stage
+        )
+
         binary = release_root / "bin/cachesim"
         binary_sha256 = _executable_hash(binary)
         release_commands_state = _combined_outcome(
@@ -1171,19 +1217,22 @@ def evaluate_r0(
             if candidate_test_outcome is not None:
                 candidate_test_state = _candidate_ctest_passed(candidate_test, policy)
         simulator_result_path = stage / "simulator-results.cachesim"
-        simulation_argv = [
-            str(binary),
-            str(trace_path),
-            "oracleGeneral",
-            policy,
-            str(cache_bytes),
-            "--num-thread=1",
-            f"--num-req={_REQUEST_COUNT}",
-            "--warmup-sec=0",
-            "--consider-obj-metadata=true",
-            "--print-head-req=false",
-            f"--output={simulator_result_path}",
-        ]
+        simulation_argv = fixed_time_run_argv(
+            fixed_time_binary,
+            [
+                str(binary),
+                str(trace_path),
+                "oracleGeneral",
+                policy,
+                str(cache_bytes),
+                "--num-thread=1",
+                f"--num-req={_REQUEST_COUNT}",
+                "--warmup-sec=0",
+                "--consider-obj-metadata=true",
+                "--print-head-req=false",
+                f"--output={simulator_result_path}",
+            ],
+        )
         simulation_one = invoke(
             "determinism-run-1", simulation_argv, command_cwd=stage
         )
@@ -1242,7 +1291,6 @@ def evaluate_r0(
             simulator_result_path, stage
         )
 
-        compiler = source["compilers"]["c"]["path"]
         probe_toolchain_clean = True
         probe_include_flags: list[str] = []
         probe_link_flags: list[str] = ["-lm", "-ldl", "-pthread"]
@@ -1391,6 +1439,8 @@ def evaluate_r0(
         expected_evidence = [
             trace_evidence,
             simulator_result_evidence,
+            fixed_time_source_evidence,
+            fixed_time_binary_evidence,
             capacity_source_evidence,
             capacity_binary_evidence,
             metadata_source_evidence,
@@ -1434,6 +1484,15 @@ def evaluate_r0(
                     capacity_binary,
                     capacity_binary_receipt,
                     capacity_binary_identity,
+                )
+                and evidence_binding_clean
+            )
+        if fixed_time_binary_identity is not None:
+            evidence_binding_clean = (
+                _refresh_file_record(
+                    fixed_time_binary,
+                    fixed_time_binary_receipt,
+                    fixed_time_binary_identity,
                 )
                 and evidence_binding_clean
             )
@@ -1514,6 +1573,13 @@ def evaluate_r0(
             checks["evidence_binding"] = False
             _clear_unavailable_checks(checks)
             measured = None
+        try:
+            if _regular_bytes(fixed_time_source) != fixed_time_source_raw:
+                raise EvaluationError("fixed-time interposer source changed")
+        except (OSError, ValueError) as error:
+            errors.append(f"fixed-time interposer binding: {_bounded(error)}")
+            checks["evidence_binding"] = False
+            checks["deterministic"] = None
         try:
             if _regular_bytes(capacity_source) != capacity_source_raw:
                 raise EvaluationError("capacity probe source changed")
@@ -1643,6 +1709,14 @@ def evaluate_r0(
             "commands": [item.record for item in commands],
             "artifact_snapshots": artifact_receipts,
             "probes": {
+                "fixed_time": {
+                    "source_path": str(fixed_time_source.relative_to(stage)),
+                    "source_sha256": hashlib.sha256(
+                        fixed_time_source_raw
+                    ).hexdigest(),
+                    "binary": fixed_time_binary_receipt,
+                    "environment": f"LD_PRELOAD={fixed_time_binary}",
+                },
                 "release_cmake_cache_sha256": release_cache_sha256,
                 "include_flags": probe_include_flags,
                 "link_flags": probe_link_flags,

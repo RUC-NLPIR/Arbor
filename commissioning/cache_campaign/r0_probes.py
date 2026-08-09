@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 REQUEST_COUNT = 10_000
+FIXED_TIME_EPOCH = 1_700_000_000
 
 
 class ProbeError(ValueError):
@@ -581,9 +582,22 @@ int munmap(void *address, size_t length) {
 }
 '''.encode("ascii")
 
+_FIXED_TIME_INTERPOSER = f'''#include <time.h>
+
+time_t time(time_t *result) {{
+  const time_t fixed = (time_t){FIXED_TIME_EPOCH};
+  if (result != NULL) *result = fixed;
+  return fixed;
+}}
+'''.encode("ascii")
+
 
 def allocator_interposer_source() -> bytes:
     return _ALLOCATOR_INTERPOSER
+
+
+def fixed_time_interposer_source() -> bytes:
+    return _FIXED_TIME_INTERPOSER
 
 
 def capacity_probe_source(policy: str) -> bytes:
@@ -684,6 +698,28 @@ def allocator_compile_argv(
         str(output),
         str(source),
     ]
+
+
+def fixed_time_compile_argv(
+    compiler: str, output: Path, source: Path
+) -> list[str]:
+    return [
+        compiler,
+        "-std=c11",
+        "-O2",
+        "-shared",
+        "-fPIC",
+        "-o",
+        str(output),
+        str(source),
+    ]
+
+
+def fixed_time_run_argv(interposer: Path, argv: Sequence[str]) -> list[str]:
+    values = list(argv)
+    if not values or any(type(item) is not str or not item for item in values):
+        raise ProbeError("fixed-time command must contain nonempty argv strings")
+    return ["/usr/bin/env", f"LD_PRELOAD={interposer}", *values]
 
 
 def metadata_compile_argv(

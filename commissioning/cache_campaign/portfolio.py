@@ -311,12 +311,17 @@ def _strict_object(
     return value, binding, bound.raw
 
 
-def _validate_trace_record(value: object, source_commit: str) -> TraceSpec:
+def _validate_trace_record(
+    value: object,
+    source_commit: str,
+    *,
+    allowed_splits: frozenset[str] = frozenset({"dev", "visible"}),
+) -> TraceSpec:
     del source_commit
     if not isinstance(value, dict) or set(value) != _TRACE_KEYS:
         raise PortfolioError("task trace record keys mismatch")
     split = value.get("split")
-    if split not in {"dev", "visible"}:
+    if split not in allowed_splits:
         raise PortfolioError("Task 5 cannot access R3 trace records")
     for name in (
         "trace_id",
@@ -360,7 +365,8 @@ def _validate_trace_record(value: object, source_commit: str) -> TraceSpec:
     ):
         raise PortfolioError("trace diagnostic self-hash mismatch")
     if (
-        diagnostics.get("schema_version") != 1
+        type(diagnostics.get("schema_version")) is not int
+        or diagnostics.get("schema_version") != 1
         or diagnostics.get("trace_id") != value.get("trace_id")
         or diagnostics.get("request_count") != maximum
         or diagnostics.get("working_set_bytes") != working_set
@@ -610,7 +616,9 @@ def _validate_r0(
     if set(receipt) != _R0_KEYS:
         raise PortfolioError("R0 receipt keys mismatch")
     if (
-        receipt.get("schema_version") != 1
+        type(receipt.get("schema_version")) is not int
+        or receipt.get("schema_version") != 1
+        or type(receipt.get("receipt_version")) is not int
         or receipt.get("receipt_version") != 1
         or receipt.get("rung") != "r0"
         or receipt.get("candidate_commit") != candidate
@@ -814,6 +822,7 @@ def _preflight(
     source_receipt: Path,
     r0_receipt: Path,
     output: Path,
+    temporal_r3: bool = False,
 ) -> Preflight:
     raw_task_root = Path(task_root).absolute()
     task_metadata = raw_task_root.lstat()
@@ -823,13 +832,25 @@ def _preflight(
     manifest, manifest_binding, manifest_raw = _strict_object(
         task_manifest, "manifest_sha256"
     )
-    if set(manifest) != _MANIFEST_KEYS:
+    expected_manifest_keys = (
+        _MANIFEST_KEYS - {"r3_commitment_sha256"}
+        if temporal_r3
+        else _MANIFEST_KEYS
+    )
+    if set(manifest) != expected_manifest_keys:
         raise PortfolioError("task manifest keys mismatch")
-    if resolved_task_root not in manifest_binding.path.parents:
+    if not temporal_r3 and resolved_task_root not in manifest_binding.path.parents:
         raise PortfolioError("task manifest must be beneath task_root")
-    if manifest.get("schema_version") != 1 or manifest.get("source_commit") != SOURCE_LOCK.get("commit"):
+    if temporal_r3 and _paths_overlap(manifest_binding.path, resolved_task_root):
+        raise PortfolioError("R3 manifest must be outside task_root")
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != 1
+        or manifest.get("source_commit") != SOURCE_LOCK.get("commit")
+    ):
         raise PortfolioError("task manifest source binding mismatch")
-    _hash(manifest.get("r3_commitment_sha256"), "R3 commitment")
+    if not temporal_r3:
+        _hash(manifest.get("r3_commitment_sha256"), "R3 commitment")
     decimal_manifest = _strict_parse_json_bytes(
         manifest_raw, decimal_numbers=True
     )
@@ -841,11 +862,24 @@ def _preflight(
     if not isinstance(raw_traces, list):
         raise PortfolioError("task manifest traces must be an array")
     traces = tuple(
-        _validate_trace_record(item, str(manifest["source_commit"]))
+        _validate_trace_record(
+            item,
+            str(manifest["source_commit"]),
+            allowed_splits=(
+                frozenset({"r3"})
+                if temporal_r3
+                else frozenset({"dev", "visible"})
+            ),
+        )
         for item in raw_traces
     )
     if len({item.record["trace_id"] for item in traces}) != len(traces):
         raise PortfolioError("task manifest trace IDs are not unique")
+    if temporal_r3 and any(
+        _paths_overlap(item.path.resolve(strict=True), resolved_task_root)
+        for item in traces
+    ):
+        raise PortfolioError("R3 trace input must be outside task_root")
     root = checkout_path(Path(checkout))
     if _HEX40.fullmatch(candidate) is None:
         raise PortfolioError("candidate must be a lowercase SHA-1 commit")
@@ -1477,7 +1511,7 @@ def _publish_preflight_failure(
             os.close(output_parent.descriptor)
 
 
-def evaluate_portfolio(
+def _evaluate_portfolio(
     *,
     rung: str,
     task_root: Path,
@@ -1489,10 +1523,11 @@ def evaluate_portfolio(
     r0_receipt: Path,
     output: Path,
     run: Run = run_child,
+    temporal_r3: bool = False,
 ) -> dict[str, object]:
-    if rung == "r3":
+    if rung == "r3" and not temporal_r3:
         raise PortfolioError("R3 is reserved for the temporal-seal evaluator")
-    if rung not in {"r1", "r2"}:
+    if rung not in {"r1", "r2", "r3"}:
         raise PortfolioError("portfolio rung must be r1 or r2")
     started = time.monotonic_ns()
     try:
@@ -1505,6 +1540,7 @@ def evaluate_portfolio(
             source_receipt=source_receipt,
             r0_receipt=r0_receipt,
             output=output,
+            temporal_r3=temporal_r3,
         )
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         _publish_preflight_failure(
@@ -1587,7 +1623,7 @@ def evaluate_portfolio(
         provenance_intact = True
         phase_apparatus: PhaseApparatus | None = None
         phase_compile_failed = False
-        if rung == "r2":
+        if rung in {"r2", "r3"}:
             try:
                     phase_apparatus = _compile_phase_probe(
                     stage=stage,
@@ -2093,7 +2129,7 @@ def evaluate_portfolio(
                     }
                     for trace in selected_traces
                 ]
-                if rung == "r2"
+                if rung in {"r2", "r3"}
                 else []
             ),
             "trace_snapshots": [
@@ -2216,3 +2252,57 @@ def evaluate_portfolio(
                 cleanup_stage_in_parent(output_parent, stage.name, stage_identity)
         finally:
             os.close(output_parent.descriptor)
+
+
+def evaluate_portfolio(
+    *,
+    rung: str,
+    task_root: Path,
+    task_manifest: Path,
+    checkout: Path,
+    candidate: str,
+    policy: str,
+    source_receipt: Path,
+    r0_receipt: Path,
+    output: Path,
+    run: Run = run_child,
+) -> dict[str, object]:
+    return _evaluate_portfolio(
+        rung=rung,
+        task_root=task_root,
+        task_manifest=task_manifest,
+        checkout=checkout,
+        candidate=candidate,
+        policy=policy,
+        source_receipt=source_receipt,
+        r0_receipt=r0_receipt,
+        output=output,
+        run=run,
+    )
+
+
+def _evaluate_temporal_portfolio(
+    *,
+    task_root: Path,
+    host_manifest: Path,
+    checkout: Path,
+    candidate: str,
+    policy: str,
+    source_receipt: Path,
+    r0_receipt: Path,
+    output: Path,
+    run: Run = run_child,
+) -> dict[str, object]:
+    return _evaluate_portfolio(
+        rung="r3",
+        task_root=task_root,
+        task_manifest=host_manifest,
+        checkout=checkout,
+        candidate=candidate,
+        policy=policy,
+        source_receipt=source_receipt,
+        r0_receipt=r0_receipt,
+        output=output,
+        run=run,
+        temporal_r3=True,
+    )

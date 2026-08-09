@@ -1051,6 +1051,43 @@ def test_source_mutation_is_sticky_even_if_later_command_would_restore(
     assert any("source binding" in error for error in receipt["errors"])
 
 
+def test_subreaper_dependency_mutation_is_sticky_and_snapshotted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependency = Path(evaluate_module.__file__).with_name("linux_subreaper.py")
+    original = dependency.read_bytes()
+
+    class DependencyRestoreRun(FakeRun):
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            if argv[:5] == ["cmake", "-S", ".", "-B", "_build-sanitize"]:
+                dependency.write_bytes(original)
+            result = super().__call__(argv, output_dir, cwd=cwd)
+            if argv[0] == "ctest" and "-R" in argv:
+                dependency.write_bytes(b"temporary subreaper mutation\n")
+            return result
+
+    try:
+        receipt, runner, *_rest = evaluated(
+            tmp_path, monkeypatch, DependencyRestoreRun()
+        )
+    finally:
+        dependency.write_bytes(original)
+    assert receipt["checks"]["evidence_binding"] is False
+    assert receipt["checks"]["sanitizer"] is None
+    assert not any(
+        command[:5] == ["cmake", "-S", ".", "-B", "_build-sanitize"]
+        for command in runner.commands
+    )
+    assert receipt["evaluator"]["linux_subreaper_sha256"] == hashlib.sha256(
+        original
+    ).hexdigest()
+    snapshot = receipt["artifact_snapshots"]["evaluator_linux_subreaper"]
+    assert snapshot["binding_intact"] is False
+    assert (tmp_path / "r0-output" / snapshot["snapshot_path"]).read_bytes() == original
+
+
 def test_candidate_ctest_cannot_preseed_sanitizer_build_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

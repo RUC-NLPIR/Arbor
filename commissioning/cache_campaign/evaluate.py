@@ -553,14 +553,18 @@ def evaluate_r0(
             if contract is not None
             else None
         )
-        evaluator_hashes = {
-            "evaluate_sha256": sha256_file(Path(__file__)),
-            "scope_sha256": sha256_file(Path(__file__).with_name("scope.py")),
-            "evidence_sha256": sha256_file(Path(__file__).with_name("evidence.py")),
-            "r0_probes_sha256": sha256_file(
-                Path(__file__).with_name("r0_probes.py")
+        evaluator_paths = {
+            "evaluate_sha256": Path(__file__),
+            "scope_sha256": Path(__file__).with_name("scope.py"),
+            "evidence_sha256": Path(__file__).with_name("evidence.py"),
+            "r0_probes_sha256": Path(__file__).with_name("r0_probes.py"),
+            "cachesim_sha256": Path(__file__).with_name("cachesim.py"),
+            "linux_subreaper_sha256": Path(__file__).with_name(
+                "linux_subreaper.py"
             ),
-            "cachesim_sha256": sha256_file(Path(__file__).with_name("cachesim.py")),
+        }
+        evaluator_hashes = {
+            key: sha256_file(path) for key, path in evaluator_paths.items()
         }
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         stage, stage_identity = _stage_directory(final)
@@ -659,6 +663,12 @@ def evaluate_r0(
         except (OSError, ValueError) as error:
             provenance_valid = False
             errors.append(f"artifact snapshot failed for {name}: {_bounded(error)}")
+
+    for dependency_key, dependency_path in evaluator_paths.items():
+        capture_artifact(
+            "evaluator_" + dependency_key.removesuffix("_sha256"),
+            dependency_path,
+        )
 
     def invoke(
         label: str, argv: Sequence[str], *, command_cwd: Path = root
@@ -1181,13 +1191,6 @@ def evaluate_r0(
         try:
             if sha256_file(Path(source["_resolved_path"])) != source["_file_sha256"]:
                 raise EvaluationError("source receipt changed")
-            evaluator_paths = {
-                "evaluate_sha256": Path(__file__),
-                "scope_sha256": Path(__file__).with_name("scope.py"),
-                "evidence_sha256": Path(__file__).with_name("evidence.py"),
-                "r0_probes_sha256": Path(__file__).with_name("r0_probes.py"),
-                "cachesim_sha256": Path(__file__).with_name("cachesim.py"),
-            }
             if any(
                 sha256_file(path) != evaluator_hashes[key]
                 for key, path in evaluator_paths.items()

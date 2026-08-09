@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -271,11 +272,12 @@ def test_ledger_is_exclusive_canonical_and_fsynced_before_parent(
 
     monkeypatch.setattr(seal_module.os, "fsync", observe)
     record = {"schema_version": 1, "state": "consumed", "requested_at_unix_ns": 1}
-    consumed, file_hash = _consume_ledger(ledger, record)
+    consumed, file_hash, file_size = _consume_ledger(ledger, record)
     assert calls == ["file", "directory"]
     assert stat.S_IMODE(ledger.stat().st_mode) == 0o600
     assert consumed["ledger_sha256"] == record_sha256(consumed, "ledger_sha256")
     assert len(file_hash) == 64
+    assert file_size == ledger.stat().st_size
     assert json.loads(ledger.read_text()) == consumed
     with pytest.raises(SealError, match="already consumed"):
         _consume_ledger(ledger, dict(record))
@@ -305,7 +307,9 @@ def test_concurrent_consumers_have_exactly_one_ledger_winner(
     assert sorted(results) == ["consumed", "rejected"]
 
 
-@pytest.mark.parametrize("failure", ["write", "file_fsync", "parent_fsync"])
+@pytest.mark.parametrize(
+    "failure", ["one_byte", "empty", "unreadable", "file_fsync", "parent_fsync"]
+)
 def test_postcreate_ledger_failure_is_terminal_and_receipted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -316,12 +320,19 @@ def test_postcreate_ledger_failure_is_terminal_and_receipted(
         "_evaluate_temporal_portfolio",
         lambda **kwargs: pytest.fail("evaluation must not launch"),
     )
-    if failure == "write":
+    if failure in {"one_byte", "empty", "unreadable"}:
         def fail_write(stream: object, raw: bytes) -> None:
-            stream.write(raw[:7])  # type: ignore[attr-defined]
+            if failure != "empty":
+                stream.write(raw[:1])  # type: ignore[attr-defined]
             raise OSError("injected ledger write failure")
 
         monkeypatch.setattr(seal_module, "_write_ledger_stream", fail_write)
+        if failure == "unreadable":
+            monkeypatch.setattr(
+                seal_module,
+                "_observe_consumed_ledger",
+                lambda path: (None, None),
+            )
     else:
         real_fsync = os.fsync
         injected = False
@@ -339,6 +350,19 @@ def test_postcreate_ledger_failure_is_terminal_and_receipted(
     receipt = run_r3(*run_arguments(tmp_path))  # type: ignore[arg-type]
     assert receipt["state"] == "process_failed"
     assert receipt["failures"][0]["kind"] == "ledger_consumption_failure"
+    assert len(receipt["ledger_intended_sha256"]) == 64
+    if failure == "one_byte":
+        assert receipt["ledger_file_sha256"] == hashlib.sha256(b"{").hexdigest()
+        assert receipt["ledger_size_bytes"] == 1
+    elif failure == "empty":
+        assert receipt["ledger_file_sha256"] == hashlib.sha256(b"").hexdigest()
+        assert receipt["ledger_size_bytes"] == 0
+    elif failure == "unreadable":
+        assert receipt["ledger_file_sha256"] is None
+        assert receipt["ledger_size_bytes"] is None
+    else:
+        assert receipt["ledger_file_sha256"] == receipt["ledger_intended_sha256"]
+        assert receipt["ledger_size_bytes"] > 1
     assert os.path.lexists(inputs.ledger)
     assert inputs.final_receipt.exists()
     with pytest.raises(SealError, match="already consumed"):

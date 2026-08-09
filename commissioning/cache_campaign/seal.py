@@ -130,10 +130,14 @@ class LedgerConsumedError(SealError):
         *,
         record: dict[str, object],
         intended_file_sha256: str,
+        observed_file_sha256: str | None,
+        observed_size_bytes: int | None,
     ) -> None:
         super().__init__(message)
         self.record = record
         self.intended_file_sha256 = intended_file_sha256
+        self.observed_file_sha256 = observed_file_sha256
+        self.observed_size_bytes = observed_size_bytes
         self.consumed = True
 
 
@@ -1102,9 +1106,17 @@ def _write_ledger_stream(stream: object, raw: bytes) -> None:
     stream.write(raw)  # type: ignore[attr-defined]
 
 
+def _observe_consumed_ledger(path: Path) -> tuple[str | None, int | None]:
+    try:
+        observed = file_binding(path, expected_mode=0o600)
+    except (OSError, ValueError):
+        return None, None
+    return observed.sha256, observed.size_bytes
+
+
 def _consume_ledger(
     path: Path, record: dict[str, object]
-) -> tuple[dict[str, object], str]:
+) -> tuple[dict[str, object], str, int]:
     record["ledger_sha256"] = record_sha256(record, "ledger_sha256")
     raw = canonical_bytes(record) + b"\n"
     file_sha256 = hashlib.sha256(raw).hexdigest()
@@ -1132,13 +1144,16 @@ def _consume_ledger(
             if descriptor >= 0:
                 os.close(descriptor)
     except BaseException as error:
+        observed_sha256, observed_size = _observe_consumed_ledger(path)
         raise LedgerConsumedError(
             "R3 ledger authority was consumed before durability failed: "
             + " ".join(str(error).split())[:384],
             record=record,
             intended_file_sha256=file_sha256,
+            observed_file_sha256=observed_sha256,
+            observed_size_bytes=observed_size,
         ) from error
-    return record, file_sha256
+    return record, file_sha256, len(raw)
 
 
 def _ledger_record(inputs: FrozenInputs) -> dict[str, object]:
@@ -1279,7 +1294,9 @@ def _measurement_facts(
 def _write_final_receipt(
     inputs: FrozenInputs,
     ledger: Mapping[str, object],
-    ledger_file_sha256: str,
+    ledger_intended_sha256: str,
+    ledger_file_sha256: str | None,
+    ledger_size_bytes: int | None,
     *,
     started_at: int,
     state: str,
@@ -1303,7 +1320,9 @@ def _write_final_receipt(
         "output_path": str(inputs.output),
         "ledger_path": str(inputs.ledger),
         "ledger_sha256": ledger["ledger_sha256"],
+        "ledger_intended_sha256": ledger_intended_sha256,
         "ledger_file_sha256": ledger_file_sha256,
+        "ledger_size_bytes": ledger_size_bytes,
         "r3_commitment_sha256": inputs.package["r3_commitment_sha256"],
         "host_r3_manifest_sha256": inputs.host_binding.sha256,
         "calibration_sha256": inputs.calibration.calibration_sha256,
@@ -1358,7 +1377,7 @@ def run_r3(
         output,
     )
     try:
-        ledger_record, ledger_file_sha256 = _consume_ledger(
+        ledger_record, ledger_file_sha256, ledger_size_bytes = _consume_ledger(
             inputs.ledger, _ledger_record(inputs)
         )
     except LedgerConsumedError as error:
@@ -1370,6 +1389,8 @@ def run_r3(
             inputs,
             error.record,
             error.intended_file_sha256,
+            error.observed_file_sha256,
+            error.observed_size_bytes,
             started_at=time.time_ns(),
             state="process_failed",
             portfolio_receipt=None,
@@ -1451,6 +1472,8 @@ def run_r3(
             inputs,
             ledger_record,
             ledger_file_sha256,
+            ledger_file_sha256,
+            ledger_size_bytes,
             started_at=started_at,
             state=state,
             portfolio_receipt=portfolio_receipt,
@@ -1470,6 +1493,8 @@ def run_r3(
             inputs,
             ledger_record,
             ledger_file_sha256,
+            ledger_file_sha256,
+            ledger_size_bytes,
             started_at=started_at,
             state="process_failed",
             portfolio_receipt=portfolio_receipt,

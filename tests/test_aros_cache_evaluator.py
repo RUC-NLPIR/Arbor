@@ -992,33 +992,43 @@ def test_preflight_r0_binary_mutation_publishes_failure_before_launch(
     assert root["provenance"]["final_binding_intact"] is False
 
 
-@pytest.mark.parametrize("layout", ["direct", "nested", "alias"])
-def test_output_cannot_overlap_r0_evidence_root_or_parent_before_staging(
+def test_output_allows_sibling_of_r0_evidence_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    r0_root = inputs["r0_receipt"].parent
+    inputs["output"] = r0_root.parent / "r2-output"
+    receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert len(receipt["measurements"]) == 9
+
+
+@pytest.mark.parametrize("layout", ["equal", "nested", "alias"])
+def test_output_cannot_overlap_exact_r0_evidence_root_before_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     layout: str,
 ) -> None:
     inputs, runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
     r0_root = inputs["r0_receipt"].parent
-    r0_parent = r0_root.parent
-    if layout == "direct":
-        output = r0_root / "forbidden-output"
+    if layout == "equal":
+        output = r0_root
     elif layout == "nested":
-        parent = r0_parent / "nested"
+        parent = r0_root / "nested"
         parent.mkdir()
         output = parent / "forbidden-output"
     else:
-        nested = r0_parent / "alias-nested"
+        nested = r0_root / "alias-nested"
         nested.mkdir()
-        alias = tmp_path / "r0-alias"
-        alias.symlink_to(r0_parent, target_is_directory=True)
+        alias = tmp_path / "r0-root-alias"
+        alias.symlink_to(r0_root, target_is_directory=True)
         output = alias / "alias-nested/forbidden-output"
     inputs["output"] = output
-    with pytest.raises(ValueError, match="R0 evidence"):
+    with pytest.raises(ValueError, match="R0 evidence|output.*exist"):
         evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     assert runner.argv == []
-    assert not output.exists()
-    assert not list(output.parent.glob(f".{output.name}-stage-*"))
+    if layout != "equal":
+        assert not output.exists()
+        assert not list(output.parent.glob(f".{output.name}-stage-*"))
 
 
 def test_rehashed_r0_metadata_forgery_is_rejected_against_raw_probe_evidence(
@@ -1239,6 +1249,54 @@ def test_foreign_output_race_is_preserved_and_stage_is_not_published(
         evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     assert (output / "foreign").read_text() == "preserve\n"
     assert not (output / "receipt.json").exists()
+
+
+def test_root_receipt_replacement_after_verification_blocks_publish_and_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    real_verify = portfolio_module._verify_publication
+    foreign = b"foreign root before publish\n"
+
+    def replace_after_verify(
+        stage: Path, receipt: dict[str, object]
+    ) -> None:
+        real_verify(stage, receipt)
+        path = stage / "receipt.json"
+        path.unlink()
+        path.write_bytes(foreign)
+
+    monkeypatch.setattr(portfolio_module, "_verify_publication", replace_after_verify)
+    with pytest.raises(ValueError, match="root receipt|record collision"):
+        evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    output = inputs["output"]
+    assert not output.exists()
+    stages = list(output.parent.glob(f".{output.name}-stage-*"))
+    assert len(stages) == 1
+    assert (stages[0] / "receipt.json").read_bytes() == foreign
+
+
+def test_root_receipt_replacement_after_publish_blocks_return_and_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    real_publish = portfolio_module.publish_stage
+    foreign = b"foreign root after publish\n"
+
+    def replace_after_publish(
+        stage: Path, identity: tuple[int, int], output: Path
+    ) -> None:
+        real_publish(stage, identity, output)
+        path = output / "receipt.json"
+        path.unlink()
+        path.write_bytes(foreign)
+
+    monkeypatch.setattr(portfolio_module, "publish_stage", replace_after_publish)
+    with pytest.raises(ValueError, match="root receipt|record collision"):
+        evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    output = inputs["output"]
+    assert output.exists()
+    assert (output / "receipt.json").read_bytes() == foreign
 
 
 def test_foreign_cell_inventory_aborts_before_next_launch(

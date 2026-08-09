@@ -736,10 +736,8 @@ def _preflight(
     final = output_path(Path(output), root)
     if _paths_overlap(final, resolved_task_root):
         raise PortfolioError("portfolio output must be outside task_root")
-    if _paths_overlap(final, r0_root.parent):
-        raise PortfolioError(
-            "portfolio output must be outside the R0 evidence root and parent"
-        )
+    if _paths_overlap(final, r0_root):
+        raise PortfolioError("portfolio output must be outside the R0 evidence root")
     if any(_paths_overlap(final, item.binding.path) for item in traces):
         raise PortfolioError("portfolio output must not overlap trace inputs")
     evaluator = _evaluator_bindings()
@@ -852,6 +850,23 @@ def _write_owned_record(
     ):
         raise RecordCollision(path)
     return observed
+
+
+def _revalidate_owned_record(
+    path: Path, receipt: NewRecordReceipt, label: str
+) -> None:
+    try:
+        observed = _file_binding(path, expected_mode=receipt.mode)
+    except (OSError, ValueError) as error:
+        if os.path.lexists(path):
+            raise RecordCollision(path) from error
+        raise PortfolioError(f"{label} disappeared before publication") from error
+    if (
+        observed.identity != receipt.identity
+        or observed.size_bytes != receipt.size_bytes
+        or observed.sha256 != receipt.sha256
+    ):
+        raise RecordCollision(path)
 
 
 def _write_failure_record(
@@ -1386,7 +1401,7 @@ def _publish_preflight_failure(
         if _paths_overlap(final, resolved_task):
             return
         r0_path = Path(r0_receipt).resolve(strict=True)
-        if _paths_overlap(final, r0_path.parent.parent):
+        if _paths_overlap(final, r0_path.parent):
             return
         stage, stage_identity = stage_directory(final)
     except (OSError, ValueError):
@@ -1495,6 +1510,7 @@ def evaluate_portfolio(
     ]
     stage, stage_identity = stage_directory(preflight.output)
     published = False
+    preserve_stage = False
     try:
         execution = _copy_execution(
             stage, preflight.artifact_bindings["release_cachesim"]
@@ -2013,13 +2029,33 @@ def evaluate_portfolio(
             "timings": {"total_wall_ns": max(0, time.monotonic_ns() - started)},
         }
         _assert_no_forbidden_keys(receipt)
-        write_new_record(stage / "receipt.json", receipt, "receipt_sha256")
+        root_receipt_path = stage / "receipt.json"
+        root_receipt_binding = write_new_record(
+            root_receipt_path, receipt, "receipt_sha256"
+        )
+        if not isinstance(root_receipt_binding, NewRecordReceipt):
+            raise PortfolioError("root receipt publisher returned no ownership receipt")
+        _revalidate_owned_record(
+            root_receipt_path, root_receipt_binding, "root receipt"
+        )
         _verify_publication(stage, receipt)
         if provenance_intact:
             guard()
+        try:
+            _revalidate_owned_record(
+                root_receipt_path, root_receipt_binding, "root receipt"
+            )
+        except (OSError, ValueError):
+            preserve_stage = True
+            raise
         publish_stage(stage, stage_identity, preflight.output)
+        _revalidate_owned_record(
+            preflight.output / "receipt.json",
+            root_receipt_binding,
+            "published root receipt",
+        )
         published = True
         return receipt
     finally:
-        if not published and os.path.lexists(stage):
+        if not published and not preserve_stage and os.path.lexists(stage):
             cleanup_owned(stage, stage_identity)

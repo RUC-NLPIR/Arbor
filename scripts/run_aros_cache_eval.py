@@ -17,13 +17,14 @@ from commissioning.cache_campaign.records import canonical_bytes  # noqa: E402
 
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
-        print(f"error: {' '.join(message.split())}", file=sys.stderr)
+        del message
+        print("error: invalid command line", file=sys.stderr)
         raise SystemExit(2)
 
 
 def _error(error: object) -> None:
-    message = " ".join(str(error).split()) or error.__class__.__name__
-    print(f"error: {message[:500]}", file=sys.stderr)
+    del error
+    print("error: evaluation failed", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:

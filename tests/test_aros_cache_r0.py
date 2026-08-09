@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from commissioning.cache_campaign import evaluate as evaluate_module
 from commissioning.cache_campaign.cachesim import ChildResult
 from commissioning.cache_campaign.evaluate import (
     EvaluationError,
@@ -390,6 +391,19 @@ def test_constraint_facts_do_not_invent_budget_or_complexity() -> None:
     )
     assert facts.metadata_within_budget is None
     assert facts.complexity_audit == "pending_independent_review"
+    unavailable = ConstraintFacts(
+        measured_metadata_bytes_per_object=None,
+        measured_global_metadata_bytes=None,
+        metadata_measurement_sha256=None,
+        metadata_within_budget=None,
+        complexity_audit="pending_independent_review",
+        capacity_conserved=None,
+        deterministic=None,
+        sanitizer_clean=None,
+    )
+    assert unavailable.capacity_conserved is None
+    assert unavailable.deterministic is None
+    assert unavailable.sanitizer_clean is None
 
 
 def test_synthetic_trace_is_deterministic_and_one_based(tmp_path: Path) -> None:
@@ -718,6 +732,22 @@ def test_candidate_ctest_must_run_exact_registered_test(
     assert any("candidate CTest" in error for error in receipt["errors"])
 
 
+def test_unavailable_candidate_ctest_is_not_a_test_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CandidateTimeoutRun(FakeRun):
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            if argv[0] == "ctest" and "-R" in argv:
+                self.commands.append(list(argv))
+                raise subprocess.TimeoutExpired(argv, timeout=1)
+            return super().__call__(argv, output_dir, cwd=cwd)
+
+    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, CandidateTimeoutRun())
+    assert receipt["checks"]["candidate_test"] is None
+
+
 def test_determinism_ignores_throughput_but_detects_scientific_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -796,6 +826,59 @@ def test_nonzero_command_keeps_raw_process_receipt_and_only_its_fact_fails(
     assert receipt["checks"]["build"] is True
 
 
+def test_release_build_failure_leaves_dependent_facts_not_measured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class BuildFailureRun(FakeRun):
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            result = super().__call__(argv, output_dir, cwd=cwd)
+            if list(argv[:3]) == ["cmake", "--build", "_build-release"]:
+                return replace(result, returncode=7)
+            return result
+
+    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, BuildFailureRun())
+    assert receipt["checks"]["build"] is False
+    assert receipt["checks"]["full_tests"] is None
+    assert receipt["checks"]["candidate_test"] is None
+    assert receipt["checks"]["deterministic"] is None
+    assert receipt["checks"]["capacity"] is None
+    assert receipt["checks"]["metadata_probe"] is None
+    assert receipt["simulations"] == []
+    assert receipt["capacity_measurement"] is None
+    assert receipt["measured_metadata"] is None
+
+
+def test_malformed_probe_output_is_not_a_scientific_negative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = FakeRun()
+    runner.capacity_output = b"not a capacity measurement\n"
+    runner.metadata_output = b"not a metadata measurement\n"
+    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, runner)
+    assert receipt["checks"]["capacity"] is None
+    assert receipt["checks"]["metadata_probe"] is None
+    assert receipt["capacity_measurement"] is None
+    assert receipt["measured_metadata"] is None
+
+
+def test_sanitizer_command_failure_is_not_a_cleanliness_finding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class SanitizerFailureRun(FakeRun):
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            result = super().__call__(argv, output_dir, cwd=cwd)
+            if list(argv[:3]) == ["ctest", "--test-dir", "_build-sanitize"]:
+                return replace(result, returncode=8)
+            return result
+
+    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, SanitizerFailureRun())
+    assert receipt["checks"]["sanitizer"] is None
+
+
 def test_timeout_is_an_explicit_command_failure_with_retained_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -812,7 +895,7 @@ def test_timeout_is_an_explicit_command_failure_with_retained_receipt(
             return super().__call__(argv, output_dir, cwd=cwd)
 
     receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, TimeoutRun())
-    assert receipt["checks"]["deterministic"] is False
+    assert receipt["checks"]["deterministic"] is None
     process = next(
         item for item in receipt["commands"] if item["label"] == "determinism-run-1"
     )
@@ -879,12 +962,12 @@ def test_untracked_source_mutation_invalidates_facts_but_retains_receipt(
         tmp_path, monkeypatch, MutatingRun()
     )
     assert receipt["checks"]["source_binding"] is False
+    assert receipt["checks"]["evidence_binding"] is True
     assert all(
-        value is False
+        value is None
         for key, value in receipt["checks"].items()
-        if key != "candidate_test"
+        if key not in {"source_binding", "evidence_binding"}
     )
-    assert receipt["checks"]["candidate_test"] is False
     assert receipt["measured_metadata"] is None
     assert (checkout / "foreign-untracked.c").read_text() == "mutation\n"
     assert (tmp_path / "r0-output/receipt.json").is_file()
@@ -905,9 +988,9 @@ def test_synthetic_trace_mutation_invalidates_dependent_measurements(
             return result
 
     receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, TraceMutatingRun())
-    assert receipt["checks"]["deterministic"] is False
-    assert receipt["checks"]["capacity"] is False
-    assert receipt["checks"]["metadata_probe"] is False
+    assert receipt["checks"]["deterministic"] is None
+    assert receipt["checks"]["capacity"] is None
+    assert receipt["checks"]["metadata_probe"] is None
     assert receipt["measured_metadata"] is None
     assert any("synthetic trace" in error for error in receipt["errors"])
 
@@ -932,12 +1015,12 @@ def test_late_evidence_mutation_is_recorded_and_invalidates_every_fact(
 
     receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, EvidenceMutatingRun())
     assert receipt["checks"]["evidence_binding"] is False
+    assert receipt["checks"]["source_binding"] is True
     assert all(
-        value is False
+        value is None
         for key, value in receipt["checks"].items()
-        if key != "candidate_test"
+        if key not in {"source_binding", "evidence_binding"}
     )
-    assert receipt["checks"]["candidate_test"] is False
     assert receipt["measured_metadata"] is None
     raw = tmp_path / "r0-output/commands/08-determinism-run-1/stdout.raw"
     process = receipt["commands"][7]["stdout"]
@@ -961,12 +1044,12 @@ def test_unregistered_stage_output_is_removed_and_invalidates_every_fact(
 
     receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch, ExtraOutputRun())
     assert receipt["checks"]["evidence_binding"] is False
+    assert receipt["checks"]["source_binding"] is True
     assert all(
-        value is False
+        value is None
         for key, value in receipt["checks"].items()
-        if key != "candidate_test"
+        if key not in {"source_binding", "evidence_binding"}
     )
-    assert receipt["checks"]["candidate_test"] is False
     assert receipt["unexpected_stage_entries"] == [
         {
             "path": "unbound-candidate-output.bin",
@@ -976,6 +1059,134 @@ def test_unregistered_stage_output_is_removed_and_invalidates_every_fact(
         }
     ]
     assert not (tmp_path / "r0-output/unbound-candidate-output.bin").exists()
+
+
+@pytest.mark.parametrize(
+    ("relative", "delete"),
+    [
+        ("commands/08-determinism-run-1/stdout.raw", True),
+        ("simulator-results.cachesim", False),
+        ("capacity-probe", True),
+        ("commands/11-capacity-run/stdout.raw", False),
+    ],
+)
+def test_final_inventory_records_missing_and_late_mutated_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+    delete: bool,
+) -> None:
+    class InventoryMutationRun(FakeRun):
+        def __call__(
+            self, argv: list[str], output_dir: Path, *, cwd: Path | None = None
+        ) -> ChildResult:
+            result = super().__call__(argv, output_dir, cwd=cwd)
+            if argv[0].endswith("metadata-probe"):
+                assert cwd is not None
+                target = Path(cwd) / relative
+                if delete:
+                    target.unlink()
+                else:
+                    target.write_bytes(b"late inventory mutation\n")
+            return result
+
+    receipt, _runner, *_rest = evaluated(
+        tmp_path, monkeypatch, InventoryMutationRun()
+    )
+    inventory = {item["path"]: item for item in receipt["evidence_inventory"]}
+    assert relative in inventory
+    assert inventory[relative]["present"] is (not delete)
+    assert inventory[relative]["binding_intact"] is False
+    assert receipt["checks"]["evidence_binding"] is False
+    assert all(
+        value is None
+        for key, value in receipt["checks"].items()
+        if key not in {"source_binding", "evidence_binding"}
+    )
+    assert (tmp_path / "r0-output/receipt.json").is_file()
+
+
+def test_success_inventory_exactly_matches_published_evidence_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt, _runner, *_rest = evaluated(tmp_path, monkeypatch)
+    output = tmp_path / "r0-output"
+    inventory = {item["path"]: item for item in receipt["evidence_inventory"]}
+    published = {
+        str(path.relative_to(output))
+        for path in output.rglob("*")
+        if path.is_file() and path.name != "receipt.json"
+    }
+    assert published == set(inventory)
+    assert all(item["present"] is True for item in inventory.values())
+    assert all(item["binding_intact"] is True for item in inventory.values())
+    receipt_path = output / "receipt.json"
+    published_receipt = load_object(receipt_path)
+    assert published_receipt == receipt
+    assert receipt["receipt_sha256"] == record_sha256(
+        published_receipt, "receipt_sha256"
+    )
+
+
+def test_post_receipt_evidence_mutation_blocks_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout, base, candidate, lock = repository(tmp_path)
+    monkeypatch.setattr("commissioning.cache_campaign.evaluate.SOURCE_LOCK", lock)
+    source = source_receipt(tmp_path / "source.json", lock)
+    output = tmp_path / "blocked-output"
+    real_write = evaluate_module.write_new_record
+
+    def mutate_after_receipt(
+        path: Path, value: dict[str, object], hash_field: str
+    ) -> None:
+        real_write(path, value, hash_field)
+        if path.name == "receipt.json":
+            (path.parent / "commands/13-metadata-run/stdout.raw").write_bytes(
+                b"post-receipt mutation\n"
+            )
+
+    monkeypatch.setattr(evaluate_module, "write_new_record", mutate_after_receipt)
+    with pytest.raises(EvaluationError, match="inventory"):
+        evaluate_r0(
+            checkout=checkout,
+            base=base,
+            candidate=candidate,
+            policy=POLICY,
+            source_receipt=source,
+            output=output,
+            run=FakeRun(),
+        )
+    assert not output.exists()
+    assert not list(tmp_path.glob(".blocked-output-stage-*"))
+
+
+def test_final_receipt_mutation_blocks_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout, base, candidate, lock = repository(tmp_path)
+    monkeypatch.setattr("commissioning.cache_campaign.evaluate.SOURCE_LOCK", lock)
+    source = source_receipt(tmp_path / "source.json", lock)
+    output = tmp_path / "blocked-receipt-output"
+    real_write = evaluate_module.write_new_record
+
+    def mutate_receipt(path: Path, value: dict[str, object], hash_field: str) -> None:
+        real_write(path, value, hash_field)
+        if path.name == "receipt.json":
+            path.write_bytes(path.read_bytes() + b" ")
+
+    monkeypatch.setattr(evaluate_module, "write_new_record", mutate_receipt)
+    with pytest.raises(EvaluationError, match="receipt"):
+        evaluate_r0(
+            checkout=checkout,
+            base=base,
+            candidate=candidate,
+            policy=POLICY,
+            source_receipt=source,
+            output=output,
+            run=FakeRun(),
+        )
+    assert not output.exists()
 
 
 def test_preflight_failure_retains_failure_receipt_and_runs_no_commands(
@@ -1124,26 +1335,73 @@ def test_output_is_no_replace_and_preserves_foreign_directory(
     assert marker.read_text() == "keep"
 
 
-def test_output_inside_checkout_is_explicitly_owned_not_a_source_mutation(
+@pytest.mark.parametrize(
+    "relative_output",
+    ["r0-evidence", "commissioning/nested-r0-evidence"],
+)
+def test_output_inside_checkout_is_rejected_without_owned_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_output: str,
+) -> None:
+    checkout, base, candidate, lock = repository(tmp_path)
+    monkeypatch.setattr("commissioning.cache_campaign.evaluate.SOURCE_LOCK", lock)
+    source = source_receipt(tmp_path / "source.json", lock)
+    output = checkout / relative_output
+    with pytest.raises(EvaluationError, match="overlap"):
+        evaluate_r0(
+            checkout=checkout,
+            base=base,
+            candidate=candidate,
+            policy=POLICY,
+            source_receipt=source,
+            output=output,
+            run=FakeRun(),
+        )
+    assert not output.exists()
+    assert not list(output.parent.glob(f".{output.name}-stage-*"))
+
+
+def test_symlink_aliased_output_inside_checkout_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     checkout, base, candidate, lock = repository(tmp_path)
     monkeypatch.setattr("commissioning.cache_campaign.evaluate.SOURCE_LOCK", lock)
     source = source_receipt(tmp_path / "source.json", lock)
-    output = checkout / "commissioning/r0-evidence"
-    receipt = evaluate_r0(
-        checkout=checkout,
-        base=base,
-        candidate=candidate,
-        policy=POLICY,
-        source_receipt=source,
-        output=output,
-        run=FakeRun(),
-    )
-    assert receipt["checks"]["source_binding"] is True
-    assert output.is_dir()
-    assert git(checkout, "diff", "--name-only") == ""
-    assert git(checkout, "diff", "--cached", "--name-only") == ""
+    alias = tmp_path / "checkout-alias"
+    alias.symlink_to(checkout, target_is_directory=True)
+    output = alias / "commissioning/aliased-r0-evidence"
+    with pytest.raises(EvaluationError, match="overlap"):
+        evaluate_r0(
+            checkout=checkout,
+            base=base,
+            candidate=candidate,
+            policy=POLICY,
+            source_receipt=source,
+            output=output,
+            run=FakeRun(),
+        )
+    assert not output.exists()
+    assert not list((checkout / "commissioning").glob(".aliased-r0-evidence-stage-*"))
+
+
+def test_checkout_equal_to_or_below_output_is_rejected_without_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout, base, candidate, lock = repository(tmp_path)
+    monkeypatch.setattr("commissioning.cache_campaign.evaluate.SOURCE_LOCK", lock)
+    source = source_receipt(tmp_path / "source.json", lock)
+    with pytest.raises(EvaluationError, match="overlap"):
+        evaluate_r0(
+            checkout=checkout,
+            base=base,
+            candidate=candidate,
+            policy=POLICY,
+            source_receipt=source,
+            output=checkout.parent,
+            run=FakeRun(),
+        )
+    assert not list(tmp_path.glob(".*-stage-*"))
 
 
 def test_cli_supports_only_r0_and_prints_individual_checks(
@@ -1197,3 +1455,39 @@ def test_cli_supports_only_r0_and_prints_individual_checks(
     error = capsys.readouterr().err
     assert error.startswith("error:")
     assert len(error.splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--rung", "x" * 10_000],
+        ["--" + "x" * 10_000],
+        [
+            "--rung",
+            "r0",
+            "--checkout",
+            "/tmp/TOP_SECRET_DO_NOT_ECHO_" + "x" * 10_000,
+            "--candidate",
+            "b" * 40,
+            "--base",
+            "a" * 40,
+            "--policy",
+            POLICY,
+            "--source-receipt",
+            "/tmp/missing-source.json",
+            "--output",
+            "/tmp/new-output",
+        ],
+    ],
+)
+def test_cli_errors_are_one_bounded_line_without_echoing_long_input(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert eval_cli.main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error:")
+    assert len(captured.err.splitlines()) == 1
+    assert len(captured.err) <= 512
+    assert "x" * 100 not in captured.err
+    assert "TOP_SECRET_DO_NOT_ECHO" not in captured.err

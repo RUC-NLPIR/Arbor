@@ -67,9 +67,9 @@ class ConstraintFacts:
     complexity_audit: Literal[
         "pending_independent_review", "accepted", "rejected"
     ]
-    capacity_conserved: bool
-    deterministic: bool
-    sanitizer_clean: bool
+    capacity_conserved: bool | None
+    deterministic: bool | None
+    sanitizer_clean: bool | None
 
 
 @dataclass(frozen=True)

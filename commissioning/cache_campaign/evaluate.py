@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
+import json
 import os
 import platform
 import re
@@ -82,6 +83,41 @@ class _Invocation:
     @property
     def ok(self) -> bool:
         return self.result is not None and self.result.returncode == 0
+
+
+@dataclass(frozen=True)
+class _EvidenceExpectation:
+    path: str
+    identity: tuple[int, int] | None
+    size_bytes: int | None
+    sha256: str | None
+
+
+def _command_outcome(invocation: _Invocation) -> bool | None:
+    if invocation.result is None:
+        return None
+    return invocation.result.returncode == 0
+
+
+def _combined_outcome(*values: bool | None) -> bool | None:
+    if any(value is False for value in values):
+        return False
+    if any(value is None for value in values):
+        return None
+    return True
+
+
+def _clear_unavailable_checks(checks: dict[str, bool | None]) -> None:
+    for key in (
+        "build",
+        "full_tests",
+        "candidate_test",
+        "sanitizer",
+        "deterministic",
+        "capacity",
+        "metadata_probe",
+    ):
+        checks[key] = None
 
 
 def _bounded(value: object, limit: int = 512) -> str:
@@ -172,12 +208,44 @@ def _refresh_file_record(
     return intact
 
 
-def _output_path(path: Path) -> Path:
+def _capture_expected_evidence(path: Path, stage: Path) -> _EvidenceExpectation:
+    relative = str(path.relative_to(stage))
+    try:
+        raw = _regular_bytes(path)
+        identity = _regular_identity(path)
+    except (OSError, ValueError):
+        return _EvidenceExpectation(relative, None, None, None)
+    return _EvidenceExpectation(
+        relative,
+        identity,
+        len(raw),
+        hashlib.sha256(raw).hexdigest(),
+    )
+
+
+def _checkout_path(path: Path) -> Path:
+    candidate = Path(path).absolute()
+    try:
+        metadata = candidate.lstat()
+        if candidate.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+            raise EvaluationError("checkout must be a real directory")
+        return candidate.resolve(strict=True)
+    except EvaluationError:
+        raise
+    except OSError as error:
+        raise EvaluationError("checkout must exist") from error
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
+
+
+def _output_path(path: Path, checkout: Path) -> Path:
     candidate = Path(path)
     if not candidate.is_absolute():
         raise EvaluationError("output must be absolute")
-    if os.path.lexists(candidate):
-        raise EvaluationError(f"output must not exist: {candidate}")
+    if candidate.name in {"", ".", ".."}:
+        raise EvaluationError("output must name a new directory")
     parent = candidate.parent
     try:
         metadata = parent.lstat()
@@ -188,7 +256,12 @@ def _output_path(path: Path) -> Path:
         raise
     except OSError as error:
         raise EvaluationError("output parent must exist") from error
-    return resolved_parent / candidate.name
+    resolved = (resolved_parent / candidate.name).resolve(strict=False)
+    if _paths_overlap(checkout, resolved):
+        raise EvaluationError("checkout and output paths must not overlap")
+    if os.path.lexists(candidate) or os.path.lexists(resolved):
+        raise EvaluationError(f"output must not exist: {resolved}")
+    return resolved
 
 
 def _stage_directory(output: Path) -> tuple[Path, tuple[int, int]]:
@@ -735,6 +808,18 @@ def _command_record(
             "cwd": str(cwd),
             "returncode": None,
             "error": error_message,
+            "stdout": {
+                "path": str((output / "stdout.raw").relative_to(stage)),
+                "size_bytes": None,
+                "sha256": None,
+                "binding_intact": False,
+            },
+            "stderr": {
+                "path": str((output / "stderr.raw").relative_to(stage)),
+                "size_bytes": None,
+                "sha256": None,
+                "binding_intact": False,
+            },
         }
         return _Invocation(record, None, b"", b"", None, None)
 
@@ -761,11 +846,181 @@ def _revalidate_command_evidence(stage: Path, commands: list[_Invocation]) -> bo
     return intact
 
 
+def _command_evidence_expectations(
+    commands: list[_Invocation],
+) -> list[_EvidenceExpectation]:
+    expected: list[_EvidenceExpectation] = []
+    for invocation in commands:
+        for name, raw, identity in (
+            (
+                "stdout",
+                invocation.stdout if invocation.result is not None else None,
+                invocation.stdout_identity,
+            ),
+            (
+                "stderr",
+                invocation.stderr if invocation.result is not None else None,
+                invocation.stderr_identity,
+            ),
+        ):
+            record = invocation.record.get(name)
+            raw_path = record.get("path") if isinstance(record, dict) else None
+            if type(raw_path) is not str:
+                raise EvaluationError("command evidence path is unavailable")
+            expected.append(
+                _EvidenceExpectation(
+                    raw_path,
+                    identity,
+                    len(raw) if raw is not None else None,
+                    hashlib.sha256(raw).hexdigest() if raw is not None else None,
+                )
+            )
+    return expected
+
+
+def _expected_directories(expected: list[_EvidenceExpectation]) -> set[str]:
+    directories: set[str] = set()
+    for item in expected:
+        parent = PurePosixPath(item.path).parent
+        while parent.as_posix() != ".":
+            directories.add(parent.as_posix())
+            parent = parent.parent
+    return directories
+
+
+def _present_inventory_directories(
+    inventory: list[dict[str, object]],
+) -> set[str]:
+    paths = [
+        _EvidenceExpectation(str(item["path"]), None, None, None)
+        for item in inventory
+        if item["present"] is True
+    ]
+    directories = _expected_directories(paths)
+    if any(str(item["path"]).startswith("commands/") for item in inventory):
+        directories.add("commands")
+    return directories
+
+
+def _stage_paths(stage: Path) -> tuple[set[str], set[str]]:
+    files: set[str] = set()
+    directories: set[str] = set()
+    pending: list[tuple[Path, str]] = [(stage, "")]
+    while pending:
+        directory, prefix = pending.pop()
+        with os.scandir(directory) as scanner:
+            for entry in scanner:
+                relative = f"{prefix}/{entry.name}" if prefix else entry.name
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(metadata.st_mode):
+                    directories.add(relative)
+                    pending.append((Path(entry.path), relative))
+                else:
+                    files.add(relative)
+    return files, directories
+
+
+def _evidence_inventory(
+    stage: Path,
+    expected: list[_EvidenceExpectation],
+) -> tuple[list[dict[str, object]], bool]:
+    if len({item.path for item in expected}) != len(expected):
+        raise EvaluationError("duplicate expected evidence path")
+    inventory: list[dict[str, object]] = []
+    intact = True
+    for item in sorted(expected, key=lambda value: value.path):
+        path = stage / item.path
+        try:
+            raw = _regular_bytes(path)
+            identity = _regular_identity(path)
+            present = True
+            size_bytes: int | None = len(raw)
+            sha256: str | None = hashlib.sha256(raw).hexdigest()
+        except (OSError, ValueError):
+            identity = None
+            present = False
+            size_bytes = None
+            sha256 = None
+        binding_intact = (
+            present
+            and item.identity is not None
+            and identity == item.identity
+            and size_bytes == item.size_bytes
+            and sha256 == item.sha256
+        )
+        intact = binding_intact and intact
+        inventory.append(
+            {
+                "path": item.path,
+                "identity": (
+                    {"device": item.identity[0], "inode": item.identity[1]}
+                    if item.identity is not None
+                    else None
+                ),
+                "size_bytes": item.size_bytes,
+                "sha256": item.sha256,
+                "present": present,
+                "observed_identity": (
+                    {"device": identity[0], "inode": identity[1]}
+                    if identity is not None
+                    else None
+                ),
+                "observed_size_bytes": size_bytes,
+                "observed_sha256": sha256,
+                "binding_intact": binding_intact,
+            }
+        )
+    files, directories = _stage_paths(stage)
+    expected_files = {item.path for item in expected}
+    evidence_files = files - {"receipt.json"}
+    intact = (
+        evidence_files
+        == {item["path"] for item in inventory if item["present"]}
+        and intact
+    )
+    intact = directories == _present_inventory_directories(inventory) and intact
+    if evidence_files - expected_files:
+        intact = False
+    return inventory, intact
+
+
+def _canonical_record_bytes(value: dict[str, object]) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+
+
+def _verify_final_stage(
+    stage: Path,
+    expected: list[_EvidenceExpectation],
+    inventory: list[dict[str, object]],
+    receipt: dict[str, object],
+) -> None:
+    observed_inventory, _inventory_intact = _evidence_inventory(stage, expected)
+    if observed_inventory != inventory:
+        raise EvaluationError("evidence inventory changed after final receipt write")
+    receipt_path = stage / "receipt.json"
+    receipt_identity = _regular_identity(receipt_path)
+    raw = _regular_bytes(receipt_path)
+    if raw != _canonical_record_bytes(receipt):
+        raise EvaluationError("final receipt canonical bytes changed")
+    if receipt.get("receipt_sha256") != record_sha256(receipt, "receipt_sha256"):
+        raise EvaluationError("final receipt self-hash mismatch")
+    if _regular_identity(receipt_path) != receipt_identity:
+        raise EvaluationError("final receipt identity changed")
+    files, directories = _stage_paths(stage)
+    present_evidence = {
+        item["path"] for item in inventory if item["present"] is True
+    }
+    if files != present_evidence | {"receipt.json"}:
+        raise EvaluationError("final publication file inventory mismatch")
+    if directories != _present_inventory_directories(inventory):
+        raise EvaluationError("final publication directory inventory mismatch")
+
+
 def _unexpected_stage_entries(
     stage: Path,
     commands: list[_Invocation],
-    *,
-    include_receipt: bool,
 ) -> list[dict[str, object]]:
     expected_files = {
         "synthetic.oracleGeneral.bin",
@@ -775,12 +1030,8 @@ def _unexpected_stage_entries(
         "metadata_probe.c",
         "metadata-probe",
     }
-    if include_receipt:
-        expected_files.add("receipt.json")
     expected_directories = {"commands"}
     for invocation in commands:
-        if invocation.result is None:
-            continue
         for name in ("stdout", "stderr"):
             raw_record = invocation.record.get(name)
             if not isinstance(raw_record, dict):
@@ -1159,18 +1410,18 @@ def evaluate_r0(
     run: Run = run_child,
 ) -> dict[str, object]:
     started = time.monotonic_ns()
-    final = _output_path(Path(output))
+    checkout_root = _checkout_path(Path(checkout))
+    final = _output_path(Path(output), checkout_root)
     preflight_progress: dict[str, object] = {}
     try:
         source, candidate_tree, scope, contract, binding = _preflight(
-            Path(checkout),
+            checkout_root,
             base,
             candidate,
             policy,
             Path(source_receipt),
             preflight_progress,
         )
-        checkout_root = Path(checkout).resolve(strict=True)
         changed_path_sha256 = {
             path: hashlib.sha256(
                 _git_bytes(checkout_root, "show", f"{candidate}:{path}")
@@ -1235,6 +1486,7 @@ def evaluate_r0(
     try:
         trace_path = stage / "synthetic.oracleGeneral.bin"
         synthetic = generate_synthetic_trace(trace_path)
+        trace_evidence = _capture_expected_evidence(trace_path, stage)
         cache_bytes = int(synthetic["working_set_bytes"]) // 10
 
         release_config = invoke(
@@ -1313,6 +1565,23 @@ def evaluate_r0(
 
         binary = release_root / "bin/cachesim"
         binary_sha256 = _executable_hash(binary)
+        release_commands_state = _combined_outcome(
+            _command_outcome(release_config),
+            _command_outcome(release_build),
+        )
+        build_state = (
+            binary_sha256 is not None
+            if release_commands_state is True
+            else release_commands_state
+        )
+        full_tests_state = (
+            _command_outcome(release_tests) if build_state is True else None
+        )
+        candidate_test_state = None
+        if build_state is True and candidate_test is not None:
+            candidate_test_outcome = _command_outcome(candidate_test)
+            if candidate_test_outcome is not None:
+                candidate_test_state = _candidate_ctest_passed(candidate_test, policy)
         simulator_result_path = stage / "simulator-results.cachesim"
         simulation_argv = [
             str(binary),
@@ -1333,9 +1602,9 @@ def evaluate_r0(
         simulation_two = invoke(
             "determinism-run-2", simulation_argv, command_cwd=stage
         )
-        deterministic = False
+        deterministic: bool | None = None
         simulation_receipts: list[dict[str, object]] = []
-        if simulation_one.ok and simulation_two.ok:
+        if build_state is True and simulation_one.ok and simulation_two.ok:
             try:
                 parsed_one = parse_cachesim_output(simulation_one.stdout.decode("ascii"))
                 parsed_two = parse_cachesim_output(simulation_two.stdout.decode("ascii"))
@@ -1380,7 +1649,10 @@ def evaluate_r0(
                 raise EvaluationError("simulator result file differs from raw stdout")
         except (OSError, ValueError) as error:
             errors.append(f"simulator result binding: {_bounded(error)}")
-            deterministic = False
+            deterministic = None
+        simulator_result_evidence = _capture_expected_evidence(
+            simulator_result_path, stage
+        )
 
         compiler = source["compilers"]["c"]["path"]
         probe_toolchain_clean = True
@@ -1400,6 +1672,7 @@ def evaluate_r0(
         capacity_source = stage / "capacity_probe.c"
         capacity_source_raw = _probe_source(_CAPACITY_TEMPLATE, policy)
         _write_private(capacity_source, capacity_source_raw)
+        capacity_source_evidence = _capture_expected_evidence(capacity_source, stage)
         capacity_binary = stage / "capacity-probe"
         capacity_compile = invoke(
             "capacity-compile",
@@ -1420,23 +1693,36 @@ def evaluate_r0(
         capacity_binary_receipt, capacity_binary_identity = _capture_executable(
             capacity_binary, stage
         )
+        capacity_binary_evidence = _capture_expected_evidence(capacity_binary, stage)
         capacity_run = invoke(
             "capacity-run",
             [str(capacity_binary), str(trace_path), policy, str(cache_bytes)],
             command_cwd=stage,
         )
-        capacity = False
+        capacity: bool | None = None
         capacity_values: dict[str, int | bool] | None = None
-        if capacity_compile.ok and capacity_run.ok and _executable_hash(capacity_binary):
+        capacity_prerequisites = (
+            build_state is True
+            and probe_toolchain_clean
+            and capacity_compile.ok
+            and capacity_binary_identity is not None
+        )
+        capacity_diagnostic = capacity_run.stdout + capacity_run.stderr
+        if capacity_prerequisites and b"capacity violation" in capacity_diagnostic.lower():
+            capacity = False
+        elif capacity_prerequisites and capacity_run.ok:
             try:
                 capacity_values = parse_capacity_probe(capacity_run.stdout.decode("ascii"))
                 capacity = capacity_values["cache_size_bytes"] == cache_bytes
             except (UnicodeError, ValueError) as error:
                 errors.append(f"capacity probe: {_bounded(error)}")
+                if "capacity violation" in str(error):
+                    capacity = False
 
         metadata_source = stage / "metadata_probe.c"
         metadata_source_raw = _probe_source(_METADATA_TEMPLATE, policy)
         _write_private(metadata_source, metadata_source_raw)
+        metadata_source_evidence = _capture_expected_evidence(metadata_source, stage)
         metadata_binary = stage / "metadata-probe"
         metadata_compile = invoke(
             "metadata-compile",
@@ -1461,17 +1747,41 @@ def evaluate_r0(
         metadata_binary_receipt, metadata_binary_identity = _capture_executable(
             metadata_binary, stage
         )
+        metadata_binary_evidence = _capture_expected_evidence(metadata_binary, stage)
         metadata_run = invoke(
             "metadata-run",
             [str(metadata_binary), str(trace_path), policy, str(cache_bytes)],
             command_cwd=stage,
         )
         measured: tuple[Decimal, int] | None = None
-        if metadata_compile.ok and metadata_run.ok and _executable_hash(metadata_binary):
+        metadata_state: bool | None = None
+        metadata_prerequisites = (
+            build_state is True
+            and probe_toolchain_clean
+            and metadata_compile.ok
+            and metadata_binary_identity is not None
+        )
+        if metadata_prerequisites and metadata_run.ok:
             try:
                 measured = parse_metadata_probe(metadata_run.stdout.decode("ascii"))
+                metadata_state = True
             except (UnicodeError, ValueError) as error:
                 errors.append(f"metadata probe: {_bounded(error)}")
+                if re.search(rb"(?:^|\n)status=(?!ok(?:\n|$))", metadata_run.stdout):
+                    metadata_state = False
+        elif metadata_prerequisites and metadata_run.result is not None:
+            if re.search(rb"(?:^|\n)status=(?!ok(?:\n|$))", metadata_run.stdout):
+                metadata_state = False
+
+        expected_evidence = [
+            trace_evidence,
+            simulator_result_evidence,
+            capacity_source_evidence,
+            capacity_binary_evidence,
+            metadata_source_evidence,
+            metadata_binary_evidence,
+            *_command_evidence_expectations(commands),
+        ]
 
         evidence_binding_clean = _revalidate_command_evidence(stage, commands)
         if simulator_result_receipt is not None and simulator_result_identity is not None:
@@ -1510,56 +1820,53 @@ def evaluate_r0(
                 )
             except OSError:
                 evidence_binding_clean = False
-        unexpected_stage_entries = _unexpected_stage_entries(
-            stage, commands, include_receipt=False
-        )
+        unexpected_stage_entries = _unexpected_stage_entries(stage, commands)
         if unexpected_stage_entries:
             evidence_binding_clean = False
             errors.append("candidate created an unregistered stage entry")
         if not evidence_binding_clean:
             errors.append("retained process or binary evidence changed after capture")
 
-        sanitizer_clean = all(
-            _SANITIZER.search(item.stdout) is None
-            and _SANITIZER.search(item.stderr) is None
-            for item in commands
+        sanitizer_finding = any(
+            _SANITIZER.search(item.stdout) is not None
+            or _SANITIZER.search(item.stderr) is not None
+            for item in (sanitize_config, sanitize_build, sanitize_tests)
+        )
+        sanitizer_commands_state = _combined_outcome(
+            _command_outcome(sanitize_config),
+            _command_outcome(sanitize_build),
+            _command_outcome(sanitize_tests),
+        )
+        sanitizer_state = (
+            False
+            if sanitizer_finding
+            else True
+            if sanitizer_commands_state is True
+            else None
         )
         checks: dict[str, bool | None] = {
             "source_binding": True,
             "evidence_binding": evidence_binding_clean,
-            "build": release_config.ok
-            and release_build.ok
-            and binary_sha256 is not None,
-            "full_tests": release_tests.ok,
-            "candidate_test": (
-                _candidate_ctest_passed(candidate_test, policy)
-                if candidate_test is not None
-                else None
-            ),
-            "sanitizer": sanitize_config.ok
-            and sanitize_build.ok
-            and sanitize_tests.ok
-            and sanitizer_clean,
+            "build": build_state,
+            "full_tests": full_tests_state,
+            "candidate_test": candidate_test_state,
+            "sanitizer": sanitizer_state,
             "deterministic": deterministic,
             "capacity": capacity,
-            "metadata_probe": measured is not None,
+            "metadata_probe": metadata_state,
         }
         if not probe_toolchain_clean:
-            checks["capacity"] = False
-            checks["metadata_probe"] = False
+            checks["capacity"] = None
+            checks["metadata_probe"] = None
             measured = None
         if not evidence_binding_clean:
-            for key in checks:
-                checks[key] = None if key == "candidate_test" and candidate == base else False
+            _clear_unavailable_checks(checks)
             measured = None
         binary_post_run_sha256 = _executable_hash(binary)
         if binary_post_run_sha256 != binary_sha256:
             errors.append("candidate binary binding mutated during evaluation")
             checks["evidence_binding"] = False
-            checks["build"] = False
-            checks["deterministic"] = False
-            checks["capacity"] = False
-            checks["metadata_probe"] = False
+            _clear_unavailable_checks(checks)
             measured = None
         try:
             if _regular_bytes(capacity_source) != capacity_source_raw:
@@ -1567,14 +1874,14 @@ def evaluate_r0(
         except (OSError, ValueError) as error:
             errors.append(f"capacity probe binding: {_bounded(error)}")
             checks["evidence_binding"] = False
-            checks["capacity"] = False
+            checks["capacity"] = None
         try:
             if _regular_bytes(metadata_source) != metadata_source_raw:
                 raise EvaluationError("metadata probe source changed")
         except (OSError, ValueError) as error:
             errors.append(f"metadata probe binding: {_bounded(error)}")
             checks["evidence_binding"] = False
-            checks["metadata_probe"] = False
+            checks["metadata_probe"] = None
             measured = None
         apparatus_binding_clean = True
         try:
@@ -1591,8 +1898,8 @@ def evaluate_r0(
             errors.append(f"apparatus binding: {_bounded(error)}")
             apparatus_binding_clean = False
         if not apparatus_binding_clean:
-            for key in checks:
-                checks[key] = None if key == "candidate_test" and candidate == base else False
+            checks["source_binding"] = False
+            _clear_unavailable_checks(checks)
             measured = None
         try:
             observed_trace_sha256 = sha256_file(trace_path)
@@ -1603,9 +1910,9 @@ def evaluate_r0(
         if observed_trace_sha256 != synthetic["sha256"]:
             errors.append("synthetic trace binding mutated during evaluation")
             checks["evidence_binding"] = False
-            checks["deterministic"] = False
-            checks["capacity"] = False
-            checks["metadata_probe"] = False
+            checks["deterministic"] = None
+            checks["capacity"] = None
+            checks["metadata_probe"] = None
             measured = None
 
         cleanup_clean = True
@@ -1625,8 +1932,21 @@ def evaluate_r0(
             errors.append(_bounded(error))
             cleanup_clean = False
         if not cleanup_clean:
-            for key in checks:
-                checks[key] = None if key == "candidate_test" and candidate == base else False
+            checks["source_binding"] = False
+            _clear_unavailable_checks(checks)
+            measured = None
+
+        evidence_inventory, final_inventory_intact = _evidence_inventory(
+            stage, expected_evidence
+        )
+        if not final_inventory_intact:
+            errors.append("expected evidence inventory is missing or changed")
+            checks["evidence_binding"] = False
+            if any(
+                item["identity"] is not None and item["binding_intact"] is False
+                for item in evidence_inventory
+            ):
+                _clear_unavailable_checks(checks)
             measured = None
 
         measured_receipt = (
@@ -1704,11 +2024,11 @@ def evaluate_r0(
                 ),
             },
             "errors": errors,
+            "evidence_inventory": evidence_inventory,
             "unexpected_stage_entries": unexpected_stage_entries,
         }
         write_new_record(stage / "receipt.json", receipt, "receipt_sha256")
-        if _unexpected_stage_entries(stage, commands, include_receipt=True):
-            raise EvaluationError("stage inventory changed after receipt publication")
+        _verify_final_stage(stage, expected_evidence, evidence_inventory, receipt)
         _publish_stage(stage, stage_identity, final)
         published = True
         return receipt

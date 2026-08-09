@@ -137,7 +137,7 @@ _PROCEDURES = {
     "aros-rival-mechanisms": (
         "SourcePacket",
         "RivalMechanismSet",
-        ("Git.read", "Receipt.read", "Research.observe"),
+        ("Git.read", "Receipt.read", "Research.observe", "Research.petition"),
     ),
     "aros-experiment-design": (
         "RivalMechanismSet",

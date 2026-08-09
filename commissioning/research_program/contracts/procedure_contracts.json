@@ -125,7 +125,8 @@
       "tools": [
         "Git.read",
         "Receipt.read",
-        "Research.observe"
+        "Research.observe",
+        "Research.petition"
       ]
     },
     "aros-experiment-design": {

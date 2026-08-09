@@ -9,6 +9,7 @@ tools:
   - Git.read
   - Receipt.read
   - Research.observe
+  - Research.petition
 ---
 
 ## Purpose
@@ -50,8 +51,10 @@ distinguish without selecting a preferred explanation prematurely.
 - Complete only with at least two surviving rivals.
 - Every surviving rival must have at least one discriminating observation and a
   stated falsifier.
-- If fewer than two rivals survive, return unresolved and seek additional sources;
-  never complete this procedure.
+- If fewer than two rivals survive, do not emit a `RivalMechanismSet`.
+- Call `Research.observe` with the missing distinguishing evidence, then call
+  `Research.petition` to request a new `SourcePacket`.
+- Exit incomplete after those calls; never complete this procedure.
 
 ## Forbidden
 
@@ -59,3 +62,4 @@ distinguish without selecting a preferred explanation prematurely.
 - Do not select a top winner.
 - Do not retain unfalsifiable mechanisms.
 - Do not choose an experiment yet.
+- Do not call any `Source.*` tool directly.

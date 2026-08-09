@@ -203,7 +203,7 @@ EXPECTED_PROCEDURES = {
     "aros-rival-mechanisms": (
         "SourcePacket",
         "RivalMechanismSet",
-        ("Git.read", "Receipt.read", "Research.observe"),
+        ("Git.read", "Receipt.read", "Research.observe", "Research.petition"),
     ),
     "aros-experiment-design": (
         "RivalMechanismSet",
@@ -315,6 +315,7 @@ EXPECTED_RIVAL_FORBIDDEN_RULES = (
     "Do not select a top winner.",
     "Do not retain unfalsifiable mechanisms.",
     "Do not choose an experiment yet.",
+    "Do not call any `Source.*` tool directly.",
 )
 EXPECTED_RIVAL_COMPLETION_RULES = (
     "Complete only with at least two surviving rivals.",
@@ -322,10 +323,12 @@ EXPECTED_RIVAL_COMPLETION_RULES = (
         "Every surviving rival must have at least one discriminating observation "
         "and a stated falsifier."
     ),
+    "If fewer than two rivals survive, do not emit a `RivalMechanismSet`.",
     (
-        "If fewer than two rivals survive, return unresolved and seek additional "
-        "sources; never complete this procedure."
+        "Call `Research.observe` with the missing distinguishing evidence, then call "
+        "`Research.petition` to request a new `SourcePacket`."
     ),
+    "Exit incomplete after those calls; never complete this procedure.",
 )
 
 
@@ -1062,6 +1065,23 @@ def test_wave_one_procedures_have_exact_sections_and_opaque_provenance(
     assert b"/workspace/" not in raw
 
 
+def test_rival_procedure_has_exact_incomplete_branch_authority() -> None:
+    metadata, _ = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-rival-mechanisms.md"
+    )
+
+    assert metadata["tools"] == [
+        "Git.read",
+        "Receipt.read",
+        "Research.observe",
+        "Research.petition",
+    ]
+    assert all(
+        isinstance(tool, str) and not tool.startswith("Source.")
+        for tool in metadata["tools"]
+    )
+
+
 def test_source_procedure_has_exact_normative_method_rules() -> None:
     _, body = _parse_procedure_frontmatter(
         PROCEDURES_ROOT / "aros-source-research.md"
@@ -1181,6 +1201,11 @@ def test_rival_completion_requires_two_surviving_discriminable_rivals() -> None:
         "Completion",
         EXPECTED_RIVAL_COMPLETION_RULES,
         numbered=False,
+    )
+    completion = _procedure_section(body, "Completion")
+    assert "return unresolved" not in completion.lower()
+    assert completion.index("`Research.observe`") < completion.index(
+        "`Research.petition`"
     )
 
 

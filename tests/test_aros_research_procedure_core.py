@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PROGRAM_ROOT = ROOT / "commissioning/research_program"
 SOURCES_PATH = PROGRAM_ROOT / "SOURCES.json"
 CONTRACTS_PATH = PROGRAM_ROOT / "contracts/procedure_contracts.json"
+PROCEDURES_ROOT = PROGRAM_ROOT / "procedures"
 UPSTREAM_PRODUCT_NAMES = ("claude", "gemini")
 SOURCE_RECORD_SUFFIXES = {".json", ".jsonl", ".yaml", ".yml", ".md"}
 SOURCE_RECORD_EXEMPTIONS = {
@@ -237,6 +238,14 @@ EXPECTED_PROCEDURES = {
         ("Source.read", "Receipt.read", "Git.read", "Research.checkpoint"),
     ),
 }
+EXPECTED_PROCEDURE_HEADINGS = (
+    "Purpose",
+    "Inputs",
+    "Method",
+    "Output",
+    "Completion",
+    "Forbidden",
+)
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -255,6 +264,48 @@ def _load_source_record() -> dict[str, object]:
     )
     assert isinstance(value, dict)
     return value
+
+
+def _parse_procedure_frontmatter(path: Path) -> tuple[dict[str, object], str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines and lines[0] == "---"
+    try:
+        closing = lines.index("---", 1)
+    except ValueError as error:
+        raise AssertionError("procedure frontmatter is not closed") from error
+
+    metadata: dict[str, object] = {}
+    active_list: list[str] | None = None
+    for line in lines[1:closing]:
+        field = re.fullmatch(r"([a-z_]+):(.*)", line)
+        if field is not None:
+            key, raw_value = field.groups()
+            assert key not in metadata, f"duplicate frontmatter key: {key}"
+            value = raw_value.strip()
+            if value:
+                metadata[key] = value
+                active_list = None
+            else:
+                active_list = []
+                metadata[key] = active_list
+            continue
+
+        item = re.fullmatch(r"  - ([A-Za-z0-9.-]+)", line)
+        assert item is not None and active_list is not None, (
+            f"invalid frontmatter line: {line!r}"
+        )
+        active_list.append(item.group(1))
+
+    assert list(metadata) == ["name", "source_ids", "input", "output", "tools"]
+    return metadata, "\n".join(lines[closing + 1 :])
+
+
+def _procedure_section(body: str, heading: str) -> str:
+    match = re.search(
+        rf"(?ms)^## {re.escape(heading)}\n(?P<section>.*?)(?=^## |\Z)", body
+    )
+    assert match is not None, f"missing procedure section: {heading}"
+    return match.group("section")
 
 
 def _assert_approved_source_record(record: dict[str, object]) -> None:
@@ -836,6 +887,144 @@ def test_contract_loader_binds_single_read_to_lstat_identity(
 
     with pytest.raises(ValueError, match="identity"):
         module.load_contracts(path)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["aros-source-research", "aros-rival-mechanisms"],
+)
+def test_wave_one_procedure_frontmatter_matches_central_contract(name: str) -> None:
+    metadata, _ = _parse_procedure_frontmatter(PROCEDURES_ROOT / f"{name}.md")
+    contracts = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    contract = contracts["procedures"][name]
+
+    assert metadata == {
+        "name": name,
+        "source_ids": ["source-1", "source-2"],
+        "input": contract["input"],
+        "output": contract["output"],
+        "tools": contract["tools"],
+    }
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["aros-source-research", "aros-rival-mechanisms"],
+)
+def test_wave_one_procedures_have_exact_sections_and_opaque_provenance(
+    name: str,
+) -> None:
+    path = PROCEDURES_ROOT / f"{name}.md"
+    metadata, body = _parse_procedure_frontmatter(path)
+    raw = path.read_bytes().lower()
+
+    assert tuple(re.findall(r"(?m)^## ([^\n]+)$", body)) == (
+        EXPECTED_PROCEDURE_HEADINGS
+    )
+    assert all(body.count(f"## {heading}\n") == 1 for heading in EXPECTED_PROCEDURE_HEADINGS)
+    assert all(
+        isinstance(source_id, str)
+        and re.fullmatch(r"source-[0-9]+", source_id) is not None
+        for source_id in metadata["source_ids"]
+    )
+    assert not any(name.encode() in raw for name in UPSTREAM_PRODUCT_NAMES)
+    assert b"repository:" not in raw
+    assert b"commit:" not in raw
+    assert b"license:" not in raw
+    assert b"/workspace/" not in raw
+
+
+def test_source_procedure_preserves_a_bound_auditable_source_packet() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-source-research.md"
+    )
+    normalized = body.lower()
+
+    for required in (
+        "prefer primary sources",
+        "multiple independent sources",
+        "exact query log",
+        "retain dead ends and contradictions",
+        "opaque source id",
+        "retrieval time",
+        "content reference",
+        "sha-256 content hash",
+        "novelty findings as evidence only",
+        "never as a scientific verdict",
+        "limitations",
+    ):
+        assert required in normalized
+
+    output = _procedure_section(body, "Output")
+    for field in (
+        "query",
+        "sources",
+        "retrieved_at",
+        "content_refs",
+        "content_sha256s",
+        "limitations",
+    ):
+        assert f"`{field}`" in output
+    assert "bound `SourcePacket`" in _procedure_section(body, "Completion")
+
+
+def test_source_procedure_forbids_direct_actions_and_scientific_verdicts() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-source-research.md"
+    )
+    forbidden = _procedure_section(body, "Forbidden").lower()
+
+    for prohibited in (
+        "do not download experimental data",
+        "do not fabricate citations",
+        "do not write to external systems",
+        "do not make scientific acceptance decisions",
+        "do not issue scientific verdicts",
+        "do not execute experiments",
+    ):
+        assert prohibited in forbidden
+
+
+def test_rival_procedure_forms_independent_falsifiable_causal_alternatives() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-rival-mechanisms.md"
+    )
+    method = _procedure_section(body, "Method").lower()
+
+    for required in (
+        "at least two",
+        "independently formed",
+        "falsifiable causal mechanisms",
+        "mechanism compression before literature novelty",
+        "literature novelty before impact",
+        "prediction",
+        "distinguishing observation",
+        "falsifier",
+        "scope",
+        "conflicts",
+        "remaining uncertainty",
+        "does not choose an experiment yet",
+    ):
+        assert required in method
+
+    completion = _procedure_section(body, "Completion").lower()
+    assert "every surviving rival" in completion
+    assert "discriminating observation" in completion
+
+
+def test_rival_procedure_rejects_score_winners_and_unfalsifiable_rivals() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-rival-mechanisms.md"
+    )
+    forbidden = _procedure_section(body, "Forbidden").lower()
+
+    for prohibited in (
+        "do not rank mechanisms by pilot score",
+        "do not select a top winner",
+        "do not retain unfalsifiable mechanisms",
+        "do not choose an experiment yet",
+    ):
+        assert prohibited in forbidden
 
 
 def test_contract_loader_fifo_swap_is_prompt_and_leaks_no_descriptor(

@@ -2020,6 +2020,8 @@ def test_verifier_rejects_checkout_head_after_active_candidate(
         "nonadditive_wiring",
         "header_extra_declaration",
         "header_too_long",
+        "cache_init_policy_space",
+        "cache_init_identifier_space",
     ],
 )
 def test_verifier_independently_recomputes_candidate_scope(
@@ -2034,7 +2036,7 @@ def test_verifier_independently_recomputes_candidate_scope(
         wiring = checkout / "libCacheSim/cache/CMakeLists.txt"
         wiring.write_text(wiring.read_text() + "# CandidatePolicy extra wiring\n")
         git(checkout, "add", str(wiring.relative_to(checkout)))
-    else:
+    elif defect in {"header_extra_declaration", "header_too_long"}:
         wiring = checkout / "libCacheSim/include/libCacheSim/evictionAlgo.h"
         lines = [
             line
@@ -2048,6 +2050,20 @@ def test_verifier_independently_recomputes_candidate_scope(
             )
         else:
             declaration = "cache_t *CandidatePolicy_init(" + "x" * 500 + ");"
+        wiring.write_text("\n".join([*lines, declaration]) + "\n")
+        git(checkout, "add", str(wiring.relative_to(checkout)))
+    else:
+        wiring = checkout / "libCacheSim/bin/cachesim/cache_init.h"
+        lines = [
+            line
+            for line in wiring.read_text().splitlines()
+            if "CandidatePolicy" not in line
+        ]
+        declaration = (
+            '{"Candidate Policy", CandidatePolicy_init},'
+            if defect == "cache_init_policy_space"
+            else '{"CandidatePolicy", CandidatePolicy _init},'
+        )
         wiring.write_text("\n".join([*lines, declaration]) + "\n")
         git(checkout, "add", str(wiring.relative_to(checkout)))
     git(checkout, "commit", "-qm", defect)
@@ -2102,6 +2118,31 @@ def test_verifier_strictly_validates_policy_contract(
     contract_path.write_text(json.dumps(contract, sort_keys=True) + "\n")
     git(checkout, "add", str(contract_path.relative_to(checkout)))
     git(checkout, "commit", "-qm", defect)
+    candidate_r0 = fixture.paths["candidate_r0"]
+    retarget_candidate_r0(candidate_r0, checkout)
+    index = json.loads(fixture.index.read_text())
+    source, _state = fixture.module._verify_source(
+        Path(index["source_receipt"]), checkout
+    )
+    with pytest.raises(fixture.module.VerificationError, match="contract"):
+        fixture.module._verify_r0(
+            candidate_r0,
+            checkout,
+            source,
+            expected_policy="CandidatePolicy",
+        )
+
+
+def test_verifier_rejects_oversized_policy_contract_before_json_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = valid_retained_substrate(tmp_path, monkeypatch)
+    checkout = fixture.paths["checkout"]
+    contract_path = checkout / "commissioning/cache_policy_contract.json"
+    contract_path.write_bytes(contract_path.read_bytes() + b" " * 65_536)
+    assert contract_path.stat().st_size > 65_536
+    git(checkout, "add", str(contract_path.relative_to(checkout)))
+    git(checkout, "commit", "-qm", "oversized contract")
     candidate_r0 = fixture.paths["candidate_r0"]
     retarget_candidate_r0(candidate_r0, checkout)
     index = json.loads(fixture.index.read_text())

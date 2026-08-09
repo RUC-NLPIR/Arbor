@@ -1200,9 +1200,23 @@ def _validate_policy_contract(value, expected_policy):
     return {key: item for key, item in contract.items() if key != "schema_version"}
 
 
+def _parse_policy_contract_blob(raw, expected_policy):
+    if not isinstance(raw, bytes) or len(raw) > 65_536:
+        raise VerificationError("candidate policy contract exceeds 65536 bytes")
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_unique_object,
+            parse_constant=_invalid_constant,
+            parse_float=_finite_float,
+        )
+    except (UnicodeError, json.JSONDecodeError, VerificationError) as error:
+        raise VerificationError("candidate policy contract Git blob is invalid") from error
+    return _validate_policy_contract(value, expected_policy)
+
+
 def _necessary_wiring_line(relative, line, policy):
     stripped = line.strip()
-    compact = "".join(stripped.split())
     if (
         not stripped
         or len(stripped) > 512
@@ -1223,10 +1237,15 @@ def _necessary_wiring_line(relative, line, policy):
     if relative == "libCacheSim/cache/CMakeLists.txt":
         return stripped == f"eviction/{policy}.c"
     if relative.endswith("cache_init.h"):
-        return compact in {
-            f'{{"{policy}",{policy}_init}}',
-            f'{{"{policy}",{policy}_init}},',
-        }
+        candidate = stripped[:-1].rstrip() if stripped.endswith(",") else stripped
+        if not candidate.startswith("{") or not candidate.endswith("}"):
+            return False
+        fields = candidate[1:-1].split(",")
+        return (
+            len(fields) == 2
+            and fields[0].strip() == f'"{policy}"'
+            and fields[1].strip() == f"{policy}_init"
+        )
     if relative == "test/CMakeLists.txt":
         normalized = " ".join(stripped.split())
         return normalized in {
@@ -1327,16 +1346,7 @@ def _recompute_scope(checkout, base, candidate, policy, diff_hash):
     baseline_unchanged = allowed_paths and additive and not any(
         status in {"D", "T"} for status in statuses.values()
     )
-    try:
-        contract_record = json.loads(
-            _git_blob(checkout, candidate, contract),
-            object_pairs_hook=_unique_object,
-            parse_constant=_invalid_constant,
-            parse_float=_finite_float,
-        )
-    except (UnicodeError, json.JSONDecodeError, VerificationError) as error:
-        raise VerificationError("candidate policy contract Git blob is invalid") from error
-    _validate_policy_contract(contract_record, policy)
+    _parse_policy_contract_blob(_git_blob(checkout, candidate, contract), policy)
     return {
         "allowed_paths": allowed_paths,
         "baseline_unchanged": baseline_unchanged,
@@ -1607,16 +1617,7 @@ def _verify_r0(path, checkout, source, *, expected_policy=None):
             or hashlib.sha256(test).hexdigest() != receipt["candidate_test_sha256"]
         ):
             raise VerificationError("candidate contract/test binding mismatch")
-        try:
-            contract_record = json.loads(
-                contract,
-                object_pairs_hook=_unique_object,
-                parse_constant=_invalid_constant,
-                parse_float=_finite_float,
-            )
-        except (UnicodeError, json.JSONDecodeError, VerificationError) as error:
-            raise VerificationError("candidate policy contract Git blob is invalid") from error
-        declared_projection = _validate_policy_contract(contract_record, policy)
+        declared_projection = _parse_policy_contract_blob(contract, policy)
         if receipt["declared_metadata"] != declared_projection:
             raise VerificationError("R0 declared metadata differs from candidate Git contract")
     checks = _exact(

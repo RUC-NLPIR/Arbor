@@ -15,6 +15,7 @@ import pytest
 from commissioning.cache_campaign.cachesim import ChildResult
 from commissioning.cache_campaign import portfolio as portfolio_module
 from commissioning.cache_campaign import portfolio_evidence as portfolio_evidence_module
+from commissioning.cache_campaign import oracle as oracle_module
 from commissioning.cache_campaign import evidence as cache_evidence
 from commissioning.cache_campaign.evidence import EvidenceError, read_bound_json_object
 from commissioning.cache_campaign.evaluate import evaluate_portfolio, parse_metadata_probe
@@ -1135,6 +1136,39 @@ def test_portfolio_evidence_dependency_mutation_is_sticky_between_cells(
     assert receipt["provenance"]["final_binding_intact"] is False
     root = json.loads((inputs["output"] / "receipt.json").read_text())
     assert "portfolio_evidence_sha256" in root["evaluator"]
+
+
+def test_oracle_dependency_mutation_is_sticky_between_cells(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    dependency = Path(oracle_module.__file__)
+    original = dependency.read_bytes()
+
+    class RestoreOnSecondCell(PortfolioRun):
+        def __call__(self, *args: object, **kwargs: object) -> ChildResult:
+            argv = args[0]
+            assert isinstance(argv, list)
+            prior = sum(portfolio_program(item) == "cachesim" for item in self.argv)
+            if portfolio_program(argv) == "cachesim" and prior == 1:
+                dependency.write_bytes(original)
+            result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
+            if portfolio_program(argv) == "cachesim" and prior == 0:
+                dependency.write_bytes(b"temporary oracle dependency replacement\n")
+            return result
+
+    runner = RestoreOnSecondCell()
+    inputs["run"] = runner
+    try:
+        receipt = evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    finally:
+        dependency.write_bytes(original)
+    assert len(runner.argv) == 1
+    assert receipt["measurements"] == []
+    assert receipt["provenance"]["final_binding_intact"] is False
+    root = json.loads((inputs["output"] / "receipt.json").read_text())
+    assert "oracle_sha256" in root["evaluator"]
+    assert "oracle_sha256" in root["evaluator_snapshots"]
 
 
 def test_nonzero_process_has_process_and_failure_receipts_but_no_measurement(

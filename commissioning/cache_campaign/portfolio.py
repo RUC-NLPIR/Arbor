@@ -757,6 +757,7 @@ def _evaluator_bindings() -> dict[str, FileBinding]:
         "portfolio_evidence_sha256": Path(__file__).with_name(
             "portfolio_evidence.py"
         ),
+        "oracle_sha256": Path(__file__).with_name("oracle.py"),
         "evaluate_sha256": Path(__file__).with_name("evaluate.py"),
         "records_sha256": Path(__file__).with_name("records.py"),
         "diagnostics_sha256": Path(__file__).with_name("diagnostics.py"),

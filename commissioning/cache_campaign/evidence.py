@@ -124,6 +124,34 @@ def _strict_parse_json_bytes(
     return value
 
 
+def _watch_directory_changes(descriptor: int) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        initialize = libc.inotify_init1
+        add_watch = libc.inotify_add_watch
+    except AttributeError as error:
+        raise EvidenceError("inotify is unavailable for bound JSON") from error
+    initialize.argtypes = [ctypes.c_int]
+    initialize.restype = ctypes.c_int
+    add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    add_watch.restype = ctypes.c_int
+    watch_descriptor = initialize(os.O_NONBLOCK | os.O_CLOEXEC)
+    if watch_descriptor < 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+    mask = 0x00000004 | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200
+    result = add_watch(
+        watch_descriptor,
+        os.fsencode(f"/proc/self/fd/{descriptor}"),
+        mask,
+    )
+    if result < 0:
+        number = ctypes.get_errno()
+        os.close(watch_descriptor)
+        raise OSError(number, os.strerror(number))
+    return watch_descriptor
+
+
 def read_bound_json_object(
     path: Path,
     *,
@@ -133,10 +161,29 @@ def read_bound_json_object(
     if type(max_bytes) is not int or not 1 <= max_bytes <= 64 * 1024 * 1024:
         raise EvidenceError("bound JSON byte limit is invalid")
     candidate = Path(path).absolute()
-    descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    parent_descriptor = os.open(
+        candidate.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        watch_descriptor = _watch_directory_changes(parent_descriptor)
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
+    try:
+        descriptor = os.open(
+            candidate.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+    except BaseException:
+        os.close(watch_descriptor)
+        os.close(parent_descriptor)
+        raise
     digest = hashlib.sha256()
     raw = bytearray()
     try:
+        parent_before = os.fstat(parent_descriptor)
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise EvidenceError("bound JSON path is not a regular file")
@@ -154,15 +201,30 @@ def read_bound_json_object(
             bytes(raw), decimal_numbers=decimal_numbers
         )
         after = candidate.stat(follow_symlinks=False)
+        parent_after = os.fstat(parent_descriptor)
+        parent_path_after = candidate.parent.stat(follow_symlinks=False)
+        try:
+            directory_events = os.read(watch_descriptor, 64 * 1024)
+        except BlockingIOError:
+            directory_events = b""
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        os.close(parent_descriptor)
+        os.close(watch_descriptor)
     if (
         stat.S_ISLNK(after.st_mode)
         or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
         or before.st_size != after.st_size
         or before.st_mtime_ns != after.st_mtime_ns
         or before.st_ctime_ns != after.st_ctime_ns
+        or (parent_before.st_dev, parent_before.st_ino)
+        != (parent_after.st_dev, parent_after.st_ino)
+        or (parent_before.st_dev, parent_before.st_ino)
+        != (parent_path_after.st_dev, parent_path_after.st_ino)
+        or parent_before.st_mtime_ns != parent_after.st_mtime_ns
+        or parent_before.st_ctime_ns != parent_after.st_ctime_ns
+        or directory_events
         or len(raw) != before.st_size
     ):
         raise EvidenceError("bound JSON path binding changed while reading")

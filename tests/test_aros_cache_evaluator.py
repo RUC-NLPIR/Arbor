@@ -58,15 +58,12 @@ def test_bound_json_parses_the_same_inode_bytes_it_receipts(
     monkeypatch.setattr(
         cache_evidence, "_strict_parse_json_bytes", replace_while_parsing
     )
-    if not restore:
-        with pytest.raises(EvidenceError, match="binding changed"):
-            read_bound_json_object(path, max_bytes=1024)
-        assert path.read_bytes() == b'{"value":"foreign"}\n'
+    with pytest.raises(EvidenceError, match="binding changed"):
+        read_bound_json_object(path, max_bytes=1024)
+    if restore:
+        assert path.read_bytes() == original
     else:
-        bound = read_bound_json_object(path, max_bytes=1024)
-        assert bound.value == {"value": "original"}
-        assert bound.raw == original
-        assert bound.sha256 == hashlib.sha256(original).hexdigest()
+        assert path.read_bytes() == b'{"value":"foreign"}\n'
 
 
 def test_output_parent_replacement_before_open_becomes_retained_authority(

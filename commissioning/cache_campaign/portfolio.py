@@ -18,10 +18,10 @@ from .cachesim import ChildResult, parse_cachesim_output, run_child
 from .diagnostics import parse_phase_probe_output, phase_probe_source
 from .evidence import (
     Binding,
+    OutputParentBinding,
     capture_binding,
     checkout_path,
-    cleanup_owned,
-    output_path,
+    cleanup_stage_in_parent,
     regular_bytes,
     read_bound_json_object,
     revalidate_checkout,
@@ -52,6 +52,7 @@ from .portfolio_evidence import (
     PublicationBindingError,
     RecordCollision,
     failed_process_record as _failed_process_record,
+    copy_verified_input,
     file_binding as _file_binding,
     inventory as _inventory,
     inventory_record as _inventory_record,
@@ -200,6 +201,7 @@ class Preflight:
     traces: tuple[TraceSpec, ...]
     evaluator_bindings: dict[str, FileBinding]
     output: Path
+    output_parent: OutputParentBinding
 
 
 @dataclass(frozen=True)
@@ -220,6 +222,23 @@ class PhaseRecordEvidence:
     bindings: tuple[FileBinding, ...]
 
 
+@dataclass(frozen=True)
+class ScientificInputs:
+    fixed_time_interposer: FileBinding
+    release_archive: FileBinding
+    release_cmake_cache: FileBinding
+    headers: Mapping[str, FileBinding]
+
+    @property
+    def bindings(self) -> tuple[FileBinding, ...]:
+        return (
+            self.fixed_time_interposer,
+            self.release_archive,
+            self.release_cmake_cache,
+            *tuple(self.headers.values()),
+        )
+
+
 def _bounded(value: object, limit: int = 512) -> str:
     message = " ".join(str(value).split()) or value.__class__.__name__
     return message if len(message) <= limit else message[: limit - 3] + "..."
@@ -227,6 +246,18 @@ def _bounded(value: object, limit: int = 512) -> str:
 
 def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
+
+
+def _output_parent_path_intact(parent: OutputParentBinding) -> bool:
+    try:
+        metadata = parent.path.lstat()
+    except OSError:
+        return False
+    return (
+        not parent.path.is_symlink()
+        and stat.S_ISDIR(metadata.st_mode)
+        and (metadata.st_dev, metadata.st_ino) == parent.identity
+    )
 
 
 def _require_process_output_inventory(path: Path) -> None:
@@ -844,33 +875,39 @@ def _preflight(
         candidate=candidate,
         policy=policy,
     )
-    final = output_path(Path(output), root)
-    if _paths_overlap(final, resolved_task_root):
-        raise PortfolioError("portfolio output must be outside task_root")
-    if _paths_overlap(final, r0_root):
-        raise PortfolioError("portfolio output must be outside the R0 evidence root")
-    if any(_paths_overlap(final, item.path) for item in traces):
-        raise PortfolioError("portfolio output must not overlap trace inputs")
-    evaluator = _evaluator_bindings()
-    return Preflight(
-        resolved_task_root,
-        manifest_binding.path,
-        manifest,
-        manifest_binding,
-        root,
-        binding,
-        candidate,
-        policy,
-        source,
-        source_binding,
-        r0,
-        r0_binding,
-        r0_root,
-        artifacts,
-        traces,
-        evaluator,
-        final,
-    )
+    output_parent = retain_output_parent(Path(output), root)
+    final = output_parent.output_path
+    try:
+        if _paths_overlap(final, resolved_task_root):
+            raise PortfolioError("portfolio output must be outside task_root")
+        if _paths_overlap(final, r0_root):
+            raise PortfolioError("portfolio output must be outside the R0 evidence root")
+        if any(_paths_overlap(final, item.path) for item in traces):
+            raise PortfolioError("portfolio output must not overlap trace inputs")
+        evaluator = _evaluator_bindings()
+        return Preflight(
+            resolved_task_root,
+            manifest_binding.path,
+            manifest,
+            manifest_binding,
+            root,
+            binding,
+            candidate,
+            policy,
+            source,
+            source_binding,
+            r0,
+            r0_binding,
+            r0_root,
+            artifacts,
+            traces,
+            evaluator,
+            final,
+            output_parent,
+        )
+    except BaseException:
+        os.close(output_parent.descriptor)
+        raise
 
 
 def _revalidate_preflight(preflight: Preflight, execution: FileBinding | None) -> None:
@@ -938,6 +975,52 @@ def _snapshot_evaluator_dependencies(
     return snapshots
 
 
+def _snapshot_scientific_inputs(
+    stage: Path, preflight: Preflight
+) -> ScientificInputs:
+    root = stage / "scientific-inputs"
+
+    def copy_artifact(key: str, destination: str) -> FileBinding:
+        source = preflight.artifact_bindings[key]
+        copied = copy_verified_input(
+            source.path,
+            root / destination,
+            expected_sha256=source.sha256,
+            expected_identity=source.identity,
+            expected_size=source.size_bytes,
+            expected_mode=source.mode,
+        )
+        return copied.snapshot
+
+    fixed_time = copy_artifact(
+        "validated_fixed_time_interposer_binary", "fixed-time-interposer.so"
+    )
+    archive = copy_artifact("release_archive", "liblibCacheSim.a")
+    cmake_cache = copy_artifact("release_cmake_cache", "CMakeCache.txt")
+    required_headers = {
+        relative: (mode, digest)
+        for relative, mode, digest in preflight.checkout_binding.tracked
+        if relative.startswith("libCacheSim/include/")
+        or relative == "libCacheSim/bin/cachesim/cache_init.h"
+    }
+    if (
+        "libCacheSim/include/libCacheSim.h" not in required_headers
+        or "libCacheSim/bin/cachesim/cache_init.h" not in required_headers
+    ):
+        raise PortfolioError("candidate phase header closure is incomplete")
+    headers: dict[str, FileBinding] = {}
+    for relative, (mode, digest) in sorted(required_headers.items()):
+        if mode not in {"regular", "executable"}:
+            raise PortfolioError("candidate phase header is not a regular tracked file")
+        copied = copy_verified_input(
+            preflight.checkout / relative,
+            root / "headers" / relative,
+            expected_sha256=digest,
+        )
+        headers[relative] = copied.snapshot
+    return ScientificInputs(fixed_time, archive, cmake_cache, headers)
+
+
 def _write_raw(path: Path, raw: bytes, mode: int) -> FileBinding:
     descriptor = os.open(
         path,
@@ -983,12 +1066,13 @@ def _compile_phase_probe(
     stage: Path,
     preflight: Preflight,
     execution: FileBinding,
+    scientific: ScientificInputs,
     run: Run,
 ) -> PhaseApparatus:
     source_raw = phase_probe_source()
     source = _write_raw(stage / "apparatus/phase_probe.c", source_raw, 0o400)
-    cmake_cache = preflight.artifact_bindings["release_cmake_cache"]
-    archive = preflight.artifact_bindings["release_archive"]
+    cmake_cache = scientific.release_cmake_cache
+    archive = scientific.release_archive
     include_flags, link_flags, cmake_cache_sha256 = probe_build_flags(
         cmake_cache.path, preflight.source
     )
@@ -1003,9 +1087,9 @@ def _compile_phase_probe(
         "-std=c11",
         "-O2",
         "-I",
-        str(preflight.checkout / "libCacheSim/include"),
+        str(cmake_cache.path.parent / "headers/libCacheSim/include"),
         "-I",
-        str(preflight.checkout / "libCacheSim/bin/cachesim"),
+        str(cmake_cache.path.parent / "headers/libCacheSim/bin/cachesim"),
         *include_flags,
         "-o",
         str(binary_path),
@@ -1014,6 +1098,8 @@ def _compile_phase_probe(
         *link_flags,
     ]
     _revalidate_preflight(preflight, execution)
+    for binding in scientific.bindings:
+        _revalidate_file(binding)
     _revalidate_compiler(compiler_path, compiler_snapshot)
     process_output = stage / "phase-compile-process"
     result: ChildResult | None = None
@@ -1030,6 +1116,8 @@ def _compile_phase_probe(
             raise PortfolioError("phase compiler returned an invalid process receipt")
         _require_process_output_inventory(process_output)
         _revalidate_preflight(preflight, execution)
+        for binding in scientific.bindings:
+            _revalidate_file(binding)
         _revalidate_file(source)
         _revalidate_compiler(compiler_path, compiler_snapshot)
         process = _process_record(
@@ -1070,6 +1158,8 @@ def _compile_phase_probe(
     binary_path.chmod(0o500)
     binary = _file_binding(binary_path, expected_mode=0o500)
     _revalidate_preflight(preflight, execution)
+    for binding in scientific.bindings:
+        _revalidate_file(binding)
     _revalidate_file(source)
     _revalidate_file(binary)
     _revalidate_compiler(compiler_path, compiler_snapshot)
@@ -1289,18 +1379,26 @@ def _publish_preflight_failure(
     error: BaseException,
     started: int,
 ) -> None:
+    output_parent: OutputParentBinding | None = None
     try:
         root = checkout_path(Path(checkout))
-        final = output_path(Path(output), root)
+        output_parent = retain_output_parent(Path(output), root)
+        final = output_parent.output_path
         resolved_task = Path(task_root).resolve(strict=True)
         if _paths_overlap(final, resolved_task):
+            os.close(output_parent.descriptor)
             return
         r0_path = Path(r0_receipt).resolve(strict=True)
         if _paths_overlap(final, r0_path.parent):
+            os.close(output_parent.descriptor)
             return
-        output_parent = retain_output_parent(final)
         stage, stage_identity = stage_directory_in_parent(output_parent)
     except (OSError, ValueError):
+        if output_parent is not None:
+            try:
+                os.close(output_parent.descriptor)
+            except OSError:
+                pass
         return
     published = False
     preserve_stage = False
@@ -1361,13 +1459,20 @@ def _publish_preflight_failure(
                 root_receipt=root_receipt,
             )
         except PublicationBindingError as publication_error:
-            preserve_stage = not publication_error.renamed
+            preserve_stage = (
+                not publication_error.renamed
+                and _output_parent_path_intact(output_parent)
+            )
             raise
         published = True
     finally:
         try:
-            if not published and not preserve_stage and os.path.lexists(stage):
-                cleanup_owned(stage, stage_identity)
+            if (
+                not published
+                and not preserve_stage
+                and os.path.lexists(output_parent.descriptor_path / stage.name)
+            ):
+                cleanup_stage_in_parent(output_parent, stage.name, stage_identity)
         finally:
             os.close(output_parent.descriptor)
 
@@ -1416,21 +1521,42 @@ def evaluate_portfolio(
             started=started,
         )
         raise PortfolioError(_bounded(error)) from error
-    selected_traces = _selected_traces(rung, preflight.traces)
-    selected_cells = [
-        {
-            "index": index,
-            "trace_id": trace.record["trace_id"],
-            "split": trace.record["split"],
-            "cache_fraction": canonical_decimal(fraction),
-            "cache_size_bytes": _cache_size(int(trace.record["working_set_bytes"]), fraction),
-        }
-        for index, (trace, fraction) in enumerate(
-            (item, fraction) for item in selected_traces for fraction in _FRACTIONS
-        )
-    ]
-    output_parent = retain_output_parent(preflight.output)
-    stage, stage_identity = stage_directory_in_parent(output_parent)
+    output_parent = preflight.output_parent
+    stage: Path | None = None
+    stage_identity: tuple[int, int] | None = None
+    preparation_complete = False
+    try:
+        selected_traces = _selected_traces(rung, preflight.traces)
+        selected_cells = [
+            {
+                "index": index,
+                "trace_id": trace.record["trace_id"],
+                "split": trace.record["split"],
+                "cache_fraction": canonical_decimal(fraction),
+                "cache_size_bytes": _cache_size(
+                    int(trace.record["working_set_bytes"]), fraction
+                ),
+            }
+            for index, (trace, fraction) in enumerate(
+                (item, fraction)
+                for item in selected_traces
+                for fraction in _FRACTIONS
+            )
+        ]
+        stage, stage_identity = stage_directory_in_parent(output_parent)
+        preparation_complete = True
+    finally:
+        if not preparation_complete:
+            try:
+                if stage is not None and stage_identity is not None:
+                    held = output_parent.descriptor_path / stage.name
+                    if os.path.lexists(held):
+                        cleanup_stage_in_parent(
+                            output_parent, stage.name, stage_identity
+                        )
+            finally:
+                os.close(output_parent.descriptor)
+    assert stage is not None and stage_identity is not None
     published = False
     preserve_stage = False
     try:
@@ -1441,12 +1567,20 @@ def evaluate_portfolio(
         evaluator_snapshots = _snapshot_evaluator_dependencies(
             stage, preflight.evaluator_bindings
         )
+        scientific_inputs = _snapshot_scientific_inputs(stage, preflight)
+        scientific_hashes = {
+            "fixed_time_interposer": scientific_inputs.fixed_time_interposer.sha256,
+            "release_archive": scientific_inputs.release_archive.sha256,
+            "release_cmake_cache": scientific_inputs.release_cmake_cache.sha256,
+            **{
+                f"header:{name}": binding.sha256
+                for name, binding in sorted(scientific_inputs.headers.items())
+            },
+        }
         execution = _copy_execution(
             stage, preflight.artifact_bindings["release_cachesim"]
         )
-        fixed_time_interposer = preflight.artifact_bindings[
-            "validated_fixed_time_interposer_binary"
-        ].path
+        fixed_time_interposer = scientific_inputs.fixed_time_interposer.path
         _revalidate_preflight(preflight, execution)
         measurements: list[dict[str, object]] = []
         failures: list[dict[str, object]] = []
@@ -1455,10 +1589,11 @@ def evaluate_portfolio(
         phase_compile_failed = False
         if rung == "r2":
             try:
-                phase_apparatus = _compile_phase_probe(
+                    phase_apparatus = _compile_phase_probe(
                     stage=stage,
                     preflight=preflight,
-                    execution=execution,
+                        execution=execution,
+                        scientific=scientific_inputs,
                     run=run,
                 )
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
@@ -1520,6 +1655,7 @@ def evaluate_portfolio(
         )
         retained_bindings.extend(trace.audit_binding for trace in selected_traces)
         retained_bindings.extend(evaluator_snapshots.values())
+        retained_bindings.extend(scientific_inputs.bindings)
         invalid_retained: set[tuple[Path, tuple[int, int]]] = set()
 
         def guard() -> None:
@@ -1744,6 +1880,7 @@ def evaluate_portfolio(
                         name: snapshot.sha256
                         for name, snapshot in sorted(evaluator_snapshots.items())
                     },
+                    "scientific_inputs": scientific_hashes,
                     "argv": argv,
                     "process": process,
                     "simulator_output": {
@@ -2001,6 +2138,31 @@ def evaluate_portfolio(
                 }
                 for name, snapshot in sorted(evaluator_snapshots.items())
             },
+            "scientific_inputs": {
+                "fixed_time_interposer": {
+                    "path": str(
+                        scientific_inputs.fixed_time_interposer.path.relative_to(stage)
+                    ),
+                    "sha256": scientific_inputs.fixed_time_interposer.sha256,
+                },
+                "release_archive": {
+                    "path": str(scientific_inputs.release_archive.path.relative_to(stage)),
+                    "sha256": scientific_inputs.release_archive.sha256,
+                },
+                "release_cmake_cache": {
+                    "path": str(
+                        scientific_inputs.release_cmake_cache.path.relative_to(stage)
+                    ),
+                    "sha256": scientific_inputs.release_cmake_cache.sha256,
+                },
+                "headers": {
+                    name: {
+                        "path": str(binding.path.relative_to(stage)),
+                        "sha256": binding.sha256,
+                    }
+                    for name, binding in sorted(scientific_inputs.headers.items())
+                },
+            },
             "host": {
                 "platform": platform.platform(),
                 "machine": platform.machine(),
@@ -2037,13 +2199,20 @@ def evaluate_portfolio(
                 root_receipt=root_receipt_binding,
             )
         except PublicationBindingError as publication_error:
-            preserve_stage = not publication_error.renamed
+            preserve_stage = (
+                not publication_error.renamed
+                and _output_parent_path_intact(output_parent)
+            )
             raise
         published = True
         return receipt
     finally:
         try:
-            if not published and not preserve_stage and os.path.lexists(stage):
-                cleanup_owned(stage, stage_identity)
+            if (
+                not published
+                and not preserve_stage
+                and os.path.lexists(output_parent.descriptor_path / stage.name)
+            ):
+                cleanup_stage_in_parent(output_parent, stage.name, stage_identity)
         finally:
             os.close(output_parent.descriptor)

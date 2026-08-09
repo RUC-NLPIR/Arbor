@@ -61,6 +61,22 @@ class OutputParentBinding:
     def descriptor_path(self) -> Path:
         return Path(f"/proc/self/fd/{self.descriptor}")
 
+    @property
+    def output_path(self) -> Path:
+        return self.path / self.output_name
+
+
+def _before_output_parent_open(_path: Path) -> None:
+    pass
+
+
+def _after_output_parent_open(_parent: OutputParentBinding) -> None:
+    pass
+
+
+def _before_stage_directory_open(_parent: OutputParentBinding) -> None:
+    pass
+
 
 def _strict_json_pairs(items: list[tuple[str, object]]) -> dict[str, object]:
     value: dict[str, object] = {}
@@ -538,23 +554,53 @@ def stage_directory(output: Path) -> tuple[Path, tuple[int, int]]:
     return stage, (metadata.st_dev, metadata.st_ino)
 
 
-def retain_output_parent(output: Path) -> OutputParentBinding:
-    parent = Path(output).parent
+def retain_output_parent(output: Path, checkout: Path) -> OutputParentBinding:
+    candidate = Path(output)
+    if not candidate.is_absolute() or candidate.name in {"", ".", ".."}:
+        raise EvidenceError("output must be an absolute new directory")
+    parent = candidate.parent
+    _before_output_parent_open(parent)
     descriptor = os.open(
         parent,
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         metadata = os.fstat(descriptor)
-        path_metadata = parent.lstat()
         identity = (metadata.st_dev, metadata.st_ino)
+        canonical_raw = os.readlink(f"/proc/self/fd/{descriptor}")
+        if canonical_raw.endswith(" (deleted)"):
+            raise EvidenceError("output parent was removed while opening")
+        canonical = Path(canonical_raw).resolve(strict=True)
+        retained = OutputParentBinding(
+            canonical, descriptor, identity, candidate.name
+        )
+        _after_output_parent_open(retained)
+        path_metadata = parent.lstat()
+        resolved_caller = parent.resolve(strict=True)
         if (
             parent.is_symlink()
             or not stat.S_ISDIR(metadata.st_mode)
             or (path_metadata.st_dev, path_metadata.st_ino) != identity
+            or resolved_caller != canonical
         ):
             raise EvidenceError("output parent binding is invalid")
-        return OutputParentBinding(parent.resolve(strict=True), descriptor, identity, output.name)
+        resolved_output = canonical / candidate.name
+        if _paths_overlap(checkout, resolved_output):
+            raise EvidenceError("checkout and output paths must not overlap")
+        if any(
+            character.isspace() or character == ":"
+            for character in str(resolved_output)
+        ):
+            raise EvidenceError("output path is unsafe for LD_PRELOAD")
+        try:
+            os.stat(candidate.name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise EvidenceError(f"output must not exist: {resolved_output}")
+        if os.path.lexists(candidate) or os.path.lexists(resolved_output):
+            raise EvidenceError(f"output must not exist: {resolved_output}")
+        return retained
     except BaseException:
         os.close(descriptor)
         raise
@@ -563,6 +609,10 @@ def retain_output_parent(output: Path) -> OutputParentBinding:
 def stage_directory_in_parent(
     parent: OutputParentBinding,
 ) -> tuple[Path, tuple[int, int]]:
+    _before_stage_directory_open(parent)
+    path_metadata = parent.path.lstat()
+    if (path_metadata.st_dev, path_metadata.st_ino) != parent.identity:
+        raise EvidenceError("output parent path changed before staging")
     for _attempt in range(16):
         name = f".{parent.output_name}-stage-{secrets.token_hex(16)}"
         try:
@@ -571,7 +621,12 @@ def stage_directory_in_parent(
             continue
         path = parent.path / name
         metadata = path.lstat()
-        return path, (metadata.st_dev, metadata.st_ino)
+        identity = (metadata.st_dev, metadata.st_ino)
+        path_parent = parent.path.lstat()
+        if (path_parent.st_dev, path_parent.st_ino) != parent.identity:
+            cleanup_owned(parent.descriptor_path / name, identity)
+            raise EvidenceError("output parent path changed during staging")
+        return path, identity
     raise EvidenceError("cannot allocate descriptor-relative stage directory")
 
 
@@ -581,6 +636,9 @@ def publish_stage_in_parent(
     identity: tuple[int, int],
 ) -> Path:
     stage_name = stage.name
+    path_parent = parent.path.lstat()
+    if (path_parent.st_dev, path_parent.st_ino) != parent.identity:
+        raise EvidenceError("output parent path changed before publication")
     metadata = os.stat(stage_name, dir_fd=parent.descriptor, follow_symlinks=False)
     if not stat.S_ISDIR(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != identity:
         raise EvidenceError("evaluation stage changed before publication")
@@ -626,6 +684,14 @@ def publish_stage_in_parent(
     ):
         raise EvidenceError("output parent path binding changed during publication")
     return held
+
+
+def cleanup_stage_in_parent(
+    parent: OutputParentBinding,
+    stage_name: str,
+    identity: tuple[int, int],
+) -> None:
+    cleanup_owned(parent.descriptor_path / stage_name, identity)
 
 
 def directory_identity(path: Path) -> tuple[int, int]:

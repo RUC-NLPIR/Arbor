@@ -79,6 +79,12 @@ class PublicationSnapshot:
     directories: tuple[PublicationDirectoryBinding, ...]
 
 
+@dataclass(frozen=True)
+class CopiedInput:
+    source: FileBinding
+    snapshot: FileBinding
+
+
 def bounded_error(value: object, limit: int = 512) -> str:
     message = " ".join(str(value).split()) or value.__class__.__name__
     return message if len(message) <= limit else message[: limit - 3] + "..."
@@ -127,6 +133,84 @@ def revalidate_file(expected: FileBinding) -> None:
     observed = file_binding(expected.path, expected_mode=expected.mode)
     if observed != expected:
         raise BindingMutationError(f"bound file changed: {expected.path.name}")
+
+
+def copy_verified_input(
+    source: Path,
+    destination: Path,
+    *,
+    expected_sha256: str,
+    expected_identity: tuple[int, int] | None = None,
+    expected_size: int | None = None,
+    expected_mode: int | None = None,
+    destination_mode: int = 0o400,
+) -> CopiedInput:
+    destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    source_descriptor = os.open(
+        source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    output_descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        destination_mode,
+    )
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise PortfolioEvidenceError("scientific input is not a regular file")
+        with os.fdopen(source_descriptor, "rb") as source_stream, os.fdopen(
+            output_descriptor, "wb"
+        ) as output_stream:
+            source_descriptor = -1
+            output_descriptor = -1
+            for block in iter(lambda: source_stream.read(1024 * 1024), b""):
+                digest.update(block)
+                size += len(block)
+                output_stream.write(block)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+            after = os.fstat(source_stream.fileno())
+        path_after = source.stat(follow_symlinks=False)
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        if output_descriptor >= 0:
+            os.close(output_descriptor)
+    source_identity = (before.st_dev, before.st_ino)
+    source_mode = stat.S_IMODE(before.st_mode)
+    observed_sha256 = digest.hexdigest()
+    if (
+        stat.S_ISLNK(path_after.st_mode)
+        or source_identity != (after.st_dev, after.st_ino)
+        or source_identity != (path_after.st_dev, path_after.st_ino)
+        or before.st_size != after.st_size
+        or before.st_size != path_after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_mtime_ns != path_after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+        or before.st_ctime_ns != path_after.st_ctime_ns
+        or observed_sha256 != expected_sha256
+        or (expected_identity is not None and source_identity != expected_identity)
+        or (expected_size is not None and size != expected_size)
+        or (expected_mode is not None and source_mode != expected_mode)
+    ):
+        raise BindingMutationError("scientific input binding changed during copy")
+    destination.chmod(destination_mode)
+    snapshot = file_binding(destination, expected_mode=destination_mode)
+    if snapshot.size_bytes != size or snapshot.sha256 != observed_sha256:
+        raise BindingMutationError("scientific input snapshot differs from source")
+    return CopiedInput(
+        FileBinding(
+            source.resolve(strict=True),
+            source_identity,
+            size,
+            observed_sha256,
+            source_mode,
+        ),
+        snapshot,
+    )
 
 
 def write_owned_record(

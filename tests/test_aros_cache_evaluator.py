@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import struct
 import subprocess
@@ -66,6 +67,145 @@ def test_bound_json_parses_the_same_inode_bytes_it_receipts(
         assert bound.value == {"value": "original"}
         assert bound.raw == original
         assert bound.sha256 == hashlib.sha256(original).hexdigest()
+
+
+def test_output_parent_replacement_before_open_becomes_retained_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = tmp_path / "host"
+    host.mkdir()
+    moved = tmp_path / "host-old"
+
+    def replace_before_open(_path: Path) -> None:
+        host.rename(moved)
+        host.mkdir()
+
+    monkeypatch.setattr(
+        cache_evidence, "_before_output_parent_open", replace_before_open
+    )
+    parent = cache_evidence.retain_output_parent(
+        host / "output", tmp_path / "checkout"
+    )
+    try:
+        assert parent.identity == (
+            host.stat().st_dev,
+            host.stat().st_ino,
+        )
+        assert parent.path == host
+    finally:
+        os.close(parent.descriptor)
+
+
+def test_output_parent_replacement_immediately_after_open_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = tmp_path / "host"
+    host.mkdir()
+    moved = tmp_path / "host-old"
+
+    def replace_after_open(_parent: object) -> None:
+        host.rename(moved)
+        host.mkdir()
+
+    monkeypatch.setattr(
+        cache_evidence, "_after_output_parent_open", replace_after_open
+    )
+    with pytest.raises(EvidenceError, match="parent binding"):
+        cache_evidence.retain_output_parent(
+            host / "output", tmp_path / "checkout"
+        )
+    assert host.exists()
+    assert moved.exists()
+
+
+def test_output_parent_replacement_before_stage_is_cleaned_via_retained_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = tmp_path / "host"
+    host.mkdir()
+    moved = tmp_path / "host-old"
+    parent = cache_evidence.retain_output_parent(
+        host / "output", tmp_path / "checkout"
+    )
+
+    def replace_before_stage(_parent: object) -> None:
+        host.rename(moved)
+        host.mkdir()
+
+    monkeypatch.setattr(
+        cache_evidence, "_before_stage_directory_open", replace_before_stage
+    )
+    try:
+        with pytest.raises(EvidenceError, match="before staging"):
+            cache_evidence.stage_directory_in_parent(parent)
+        assert not list(moved.glob(".output-stage-*"))
+    finally:
+        os.close(parent.descriptor)
+
+
+@pytest.mark.parametrize(
+    "failure", ["selection", "cache_size", "staging", "snapshot"]
+)
+def test_evaluator_closes_retained_output_parent_on_pre_stage_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    inputs, _runner, _trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    parent = inputs["output"].parent.resolve()
+
+    def matching_fds() -> set[int]:
+        matches = set()
+        for raw_fd in os.listdir("/proc/self/fd"):
+            try:
+                target = Path(os.readlink(f"/proc/self/fd/{raw_fd}"))
+            except OSError:
+                continue
+            if target == parent:
+                matches.add(int(raw_fd))
+        return matches
+
+    before = matching_fds()
+    if failure == "selection":
+        manifest_path = inputs["task_manifest"]
+        manifest = json.loads(manifest_path.read_text())
+        manifest["traces"] = manifest["traces"][:2]
+        manifest["manifest_sha256"] = record_sha256(
+            manifest, "manifest_sha256"
+        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+    elif failure == "cache_size":
+        manifest_path = inputs["task_manifest"]
+        manifest = json.loads(manifest_path.read_text())
+        for trace in manifest["traces"][:3]:
+            trace["working_set_bytes"] = 1
+            trace["diagnostics"]["working_set_bytes"] = 1
+            trace["diagnostics"]["diagnostic_sha256"] = record_sha256(
+                trace["diagnostics"], "diagnostic_sha256"
+            )
+            trace["diagnostic_sha256"] = trace["diagnostics"][
+                "diagnostic_sha256"
+            ]
+        manifest["manifest_sha256"] = record_sha256(
+            manifest, "manifest_sha256"
+        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+    elif failure == "staging":
+        def fail_stage(_parent: object) -> None:
+            raise EvidenceError("injected stage failure")
+
+        monkeypatch.setattr(
+            cache_evidence, "_before_stage_directory_open", fail_stage
+        )
+    else:
+        def fail_snapshot(*args: object, **kwargs: object) -> object:
+            raise EvidenceError("injected snapshot failure")
+
+        monkeypatch.setattr(portfolio_module, "_snapshot_trace", fail_snapshot)
+    with pytest.raises(ValueError):
+        evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
+    assert matching_fds() == before
+    assert not list(parent.glob(".portfolio-output-stage-*"))
 
 
 def measurement(**changes: object) -> ParetoMeasurement:
@@ -965,6 +1105,50 @@ def test_r2_covers_all_frozen_traces_and_binds_continuous_phase_facts(
     assert receipt["failures"] == []
 
 
+def test_phase_compile_and_runs_use_only_private_scientific_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _runner, trace_ids = portfolio_inputs(tmp_path, monkeypatch)
+    checkout = inputs["checkout"]
+    r0_root = inputs["r0_receipt"].parent
+    originals = {
+        checkout / "libCacheSim/bin/cachesim/cache_init.h": None,
+        r0_root / "artifact_snapshots/release_archive": None,
+        r0_root / "artifact_snapshots/release_cmake_cache": None,
+        r0_root / "artifact_snapshots/fixed_time_interposer_binary": None,
+    }
+    originals = {path: path.read_bytes() for path in originals}
+
+    class ScientificInputReplacingRun(PortfolioRun):
+        def __call__(self, *args: object, **kwargs: object) -> ChildResult:
+            argv = args[0]
+            assert isinstance(argv, list)
+            program = portfolio_program(argv)
+            if argv[0] == "/usr/bin/cc" or program in {"cachesim", "phase-probe"}:
+                assert not any(str(checkout) in item for item in argv)
+                assert not any(str(r0_root) in item for item in argv)
+                assert any("scientific-inputs" in item for item in argv)
+                for path in originals:
+                    path.write_bytes(b"temporary scientific input replacement\n")
+                try:
+                    return super().__call__(*args, **kwargs)  # type: ignore[arg-type]
+                finally:
+                    for path, raw in originals.items():
+                        path.write_bytes(raw)
+            return super().__call__(*args, **kwargs)  # type: ignore[arg-type]
+
+    runner = ScientificInputReplacingRun()
+    inputs["run"] = runner
+    receipt = evaluate_portfolio(rung="r2", **inputs)  # type: ignore[arg-type]
+    assert len(receipt["measurements"]) == len(trace_ids) * 3
+    assert receipt["failures"] == []
+    assert {
+        "fixed_time_interposer",
+        "release_archive",
+        "release_cmake_cache",
+    } <= set(receipt["scientific_inputs"])
+
+
 def test_cli_routes_r1_with_exact_arguments_and_prints_only_receipt_counts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1547,7 +1731,8 @@ def test_output_parent_swap_cannot_redirect_descriptor_relative_publication(
     with pytest.raises(ValueError, match="parent|publication"):
         evaluate_portfolio(rung="r1", **inputs)  # type: ignore[arg-type]
     assert not output.exists()
-    assert (moved / "r2-output/receipt.json").exists()
+    assert not (moved / "r2-output").exists()
+    assert not list(moved.glob(".r2-output-stage-*"))
 
 
 def test_root_receipt_replacement_after_verification_blocks_publish_and_is_preserved(

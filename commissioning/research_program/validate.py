@@ -77,6 +77,7 @@ _ARTIFACTS = {
         "mechanism_refs",
         "experiment_proposal_ref",
         "prediction_ref",
+        "falsifier_ref",
         "preregistration_ref",
     ),
     "ObservationUpdate": (
@@ -105,6 +106,10 @@ _ARTIFACTS = {
         "output_schema_sha256",
         "analysis_boundaries",
         "rerun_rules",
+        "experiment_proposal_ref",
+        "mechanism_refs",
+        "prediction_ref",
+        "falsifier_ref",
     ),
     "FrozenEvidencePacket": (
         "task_brief_ref",

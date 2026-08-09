@@ -143,6 +143,7 @@ EXPECTED_ARTIFACTS = {
         "mechanism_refs",
         "experiment_proposal_ref",
         "prediction_ref",
+        "falsifier_ref",
         "preregistration_ref",
     ),
     "ObservationUpdate": (
@@ -171,6 +172,10 @@ EXPECTED_ARTIFACTS = {
         "output_schema_sha256",
         "analysis_boundaries",
         "rerun_rules",
+        "experiment_proposal_ref",
+        "mechanism_refs",
+        "prediction_ref",
+        "falsifier_ref",
     ),
     "FrozenEvidencePacket": (
         "task_brief_ref",
@@ -428,7 +433,8 @@ EXPECTED_EVIDENCE_INPUT_RULES = (
     (
         "Required fields: `run_ref`, `eval_refs`, `raw_refs`, `process_state`, "
         "`budget_used`, `rival_mechanism_set_ref`, `mechanism_refs`, "
-        "`experiment_proposal_ref`, `prediction_ref`, `preregistration_ref`."
+        "`experiment_proposal_ref`, `prediction_ref`, `falsifier_ref`, "
+        "`preregistration_ref`."
     ),
     (
         "Immutability: Treat `run_ref`, every `eval_ref`, and every `raw_ref` as "
@@ -436,9 +442,9 @@ EXPECTED_EVIDENCE_INPUT_RULES = (
     ),
     (
         "Lineage: Treat `rival_mechanism_set_ref`, `mechanism_refs`, "
-        "`experiment_proposal_ref`, and `prediction_ref` as required non-null "
-        "lineage, and treat `preregistration_ref` as a required field whose value "
-        "may be null; do not infer omitted lineage."
+        "`experiment_proposal_ref`, `prediction_ref`, and `falsifier_ref` as "
+        "required non-null lineage, and treat `preregistration_ref` as a required "
+        "field whose value may be null; do not infer omitted lineage."
     ),
 )
 EXPECTED_EVIDENCE_CLASSIFICATION_FIELDS = (
@@ -463,45 +469,79 @@ EXPECTED_CONFIRMATION_MATCH_FIELDS = (
 )
 EXPECTED_CONFIRMATION_MATCH_RULES = (
     (
-        "For `candidate_commit`, require the executed receipt value to exactly "
-        "equal the `Preregistration` value."
+        "When `preregistration_ref` is non-null, for `candidate_commit`, require "
+        "the executed receipt value to exactly equal the `Preregistration` value."
     ),
     (
-        "For `data_manifest_refs`, require the executed receipt references and "
-        "order to exactly equal the `Preregistration` value."
+        "When `preregistration_ref` is non-null, for `data_manifest_refs`, require "
+        "the executed receipt references and order to exactly equal the "
+        "`Preregistration` value."
     ),
     (
-        "For `environment_sha256`, require the executed receipt value to exactly "
-        "equal the `Preregistration` value."
+        "When `preregistration_ref` is non-null, for `environment_sha256`, require "
+        "the executed receipt value to exactly equal the `Preregistration` value."
     ),
     (
-        "For `evaluator_version`, require the executed receipt value to exactly "
-        "equal the `Preregistration` value."
+        "When `preregistration_ref` is non-null, for `evaluator_version`, require "
+        "the executed receipt value to exactly equal the `Preregistration` value."
     ),
     (
-        "For `output_schema_sha256`, require the executed receipt value to exactly "
-        "equal the `Preregistration` value."
+        "When `preregistration_ref` is non-null, for `output_schema_sha256`, "
+        "require the executed receipt value to exactly equal the `Preregistration` "
+        "value."
     ),
     (
-        "For `controls`, require the executed receipt controls and values to "
-        "exactly equal the `Preregistration` value."
-    ),
-    (
-        "For `primary_comparisons`, require the executed receipt comparison "
-        "identities and measurements to exactly equal the `Preregistration` "
-        "specification."
-    ),
-    (
-        "For `analysis_boundaries`, require the executed analysis to exactly equal "
+        "When `preregistration_ref` is non-null, for `controls`, require the "
+        "executed receipt control definitions and specifications to exactly equal "
         "the `Preregistration` value."
     ),
     (
-        "For `stopping_rules`, require the executed stopping behavior to exactly "
-        "equal the `Preregistration` value."
+        "When `preregistration_ref` is non-null, for `primary_comparisons`, "
+        "require the executed receipt comparison definitions, metric "
+        "specifications, control specifications, and analysis specifications to "
+        "exactly equal the `Preregistration` value; never compare observed outcome "
+        "values."
     ),
     (
-        "For `rerun_rules`, require the executed rerun behavior to exactly equal "
-        "the `Preregistration` value."
+        "When `preregistration_ref` is non-null, for `analysis_boundaries`, require "
+        "the executed analysis boundaries to exactly equal the `Preregistration` "
+        "value."
+    ),
+    (
+        "When `preregistration_ref` is non-null, for `stopping_rules`, require the "
+        "executed stopping behavior to exactly equal the `Preregistration` value."
+    ),
+    (
+        "When `preregistration_ref` is non-null, for `rerun_rules`, require the "
+        "executed rerun behavior to exactly equal the `Preregistration` value."
+    ),
+)
+EXPECTED_SCIENTIFIC_CONFIRMATION_FIELDS = (
+    "experiment_proposal_ref",
+    "mechanism_refs",
+    "prediction_ref",
+    "falsifier_ref",
+)
+EXPECTED_SCIENTIFIC_CONFIRMATION_RULES = (
+    (
+        "When `preregistration_ref` is non-null, require the input "
+        "`experiment_proposal_ref` to exactly equal the `Preregistration` "
+        "`experiment_proposal_ref`."
+    ),
+    (
+        "When `preregistration_ref` is non-null, require the input "
+        "`mechanism_refs` and `Preregistration` `mechanism_refs` to have the same "
+        "duplicate-free ordered sequence and the same set, and require every "
+        "mechanism to belong to the current `RivalMechanismSet` read from "
+        "`rival_mechanism_set_ref`."
+    ),
+    (
+        "When `preregistration_ref` is non-null, require the input "
+        "`prediction_ref` to exactly equal the `Preregistration` `prediction_ref`."
+    ),
+    (
+        "When `preregistration_ref` is non-null, require the input "
+        "`falsifier_ref` to exactly equal the `Preregistration` `falsifier_ref`."
     ),
 )
 EXPECTED_EVIDENCE_METHOD_RULES = (
@@ -512,16 +552,16 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
     ),
     (
         "Use `Git.read` to read the exact `RivalMechanismSet`, "
-        "`ExperimentProposal`, and prediction named by the non-null lineage fields "
-        "before classification; when `preregistration_ref` is non-null, also read "
-        "that exact `Preregistration`; reject missing or inconsistent non-null "
-        "lineage."
+        "`ExperimentProposal`, prediction, and falsifier named by the non-null "
+        "lineage fields before classification; when `preregistration_ref` is "
+        "non-null, also read that exact `Preregistration`; reject missing or "
+        "inconsistent non-null lineage."
     ),
     (
         "Require input `mechanism_refs` to belong to the referenced "
         "`RivalMechanismSet` and to match the `ExperimentProposal` "
         "`mechanism_refs`; require `prediction_ref` to identify that proposal's "
-        "prediction."
+        "prediction and `falsifier_ref` to identify that proposal's falsifier."
     ),
     (
         "Emit exactly one `classifications` entry for every evidence item; each "
@@ -565,27 +605,31 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
     ),
     (
         "Connect every executed classification's `evidence_ref` to the input "
-        "`experiment_proposal_ref` and `prediction_ref` before applying any "
-        "scientific relation."
+        "`experiment_proposal_ref`, `prediction_ref`, and `falsifier_ref` before "
+        "applying any scientific relation."
     ),
     (
         "When the input `preregistration_ref` is null, set every "
-        "`confirmation_status` to `non_confirmatory`; executed evidence may still "
-        "carry `supports`, `weakens`, `eliminates`, `counterexample`, or "
+        "`confirmation_status` to `non_confirmatory` and "
+        "`confirmation_deviations` to exactly [`missing_preregistration`]; do not "
+        "apply methods 14 through 23 or compare expected values. Executed evidence "
+        "may still carry `supports`, `weakens`, `eliminates`, `counterexample`, or "
         "`negative_result`."
     ),
     *EXPECTED_CONFIRMATION_MATCH_RULES,
+    *EXPECTED_SCIENTIFIC_CONFIRMATION_RULES,
     (
-        "For any missing or deviating confirmation binding, set "
-        "`confirmation_status` to `non_confirmatory` and append a "
-        "`confirmation_deviations` item containing the field name, expected "
-        "preregistered value, observed receipt value or a missing marker, and "
-        "`evidence_ref`; record every mismatch."
+        "When `preregistration_ref` is non-null, for any missing or deviating "
+        "confirmation binding, set `confirmation_status` to `non_confirmatory` and "
+        "append a `confirmation_deviations` item containing the field name, "
+        "expected preregistered value, observed receipt value or a missing marker, "
+        "and `evidence_ref`; record every mismatch."
     ),
     (
         "Set `confirmation_status` to `confirmatory` only for executed evidence "
-        "when `preregistration_ref` is non-null, the proposal and prediction "
-        "lineage matches, every confirmation binding matches exactly, and "
+        "when `preregistration_ref` is non-null, the proposal, mechanism, "
+        "prediction, falsifier, and current-rival-set bindings match exactly, "
+        "every execution-envelope binding matches exactly, and "
         "`confirmation_deviations` is empty; null never yields `confirmatory`."
     ),
     (
@@ -616,7 +660,7 @@ EXPECTED_EVIDENCE_COMPLETION_RULES = (
         "valid classification in one `ObservationUpdate`."
     ),
     (
-        "If required rival, proposal, or prediction lineage is missing or "
+        "If required rival, proposal, prediction, or falsifier lineage is missing or "
         "inconsistent, do not emit an `ObservationUpdate`; a null "
         "`preregistration_ref` is allowed and does not block completion."
     ),
@@ -1790,7 +1834,9 @@ def test_evidence_update_reads_exact_evidence_and_classifies_independent_axes() 
     assert "assign zero or more" in method_text
     assert "both `negative_result` and `counterexample`" in method_text
     assert "empty `scientific_relations`" in method_text
-    assert "`experiment_proposal_ref` and `prediction_ref`" in method_text
+    assert "`experiment_proposal_ref`, `prediction_ref`, and `falsifier_ref`" in (
+        method_text
+    )
     assert "`preregistration_ref`" in method_text
     assert not any(
         rule.startswith("Classify each evidence item as exactly one of")
@@ -1818,9 +1864,11 @@ def test_evidence_update_returns_exact_fields_then_checkpoints_and_exits() -> No
     )
     assert output[3] == (
         "Confirmation deviations: `confirmation_deviations` is empty only when "
-        "`confirmation_status` is `confirmatory`; for `non_confirmatory`, list "
-        "every missing or deviating preregistration binding with its field name, "
-        "expected value, observed value or missing marker, and `evidence_ref`."
+        "`confirmation_status` is `confirmatory`; when `preregistration_ref` is "
+        "null it is exactly [`missing_preregistration`], and otherwise for "
+        "`non_confirmatory`, list every missing or deviating preregistration "
+        "binding with its field name, expected value, observed value or missing "
+        "marker, and `evidence_ref`."
     )
     assert output[4] == (
         "Evidence binding: Cite an exact input receipt or raw reference for every "
@@ -1854,7 +1902,11 @@ def test_evidence_update_allows_null_preregistration_for_exploratory_relations()
 
     assert "required field whose value may be null" in inputs[3]
     assert "`confirmation_status` to `non_confirmatory`" in method_text
-    assert "executed evidence may still carry `supports`, `weakens`, `eliminates`" in (
+    assert "Executed evidence may still carry `supports`, `weakens`, `eliminates`" in (
+        method_text
+    )
+    assert "exactly [`missing_preregistration`]" in method_text
+    assert "do not apply methods 14 through 23 or compare expected values" in (
         method_text
     )
     assert "null never yields `confirmatory`" in method_text
@@ -1878,16 +1930,90 @@ def test_evidence_update_each_preregistration_mismatch_is_nonconfirmatory(
     mismatch_rule = next(
         rule
         for rule in method
-        if rule.startswith("For any missing or deviating confirmation binding")
+        if "for any missing or deviating confirmation binding" in rule
     )
     assert "`non_confirmatory`" in mismatch_rule
     assert "`confirmation_deviations`" in mismatch_rule
     assert "record every mismatch" in mismatch_rule
 
     ordinal = EXPECTED_EVIDENCE_METHOD_RULES.index(expected_rule) + 1
-    old = f"{ordinal}. For `{field}`, require"
-    new = f"{ordinal}. For `{field}`, permit a mismatch and"
+    assert 14 <= ordinal <= 23
+    old = (
+        f"{ordinal}. When `preregistration_ref` is non-null, for `{field}`, require"
+    )
+    new = f"{ordinal}. Without a preregistration, for `{field}`, permit mismatch and"
     mutated = body.replace(old, new, 1)
+    assert mutated != body
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            "Method",
+            EXPECTED_EVIDENCE_METHOD_RULES,
+            numbered=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_rule"),
+    tuple(
+        zip(
+            EXPECTED_SCIENTIFIC_CONFIRMATION_FIELDS,
+            EXPECTED_SCIENTIFIC_CONFIRMATION_RULES,
+        )
+    ),
+    ids=EXPECTED_SCIENTIFIC_CONFIRMATION_FIELDS,
+)
+def test_evidence_update_rejects_unrelated_preregistered_scientific_lineage(
+    field: str, expected_rule: str
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    method = _procedure_rules(_procedure_section(body, "Method"), numbered=True)
+
+    assert expected_rule in method
+    ordinal = EXPECTED_EVIDENCE_METHOD_RULES.index(expected_rule) + 1
+    old = (
+        f"{ordinal}. When `preregistration_ref` is non-null, require the input"
+    )
+    new = f"{ordinal}. Accept an unrelated preregistration for the input"
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            "Method",
+            EXPECTED_EVIDENCE_METHOD_RULES,
+            numbered=True,
+        )
+
+    if field == "mechanism_refs":
+        assert "same duplicate-free ordered sequence and the same set" in expected_rule
+        assert "current `RivalMechanismSet`" in expected_rule
+
+
+def test_evidence_update_primary_comparison_match_excludes_observed_outcomes() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    method = _procedure_rules(_procedure_section(body, "Method"), numbered=True)
+    rule = EXPECTED_CONFIRMATION_MATCH_RULES[
+        EXPECTED_CONFIRMATION_MATCH_FIELDS.index("primary_comparisons")
+    ]
+
+    assert rule in method
+    assert "comparison definitions" in rule
+    assert "metric specifications" in rule
+    assert "control specifications" in rule
+    assert "analysis specifications" in rule
+    assert "never compare observed outcome values" in rule
+    mutated = body.replace(
+        "never compare observed outcome values",
+        "compare observed outcome values",
+        1,
+    )
     assert mutated != body
 
     with pytest.raises(AssertionError):
@@ -2004,14 +2130,20 @@ def test_evidence_update_rejects_missing_lineage_and_unrelated_targets(
     [
         (
             "Inputs",
-            "required field whose value may be null",
-            "required field whose value must be non-null",
+            "may be null; do not infer omitted lineage",
+            "must be non-null; do not infer omitted lineage",
             False,
         ),
         (
             "Method",
-            "executed evidence may still carry",
-            "executed evidence must not carry",
+            "Executed evidence may still carry",
+            "Executed evidence must not carry",
+            True,
+        ),
+        (
+            "Method",
+            "do not apply methods 14 through 23 or compare",
+            "apply methods 14 through 23 and compare",
             True,
         ),
         (

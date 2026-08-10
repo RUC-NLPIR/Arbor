@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 import marshal
 import math
@@ -855,6 +856,19 @@ def _bytecode_name(path: Path) -> re.Match[str]:
     return match
 
 
+def _load_bytecode(raw: bytes) -> CodeType:
+    stream = io.BytesIO(raw[16:])
+    try:
+        code = marshal.load(stream)
+    except (EOFError, TypeError, ValueError) as error:
+        raise ValueError(
+            "program filesystem inventory contains invalid bytecode"
+        ) from error
+    if type(code) is not CodeType or stream.read(1) != b"":
+        raise ValueError("program filesystem inventory contains invalid bytecode")
+    return code
+
+
 def _validate_bytecode_envelope(path: Path, binding: FileBinding) -> None:
     match = _bytecode_name(path)
     raw = binding.raw
@@ -867,14 +881,9 @@ def _validate_bytecode_envelope(path: Path, binding: FileBinding) -> None:
         raise ValueError("program filesystem inventory contains invalid bytecode")
     if match.group("tag") != current_tag:
         return
-    try:
-        code = marshal.loads(raw[16:])
-    except (EOFError, TypeError, ValueError) as error:
-        raise ValueError(
-            "program filesystem inventory contains invalid bytecode"
-        ) from error
+    code = _load_bytecode(raw)
     source_name = "__init__.py" if match.group("module") == "__init__" else "validate.py"
-    if type(code) is not CodeType or Path(code.co_filename).name != source_name:
+    if Path(code.co_filename).name != source_name:
         raise ValueError("program filesystem inventory contains invalid bytecode")
 
 
@@ -938,7 +947,7 @@ def _validate_bytecode_source(
         header_matches = (
             binding.raw[8:16] == importlib.util.source_hash(source_binding.raw)
         )
-    actual_code = marshal.loads(binding.raw[16:])
+    actual_code = _load_bytecode(binding.raw)
     filename = _validated_bytecode_filename(actual_code, source_path)
     expected_code = compile(
         source_binding.raw,

@@ -3639,6 +3639,7 @@ def test_contract_loader_uses_only_standard_library_imports() -> None:
         "dataclasses",
         "hashlib",
         "importlib",
+        "io",
         "json",
         "marshal",
         "math",
@@ -4598,18 +4599,28 @@ def test_program_validator_rejects_fake_supported_foreign_magic(
         module.validate_program(program)
 
 
-def test_program_validator_rejects_foreign_bytecode_with_trailing_data(
-    tmp_path: Path,
+@pytest.mark.parametrize("tag", ["current", "foreign"])
+@pytest.mark.parametrize("trailing", ["zero", "arbitrary", "source_path"])
+def test_program_validator_rejects_bytecode_with_trailing_data(
+    tmp_path: Path, tag: str, trailing: str
 ) -> None:
     module = _contract_module()
     program = _copied_program(tmp_path)
-    subprocess.run(
-        ["python3.10", "-m", "py_compile", str(program / "validate.py")],
-        check=True,
-        capture_output=True,
-    )
-    cache = program / "__pycache__/validate.cpython-310.pyc"
-    cache.write_bytes(cache.read_bytes() + b"trailing")
+    if tag == "current":
+        cache = _compile_program_module(program, "validate")
+    else:
+        subprocess.run(
+            ["python3.10", "-m", "py_compile", str(program / "validate.py")],
+            check=True,
+            capture_output=True,
+        )
+        cache = program / "__pycache__/validate.cpython-310.pyc"
+    suffix = {
+        "zero": b"\x00",
+        "arbitrary": b"trailing",
+        "source_path": str(program / "validate.py").encode("utf-8"),
+    }[trailing]
+    cache.write_bytes(cache.read_bytes() + suffix)
 
     with pytest.raises(ValueError, match="bytecode"):
         module.validate_program(program)

@@ -302,7 +302,7 @@ EXPECTED_PROCEDURES = {
 }
 APPROVED_PROCEDURE_SHA256 = {
     "aros-claim-package": "b6f661a42c2e18aca8cf0a1a2a49956bf04c7c166ad6f24f9aaee0e00c39737e",
-    "aros-evidence-update": "2d28d7003eea2b11efafcfce8c96fef292fbc9a7a3a54ba31771952b875d7776",
+    "aros-evidence-update": "ea14965ea556085c459f8af5f15355081f3b05739c4f792a63ce2d5a82ce3c4c",
     "aros-experiment-design": "a40ff958ebe3fd87ed88b869ade75063f09d6e96969761911ae447057a27727c",
     "aros-independent-review": "7eac1ab5f835a0a630b796103a4b767db35a1a0cc3d6ad51cf83c1625a548e06",
     "aros-rival-mechanisms": "d38f66fe7631900769b5d7a37595e1522c5275e01fe5b50e56e609fea54cd989",
@@ -648,7 +648,12 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
     (
         "An item whose `operational_state` is `unavailable` or `failed` must have "
         "empty `scientific_relations` and must never be recorded as a "
-        "`negative_result`; set its `confirmation_status` to `non_confirmatory`."
+        "`negative_result`; set its `confirmation_status` to `non_confirmatory`. "
+        "When `preregistration_ref` is non-null, an unavailable item's "
+        "`confirmation_deviations` must consist of `execution_unavailable` followed "
+        "by every protocol deviation and nothing else, while a failed item's list "
+        "must consist of `execution_failed` followed by every protocol deviation "
+        "and nothing else."
     ),
     (
         "For every `supports`, `weakens`, `eliminates`, or `counterexample` "
@@ -671,18 +676,20 @@ EXPECTED_EVIDENCE_METHOD_RULES = (
     *EXPECTED_CONFIRMATION_MATCH_RULES,
     *EXPECTED_SCIENTIFIC_CONFIRMATION_RULES,
     (
-        "When `preregistration_ref` is non-null, for any missing or deviating "
-        "confirmation binding, set `confirmation_status` to `non_confirmatory` and "
-        "append a `confirmation_deviations` item containing the field name, "
-        "expected preregistered value, observed receipt value or a missing marker, "
-        "and `evidence_ref`; record every mismatch."
+        "When `preregistration_ref` is non-null and executed evidence has any "
+        "missing confirmation binding or protocol or matching deviation, set "
+        "`confirmation_status` to `non_confirmatory` and set "
+        "`confirmation_deviations` to every exact missing, protocol, or matching "
+        "reason with its field name, expected preregistered value, observed receipt "
+        "value or a missing marker, and `evidence_ref`; record every reason."
     ),
     (
         "Set `confirmation_status` to `confirmatory` only for executed evidence "
         "when `preregistration_ref` is non-null, the proposal, mechanism, "
         "prediction, falsifier, and current-rival-set bindings match exactly, "
         "every execution-envelope binding matches exactly, and "
-        "`confirmation_deviations` is empty; null never yields `confirmatory`."
+        "there are no protocol deviations; set `confirmation_deviations` to the "
+        "empty list. Null never yields `confirmatory`."
     ),
     (
         "Map `supports` to `strengthened`, `weakens` to `weakened`, and "
@@ -2457,12 +2464,14 @@ def test_evidence_update_returns_exact_fields_then_checkpoints_and_exits() -> No
         EXPECTED_EVIDENCE_CLASSIFICATION_FIELDS
     )
     assert output[3] == (
-        "Confirmation deviations: `confirmation_deviations` is empty only when "
-        "`confirmation_status` is `confirmatory`; when `preregistration_ref` is "
-        "null it is exactly [`missing_preregistration`], and otherwise for "
-        "`non_confirmatory`, list every missing or deviating preregistration "
-        "binding with its field name, expected value, observed value or missing "
-        "marker, and `evidence_ref`."
+        "Confirmation deviations: For null `preregistration_ref`, "
+        "`confirmation_deviations` is exactly [`missing_preregistration`]. For a "
+        "preregistered unavailable item it is `execution_unavailable` followed by "
+        "every protocol deviation; for a preregistered failed item it is "
+        "`execution_failed` followed by every protocol deviation; for an executed "
+        "confirmatory item it is empty; and for an executed non-confirmatory item "
+        "it lists every exact missing, protocol, or matching reason with its field "
+        "name, expected value, observed value or missing marker, and `evidence_ref`."
     )
     assert output[4] == (
         "Evidence binding: Cite an exact input receipt or raw reference for every "
@@ -2503,8 +2512,79 @@ def test_evidence_update_allows_null_preregistration_for_exploratory_relations()
     assert "do not apply methods 14 through 23 or compare expected values" in (
         method_text
     )
-    assert "null never yields `confirmatory`" in method_text
+    assert "Null never yields `confirmatory`" in method_text
     assert "does not block completion" in completion[1]
+
+
+def test_evidence_update_operational_states_have_exact_confirmation_deviations() -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    method = _procedure_rules(_procedure_section(body, "Method"), numbered=True)
+    output = _procedure_rules(_procedure_section(body, "Output"), numbered=False)
+    state_rule = method[9]
+    executed_nonconfirmatory_rule = next(
+        rule
+        for rule in method
+        if rule.startswith(
+            "When `preregistration_ref` is non-null and executed evidence"
+        )
+    )
+    confirmatory_rule = next(
+        rule
+        for rule in method
+        if rule.startswith("Set `confirmation_status` to `confirmatory` only")
+    )
+
+    assert "empty `scientific_relations`" in state_rule
+    assert "`non_confirmatory`" in state_rule
+    assert "`execution_unavailable`" in state_rule
+    assert "`execution_failed`" in state_rule
+    assert "every protocol deviation and nothing else" in state_rule
+    assert "every exact missing, protocol, or matching reason" in (
+        executed_nonconfirmatory_rule
+    )
+    assert "set `confirmation_deviations` to the empty list" in confirmatory_rule
+    assert "preregistered unavailable item" in output[3]
+    assert "preregistered failed item" in output[3]
+    assert "executed confirmatory item it is empty" in output[3]
+    assert "executed non-confirmatory item" in output[3]
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("`execution_unavailable`", "`execution_failed`"),
+        (
+            "must consist of `execution_failed`",
+            "may omit `execution_failed`",
+        ),
+        (
+            "every exact missing, protocol, or matching reason",
+            "only selected protocol reasons",
+        ),
+        (
+            "set `confirmation_deviations` to the empty list",
+            "retain nonempty `confirmation_deviations`",
+        ),
+    ],
+)
+def test_evidence_update_rejects_operational_deviation_polarity_mutations(
+    old: str, new: str
+) -> None:
+    _, body = _parse_procedure_frontmatter(
+        PROCEDURES_ROOT / "aros-evidence-update.md"
+    )
+    mutated = body.replace(old, new, 1)
+    assert mutated != body
+
+    with pytest.raises(AssertionError):
+        _assert_procedure_rules(
+            mutated,
+            "Method",
+            EXPECTED_EVIDENCE_METHOD_RULES,
+            numbered=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -2524,11 +2604,13 @@ def test_evidence_update_each_preregistration_mismatch_is_nonconfirmatory(
     mismatch_rule = next(
         rule
         for rule in method
-        if "for any missing or deviating confirmation binding" in rule
+        if rule.startswith(
+            "When `preregistration_ref` is non-null and executed evidence"
+        )
     )
     assert "`non_confirmatory`" in mismatch_rule
     assert "`confirmation_deviations`" in mismatch_rule
-    assert "record every mismatch" in mismatch_rule
+    assert "record every reason" in mismatch_rule
 
     ordinal = EXPECTED_EVIDENCE_METHOD_RULES.index(expected_rule) + 1
     assert 14 <= ordinal <= 23

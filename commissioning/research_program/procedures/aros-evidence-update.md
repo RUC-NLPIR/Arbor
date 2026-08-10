@@ -63,7 +63,11 @@ without changing the evidence or continuing the experimental session.
    when both apply; scientific relations are not mutually exclusive.
 10. An item whose `operational_state` is `unavailable` or `failed` must have empty
     `scientific_relations` and must never be recorded as a `negative_result`; set
-    its `confirmation_status` to `non_confirmatory`.
+    its `confirmation_status` to `non_confirmatory`. When `preregistration_ref` is
+    non-null, an unavailable item's `confirmation_deviations` must consist of
+    `execution_unavailable` followed by every protocol deviation and nothing else,
+    while a failed item's list must consist of `execution_failed` followed by every
+    protocol deviation and nothing else.
 11. For every `supports`, `weakens`, `eliminates`, or `counterexample` relation,
     require every `relation_targets` value to belong to the input `mechanism_refs`;
     do not infer or name an arbitrary rival.
@@ -110,16 +114,18 @@ without changing the evidence or continuing the experimental session.
     exactly equal the `Preregistration` `prediction_ref`.
 27. When `preregistration_ref` is non-null, require the input `falsifier_ref` to
     exactly equal the `Preregistration` `falsifier_ref`.
-28. When `preregistration_ref` is non-null, for any missing or deviating confirmation
-    binding, set `confirmation_status` to `non_confirmatory` and append a
-    `confirmation_deviations` item containing the field name, expected
+28. When `preregistration_ref` is non-null and executed evidence has any missing
+    confirmation binding or protocol or matching deviation, set
+    `confirmation_status` to `non_confirmatory` and set `confirmation_deviations` to
+    every exact missing, protocol, or matching reason with its field name, expected
     preregistered value, observed receipt value or a missing marker, and
-    `evidence_ref`; record every mismatch.
+    `evidence_ref`; record every reason.
 29. Set `confirmation_status` to `confirmatory` only for executed evidence when
     `preregistration_ref` is non-null, the proposal, mechanism, prediction,
     falsifier, and current-rival-set bindings match exactly, every
-    execution-envelope binding matches exactly, and `confirmation_deviations` is
-    empty; null never yields `confirmatory`.
+    execution-envelope binding matches exactly, and there are no protocol
+    deviations; set `confirmation_deviations` to the empty list. Null never yields
+    `confirmatory`.
 30. Map `supports` to `strengthened`, `weakens` to `weakened`, and `eliminates` to
     `eliminated`; attach the exact evidence reference to every update.
 31. Preserve every negative result, counterexample, preregistration deviation,
@@ -139,11 +145,14 @@ without changing the evidence or continuing the experimental session.
 - Classification entries: Every `classifications` item contains exactly
   `evidence_ref`, `operational_state`, `scientific_relations`, and
   `relation_targets`, `confirmation_status`, and `confirmation_deviations`.
-- Confirmation deviations: `confirmation_deviations` is empty only when
-  `confirmation_status` is `confirmatory`; when `preregistration_ref` is null it is
-  exactly [`missing_preregistration`], and otherwise for `non_confirmatory`, list
-  every missing or deviating preregistration binding with its field name, expected
-  value, observed value or missing marker, and `evidence_ref`.
+- Confirmation deviations: For null `preregistration_ref`,
+  `confirmation_deviations` is exactly [`missing_preregistration`]. For a
+  preregistered unavailable item it is `execution_unavailable` followed by every
+  protocol deviation; for a preregistered failed item it is `execution_failed`
+  followed by every protocol deviation; for an executed confirmatory item it is
+  empty; and for an executed non-confirmatory item it lists every exact missing,
+  protocol, or matching reason with its field name, expected value, observed value
+  or missing marker, and `evidence_ref`.
 - Evidence binding: Cite an exact input receipt or raw reference for every
   strengthened, weakened, eliminated, counterexample, and negative-result entry;
   preserve the same reference in both lists when one executed item has both

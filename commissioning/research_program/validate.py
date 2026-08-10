@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -7,6 +8,7 @@ import marshal
 import math
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -58,6 +60,108 @@ _BYTECODE_MAGIC_BY_TAG.update(
 )
 if (sys.implementation.cache_tag or "").startswith("pypy3"):
     _BYTECODE_MAGIC_BY_TAG[sys.implementation.cache_tag] = importlib.util.MAGIC_NUMBER
+_FOREIGN_BYTECODE_SCRIPT = r"""
+import base64
+import importlib.util
+import io
+import json
+import marshal
+import struct
+import sys
+from types import CodeType
+
+LIMIT = 512 * 1024
+ATTRS = (
+    "co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_nlocals",
+    "co_stacksize", "co_flags", "co_code", "co_names", "co_varnames",
+    "co_filename", "co_name", "co_qualname", "co_firstlineno", "co_lnotab",
+    "co_linetable", "co_exceptiontable", "co_freevars", "co_cellvars",
+)
+
+def same_const(left, right):
+    if type(left) is not type(right):
+        return False
+    if type(left) is CodeType:
+        return same_code(left, right)
+    if type(left) is tuple:
+        return len(left) == len(right) and all(
+            same_const(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    if type(left) is frozenset:
+        remaining = list(right)
+        for left_item in left:
+            for index, right_item in enumerate(remaining):
+                if same_const(left_item, right_item):
+                    remaining.pop(index)
+                    break
+            else:
+                return False
+        return not remaining
+    if type(left) is float:
+        return struct.pack("!d", left) == struct.pack("!d", right)
+    if type(left) is complex:
+        return (
+            struct.pack("!d", left.real) == struct.pack("!d", right.real)
+            and struct.pack("!d", left.imag) == struct.pack("!d", right.imag)
+        )
+    return left == right
+
+def same_code(left, right):
+    if type(left) is not CodeType or type(right) is not CodeType:
+        return False
+    for name in ATTRS:
+        if hasattr(left, name) != hasattr(right, name):
+            return False
+        if hasattr(left, name) and getattr(left, name) != getattr(right, name):
+            return False
+    if len(left.co_consts) != len(right.co_consts):
+        return False
+    for left_item, right_item in zip(left.co_consts, right.co_consts):
+        if not same_const(left_item, right_item):
+            return False
+    return True
+
+def main():
+    encoded = sys.stdin.buffer.read(LIMIT + 1)
+    if len(encoded) > LIMIT:
+        return False
+    payload = json.loads(encoded)
+    if sys.implementation.cache_tag != payload["tag"]:
+        return False
+    pyc = base64.b64decode(payload["pyc"], validate=True)
+    source = base64.b64decode(payload["source"], validate=True)
+    if len(pyc) < 16 or pyc[:4] != importlib.util.MAGIC_NUMBER:
+        return False
+    flags = int.from_bytes(pyc[4:8], "little")
+    if flags not in (0, 1, 3):
+        return False
+    if flags == 0:
+        if int.from_bytes(pyc[8:12], "little") != payload["mtime"]:
+            return False
+        if int.from_bytes(pyc[12:16], "little") != payload["size"]:
+            return False
+    elif pyc[8:16] != importlib.util.source_hash(source):
+        return False
+    stream = io.BytesIO(pyc[16:])
+    actual = marshal.load(stream)
+    if stream.read(1):
+        return False
+    expected = compile(
+        source,
+        payload["filename"],
+        "exec",
+        dont_inherit=True,
+        optimize=payload["optimization"],
+    )
+    return same_code(actual, expected)
+
+try:
+    valid = main()
+except BaseException:
+    valid = False
+raise SystemExit(0 if valid else 1)
+"""
 _FORBIDDEN_FIELDS = {
     "score",
     "ranking",
@@ -782,6 +886,71 @@ def _validate_bytecode_source(
         raise ValueError("program filesystem inventory contains invalid bytecode")
 
 
+def _foreign_bytecode_interpreter(tag: str) -> str:
+    if tag.startswith("cpython-"):
+        digits = tag.removeprefix("cpython-")
+        candidates = (f"python{digits[0]}.{digits[1:]}",)
+    elif tag.startswith("pypy"):
+        digits = tag.removeprefix("pypy")
+        candidates = (f"pypy{digits[0]}.{digits[1:]}", "pypy3")
+    else:
+        candidates = ()
+    for candidate in candidates:
+        executable = shutil.which(candidate, path=os.defpath)
+        if executable is not None:
+            return executable
+    raise ValueError("foreign bytecode interpreter is unavailable")
+
+
+def _validate_foreign_bytecode_source(
+    path: Path,
+    binding: FileBinding,
+    source_path: Path,
+    source_binding: FileBinding,
+) -> None:
+    match = _bytecode_name(path)
+    tag = match.group("tag")
+    executable = _foreign_bytecode_interpreter(tag)
+    optimization_match = re.search(r"\.opt-([0-9]+)\.pyc$", path.name)
+    optimization = (
+        int(optimization_match.group(1))
+        if optimization_match is not None
+        else 0
+    )
+    payload = json.dumps(
+        {
+            "filename": str(source_path),
+            "mtime": (source_binding.mtime_ns // 1_000_000_000) & 0xFFFFFFFF,
+            "optimization": optimization,
+            "pyc": base64.b64encode(binding.raw).decode("ascii"),
+            "size": source_binding.size & 0xFFFFFFFF,
+            "source": base64.b64encode(source_binding.raw).decode("ascii"),
+            "tag": tag,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    environment = {
+        "HOME": os.devnull,
+        "LC_ALL": "C",
+        "PATH": os.defpath,
+    }
+    try:
+        completed = subprocess.run(
+            [executable, "-I", "-S", "-c", _FOREIGN_BYTECODE_SCRIPT],
+            check=False,
+            close_fds=True,
+            env=environment,
+            input=payload,
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError("foreign bytecode validation failed") from error
+    if completed.returncode != 0:
+        raise ValueError("foreign bytecode validation failed")
+
+
 def _validate_program_inventory(root: Path) -> Mapping[str, FileBinding]:
     expected_files = {
         *_PROGRAM_FILES,
@@ -1048,9 +1217,9 @@ def _contains_source_detail(raw: bytes, source_details: tuple[bytes, ...]) -> bo
                 (folded, folded_detail),
             ):
                 if re.search(
-                    rb"(?<![a-z0-9])"
+                    rb"(?<![A-Za-z0-9])"
                     + re.escape(candidate)
-                    + rb"(?![a-z0-9])",
+                    + rb"(?![A-Za-z0-9])",
                     content,
                 ) is not None:
                     return True
@@ -1172,18 +1341,24 @@ def validate_program(root: Path) -> dict[str, object]:
     for relative, binding in initial_bindings.items():
         if not relative.startswith("__pycache__/"):
             continue
-        if _bytecode_name(program_root / relative).group(
-            "tag"
-        ) != sys.implementation.cache_tag:
-            continue
-        module_name = _bytecode_name(program_root / relative).group("module")
+        bytecode_path = program_root / relative
+        bytecode_name = _bytecode_name(bytecode_path)
+        module_name = bytecode_name.group("module")
         source_relative = "__init__.py" if module_name == "__init__" else "validate.py"
-        _validate_bytecode_source(
-            program_root / relative,
-            binding,
-            program_root / source_relative,
-            initial_bindings[source_relative],
-        )
+        if bytecode_name.group("tag") == sys.implementation.cache_tag:
+            _validate_bytecode_source(
+                bytecode_path,
+                binding,
+                program_root / source_relative,
+                initial_bindings[source_relative],
+            )
+        else:
+            _validate_foreign_bytecode_source(
+                bytecode_path,
+                binding,
+                program_root / source_relative,
+                initial_bindings[source_relative],
+            )
     final_bindings = _validate_program_inventory(program_root)
     if final_bindings != initial_bindings:
         raise ValueError("program files changed during validation")

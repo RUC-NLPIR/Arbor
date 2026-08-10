@@ -3634,6 +3634,7 @@ def test_contract_loader_uses_only_standard_library_imports() -> None:
 
     assert imports <= {
         "__future__",
+        "base64",
         "dataclasses",
         "hashlib",
         "importlib",
@@ -3643,6 +3644,7 @@ def test_contract_loader_uses_only_standard_library_imports() -> None:
         "os",
         "pathlib",
         "re",
+        "shutil",
         "stat",
         "subprocess",
         "sys",
@@ -4175,6 +4177,25 @@ def test_program_validator_allows_only_module_bytecode_cache(tmp_path: Path) -> 
     assert module.validate_program(program)["state"] == "valid"
 
 
+def test_program_validator_validates_current_bytecode_in_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    _compile_program_module(program, "validate")
+    real_run = module.subprocess.run
+
+    def rejecting_foreign_helper(*args: object, **kwargs: object):
+        command = args[0]
+        if isinstance(command, list) and "-c" in command:
+            raise AssertionError("current bytecode used a foreign interpreter")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", rejecting_foreign_helper)
+
+    assert module.validate_program(program)["state"] == "valid"
+
+
 @pytest.mark.parametrize(
     "invalidation_mode",
     [
@@ -4228,6 +4249,18 @@ def test_program_validator_allows_real_supported_cpython_caches(
 
 def test_program_validator_accepts_canonical_import_generated_cache() -> None:
     module = _contract_module()
+    for executable in ("python3.10", "python3.12"):
+        subprocess.run(
+            [
+                executable,
+                "-m",
+                "py_compile",
+                str(PROGRAM_ROOT / "__init__.py"),
+                str(PROGRAM_ROOT / "validate.py"),
+            ],
+            check=True,
+            capture_output=True,
+        )
     cache_path = Path(
         importlib.util.cache_from_source(str(PROGRAM_ROOT / "validate.py"))
     )
@@ -4355,14 +4388,73 @@ def test_program_validator_rejects_fake_supported_foreign_magic(
         module.validate_program(program)
 
 
+def test_program_validator_rejects_foreign_bytecode_with_trailing_data(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    subprocess.run(
+        ["python3.10", "-m", "py_compile", str(program / "validate.py")],
+        check=True,
+        capture_output=True,
+    )
+    cache = program / "__pycache__/validate.cpython-310.pyc"
+    cache.write_bytes(cache.read_bytes() + b"trailing")
+
+    with pytest.raises(ValueError, match="bytecode"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_equal_differently_typed_foreign_constant(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    subprocess.run(
+        ["python3.10", "-m", "py_compile", str(program / "validate.py")],
+        check=True,
+        capture_output=True,
+    )
+    cache = program / "__pycache__/validate.cpython-310.pyc"
+    subprocess.run(
+        [
+            "python3.10",
+            "-c",
+            (
+                "import marshal,sys;"
+                "p=sys.argv[1];raw=open(p,'rb').read();"
+                "code=marshal.loads(raw[16:]);items=list(code.co_consts);"
+                "i=next(i for i,v in enumerate(items) if type(v) is bool);"
+                "items[i]=int(items[i]);"
+                "open(p,'wb').write(raw[:16]+marshal.dumps("
+                "code.replace(co_consts=tuple(items))))"
+            ),
+            str(cache),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(ValueError, match="bytecode"):
+        module.validate_program(program)
+
+
 @pytest.mark.parametrize(
     ("tag", "magic"),
     [("pypy310", 384), ("pypy311", 432), ("pypy312", 448)],
 )
-def test_program_validator_allows_real_pypy_foreign_envelopes(
-    tmp_path: Path, tag: str, magic: int
+def test_program_validator_rejects_pypy_envelope_without_matching_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag: str, magic: int
 ) -> None:
     module = _contract_module()
+    real_which = module.shutil.which
+
+    def missing_pypy(command: str, *, path: str | None = None) -> str | None:
+        if command.startswith("pypy"):
+            return None
+        return real_which(command, path=path)
+
+    monkeypatch.setattr(module.shutil, "which", missing_pypy)
     program = _copied_program(tmp_path)
     cache = program / f"__pycache__/validate.{tag}.pyc"
     cache.parent.mkdir(exist_ok=True)
@@ -4370,7 +4462,158 @@ def test_program_validator_allows_real_pypy_foreign_envelopes(
         magic.to_bytes(2, "little") + b"\r\n" + b"\x00" * 12 + b"opaque"
     )
 
+    with pytest.raises(ValueError, match="bytecode|interpreter"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_mismatched_foreign_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    subprocess.run(
+        ["python3.10", "-m", "py_compile", str(program / "validate.py")],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(
+        module, "_foreign_bytecode_interpreter", lambda _tag: module.sys.executable
+    )
+
+    with pytest.raises(ValueError, match="bytecode"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_foreign_bytecode_with_repository_constant(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources = json.loads((program / "SOURCES.json").read_text(encoding="utf-8"))
+    repository = sources["sources"][1]["repository"]
+    validate_path = program / "validate.py"
+    original = validate_path.read_text(encoding="utf-8")
+    validate_path.write_text(
+        f"{original}\nREPOSITORY = {repository!r}\n", encoding="utf-8"
+    )
+    subprocess.run(
+        ["python3.10", "-m", "py_compile", str(validate_path)],
+        check=True,
+        capture_output=True,
+    )
+    validate_path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bytecode"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize("alteration", ["filename", "code"])
+def test_program_validator_rejects_altered_foreign_bytecode(
+    tmp_path: Path, alteration: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    validate_path = program / "validate.py"
+    original = validate_path.read_text(encoding="utf-8")
+    cache_path = program / "__pycache__/validate.cpython-310.pyc"
+    cache_path.parent.mkdir()
+    if alteration == "filename":
+        source_path = tmp_path / "other/validate.py"
+        source_path.parent.mkdir()
+        source_path.write_text(original, encoding="utf-8")
+    else:
+        source_path = validate_path
+        validate_path.write_text(f"{original}\nALTERED = True\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "python3.10",
+            "-m",
+            "py_compile",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    generated = Path(importlib.util.cache_from_source(str(source_path))).with_name(
+        f"{source_path.stem}.cpython-310.pyc"
+    )
+    if generated != cache_path:
+        shutil.copyfile(generated, cache_path)
+    validate_path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bytecode"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout", "oserror"])
+def test_program_validator_bounds_foreign_bytecode_subprocess_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    subprocess.run(
+        ["python3.10", "-m", "py_compile", str(program / "validate.py")],
+        check=True,
+        capture_output=True,
+    )
+    real_run = module.subprocess.run
+
+    def failing_run(*args: object, **kwargs: object):
+        command = args[0]
+        if isinstance(command, list) and command and "python3.10" in command[0]:
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(command, 1)
+            if failure == "oserror":
+                raise OSError("unavailable")
+            return subprocess.CompletedProcess(
+                command, 1, stdout=b"", stderr=b"failed"
+            )
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", failing_run)
+
+    with pytest.raises(ValueError, match="bytecode"):
+        module.validate_program(program)
+
+
+def test_program_validator_sanitizes_foreign_bytecode_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    subprocess.run(
+        ["python3.10", "-m", "py_compile", str(program / "validate.py")],
+        check=True,
+        capture_output=True,
+    )
+    real_run = module.subprocess.run
+    observed = False
+
+    def inspecting_run(*args: object, **kwargs: object):
+        nonlocal observed
+        command = args[0]
+        if isinstance(command, list) and command and "python3.10" in command[0]:
+            observed = True
+            assert command[1:3] == ["-I", "-S"]
+            assert kwargs["close_fds"] is True
+            assert kwargs["stdout"] is subprocess.DEVNULL
+            assert kwargs["stderr"] is subprocess.DEVNULL
+            assert kwargs["timeout"] == 5
+            assert kwargs["env"] == {
+                "HOME": os.devnull,
+                "LC_ALL": "C",
+                "PATH": os.defpath,
+            }
+            assert isinstance(kwargs["input"], bytes)
+            assert len(kwargs["input"]) <= 512 * 1024
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", inspecting_run)
+    before_descriptors = set(os.listdir("/proc/self/fd"))
+
     assert module.validate_program(program)["state"] == "valid"
+    assert observed
+    assert set(os.listdir("/proc/self/fd")) == before_descriptors
 
 
 def test_program_validator_rejects_bytecode_for_wrong_source_module(

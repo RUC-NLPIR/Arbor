@@ -40,6 +40,24 @@ _PROCEDURE_HEADINGS = (
 )
 _PROGRAM_FILES = {"SOURCES.json", "__init__.py", "validate.py"}
 _PROGRAM_DIRECTORIES = {"contracts", "procedures"}
+_BYTECODE_MAGIC_BY_TAG = {
+    f"cpython-3{minor}": magic.to_bytes(2, "little") + b"\r\n"
+    for minor, magic in {
+        10: 3439,
+        11: 3495,
+        12: 3531,
+        13: 3571,
+        14: 3627,
+    }.items()
+}
+_BYTECODE_MAGIC_BY_TAG.update(
+    {
+        f"pypy3{minor}": magic.to_bytes(2, "little") + b"\r\n"
+        for minor, magic in {10: 384, 11: 432, 12: 448}.items()
+    }
+)
+if (sys.implementation.cache_tag or "").startswith("pypy3"):
+    _BYTECODE_MAGIC_BY_TAG[sys.implementation.cache_tag] = importlib.util.MAGIC_NUMBER
 _FORBIDDEN_FIELDS = {
     "score",
     "ranking",
@@ -687,15 +705,12 @@ def _require_directory(path: Path, label: str) -> None:
 
 
 def _bytecode_name(path: Path) -> re.Match[str]:
-    cache_tag = sys.implementation.cache_tag
-    if cache_tag is None:
-        raise ValueError("program filesystem inventory cannot identify bytecode tag")
     match = re.fullmatch(
-        rf"(?P<module>__init__|validate)\.{re.escape(cache_tag)}"
-        r"(?:\.opt-[0-9]+)?\.pyc",
+        r"(?P<module>__init__|validate)\.(?P<tag>[A-Za-z0-9-]+)"
+        r"(?:\.opt-[12])?\.pyc",
         path.name,
     )
-    if match is None:
+    if match is None or match.group("tag") not in _BYTECODE_MAGIC_BY_TAG:
         raise ValueError("program filesystem inventory contains invalid bytecode")
     return match
 
@@ -703,12 +718,15 @@ def _bytecode_name(path: Path) -> re.Match[str]:
 def _validate_bytecode_envelope(path: Path, binding: FileBinding) -> None:
     match = _bytecode_name(path)
     raw = binding.raw
+    current_tag = sys.implementation.cache_tag
     if (
         len(raw) < 16
-        or raw[:4] != importlib.util.MAGIC_NUMBER
         or int.from_bytes(raw[4:8], "little") not in {0, 1, 3}
+        or raw[:4] != _BYTECODE_MAGIC_BY_TAG[match.group("tag")]
     ):
         raise ValueError("program filesystem inventory contains invalid bytecode")
+    if match.group("tag") != current_tag:
+        return
     try:
         code = marshal.loads(raw[16:])
     except (EOFError, TypeError, ValueError) as error:
@@ -754,11 +772,12 @@ def _validate_bytecode_source(
         dont_inherit=True,
         optimize=optimization,
     )
+    actual_code = marshal.loads(binding.raw[16:])
     source_name = "__init__" if match.group("module") == "__init__" else "validate"
     if (
         source_path.stem != source_name
         or not header_matches
-        or binding.raw[16:] != marshal.dumps(expected_code)
+        or actual_code != expected_code
     ):
         raise ValueError("program filesystem inventory contains invalid bytecode")
 
@@ -1094,8 +1113,9 @@ def _validate_source_isolation(
 
 
 def validate_program(root: Path) -> dict[str, object]:
-    program_root = Path(root)
-    _require_directory(program_root, "program root")
+    candidate_root = Path(root)
+    _require_directory(candidate_root, "program root")
+    program_root = candidate_root.resolve(strict=True)
     initial_bindings = _validate_program_inventory(program_root)
     sources_path = program_root / "SOURCES.json"
 
@@ -1141,6 +1161,10 @@ def validate_program(root: Path) -> dict[str, object]:
     )
     for relative, binding in initial_bindings.items():
         if not relative.startswith("__pycache__/"):
+            continue
+        if _bytecode_name(program_root / relative).group(
+            "tag"
+        ) != sys.implementation.cache_tag:
             continue
         module_name = _bytecode_name(program_root / relative).group("module")
         source_relative = "__init__.py" if module_name == "__init__" else "validate.py"

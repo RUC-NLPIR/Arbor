@@ -4197,6 +4197,35 @@ def test_program_validator_allows_source_bound_hash_bytecode(
     assert module.validate_program(program)["state"] == "valid"
 
 
+def test_program_validator_relative_root_matches_absolute_with_bytecode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    _compile_program_module(program, "validate")
+    absolute = module.validate_program(program)
+    monkeypatch.chdir(tmp_path)
+
+    relative = module.validate_program(Path("research_program"))
+
+    assert relative == absolute
+
+
+def test_program_validator_allows_real_supported_cpython_caches(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    for executable in ("python3.10", "python3.12"):
+        subprocess.run(
+            [executable, "-m", "py_compile", str(program / "validate.py")],
+            check=True,
+            capture_output=True,
+        )
+
+    assert module.validate_program(program)["state"] == "valid"
+
+
 def test_program_validator_rejects_empty_bytecode_cache(tmp_path: Path) -> None:
     module = _contract_module()
     program = _copied_program(tmp_path)
@@ -4281,6 +4310,37 @@ def test_program_validator_rejects_wrong_bytecode_implementation_tag(
 
     with pytest.raises(ValueError, match="inventory|bytecode"):
         module.validate_program(program)
+
+
+def test_program_validator_rejects_fake_supported_foreign_magic(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    cache = program / "__pycache__/validate.cpython-310.pyc"
+    cache.parent.mkdir()
+    cache.write_bytes(b"\x00\x00\r\n" + b"\x00" * 12 + b"not-marshal")
+
+    with pytest.raises(ValueError, match="inventory|bytecode"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize(
+    ("tag", "magic"),
+    [("pypy310", 384), ("pypy311", 432), ("pypy312", 448)],
+)
+def test_program_validator_allows_real_pypy_foreign_envelopes(
+    tmp_path: Path, tag: str, magic: int
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    cache = program / f"__pycache__/validate.{tag}.pyc"
+    cache.parent.mkdir(exist_ok=True)
+    cache.write_bytes(
+        magic.to_bytes(2, "little") + b"\r\n" + b"\x00" * 12 + b"opaque"
+    )
+
+    assert module.validate_program(program)["state"] == "valid"
 
 
 def test_program_validator_rejects_bytecode_for_wrong_source_module(

@@ -4,6 +4,7 @@ import ast
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -70,7 +71,7 @@ def _assert_research_procedure_wave1_changes(name_status: str) -> None:
         assert status_code in {"A", "M", "D"}, (
             f"Wave 1 change status must be A, M, or D: {line!r}"
         )
-        assert not path.startswith("src/aros/"), (
+        assert path != "src/aros" and not path.startswith("src/aros/"), (
             f"Wave 1 must not change runtime architecture: {line!r}"
         )
         assert (
@@ -159,30 +160,168 @@ def _research_procedure_wave1_name_status(
         elif indexed != [(expected[0], expected[1], "0")]:
             violations.add(("M", path))
 
-    for path, (expected_mode, expected_id) in head_entries.items():
-        worktree_path = repository / path
+    expected_directories = {"src/aros"}
+    for path in head_entries:
+        parent = Path(path).parent
+        while parent.as_posix().startswith("src/aros"):
+            expected_directories.add(parent.as_posix())
+            parent = parent.parent
+
+    def same_stat(left: os.stat_result, right: os.stat_result) -> bool:
+        return (
+            left.st_dev,
+            left.st_ino,
+            left.st_mode,
+            left.st_size,
+            left.st_mtime_ns,
+            left.st_ctime_ns,
+        ) == (
+            right.st_dev,
+            right.st_ino,
+            right.st_mode,
+            right.st_size,
+            right.st_mtime_ns,
+            right.st_ctime_ns,
+        )
+
+    def read_regular(
+        name: str, directory_fd: int, before: os.stat_result
+    ) -> tuple[bytes, os.stat_result]:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
         try:
-            metadata = worktree_path.lstat()
-            if expected_mode == "120000":
-                if not stat.S_ISLNK(metadata.st_mode):
-                    raise ValueError
-                raw = os.fsencode(os.readlink(worktree_path))
-                actual_mode = "120000"
-            else:
-                if not stat.S_ISREG(metadata.st_mode):
-                    raise ValueError
-                raw = worktree_path.read_bytes()
-                actual_mode = "100755" if metadata.st_mode & 0o111 else "100644"
-            actual_id = git_bytes(
-                "hash-object", "--no-filters", "--stdin", input_bytes=raw
-            ).decode("ascii").strip()
-            if (actual_mode, actual_id) != (expected_mode, expected_id):
-                violations.add(("M", path))
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or not same_stat(before, opened):
+                raise ValueError
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after_read = os.fstat(descriptor)
+            after_path = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not same_stat(opened, after_read) or not same_stat(opened, after_path):
+                raise ValueError
+            raw = b"".join(chunks)
+            if len(raw) != opened.st_size:
+                raise ValueError
+            return raw, opened
+        finally:
+            os.close(descriptor)
+
+    actual_head_paths: set[str] = set()
+    directory_bindings: dict[str, os.stat_result] = {}
+    file_bindings: dict[str, os.stat_result] = {}
+    source_root = repository / "src/aros"
+    try:
+        root_metadata = source_root.lstat()
+    except FileNotFoundError:
+        root_metadata = None
+    if root_metadata is not None:
+        if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+            violations.add(("M", "src/aros"))
+        else:
+            for directory, directories, files, directory_fd in os.fwalk(
+                source_root, topdown=True, follow_symlinks=False
+            ):
+                directory_relative = Path(directory).relative_to(repository).as_posix()
+                opened_directory = os.fstat(directory_fd)
+                try:
+                    live_directory = os.stat(directory, follow_symlinks=False)
+                    if (
+                        not stat.S_ISDIR(opened_directory.st_mode)
+                        or not same_stat(opened_directory, live_directory)
+                    ):
+                        raise ValueError
+                    directory_bindings[directory_relative] = opened_directory
+                except (FileNotFoundError, OSError, ValueError):
+                    violations.add(("M", directory_relative))
+                for name in tuple(directories):
+                    metadata = os.stat(
+                        name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    relative = f"{directory_relative}/{name}"
+                    if stat.S_ISLNK(metadata.st_mode):
+                        violations.add(("A", relative))
+                        directories.remove(name)
+                    elif not stat.S_ISDIR(metadata.st_mode):
+                        violations.add(("A", relative))
+                    elif name != "__pycache__" and relative not in expected_directories:
+                        violations.add(("A", relative))
+                for name in files:
+                    metadata = os.stat(
+                        name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    relative = f"{directory_relative}/{name}"
+                    expected = head_entries.get(relative)
+                    if expected is None:
+                        if not (
+                            Path(directory).name == "__pycache__"
+                            and stat.S_ISREG(metadata.st_mode)
+                            and name.endswith(".pyc")
+                        ):
+                            violations.add(("A", relative))
+                        continue
+                    expected_mode, expected_id = expected
+                    try:
+                        if expected_mode == "120000":
+                            if not stat.S_ISLNK(metadata.st_mode):
+                                raise ValueError
+                            raw = os.fsencode(os.readlink(name, dir_fd=directory_fd))
+                            actual_mode = "120000"
+                            file_bindings[relative] = metadata
+                        else:
+                            raw, opened_file = read_regular(
+                                name, directory_fd, metadata
+                            )
+                            file_bindings[relative] = opened_file
+                            actual_mode = (
+                                "100755" if metadata.st_mode & 0o111 else "100644"
+                            )
+                        actual_id = git_bytes(
+                            "hash-object", "--no-filters", "--stdin", input_bytes=raw
+                        ).decode("ascii").strip()
+                        if (actual_mode, actual_id) != (expected_mode, expected_id):
+                            violations.add(("M", relative))
+                        actual_head_paths.add(relative)
+                    except (FileNotFoundError, OSError, ValueError):
+                        violations.add(("D", relative))
+
+    for relative, before in directory_bindings.items():
+        try:
+            after = (repository / relative).lstat()
+            if not same_stat(before, after):
+                raise ValueError
         except (FileNotFoundError, OSError, ValueError):
-            violations.add(("D", path))
+            violations.add(("M", relative))
+
+    for relative, before in file_bindings.items():
+        try:
+            after = (repository / relative).lstat()
+            if not same_stat(before, after):
+                raise ValueError
+        except (FileNotFoundError, OSError, ValueError):
+            violations.add(("M", relative))
+
+    for path in set(head_entries) - actual_head_paths:
+        violations.add(("D", path))
+
+    untracked_paths = [
+        path
+        for path in untracked.splitlines()
+        if not (
+            path.startswith("src/aros/")
+            and "/__pycache__/" in path
+            and path.endswith(".pyc")
+        )
+    ]
 
     return tracked + "".join(
-        f"A\t{path}\n" for path in untracked.splitlines()
+        f"A\t{path}\n" for path in untracked_paths
     ) + "".join(f"{status}\t{path}\n" for status, path in sorted(violations))
 
 
@@ -2969,3 +3108,172 @@ def test_research_procedure_wave1_boundary_rejects_hidden_index_flags(
             _assert_research_procedure_wave1_changes(name_status)
     finally:
         _git(repository, "update-index", clear_flag, relative)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "src/aros/ignored.py",
+        "src/aros/.hidden.py",
+        "src/aros/.hidden/inside.py",
+        "src/aros/linked.py",
+    ],
+)
+def test_research_procedure_wave1_boundary_rejects_git_ignored_sources(
+    tmp_path: Path, relative_path: str
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "boundary@example.invalid")
+    _git(repository, "config", "user.name", "Boundary Test")
+    tracked = repository / "src/aros/tracked.py"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("value = 1\n", encoding="utf-8")
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "base")
+    baseline = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    candidate = repository / relative_path
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    if candidate.name == "linked.py":
+        candidate.symlink_to(repository / "README.md")
+    else:
+        candidate.write_text("value = 2\n", encoding="utf-8")
+    exclude = repository / ".git/info/exclude"
+    exclude.write_text(
+        exclude.read_text(encoding="utf-8") + f"\n{relative_path}\n",
+        encoding="utf-8",
+    )
+
+    try:
+        name_status = _research_procedure_wave1_name_status(
+            repository, baseline
+        )
+
+        with pytest.raises(AssertionError, match="runtime architecture"):
+            _assert_research_procedure_wave1_changes(name_status)
+    finally:
+        if candidate.is_symlink() or candidate.is_file():
+            candidate.unlink()
+        hidden_directory = repository / "src/aros/.hidden"
+        if hidden_directory.is_dir():
+            shutil.rmtree(hidden_directory)
+
+
+def test_research_procedure_wave1_boundary_allows_generated_bytecode(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "boundary@example.invalid")
+    _git(repository, "config", "user.name", "Boundary Test")
+    tracked = repository / "src/aros/tracked.py"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("value = 1\n", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "base")
+    baseline = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    cache = repository / "src/aros/__pycache__/tracked.cpython-312.pyc"
+    cache.parent.mkdir()
+    cache.write_bytes(b"generated bytecode")
+    exclude = repository / ".git/info/exclude"
+    exclude.write_text(
+        exclude.read_text(encoding="utf-8") + "\nsrc/aros/__pycache__/\n",
+        encoding="utf-8",
+    )
+
+    try:
+        name_status = _research_procedure_wave1_name_status(
+            repository, baseline
+        )
+        _assert_research_procedure_wave1_changes(name_status)
+    finally:
+        shutil.rmtree(cache.parent)
+
+
+def test_research_procedure_wave1_boundary_rechecks_live_directory_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "boundary@example.invalid")
+    _git(repository, "config", "user.name", "Boundary Test")
+    source_root = repository / "src/aros"
+    source_root.mkdir(parents=True)
+    (source_root / "tracked.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "base")
+    baseline = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    held = repository / "src/held-aros"
+    real_fwalk = os.fwalk
+    replaced = False
+
+    def replacing_fwalk(*args: object, **kwargs: object):
+        nonlocal replaced
+        iterator = real_fwalk(*args, **kwargs)
+        first = next(iterator)
+        source_root.rename(held)
+        shutil.copytree(held, source_root)
+        (source_root / "evil.py").write_text("value = 2\n", encoding="utf-8")
+        replaced = True
+        yield first
+        yield from iterator
+
+    monkeypatch.setattr(os, "fwalk", replacing_fwalk)
+
+    try:
+        name_status = _research_procedure_wave1_name_status(
+            repository, baseline
+        )
+
+        assert replaced
+        with pytest.raises(AssertionError, match="runtime architecture"):
+            _assert_research_procedure_wave1_changes(name_status)
+    finally:
+        if source_root.is_dir():
+            shutil.rmtree(source_root)
+        if held.is_dir():
+            held.rename(source_root)
+
+
+def test_research_procedure_wave1_boundary_rechecks_live_file_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "boundary@example.invalid")
+    _git(repository, "config", "user.name", "Boundary Test")
+    tracked = repository / "src/aros/tracked.py"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("value = 1\n", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "base")
+    baseline = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    real_run = subprocess.run
+    mutated = False
+
+    def mutating_run(*args: object, **kwargs: object):
+        nonlocal mutated
+        result = real_run(*args, **kwargs)
+        command = args[0]
+        if not mutated and isinstance(command, list) and "hash-object" in command:
+            tracked.write_text("value = 2\n", encoding="utf-8")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(subprocess, "run", mutating_run)
+
+    try:
+        name_status = _research_procedure_wave1_name_status(
+            repository, baseline
+        )
+
+        assert mutated
+        with pytest.raises(AssertionError, match="runtime architecture"):
+            _assert_research_procedure_wave1_changes(name_status)
+    finally:
+        tracked.write_text("value = 1\n", encoding="utf-8")

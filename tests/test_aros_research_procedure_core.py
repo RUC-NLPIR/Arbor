@@ -4312,7 +4312,7 @@ def test_program_validator_allows_real_supported_cpython_caches(
     assert module.validate_program(program)["state"] == "valid"
 
 
-@pytest.mark.parametrize("filename", ["canonical", "prefixed", "absolute"])
+@pytest.mark.parametrize("filename", ["canonical", "dot_relative", "absolute"])
 def test_current_validator_accepts_canonical_embedded_filenames(
     tmp_path: Path, filename: str
 ) -> None:
@@ -4321,7 +4321,7 @@ def test_current_validator_accepts_canonical_embedded_filenames(
     canonical = "commissioning/research_program/validate.py"
     embedded = {
         "canonical": canonical,
-        "prefixed": f"checkout/{canonical}",
+        "dot_relative": f"./{canonical}",
         "absolute": str((program / "validate.py").resolve()),
     }[filename]
     _compile_current_validate_cache(program, embedded)
@@ -4334,6 +4334,8 @@ def test_current_validator_accepts_canonical_embedded_filenames(
     [
         "source1_absolute",
         "other_absolute",
+        "prefixed",
+        "deep_prefixed",
         "validate.py",
         "../commissioning/research_program/validate.py",
         "source1/tmp/validate.py",
@@ -4345,11 +4347,14 @@ def test_current_validator_rejects_noncanonical_embedded_filenames(
     module = _contract_module()
     program = _copied_program(tmp_path)
     sources = json.loads((program / "SOURCES.json").read_text(encoding="utf-8"))
+    canonical = "commissioning/research_program/validate.py"
     embedded = {
         "source1_absolute": str(
             Path(sources["sources"][0]["repository"]) / "validate.py"
         ),
         "other_absolute": str((tmp_path / "other/validate.py").resolve()),
+        "prefixed": f"checkout/{canonical}",
+        "deep_prefixed": f"x/workspace/source1/{canonical}",
     }.get(filename, filename)
     _compile_current_validate_cache(program, embedded)
 
@@ -4381,7 +4386,7 @@ def test_current_validator_rejects_inconsistent_nested_filename(
         module.validate_program(program)
 
 
-@pytest.mark.parametrize("filename", ["canonical", "prefixed", "absolute"])
+@pytest.mark.parametrize("filename", ["canonical", "dot_relative", "absolute"])
 def test_foreign_validator_accepts_canonical_embedded_filenames(
     tmp_path: Path, filename: str
 ) -> None:
@@ -4389,7 +4394,7 @@ def test_foreign_validator_accepts_canonical_embedded_filenames(
     canonical = "commissioning/research_program/validate.py"
     embedded = {
         "canonical": canonical,
-        "prefixed": f"checkout/{canonical}",
+        "dot_relative": f"./{canonical}",
         "absolute": str((program / "validate.py").resolve()),
     }[filename]
 
@@ -4401,6 +4406,8 @@ def test_foreign_validator_accepts_canonical_embedded_filenames(
 @pytest.mark.parametrize(
     "embedded",
     [
+        "checkout/commissioning/research_program/validate.py",
+        "x/workspace/source1/commissioning/research_program/validate.py",
         "validate.py",
         "../commissioning/research_program/validate.py",
         "source1/tmp/validate.py",

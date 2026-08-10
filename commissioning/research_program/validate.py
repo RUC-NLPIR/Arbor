@@ -140,16 +140,12 @@ def validated_filename(code, absolute, relative):
     if path.is_absolute():
         valid = filename == absolute
     else:
-        allowed_parts = PurePosixPath(relative).parts
+        normalized = filename[2:] if filename.startswith("./") else filename
         valid = (
-            filename == path.as_posix()
+            normalized == relative
             and "\\" not in filename
             and "\x00" not in filename
             and ":" not in filename
-            and path.parts
-            and all(part not in ("", ".", "..") for part in path.parts)
-            and len(path.parts) >= len(allowed_parts)
-            and path.parts[-len(allowed_parts):] == allowed_parts
         )
     if not valid or not code_filenames_match(code, filename):
         return None
@@ -900,18 +896,15 @@ def _validated_bytecode_filename(code: object, source_path: Path) -> str:
     if path.is_absolute():
         valid = filename == str(source_path)
     else:
-        allowed_parts = PurePosixPath(
+        relative = PurePosixPath(
             "commissioning", "research_program", source_path.name
-        ).parts
+        ).as_posix()
+        normalized = filename[2:] if filename.startswith("./") else filename
         valid = (
-            filename == path.as_posix()
+            normalized == relative
             and "\\" not in filename
             and "\x00" not in filename
             and ":" not in filename
-            and path.parts
-            and all(part not in ("", ".", "..") for part in path.parts)
-            and len(path.parts) >= len(allowed_parts)
-            and path.parts[-len(allowed_parts) :] == allowed_parts
         )
     if not valid or not _bytecode_filenames_match(code, filename):
         raise ValueError("program filesystem inventory contains invalid bytecode")

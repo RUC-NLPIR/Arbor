@@ -4,6 +4,7 @@ import ast
 import hashlib
 import importlib
 import json
+import marshal
 import os
 import py_compile
 import re
@@ -13,7 +14,7 @@ import subprocess
 import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path, PurePosixPath
-from types import MappingProxyType
+from types import CodeType, MappingProxyType
 
 import pytest
 
@@ -3669,6 +3670,19 @@ def _compile_program_module(program: Path, module_name: str) -> Path:
     return Path(importlib.util.cache_from_source(str(source)))
 
 
+def _compile_current_validate_cache(program: Path, embedded_filename: str) -> Path:
+    source = program / "validate.py"
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    cache.parent.mkdir(exist_ok=True)
+    py_compile.compile(
+        str(source),
+        cfile=str(cache),
+        dfile=embedded_filename,
+        doraise=True,
+    )
+    return cache
+
+
 def _run_program_validator_with_python310(
     program: Path,
 ) -> subprocess.CompletedProcess[bytes]:
@@ -4296,6 +4310,75 @@ def test_program_validator_allows_real_supported_cpython_caches(
         )
 
     assert module.validate_program(program)["state"] == "valid"
+
+
+@pytest.mark.parametrize("filename", ["canonical", "prefixed", "absolute"])
+def test_current_validator_accepts_canonical_embedded_filenames(
+    tmp_path: Path, filename: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    canonical = "commissioning/research_program/validate.py"
+    embedded = {
+        "canonical": canonical,
+        "prefixed": f"checkout/{canonical}",
+        "absolute": str((program / "validate.py").resolve()),
+    }[filename]
+    _compile_current_validate_cache(program, embedded)
+
+    assert module.validate_program(program)["state"] == "valid"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "source1_absolute",
+        "other_absolute",
+        "validate.py",
+        "../commissioning/research_program/validate.py",
+        "source1/tmp/validate.py",
+    ],
+)
+def test_current_validator_rejects_noncanonical_embedded_filenames(
+    tmp_path: Path, filename: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources = json.loads((program / "SOURCES.json").read_text(encoding="utf-8"))
+    embedded = {
+        "source1_absolute": str(
+            Path(sources["sources"][0]["repository"]) / "validate.py"
+        ),
+        "other_absolute": str((tmp_path / "other/validate.py").resolve()),
+    }.get(filename, filename)
+    _compile_current_validate_cache(program, embedded)
+
+    with pytest.raises(ValueError, match="bytecode"):
+        module.validate_program(program)
+
+
+def test_current_validator_rejects_inconsistent_nested_filename(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    canonical = "commissioning/research_program/validate.py"
+    cache = _compile_current_validate_cache(program, canonical)
+    raw = cache.read_bytes()
+    code = marshal.loads(raw[16:])
+    constants = list(code.co_consts)
+    index = next(
+        index for index, value in enumerate(constants) if type(value) is CodeType
+    )
+    constants[index] = constants[index].replace(
+        co_filename="source1/tmp/validate.py"
+    )
+    cache.write_bytes(
+        raw[:16] + marshal.dumps(code.replace(co_consts=tuple(constants)))
+    )
+
+    with pytest.raises(ValueError, match="bytecode"):
+        module.validate_program(program)
 
 
 @pytest.mark.parametrize("filename", ["canonical", "prefixed", "absolute"])

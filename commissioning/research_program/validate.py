@@ -882,6 +882,42 @@ def _validate_bytecode_envelope(path: Path, binding: FileBinding) -> None:
         raise ValueError("program filesystem inventory contains invalid bytecode")
 
 
+def _bytecode_filenames_match(value: object, filename: str) -> bool:
+    if type(value) is CodeType:
+        return value.co_filename == filename and all(
+            _bytecode_filenames_match(item, filename) for item in value.co_consts
+        )
+    if type(value) in (tuple, frozenset):
+        return all(_bytecode_filenames_match(item, filename) for item in value)
+    return True
+
+
+def _validated_bytecode_filename(code: object, source_path: Path) -> str:
+    if type(code) is not CodeType or type(code.co_filename) is not str:
+        raise ValueError("program filesystem inventory contains invalid bytecode")
+    filename = code.co_filename
+    path = PurePosixPath(filename)
+    if path.is_absolute():
+        valid = filename == str(source_path)
+    else:
+        allowed_parts = PurePosixPath(
+            "commissioning", "research_program", source_path.name
+        ).parts
+        valid = (
+            filename == path.as_posix()
+            and "\\" not in filename
+            and "\x00" not in filename
+            and ":" not in filename
+            and path.parts
+            and all(part not in ("", ".", "..") for part in path.parts)
+            and len(path.parts) >= len(allowed_parts)
+            and path.parts[-len(allowed_parts) :] == allowed_parts
+        )
+    if not valid or not _bytecode_filenames_match(code, filename):
+        raise ValueError("program filesystem inventory contains invalid bytecode")
+    return filename
+
+
 def _validate_bytecode_source(
     path: Path,
     binding: FileBinding,
@@ -909,14 +945,15 @@ def _validate_bytecode_source(
         header_matches = (
             binding.raw[8:16] == importlib.util.source_hash(source_binding.raw)
         )
+    actual_code = marshal.loads(binding.raw[16:])
+    filename = _validated_bytecode_filename(actual_code, source_path)
     expected_code = compile(
         source_binding.raw,
-        str(source_path),
+        filename,
         "exec",
         dont_inherit=True,
         optimize=optimization,
     )
-    actual_code = marshal.loads(binding.raw[16:])
     source_name = "__init__" if match.group("module") == "__init__" else "validate"
     if (
         source_path.stem != source_name

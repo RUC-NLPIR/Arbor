@@ -4226,6 +4226,18 @@ def test_program_validator_allows_real_supported_cpython_caches(
     assert module.validate_program(program)["state"] == "valid"
 
 
+def test_program_validator_accepts_canonical_import_generated_cache() -> None:
+    module = _contract_module()
+    cache_path = Path(
+        importlib.util.cache_from_source(str(PROGRAM_ROOT / "validate.py"))
+    )
+    assert cache_path.is_file()
+
+    result = module.validate_program(PROGRAM_ROOT)
+
+    assert result["state"] == "valid"
+
+
 def test_program_validator_rejects_empty_bytecode_cache(tmp_path: Path) -> None:
     module = _contract_module()
     program = _copied_program(tmp_path)
@@ -4235,7 +4247,7 @@ def test_program_validator_rejects_empty_bytecode_cache(tmp_path: Path) -> None:
         module.validate_program(program)
 
 
-@pytest.mark.parametrize("sensitive", ["sources", "commit", "repository"])
+@pytest.mark.parametrize("sensitive", ["sources", "commit"])
 def test_program_validator_rejects_source_details_embedded_in_bytecode(
     tmp_path: Path, sensitive: str
 ) -> None:
@@ -4256,6 +4268,24 @@ def test_program_validator_rejects_source_details_embedded_in_bytecode(
     validate_path.write_text(original, encoding="utf-8")
 
     with pytest.raises(ValueError, match="source details|provenance"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_repository_detail_in_runtime_text(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources = json.loads((program / "SOURCES.json").read_text(encoding="utf-8"))
+    repository = sources["sources"][1]["repository"]
+    validate_path = program / "validate.py"
+    validate_path.write_text(
+        validate_path.read_text(encoding="utf-8")
+        + f"\nREPOSITORY = {repository!r}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="source details"):
         module.validate_program(program)
 
 

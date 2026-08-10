@@ -1080,10 +1080,20 @@ def _validate_source_isolation(
             source.adaptation,
         )
     )
+    bytecode_value_details = tuple(
+        value.encode("utf-8")
+        for source in sources.sources
+        for value in (
+            source.commit,
+            source.license,
+            *source.selected_paths,
+            source.adaptation,
+        )
+    )
     bytecode_source_details = (
         validated_content[sources_path],
         *(source.id.encode("utf-8") for source in sources.sources),
-        *source_details,
+        *bytecode_value_details,
     )
     for path, raw in validated_content.items():
         relative = path.relative_to(root)

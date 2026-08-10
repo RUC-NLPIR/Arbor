@@ -295,6 +295,17 @@ class SourceSet:
     sources: tuple[SourceRecord, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class FileBinding:
+    dev: int
+    ino: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    sha256: str
+    raw: bytes
+
+
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     value: dict[str, object] = {}
     for key, item in pairs:
@@ -353,7 +364,9 @@ def _read_contract(path: Path) -> str:
     return text
 
 
-def _read_regular_bytes(path: Path, *, label: str, limit: int) -> bytes:
+def _read_bound_regular_bytes(
+    path: Path, *, label: str, limit: int
+) -> tuple[bytes, FileBinding]:
     candidate = Path(path)
     try:
         before = candidate.lstat()
@@ -399,17 +412,34 @@ def _read_regular_bytes(path: Path, *, label: str, limit: int) -> bytes:
         or len(raw) != opened.st_size
     ):
         raise ValueError(f"{label} identity or contents changed while reading")
+    return raw, FileBinding(
+        dev=after_read.st_dev,
+        ino=after_read.st_ino,
+        size=after_read.st_size,
+        mtime_ns=after_read.st_mtime_ns,
+        ctime_ns=after_read.st_ctime_ns,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        raw=raw,
+    )
+
+
+def _read_regular_bytes(path: Path, *, label: str, limit: int) -> bytes:
+    raw, _ = _read_bound_regular_bytes(path, label=label, limit=limit)
     return raw
+
+
+def _decode_utf8(raw: bytes, label: str) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{label} must be UTF-8") from error
 
 
 def _read_regular_utf8(
     path: Path, *, label: str, limit: int
 ) -> tuple[bytes, str]:
     raw = _read_regular_bytes(path, label=label, limit=limit)
-    try:
-        return raw, raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError(f"{label} must be UTF-8") from error
+    return raw, _decode_utf8(raw, label)
 
 
 def _exact_keys(value: object, expected: set[str], label: str) -> dict[str, object]:
@@ -538,8 +568,8 @@ def _git(repository: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
-def load_sources(path: Path) -> SourceSet:
-    _, text = _read_regular_utf8(path, label="source record", limit=_MAX_CONTRACT_BYTES)
+def _parse_sources(raw: bytes) -> SourceSet:
+    text = _decode_utf8(raw, "source record")
     try:
         value = json.loads(
             text,
@@ -635,6 +665,13 @@ def load_sources(path: Path) -> SourceSet:
     return SourceSet(schema_version=1, sources=tuple(records))
 
 
+def load_sources(path: Path) -> SourceSet:
+    raw = _read_regular_bytes(
+        path, label="source record", limit=_MAX_CONTRACT_BYTES
+    )
+    return _parse_sources(raw)
+
+
 def _require_directory(path: Path, label: str) -> None:
     try:
         metadata = path.lstat()
@@ -646,15 +683,16 @@ def _require_directory(path: Path, label: str) -> None:
         raise ValueError(f"{label} must be a directory")
 
 
-def _validate_program_inventory(root: Path) -> None:
+def _validate_program_inventory(root: Path) -> Mapping[str, FileBinding]:
     expected_files = {
-        *(_PROGRAM_FILES),
+        *_PROGRAM_FILES,
         "contracts/procedure_contracts.json",
         *(f"procedures/{name}.md" for name in _PROCEDURES),
     }
     expected_directories = set(_PROGRAM_DIRECTORIES)
     seen_files: set[str] = set()
     seen_directories: set[str] = set()
+    bindings: dict[str, FileBinding] = {}
     cache_present = False
     cache_files = 0
     pending = [root]
@@ -694,15 +732,22 @@ def _validate_program_inventory(root: Path) -> None:
                     raise ValueError(
                         "program filesystem inventory contains invalid bytecode"
                     )
+                _, bindings[relative] = _read_bound_regular_bytes(
+                    path, label="program inventory file", limit=_MAX_PROCEDURE_BYTES
+                )
                 cache_files += 1
                 continue
             if relative not in expected_files:
                 raise ValueError("program filesystem inventory contains an unknown entry")
+            _, bindings[relative] = _read_bound_regular_bytes(
+                path, label="program inventory file", limit=_MAX_PROCEDURE_BYTES
+            )
             seen_files.add(relative)
     if seen_files != expected_files or seen_directories != expected_directories:
         raise ValueError("program filesystem inventory is incomplete")
     if cache_present and cache_files == 0:
         raise ValueError("program filesystem inventory contains empty bytecode cache")
+    return MappingProxyType(bindings)
 
 
 def _parse_frontmatter(text: str, name: str) -> tuple[dict[str, object], str]:
@@ -921,20 +966,10 @@ def _validate_source_isolation(
             source.adaptation,
         )
     )
-    for path in root.rglob("*"):
+    for path, raw in validated_content.items():
         relative = path.relative_to(root)
         folded_parts = tuple(part.casefold() for part in relative.parts)
-        if any(part.startswith(".") for part in relative.parts) or any(
-            part in {"__pycache__", "build"} for part in folded_parts
-        ):
-            continue
-        try:
-            metadata = path.lstat()
-        except OSError as error:
-            raise ValueError("program tree changed during validation") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError("program path must not be a symlink")
-        if not stat.S_ISREG(metadata.st_mode):
+        if "__pycache__" in folded_parts:
             continue
         if _is_source_record_path(relative):
             raise ValueError("unexpected source or provenance record")
@@ -943,11 +978,6 @@ def _validate_source_isolation(
             raise ValueError("upstream product name is forbidden at runtime")
         if path == sources_path:
             continue
-        raw = validated_content.get(path)
-        if raw is None:
-            raw = _read_regular_bytes(
-                path, label="program runtime file", limit=_MAX_PROCEDURE_BYTES
-            )
         folded = raw.lower()
         if any(product in folded for product in upstream_names):
             raise ValueError("upstream product name is forbidden at runtime")
@@ -975,45 +1005,25 @@ def _validate_source_isolation(
 def validate_program(root: Path) -> dict[str, object]:
     program_root = Path(root)
     _require_directory(program_root, "program root")
-    _validate_program_inventory(program_root)
+    initial_bindings = _validate_program_inventory(program_root)
     sources_path = program_root / "SOURCES.json"
-    contracts_root = program_root / "contracts"
-    contract_path = contracts_root / "procedure_contracts.json"
-    procedures_root = program_root / "procedures"
-    _require_directory(contracts_root, "contracts directory")
-    _require_directory(procedures_root, "procedures directory")
 
-    sources = load_sources(sources_path)
-    contract_raw, contract_text = _read_regular_utf8(
-        contract_path, label="contract file", limit=_MAX_CONTRACT_BYTES
-    )
+    sources = _parse_sources(initial_bindings["SOURCES.json"].raw)
+    contract_raw = initial_bindings["contracts/procedure_contracts.json"].raw
+    contract_text = _decode_utf8(contract_raw, "contract file")
     contracts = _parse_contracts(contract_text)
 
     expected_filenames = {f"{name}.md" for name in contracts.procedures}
-    actual_filenames: set[str] = set()
-    for path in procedures_root.iterdir():
-        try:
-            metadata = path.lstat()
-        except OSError as error:
-            raise ValueError("procedure directory changed during validation") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError(f"procedure path must not be a symlink: {path.name}")
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"unexpected procedure path: {path.name}")
-        actual_filenames.add(path.name)
-    if actual_filenames != expected_filenames:
-        raise ValueError("procedure directory must contain exactly the six canonical files")
-
     source_ids = tuple(source.id for source in sources.sources)
     procedure_results: list[dict[str, object]] = []
-    validated_content = {contract_path: contract_raw}
+    validated_content = {
+        program_root / relative: binding.raw
+        for relative, binding in initial_bindings.items()
+    }
     for filename in sorted(expected_filenames):
         name = filename.removesuffix(".md")
-        path = procedures_root / filename
-        raw, text = _read_regular_utf8(
-            path, label=f"procedure {name}", limit=_MAX_PROCEDURE_BYTES
-        )
-        validated_content[path] = raw
+        raw = initial_bindings[f"procedures/{name}.md"].raw
+        text = _decode_utf8(raw, f"procedure {name}")
         metadata, body = _parse_frontmatter(text, name)
         sections = _sections(body, name)
         contract = contracts.procedures[name]
@@ -1028,11 +1038,9 @@ def validate_program(root: Path) -> dict[str, object]:
         ):
             raise ValueError(f"procedure {name} frontmatter does not match its contract")
         _validate_runtime_actions(sections, name)
-        procedure_sha256 = hashlib.sha256(raw).hexdigest()
         procedure_results.append(
             {
                 "name": name,
-                "sha256": procedure_sha256,
                 "tools": list(contract.tools),
             }
         )
@@ -1040,11 +1048,15 @@ def validate_program(root: Path) -> dict[str, object]:
     _validate_source_isolation(
         program_root, sources_path, sources, validated_content
     )
+    final_bindings = _validate_program_inventory(program_root)
+    if final_bindings != initial_bindings:
+        raise ValueError("program files changed during validation")
     for procedure in procedure_results:
         name = procedure["name"]
-        if procedure["sha256"] != _PROCEDURE_SHA256[name]:
+        procedure_sha256 = final_bindings[f"procedures/{name}.md"].sha256
+        if procedure_sha256 != _PROCEDURE_SHA256[name]:
             raise ValueError(f"procedure {name} does not match approved SHA-256")
-    _validate_program_inventory(program_root)
+        procedure["sha256"] = procedure_sha256
     return {
         "schema_version": 1,
         "state": "valid",
@@ -1052,6 +1064,8 @@ def validate_program(root: Path) -> dict[str, object]:
             {"id": source.id, "commit": source.commit}
             for source in sorted(sources.sources, key=lambda source: source.id)
         ],
-        "contract_sha256": hashlib.sha256(contract_raw).hexdigest(),
+        "contract_sha256": final_bindings[
+            "contracts/procedure_contracts.json"
+        ].sha256,
         "procedures": procedure_results,
     }

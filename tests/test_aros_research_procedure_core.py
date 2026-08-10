@@ -3786,7 +3786,7 @@ def test_program_validator_hash_gate_rejects_cited_runtime_variants(
         module.validate_program(program)
 
 
-def test_program_validator_reads_contract_once(
+def test_program_validator_reads_contract_once_per_binding_stage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _contract_module()
@@ -3805,7 +3805,7 @@ def test_program_validator_reads_contract_once(
 
     module.validate_program(program)
 
-    assert contract_opens == 1
+    assert contract_opens == 2
 
 
 @pytest.mark.parametrize(
@@ -3875,12 +3875,13 @@ def test_program_validator_revalidates_inventory_before_success(
     real_validate_inventory = module._validate_program_inventory
     calls = 0
 
-    def injecting_inventory(root: Path) -> None:
+    def injecting_inventory(root: Path) -> object:
         nonlocal calls
         calls += 1
-        real_validate_inventory(root)
+        bindings = real_validate_inventory(root)
         if calls == 1:
             (root / "unknown.txt").write_text("late\n", encoding="utf-8")
+        return bindings
 
     monkeypatch.setattr(module, "_validate_program_inventory", injecting_inventory)
 
@@ -3888,6 +3889,271 @@ def test_program_validator_revalidates_inventory_before_success(
         module.validate_program(program)
 
     assert calls == 2
+
+
+def test_program_inventory_binds_every_allowed_regular_file(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+
+    bindings = module._validate_program_inventory(program)
+
+    expected = {
+        "SOURCES.json",
+        "__init__.py",
+        "validate.py",
+        "contracts/procedure_contracts.json",
+        *(f"procedures/{name}.md" for name in EXPECTED_PROCEDURES),
+    }
+    assert set(bindings) == expected
+    for relative, binding in bindings.items():
+        metadata = (program / relative).lstat()
+        assert binding.dev == metadata.st_dev
+        assert binding.ino == metadata.st_ino
+        assert binding.size == metadata.st_size
+        assert binding.mtime_ns == metadata.st_mtime_ns
+        assert binding.ctime_ns == metadata.st_ctime_ns
+        assert binding.sha256 == hashlib.sha256(
+            (program / relative).read_bytes()
+        ).hexdigest()
+        assert binding.raw == (program / relative).read_bytes()
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "procedures/aros-source-research.md",
+        "contracts/procedure_contracts.json",
+        "SOURCES.json",
+    ],
+)
+def test_program_validator_rejects_late_same_name_content_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative_path: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    real_validate_inventory = module._validate_program_inventory
+    calls = 0
+
+    def mutating_final_inventory(root: Path) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            candidate = root / relative_path
+            candidate.write_bytes(candidate.read_bytes() + b"\n")
+        return real_validate_inventory(root)
+
+    monkeypatch.setattr(
+        module, "_validate_program_inventory", mutating_final_inventory
+    )
+
+    with pytest.raises(ValueError, match="changed during validation"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_late_same_content_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    real_validate_inventory = module._validate_program_inventory
+    calls = 0
+
+    def replacing_final_inventory(root: Path) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            candidate = root / "SOURCES.json"
+            original = candidate.read_bytes()
+            candidate.unlink()
+            candidate.write_bytes(original)
+        return real_validate_inventory(root)
+
+    monkeypatch.setattr(
+        module, "_validate_program_inventory", replacing_final_inventory
+    )
+
+    with pytest.raises(ValueError, match="changed during validation"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_late_mutate_then_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    real_validate_inventory = module._validate_program_inventory
+    calls = 0
+
+    def restoring_final_inventory(root: Path) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            candidate = root / "contracts/procedure_contracts.json"
+            original = candidate.read_bytes()
+            candidate.write_bytes(original + b"\n")
+            candidate.write_bytes(original)
+        return real_validate_inventory(root)
+
+    monkeypatch.setattr(
+        module, "_validate_program_inventory", restoring_final_inventory
+    )
+
+    with pytest.raises(ValueError, match="changed during validation"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_transient_procedure_directory_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedures = program / "procedures"
+    alternate = tmp_path / "alternate-procedures"
+    held = tmp_path / "held-procedures"
+    shutil.copytree(procedures, alternate)
+    alternate_source = alternate / "aros-source-research.md"
+    alternate_source.write_text(
+        alternate_source.read_text(encoding="utf-8").replace(
+            "Build an auditable evidence packet",
+            "Build a traceable evidence packet",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    source_path = procedures / "aros-source-research.md"
+    real_read_bound = module._read_bound_regular_bytes
+    source_reads = 0
+
+    def swapping_read(
+        path: Path, *, label: str, limit: int
+    ) -> tuple[bytes, object]:
+        nonlocal source_reads
+        if Path(path) != source_path:
+            return real_read_bound(path, label=label, limit=limit)
+        source_reads += 1
+        if source_reads != 2:
+            return real_read_bound(path, label=label, limit=limit)
+        procedures.rename(held)
+        alternate.rename(procedures)
+        try:
+            return real_read_bound(path, label=label, limit=limit)
+        finally:
+            procedures.rename(alternate)
+            held.rename(procedures)
+
+    monkeypatch.setattr(module, "_read_bound_regular_bytes", swapping_read)
+
+    with pytest.raises(ValueError, match="changed during validation"):
+        module.validate_program(program)
+
+
+def test_program_validator_parses_retained_bytes_during_directory_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedures = program / "procedures"
+    alternate = tmp_path / "alternate-procedures"
+    held = tmp_path / "held-procedures"
+    shutil.copytree(procedures, alternate)
+    alternate_source = alternate / "aros-source-research.md"
+    alternate_source.write_text(
+        alternate_source.read_text(encoding="utf-8").replace(
+            "Build an auditable evidence packet",
+            "Build a traceable evidence packet",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    real_parse_frontmatter = module._parse_frontmatter
+    swapped = False
+
+    def swapping_parse(text: str, name: str) -> tuple[dict[str, object], str]:
+        nonlocal swapped
+        if name != "aros-source-research":
+            return real_parse_frontmatter(text, name)
+        procedures.rename(held)
+        alternate.rename(procedures)
+        swapped = True
+        try:
+            assert "Build a traceable evidence packet" in (
+                procedures / "aros-source-research.md"
+            ).read_text(encoding="utf-8")
+            return real_parse_frontmatter(text, name)
+        finally:
+            procedures.rename(alternate)
+            held.rename(procedures)
+
+    monkeypatch.setattr(module, "_parse_frontmatter", swapping_parse)
+
+    result = module.validate_program(program)
+
+    assert swapped
+    assert result["state"] == "valid"
+    assert {item["name"]: item["sha256"] for item in result["procedures"]} == (
+        APPROVED_PROCEDURE_SHA256
+    )
+
+
+def test_program_validator_returns_hashes_from_final_bound_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    real_validate_inventory = module._validate_program_inventory
+    inventories: list[object] = []
+
+    def capturing_inventory(root: Path) -> object:
+        bindings = real_validate_inventory(root)
+        inventories.append(bindings)
+        return bindings
+
+    monkeypatch.setattr(module, "_validate_program_inventory", capturing_inventory)
+
+    result = module.validate_program(program)
+
+    final = inventories[-1]
+    assert result["contract_sha256"] == final[
+        "contracts/procedure_contracts.json"
+    ].sha256
+    assert {item["name"]: item["sha256"] for item in result["procedures"]} == {
+        name: final[f"procedures/{name}.md"].sha256
+        for name in EXPECTED_PROCEDURES
+    }
+
+
+def test_source_isolation_scans_retained_bytes_when_live_path_is_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    validate_path = program / "validate.py"
+    validate_path.write_text(
+        validate_path.read_text(encoding="utf-8")
+        + f"\nUPSTREAM = {UPSTREAM_PRODUCT_NAMES[0]!r}\n",
+        encoding="utf-8",
+    )
+    held = tmp_path / "held-validate.py"
+    real_validate_isolation = module._validate_source_isolation
+
+    def moving_isolation(
+        root: Path,
+        sources_path: Path,
+        sources: object,
+        retained_content: object,
+    ) -> None:
+        validate_path.rename(held)
+        try:
+            real_validate_isolation(
+                root, sources_path, sources, retained_content
+            )
+        finally:
+            held.rename(validate_path)
+
+    monkeypatch.setattr(module, "_validate_source_isolation", moving_isolation)
+
+    with pytest.raises(ValueError, match="upstream product name"):
+        module.validate_program(program)
 
 
 def test_program_validator_allows_only_module_bytecode_cache(tmp_path: Path) -> None:

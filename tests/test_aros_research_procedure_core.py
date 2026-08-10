@@ -3669,6 +3669,57 @@ def _compile_program_module(program: Path, module_name: str) -> Path:
     return Path(importlib.util.cache_from_source(str(source)))
 
 
+def _run_program_validator_with_python310(
+    program: Path,
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [
+            "python3.10",
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            (
+                "import importlib.util,pathlib,sys;"
+                "spec=importlib.util.spec_from_file_location('candidate',sys.argv[1]);"
+                "module=importlib.util.module_from_spec(spec);"
+                "sys.modules[spec.name]=module;"
+                "spec.loader.exec_module(module);"
+                "module.validate_program(pathlib.Path(sys.argv[2]))"
+            ),
+            str(program / "validate.py"),
+            str(program),
+        ],
+        check=False,
+        capture_output=True,
+    )
+
+
+def _validate_python312_cache_with_python310(
+    program: Path, embedded_filename: str
+) -> subprocess.CompletedProcess[bytes]:
+    source = program / "validate.py"
+    cache = program / "__pycache__/validate.cpython-312.pyc"
+    cache.parent.mkdir(exist_ok=True)
+    subprocess.run(
+        [
+            "python3.12",
+            "-c",
+            (
+                "import py_compile,sys;"
+                "py_compile.compile(sys.argv[1],cfile=sys.argv[2],"
+                "dfile=sys.argv[3],doraise=True)"
+            ),
+            str(source),
+            str(cache),
+            embedded_filename,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return _run_program_validator_with_python310(program)
+
+
 def test_program_validator_returns_only_canonical_validation_identity(
     tmp_path: Path,
 ) -> None:
@@ -4245,6 +4296,75 @@ def test_program_validator_allows_real_supported_cpython_caches(
         )
 
     assert module.validate_program(program)["state"] == "valid"
+
+
+@pytest.mark.parametrize("filename", ["canonical", "prefixed", "absolute"])
+def test_foreign_validator_accepts_canonical_embedded_filenames(
+    tmp_path: Path, filename: str
+) -> None:
+    program = _copied_program(tmp_path)
+    canonical = "commissioning/research_program/validate.py"
+    embedded = {
+        "canonical": canonical,
+        "prefixed": f"checkout/{canonical}",
+        "absolute": str((program / "validate.py").resolve()),
+    }[filename]
+
+    completed = _validate_python312_cache_with_python310(program, embedded)
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize(
+    "embedded",
+    [
+        "validate.py",
+        "../commissioning/research_program/validate.py",
+        "source1/tmp/validate.py",
+        "other/research_program/validate.py",
+    ],
+)
+def test_foreign_validator_rejects_noncanonical_relative_filenames(
+    tmp_path: Path, embedded: str
+) -> None:
+    program = _copied_program(tmp_path)
+
+    completed = _validate_python312_cache_with_python310(program, embedded)
+
+    assert completed.returncode != 0
+
+
+def test_foreign_validator_rejects_inconsistent_nested_filename(
+    tmp_path: Path,
+) -> None:
+    program = _copied_program(tmp_path)
+    canonical = "commissioning/research_program/validate.py"
+    completed = _validate_python312_cache_with_python310(program, canonical)
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+    cache = program / "__pycache__/validate.cpython-312.pyc"
+    subprocess.run(
+        [
+            "python3.12",
+            "-c",
+            (
+                "import marshal,sys,types;"
+                "p=sys.argv[1];raw=open(p,'rb').read();"
+                "code=marshal.loads(raw[16:]);items=list(code.co_consts);"
+                "i=next(i for i,v in enumerate(items) if type(v) is types.CodeType);"
+                "items[i]=items[i].replace(co_filename=sys.argv[2]);"
+                "open(p,'wb').write(raw[:16]+marshal.dumps("
+                "code.replace(co_consts=tuple(items))))"
+            ),
+            str(cache),
+            "source1/tmp/validate.py",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    completed = _run_program_validator_with_python310(program)
+
+    assert completed.returncode != 0
 
 
 def test_program_validator_accepts_canonical_import_generated_cache() -> None:

@@ -68,6 +68,7 @@ import json
 import marshal
 import struct
 import sys
+from pathlib import PurePosixPath
 from types import CodeType
 
 LIMIT = 512 * 1024
@@ -122,6 +123,38 @@ def same_code(left, right):
             return False
     return True
 
+def code_filenames_match(value, filename):
+    if type(value) is CodeType:
+        return value.co_filename == filename and all(
+            code_filenames_match(item, filename) for item in value.co_consts
+        )
+    if type(value) in (tuple, frozenset):
+        return all(code_filenames_match(item, filename) for item in value)
+    return True
+
+def validated_filename(code, absolute, relative):
+    if type(code) is not CodeType or type(code.co_filename) is not str:
+        return None
+    filename = code.co_filename
+    path = PurePosixPath(filename)
+    if path.is_absolute():
+        valid = filename == absolute
+    else:
+        allowed_parts = PurePosixPath(relative).parts
+        valid = (
+            filename == path.as_posix()
+            and "\\" not in filename
+            and "\x00" not in filename
+            and ":" not in filename
+            and path.parts
+            and all(part not in ("", ".", "..") for part in path.parts)
+            and len(path.parts) >= len(allowed_parts)
+            and path.parts[-len(allowed_parts):] == allowed_parts
+        )
+    if not valid or not code_filenames_match(code, filename):
+        return None
+    return filename
+
 def main():
     encoded = sys.stdin.buffer.read(LIMIT + 1)
     if len(encoded) > LIMIT:
@@ -147,9 +180,16 @@ def main():
     actual = marshal.load(stream)
     if stream.read(1):
         return False
+    filename = validated_filename(
+        actual,
+        payload["filename"],
+        payload["relative_filename"],
+    )
+    if filename is None:
+        return False
     expected = compile(
         source,
-        payload["filename"],
+        filename,
         "exec",
         dont_inherit=True,
         optimize=payload["optimization"],
@@ -923,6 +963,9 @@ def _validate_foreign_bytecode_source(
             "mtime": (source_binding.mtime_ns // 1_000_000_000) & 0xFFFFFFFF,
             "optimization": optimization,
             "pyc": base64.b64encode(binding.raw).decode("ascii"),
+            "relative_filename": (
+                f"commissioning/research_program/{source_path.name}"
+            ),
             "size": source_binding.size & 0xFFFFFFFF,
             "source": base64.b64encode(source_binding.raw).decode("ascii"),
             "tag": tag,

@@ -298,6 +298,14 @@ EXPECTED_PROCEDURES = {
         ("Source.read", "Receipt.read", "Git.read", "Research.checkpoint"),
     ),
 }
+APPROVED_PROCEDURE_SHA256 = {
+    "aros-claim-package": "b6f661a42c2e18aca8cf0a1a2a49956bf04c7c166ad6f24f9aaee0e00c39737e",
+    "aros-evidence-update": "2d28d7003eea2b11efafcfce8c96fef292fbc9a7a3a54ba31771952b875d7776",
+    "aros-experiment-design": "a40ff958ebe3fd87ed88b869ade75063f09d6e96969761911ae447057a27727c",
+    "aros-independent-review": "7eac1ab5f835a0a630b796103a4b767db35a1a0cc3d6ad51cf83c1625a548e06",
+    "aros-rival-mechanisms": "d38f66fe7631900769b5d7a37595e1522c5275e01fe5b50e56e609fea54cd989",
+    "aros-source-research": "2e9aa3126854944234ad7e99550918fc91f228b1da780bbd87550681184b9dec",
+}
 EXPECTED_PROCEDURE_HEADINGS = (
     "Purpose",
     "Inputs",
@@ -3687,6 +3695,97 @@ def test_program_validator_returns_only_canonical_validation_identity(
     assert not ({"score", "pass", "quality", "verdict"} & set(result))
 
 
+def test_program_validator_uses_exact_approved_procedure_hashes(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+
+    result = module.validate_program(program)
+
+    assert module._PROCEDURE_SHA256 == APPROVED_PROCEDURE_SHA256
+    assert {item["name"]: item["sha256"] for item in result["procedures"]} == (
+        APPROVED_PROCEDURE_SHA256
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "old", "new"),
+    [
+        (
+            "aros-source-research",
+            "Build an auditable evidence packet",
+            "Build a traceable evidence packet",
+        ),
+        (
+            "aros-rival-mechanisms",
+            "Turn bound source evidence",
+            "Transform bound source evidence",
+        ),
+        (
+            "aros-experiment-design",
+            "Choose one information-seeking experiment",
+            "Design one information-seeking experiment",
+        ),
+        (
+            "aros-evidence-update",
+            "Turn immutable run, evaluation, and raw evidence",
+            "Convert immutable run, evaluation, and raw evidence",
+        ),
+        (
+            "aros-independent-review",
+            "Independently reproduce and attack",
+            "Independently replicate and challenge",
+        ),
+        (
+            "aros-claim-package",
+            "Package a verified Principal adjudication",
+            "Assemble a verified Principal adjudication",
+        ),
+    ],
+)
+def test_program_validator_rejects_any_procedure_paraphrase(
+    tmp_path: Path, name: str, old: str, new: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / f"procedures/{name}.md"
+    text = procedure.read_text(encoding="utf-8")
+    assert old in text
+    procedure.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="approved SHA-256"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "Use a fixed number of rounds.",
+        "The best pilot advances automatically.",
+        "Use /bin/sh to run -c experiment.py.",
+        "Call os.system to launch the experiment.",
+        "Do not allow delays before Bash executes the experiment.",
+    ],
+)
+def test_program_validator_hash_gate_rejects_cited_runtime_variants(
+    tmp_path: Path, variant: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    procedure = program / "procedures/aros-experiment-design.md"
+    text = procedure.read_text(encoding="utf-8")
+    procedure.write_text(
+        text.replace("\n## Output\n", f"\n7. {variant}\n\n## Output\n", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="approved SHA-256|forbidden runtime authority"
+    ):
+        module.validate_program(program)
+
+
 def test_program_validator_reads_contract_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3737,6 +3836,102 @@ def test_program_validator_rejects_symlinked_program_paths(
         module.validate_program(program)
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "payload"),
+    [
+        (".provenance", b"hidden\n"),
+        ("build/notes.bin", b"generated\n"),
+        ("unknown.txt", b"unknown\n"),
+        ("procedures/.hidden", b"hidden\n"),
+    ],
+)
+def test_program_validator_rejects_unknown_hidden_and_build_entries(
+    tmp_path: Path, relative_path: str, payload: bytes
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    candidate = program / relative_path
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_bytes(payload)
+
+    with pytest.raises(ValueError, match="inventory"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_hidden_symlink_before_ignore(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    (program / ".hidden-link").symlink_to(SOURCES_PATH)
+
+    with pytest.raises(ValueError, match="symlink|inventory"):
+        module.validate_program(program)
+
+
+def test_program_validator_revalidates_inventory_before_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    real_validate_inventory = module._validate_program_inventory
+    calls = 0
+
+    def injecting_inventory(root: Path) -> None:
+        nonlocal calls
+        calls += 1
+        real_validate_inventory(root)
+        if calls == 1:
+            (root / "unknown.txt").write_text("late\n", encoding="utf-8")
+
+    monkeypatch.setattr(module, "_validate_program_inventory", injecting_inventory)
+
+    with pytest.raises(ValueError, match="inventory"):
+        module.validate_program(program)
+
+    assert calls == 2
+
+
+def test_program_validator_allows_only_module_bytecode_cache(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    cache = program / "__pycache__"
+    cache.mkdir()
+    (cache / "__init__.cpython-310.pyc").write_bytes(b"bytecode")
+    (cache / "validate.cpython-312.pyc").write_bytes(b"bytecode")
+
+    assert module.validate_program(program)["state"] == "valid"
+
+
+def test_program_validator_rejects_empty_bytecode_cache(tmp_path: Path) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    (program / "__pycache__").mkdir()
+
+    with pytest.raises(ValueError, match="inventory"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "__pycache__/unknown.cpython-312.pyc",
+        "__pycache__/validate.evil.pyc",
+        "__pycache__/validate.txt",
+        "procedures/__pycache__/validate.cpython-312.pyc",
+    ],
+)
+def test_program_validator_rejects_non_module_bytecode_cache_entries(
+    tmp_path: Path, relative_path: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    candidate = program / relative_path
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_bytes(b"bytecode")
+
+    with pytest.raises(ValueError, match="inventory"):
+        module.validate_program(program)
+
+
 @pytest.mark.parametrize("payload", [b"\xff", b" " * (128 * 1024 + 1)])
 def test_program_validator_rejects_non_utf8_or_oversize_procedure(
     tmp_path: Path, payload: bytes
@@ -3758,7 +3953,7 @@ def test_program_validator_rejects_unknown_procedure_filename(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="exactly the six"):
+    with pytest.raises(ValueError, match="inventory|exactly the six"):
         module.validate_program(program)
 
 
@@ -3921,7 +4116,7 @@ def test_program_validator_rejects_second_source_record(tmp_path: Path) -> None:
     program = _copied_program(tmp_path)
     (program / "provenance.json").write_text("{}\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="source or provenance"):
+    with pytest.raises(ValueError, match="inventory|source or provenance"):
         module.validate_program(program)
 
 
@@ -4013,7 +4208,11 @@ def test_program_validator_allows_direct_new_runtime_prohibitions(
     text = procedure.read_text(encoding="utf-8")
     procedure.write_text(f"{text.rstrip()}\n- {prohibition}\n", encoding="utf-8")
 
-    assert module.validate_program(program)["state"] == "valid"
+    _, body = module._parse_frontmatter(
+        procedure.read_text(encoding="utf-8"), "aros-experiment-design"
+    )
+    sections = module._sections(body, "aros-experiment-design")
+    module._validate_runtime_actions(sections, "aros-experiment-design")
 
 
 @pytest.mark.parametrize(
@@ -4141,7 +4340,7 @@ def test_program_validator_keeps_exact_source_details_only_in_sources(
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="source details"):
+    with pytest.raises(ValueError, match="inventory|source details"):
         module.validate_program(program)
 
 
@@ -4154,7 +4353,7 @@ def test_program_validator_scans_yaml_for_source_detail_leaks(tmp_path: Path) ->
         f"source_commit: {leaked_commit}\n", encoding="utf-8"
     )
 
-    with pytest.raises(ValueError, match="source details"):
+    with pytest.raises(ValueError, match="inventory|source details"):
         module.validate_program(program)
 
 
@@ -4168,7 +4367,7 @@ def test_program_validator_scans_every_file_for_source_detail_leaks(
     leaked_commit = sources["sources"][0]["commit"]
     (program / f"notes{suffix}").write_bytes(leaked_commit.encode())
 
-    with pytest.raises(ValueError, match="source details"):
+    with pytest.raises(ValueError, match="inventory|source details"):
         module.validate_program(program)
 
 

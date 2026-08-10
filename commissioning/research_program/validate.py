@@ -35,6 +35,8 @@ _PROCEDURE_HEADINGS = (
     "Completion",
     "Forbidden",
 )
+_PROGRAM_FILES = {"SOURCES.json", "__init__.py", "validate.py"}
+_PROGRAM_DIRECTORIES = {"contracts", "procedures"}
 _FORBIDDEN_FIELDS = {
     "score",
     "ranking",
@@ -251,6 +253,14 @@ _PROCEDURES = {
         "ClaimPackage",
         ("Source.read", "Receipt.read", "Git.read", "Research.checkpoint"),
     ),
+}
+_PROCEDURE_SHA256 = {
+    "aros-claim-package": "b6f661a42c2e18aca8cf0a1a2a49956bf04c7c166ad6f24f9aaee0e00c39737e",
+    "aros-evidence-update": "2d28d7003eea2b11efafcfce8c96fef292fbc9a7a3a54ba31771952b875d7776",
+    "aros-experiment-design": "a40ff958ebe3fd87ed88b869ade75063f09d6e96969761911ae447057a27727c",
+    "aros-independent-review": "7eac1ab5f835a0a630b796103a4b767db35a1a0cc3d6ad51cf83c1625a548e06",
+    "aros-rival-mechanisms": "d38f66fe7631900769b5d7a37595e1522c5275e01fe5b50e56e609fea54cd989",
+    "aros-source-research": "2e9aa3126854944234ad7e99550918fc91f228b1da780bbd87550681184b9dec",
 }
 
 
@@ -636,6 +646,65 @@ def _require_directory(path: Path, label: str) -> None:
         raise ValueError(f"{label} must be a directory")
 
 
+def _validate_program_inventory(root: Path) -> None:
+    expected_files = {
+        *(_PROGRAM_FILES),
+        "contracts/procedure_contracts.json",
+        *(f"procedures/{name}.md" for name in _PROCEDURES),
+    }
+    expected_directories = set(_PROGRAM_DIRECTORIES)
+    seen_files: set[str] = set()
+    seen_directories: set[str] = set()
+    cache_present = False
+    cache_files = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = tuple(directory.iterdir())
+        except OSError as error:
+            raise ValueError("program filesystem inventory is not readable") from error
+        for path in entries:
+            relative = path.relative_to(root).as_posix()
+            try:
+                metadata = path.lstat()
+            except OSError as error:
+                raise ValueError("program filesystem inventory changed") from error
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("program filesystem inventory contains a symlink")
+            if stat.S_ISDIR(metadata.st_mode):
+                if relative in expected_directories:
+                    seen_directories.add(relative)
+                    pending.append(path)
+                    continue
+                if relative == "__pycache__":
+                    cache_present = True
+                    pending.append(path)
+                    continue
+                raise ValueError("program filesystem inventory contains an unknown entry")
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("program filesystem inventory contains a non-file entry")
+            if relative.startswith("__pycache__/"):
+                cache_name = path.name
+                if re.fullmatch(
+                    r"(?:__init__|validate)\.(?:cpython-[0-9]+|pypy[0-9]+)"
+                    r"(?:\.opt-[0-9]+)?\.pyc",
+                    cache_name,
+                ) is None:
+                    raise ValueError(
+                        "program filesystem inventory contains invalid bytecode"
+                    )
+                cache_files += 1
+                continue
+            if relative not in expected_files:
+                raise ValueError("program filesystem inventory contains an unknown entry")
+            seen_files.add(relative)
+    if seen_files != expected_files or seen_directories != expected_directories:
+        raise ValueError("program filesystem inventory is incomplete")
+    if cache_present and cache_files == 0:
+        raise ValueError("program filesystem inventory contains empty bytecode cache")
+
+
 def _parse_frontmatter(text: str, name: str) -> tuple[dict[str, object], str]:
     lines = text.splitlines()
     if not lines or lines[0] != "---":
@@ -906,6 +975,7 @@ def _validate_source_isolation(
 def validate_program(root: Path) -> dict[str, object]:
     program_root = Path(root)
     _require_directory(program_root, "program root")
+    _validate_program_inventory(program_root)
     sources_path = program_root / "SOURCES.json"
     contracts_root = program_root / "contracts"
     contract_path = contracts_root / "procedure_contracts.json"
@@ -958,10 +1028,11 @@ def validate_program(root: Path) -> dict[str, object]:
         ):
             raise ValueError(f"procedure {name} frontmatter does not match its contract")
         _validate_runtime_actions(sections, name)
+        procedure_sha256 = hashlib.sha256(raw).hexdigest()
         procedure_results.append(
             {
                 "name": name,
-                "sha256": hashlib.sha256(raw).hexdigest(),
+                "sha256": procedure_sha256,
                 "tools": list(contract.tools),
             }
         )
@@ -969,6 +1040,11 @@ def validate_program(root: Path) -> dict[str, object]:
     _validate_source_isolation(
         program_root, sources_path, sources, validated_content
     )
+    for procedure in procedure_results:
+        name = procedure["name"]
+        if procedure["sha256"] != _PROCEDURE_SHA256[name]:
+            raise ValueError(f"procedure {name} does not match approved SHA-256")
+    _validate_program_inventory(program_root)
     return {
         "schema_version": 1,
         "state": "valid",

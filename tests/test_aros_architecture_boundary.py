@@ -85,22 +85,31 @@ def _research_procedure_wave1_name_status(
 ) -> str:
     environment = os.environ.copy()
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
-    completed = subprocess.run(
-        [
-            "git",
-            "--no-replace-objects",
+
+    def git_output(*arguments: str) -> str:
+        return subprocess.run(
+            ["git", "--no-replace-objects", *arguments],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            env=environment,
+            text=True,
+        ).stdout
+
+    tracked = (
+        git_output(
             "diff",
             "--name-status",
             "--no-renames",
             f"{baseline}..{head}",
-        ],
-        cwd=repository,
-        check=True,
-        capture_output=True,
-        env=environment,
-        text=True,
+        )
+        + git_output("diff", "--cached", "--name-status", "--no-renames")
+        + git_output("diff", "--name-status", "--no-renames")
     )
-    return completed.stdout
+    untracked = git_output("ls-files", "--others", "--exclude-standard")
+    return tracked + "".join(
+        f"A\t{path}\n" for path in untracked.splitlines()
+    )
 
 
 def _configured_package_path(package: str, package_dirs: dict[str, str]) -> Path:
@@ -2815,3 +2824,38 @@ def test_research_procedure_wave1_boundary_allows_exact_plan_correction() -> Non
     _assert_research_procedure_wave1_changes(
         "M\tdocs/superpowers/plans/2026-08-09-aros-research-procedure-core.md\n"
     )
+
+
+@pytest.mark.parametrize("surface", ["working_deletion", "staged", "untracked"])
+def test_research_procedure_wave1_boundary_includes_worktree_surfaces(
+    tmp_path: Path, surface: str
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "boundary@example.invalid")
+    _git(repository, "config", "user.name", "Boundary Test")
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    if surface == "working_deletion":
+        runtime = repository / "src/aros/deleted.py"
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text("value = 1\n", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "base")
+    baseline = _git(repository, "rev-parse", "HEAD").stdout.strip()
+
+    if surface == "working_deletion":
+        (repository / "src/aros/deleted.py").unlink()
+    else:
+        runtime = repository / f"src/aros/{surface}.py"
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text("value = 1\n", encoding="utf-8")
+        if surface == "staged":
+            _git(repository, "add", str(runtime.relative_to(repository)))
+
+    name_status = _research_procedure_wave1_name_status(
+        repository, baseline
+    )
+
+    with pytest.raises(AssertionError, match="runtime architecture"):
+        _assert_research_procedure_wave1_changes(name_status)

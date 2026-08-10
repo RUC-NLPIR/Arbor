@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import json
 import os
+import py_compile
 import re
 import shutil
 import signal
@@ -3635,13 +3636,16 @@ def test_contract_loader_uses_only_standard_library_imports() -> None:
         "__future__",
         "dataclasses",
         "hashlib",
+        "importlib",
         "json",
+        "marshal",
         "math",
         "os",
         "pathlib",
         "re",
         "stat",
         "subprocess",
+        "sys",
         "types",
         "typing",
     }
@@ -3655,6 +3659,12 @@ def _copied_program(tmp_path: Path) -> Path:
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
     return copied
+
+
+def _compile_program_module(program: Path, module_name: str) -> Path:
+    source = program / ("__init__.py" if module_name == "__init__" else "validate.py")
+    py_compile.compile(str(source), doraise=True)
+    return Path(importlib.util.cache_from_source(str(source)))
 
 
 def test_program_validator_returns_only_canonical_validation_identity(
@@ -4159,10 +4169,30 @@ def test_source_isolation_scans_retained_bytes_when_live_path_is_moved(
 def test_program_validator_allows_only_module_bytecode_cache(tmp_path: Path) -> None:
     module = _contract_module()
     program = _copied_program(tmp_path)
-    cache = program / "__pycache__"
-    cache.mkdir()
-    (cache / "__init__.cpython-310.pyc").write_bytes(b"bytecode")
-    (cache / "validate.cpython-312.pyc").write_bytes(b"bytecode")
+    _compile_program_module(program, "__init__")
+    _compile_program_module(program, "validate")
+
+    assert module.validate_program(program)["state"] == "valid"
+
+
+@pytest.mark.parametrize(
+    "invalidation_mode",
+    [
+        py_compile.PycInvalidationMode.CHECKED_HASH,
+        py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    ],
+)
+def test_program_validator_allows_source_bound_hash_bytecode(
+    tmp_path: Path, invalidation_mode: py_compile.PycInvalidationMode
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    validate_path = program / "validate.py"
+    py_compile.compile(
+        str(validate_path),
+        doraise=True,
+        invalidation_mode=invalidation_mode,
+    )
 
     assert module.validate_program(program)["state"] == "valid"
 
@@ -4173,6 +4203,123 @@ def test_program_validator_rejects_empty_bytecode_cache(tmp_path: Path) -> None:
     (program / "__pycache__").mkdir()
 
     with pytest.raises(ValueError, match="inventory"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize("sensitive", ["sources", "commit", "repository"])
+def test_program_validator_rejects_source_details_embedded_in_bytecode(
+    tmp_path: Path, sensitive: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources_path = program / "SOURCES.json"
+    sources = json.loads(sources_path.read_text(encoding="utf-8"))
+    if sensitive == "sources":
+        value = sources_path.read_text(encoding="utf-8")
+    else:
+        value = sources["sources"][0][sensitive]
+    validate_path = program / "validate.py"
+    original = validate_path.read_text(encoding="utf-8")
+    validate_path.write_text(
+        f"{original}\nSENSITIVE = {value!r}\n", encoding="utf-8"
+    )
+    _compile_program_module(program, "validate")
+    validate_path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source details|provenance"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_exact_unicode_source_detail_bytes(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    sources_path = program / "SOURCES.json"
+    sources = json.loads(sources_path.read_text(encoding="utf-8"))
+    sensitive = "ÄAAAAAAA"
+    sources["sources"][0]["adaptation"] = sensitive
+    sources_path.write_text(
+        json.dumps(sources, ensure_ascii=False), encoding="utf-8"
+    )
+    validate_path = program / "validate.py"
+    validate_path.write_text(
+        validate_path.read_text(encoding="utf-8")
+        + f"\nSENSITIVE = {sensitive!r}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="source details"):
+        module.validate_program(program)
+
+
+@pytest.mark.parametrize("damage", ["magic", "flags"])
+def test_program_validator_rejects_invalid_bytecode_header(
+    tmp_path: Path, damage: str
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    cache_path = _compile_program_module(program, "validate")
+    raw = bytearray(cache_path.read_bytes())
+    if damage == "magic":
+        raw[0] ^= 0xFF
+    else:
+        raw[4:8] = (4).to_bytes(4, "little")
+    cache_path.write_bytes(raw)
+
+    with pytest.raises(ValueError, match="inventory|bytecode"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_wrong_bytecode_implementation_tag(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    cache_path = _compile_program_module(program, "validate")
+    cache_path.rename(cache_path.with_name("validate.cpython-999.pyc"))
+
+    with pytest.raises(ValueError, match="inventory|bytecode"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_bytecode_for_wrong_source_module(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    cache_path = Path(
+        importlib.util.cache_from_source(str(program / "validate.py"))
+    )
+    cache_path.parent.mkdir()
+    unrelated = tmp_path / "unrelated.py"
+    unrelated.write_text("value = 1\n", encoding="utf-8")
+    py_compile.compile(str(unrelated), cfile=str(cache_path), doraise=True)
+
+    with pytest.raises(ValueError, match="inventory|bytecode"):
+        module.validate_program(program)
+
+
+def test_program_validator_rejects_bytecode_from_same_named_other_source(
+    tmp_path: Path,
+) -> None:
+    module = _contract_module()
+    program = _copied_program(tmp_path)
+    cache_path = Path(
+        importlib.util.cache_from_source(str(program / "validate.py"))
+    )
+    cache_path.parent.mkdir()
+    other = tmp_path / "other/validate.py"
+    other.parent.mkdir()
+    other.write_text("unrelated = True\n", encoding="utf-8")
+    py_compile.compile(
+        str(other),
+        cfile=str(cache_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+
+    with pytest.raises(ValueError, match="inventory|bytecode"):
         module.validate_program(program)
 
 

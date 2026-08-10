@@ -96,6 +96,16 @@ def _research_procedure_wave1_name_status(
             text=True,
         ).stdout
 
+    def git_bytes(*arguments: str, input_bytes: bytes | None = None) -> bytes:
+        return subprocess.run(
+            ["git", "--no-replace-objects", *arguments],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            env=environment,
+            input=input_bytes,
+        ).stdout
+
     tracked = (
         git_output(
             "diff",
@@ -107,9 +117,73 @@ def _research_procedure_wave1_name_status(
         + git_output("diff", "--name-status", "--no-renames")
     )
     untracked = git_output("ls-files", "--others", "--exclude-standard")
+    violations: set[tuple[str, str]] = set()
+
+    flagged = git_bytes("ls-files", "-v", "-z", "--", "src/aros")
+    for entry in flagged.rstrip(b"\0").split(b"\0"):
+        if not entry:
+            continue
+        tag, path_bytes = entry[:1], entry[2:]
+        if tag != b"H":
+            violations.add(("M", os.fsdecode(path_bytes)))
+
+    head_entries: dict[str, tuple[str, str]] = {}
+    head_tree = git_bytes("ls-tree", "-r", "-z", head, "--", "src/aros")
+    for entry in head_tree.rstrip(b"\0").split(b"\0"):
+        if not entry:
+            continue
+        header, path_bytes = entry.split(b"\t", 1)
+        mode, object_type, object_id = header.decode("ascii").split()
+        path = os.fsdecode(path_bytes)
+        if object_type == "blob":
+            head_entries[path] = (mode, object_id)
+
+    index_entries: dict[str, list[tuple[str, str, str]]] = {}
+    staged_entries = git_bytes("ls-files", "--stage", "-z", "--", "src/aros")
+    for entry in staged_entries.rstrip(b"\0").split(b"\0"):
+        if not entry:
+            continue
+        header, path_bytes = entry.split(b"\t", 1)
+        mode, object_id, stage = header.decode("ascii").split()
+        index_entries.setdefault(os.fsdecode(path_bytes), []).append(
+            (mode, object_id, stage)
+        )
+
+    for path in set(head_entries) | set(index_entries):
+        expected = head_entries.get(path)
+        indexed = index_entries.get(path)
+        if expected is None:
+            violations.add(("A", path))
+        elif indexed is None:
+            violations.add(("D", path))
+        elif indexed != [(expected[0], expected[1], "0")]:
+            violations.add(("M", path))
+
+    for path, (expected_mode, expected_id) in head_entries.items():
+        worktree_path = repository / path
+        try:
+            metadata = worktree_path.lstat()
+            if expected_mode == "120000":
+                if not stat.S_ISLNK(metadata.st_mode):
+                    raise ValueError
+                raw = os.fsencode(os.readlink(worktree_path))
+                actual_mode = "120000"
+            else:
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError
+                raw = worktree_path.read_bytes()
+                actual_mode = "100755" if metadata.st_mode & 0o111 else "100644"
+            actual_id = git_bytes(
+                "hash-object", "--no-filters", "--stdin", input_bytes=raw
+            ).decode("ascii").strip()
+            if (actual_mode, actual_id) != (expected_mode, expected_id):
+                violations.add(("M", path))
+        except (FileNotFoundError, OSError, ValueError):
+            violations.add(("D", path))
+
     return tracked + "".join(
         f"A\t{path}\n" for path in untracked.splitlines()
-    )
+    ) + "".join(f"{status}\t{path}\n" for status, path in sorted(violations))
 
 
 def _configured_package_path(package: str, package_dirs: dict[str, str]) -> Path:
@@ -2859,3 +2933,39 @@ def test_research_procedure_wave1_boundary_includes_worktree_surfaces(
 
     with pytest.raises(AssertionError, match="runtime architecture"):
         _assert_research_procedure_wave1_changes(name_status)
+
+
+@pytest.mark.parametrize(
+    ("flag", "clear_flag"),
+    [
+        ("--assume-unchanged", "--no-assume-unchanged"),
+        ("--skip-worktree", "--no-skip-worktree"),
+    ],
+)
+def test_research_procedure_wave1_boundary_rejects_hidden_index_flags(
+    tmp_path: Path, flag: str, clear_flag: str
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "boundary@example.invalid")
+    _git(repository, "config", "user.name", "Boundary Test")
+    runtime = repository / "src/aros/hidden.py"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("value = 1\n", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "base")
+    baseline = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    relative = runtime.relative_to(repository).as_posix()
+
+    try:
+        _git(repository, "update-index", flag, relative)
+        runtime.write_text("value = 2\n", encoding="utf-8")
+        name_status = _research_procedure_wave1_name_status(
+            repository, baseline
+        )
+
+        with pytest.raises(AssertionError, match="runtime architecture"):
+            _assert_research_procedure_wave1_changes(name_status)
+    finally:
+        _git(repository, "update-index", clear_flag, relative)

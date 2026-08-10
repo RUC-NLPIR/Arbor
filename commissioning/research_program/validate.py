@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import marshal
 import math
 import os
 import re
 import stat
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from types import MappingProxyType
+from types import CodeType, MappingProxyType
 from typing import Mapping
 
 
@@ -683,6 +686,83 @@ def _require_directory(path: Path, label: str) -> None:
         raise ValueError(f"{label} must be a directory")
 
 
+def _bytecode_name(path: Path) -> re.Match[str]:
+    cache_tag = sys.implementation.cache_tag
+    if cache_tag is None:
+        raise ValueError("program filesystem inventory cannot identify bytecode tag")
+    match = re.fullmatch(
+        rf"(?P<module>__init__|validate)\.{re.escape(cache_tag)}"
+        r"(?:\.opt-[0-9]+)?\.pyc",
+        path.name,
+    )
+    if match is None:
+        raise ValueError("program filesystem inventory contains invalid bytecode")
+    return match
+
+
+def _validate_bytecode_envelope(path: Path, binding: FileBinding) -> None:
+    match = _bytecode_name(path)
+    raw = binding.raw
+    if (
+        len(raw) < 16
+        or raw[:4] != importlib.util.MAGIC_NUMBER
+        or int.from_bytes(raw[4:8], "little") not in {0, 1, 3}
+    ):
+        raise ValueError("program filesystem inventory contains invalid bytecode")
+    try:
+        code = marshal.loads(raw[16:])
+    except (EOFError, TypeError, ValueError) as error:
+        raise ValueError(
+            "program filesystem inventory contains invalid bytecode"
+        ) from error
+    source_name = "__init__.py" if match.group("module") == "__init__" else "validate.py"
+    if type(code) is not CodeType or Path(code.co_filename).name != source_name:
+        raise ValueError("program filesystem inventory contains invalid bytecode")
+
+
+def _validate_bytecode_source(
+    path: Path,
+    binding: FileBinding,
+    source_path: Path,
+    source_binding: FileBinding,
+) -> None:
+    match = _bytecode_name(path)
+    optimization_match = re.search(r"\.opt-([0-9]+)\.pyc$", path.name)
+    optimization = (
+        int(optimization_match.group(1))
+        if optimization_match is not None
+        else sys.flags.optimize
+    )
+    if optimization not in {0, 1, 2}:
+        raise ValueError("program filesystem inventory contains invalid bytecode")
+    flags = int.from_bytes(binding.raw[4:8], "little")
+    if flags == 0:
+        header_matches = (
+            int.from_bytes(binding.raw[8:12], "little")
+            == ((source_binding.mtime_ns // 1_000_000_000) & 0xFFFFFFFF)
+            and int.from_bytes(binding.raw[12:16], "little")
+            == (source_binding.size & 0xFFFFFFFF)
+        )
+    else:
+        header_matches = (
+            binding.raw[8:16] == importlib.util.source_hash(source_binding.raw)
+        )
+    expected_code = compile(
+        source_binding.raw,
+        str(source_path),
+        "exec",
+        dont_inherit=True,
+        optimize=optimization,
+    )
+    source_name = "__init__" if match.group("module") == "__init__" else "validate"
+    if (
+        source_path.stem != source_name
+        or not header_matches
+        or binding.raw[16:] != marshal.dumps(expected_code)
+    ):
+        raise ValueError("program filesystem inventory contains invalid bytecode")
+
+
 def _validate_program_inventory(root: Path) -> Mapping[str, FileBinding]:
     expected_files = {
         *_PROGRAM_FILES,
@@ -723,18 +803,11 @@ def _validate_program_inventory(root: Path) -> Mapping[str, FileBinding]:
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError("program filesystem inventory contains a non-file entry")
             if relative.startswith("__pycache__/"):
-                cache_name = path.name
-                if re.fullmatch(
-                    r"(?:__init__|validate)\.(?:cpython-[0-9]+|pypy[0-9]+)"
-                    r"(?:\.opt-[0-9]+)?\.pyc",
-                    cache_name,
-                ) is None:
-                    raise ValueError(
-                        "program filesystem inventory contains invalid bytecode"
-                    )
-                _, bindings[relative] = _read_bound_regular_bytes(
+                _, binding = _read_bound_regular_bytes(
                     path, label="program inventory file", limit=_MAX_PROCEDURE_BYTES
                 )
+                _validate_bytecode_envelope(path, binding)
+                bindings[relative] = binding
                 cache_files += 1
                 continue
             if relative not in expected_files:
@@ -943,6 +1016,28 @@ def _is_source_record_path(relative: Path) -> bool:
     return False
 
 
+def _contains_source_detail(raw: bytes, source_details: tuple[bytes, ...]) -> bool:
+    folded = raw.lower()
+    for detail in source_details:
+        folded_detail = detail.lower()
+        if len(detail) >= 8:
+            if detail in raw or folded_detail in folded:
+                return True
+        else:
+            for content, candidate in (
+                (raw, detail),
+                (folded, folded_detail),
+            ):
+                if re.search(
+                    rb"(?<![a-z0-9])"
+                    + re.escape(candidate)
+                    + rb"(?![a-z0-9])",
+                    content,
+                ) is not None:
+                    return True
+    return False
+
+
 def _validate_source_isolation(
     root: Path,
     sources_path: Path,
@@ -956,7 +1051,7 @@ def _validate_source_isolation(
         ("/work" + "space/").encode(),
     )
     source_details = tuple(
-        value.casefold().encode()
+        value.encode("utf-8")
         for source in sources.sources
         for value in (
             source.repository,
@@ -966,10 +1061,19 @@ def _validate_source_isolation(
             source.adaptation,
         )
     )
+    bytecode_source_details = (
+        validated_content[sources_path],
+        *(source.id.encode("utf-8") for source in sources.sources),
+        *source_details,
+    )
     for path, raw in validated_content.items():
         relative = path.relative_to(root)
         folded_parts = tuple(part.casefold() for part in relative.parts)
         if "__pycache__" in folded_parts:
+            if _contains_source_detail(raw, bytecode_source_details):
+                raise ValueError(
+                    "source details are permitted only in SOURCES.json"
+                )
             continue
         if _is_source_record_path(relative):
             raise ValueError("unexpected source or provenance record")
@@ -985,21 +1089,8 @@ def _validate_source_isolation(
             marker in folded for marker in detail_markers
         ):
             raise ValueError("source details are permitted only in SOURCES.json")
-        for detail in source_details:
-            if len(detail) >= 8:
-                leaked = detail in folded
-            else:
-                leaked = (
-                    re.search(
-                        rb"(?<![a-z0-9])"
-                        + re.escape(detail)
-                        + rb"(?![a-z0-9])",
-                        folded,
-                    )
-                    is not None
-                )
-            if leaked:
-                raise ValueError("source details are permitted only in SOURCES.json")
+        if _contains_source_detail(raw, source_details):
+            raise ValueError("source details are permitted only in SOURCES.json")
 
 
 def validate_program(root: Path) -> dict[str, object]:
@@ -1048,6 +1139,17 @@ def validate_program(root: Path) -> dict[str, object]:
     _validate_source_isolation(
         program_root, sources_path, sources, validated_content
     )
+    for relative, binding in initial_bindings.items():
+        if not relative.startswith("__pycache__/"):
+            continue
+        module_name = _bytecode_name(program_root / relative).group("module")
+        source_relative = "__init__.py" if module_name == "__init__" else "validate.py"
+        _validate_bytecode_source(
+            program_root / relative,
+            binding,
+            program_root / source_relative,
+            initial_bindings[source_relative],
+        )
     final_bindings = _validate_program_inventory(program_root)
     if final_bindings != initial_bindings:
         raise ValueError("program files changed during validation")

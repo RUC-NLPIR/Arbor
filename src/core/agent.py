@@ -845,6 +845,13 @@ def _looks_like_premature_no_tool_stop(text: str) -> bool:
     if not normalized:
         return False
 
+    # Models sometimes carry the subject across a coordinated clause
+    # ("I created ... and will test it next") or describe the next action with
+    # a non-first-person subject.  Keep this narrower than a bare ``will``:
+    # ``next`` must be the sentence-final adverb, not e.g. "the next job".
+    if re.search(r"\bwill\b[^.!?]*\bnext(?=\s*(?:[.!?]|$))", normalized):
+        return True
+
     future_markers = (
         "now let me",
         "let me ",

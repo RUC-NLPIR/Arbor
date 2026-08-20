@@ -342,6 +342,63 @@ def test_default_autonomous_agent_keeps_premature_stop_nudge(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "future_work",
+    [
+        "The initial portfolio will separate the approaches and will test them next.",
+        "I created the portfolio and will test it next.",
+    ],
+)
+def test_autonomous_agent_nudges_reported_implicit_future_work(
+    tmp_path, future_work
+):
+    agent, provider, tool, result = _run_agent(
+        tmp_path,
+        [
+            _text_response(future_work),
+            _tool_response(tool_input={"path": "portfolio.json"}),
+            _text_response("The portfolio test completed successfully."),
+        ],
+        yield_on_text=False,
+        premature_stop_nudges=True,
+    )
+
+    assert result == "The portfolio test completed successfully."
+    assert len(provider.calls) == 3
+    assert tool.calls == [{"path": "portfolio.json"}]
+    assert any(
+        message.get("_internal") == "premature_stop_nudge"
+        for message in agent.messages
+    )
+    final_history = provider.calls[-1]["messages"]
+    assert final_history[-2]["role"] == "assistant"
+    assert final_history[-1]["role"] == "user"
+    assert final_history[-1]["content"][0]["type"] == "tool_result"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The scheduler will retry failed jobs automatically.",
+        "This portfolio will test the next approach.",
+        "The scheduler will retry failed jobs next week.",
+    ],
+)
+def test_autonomous_agent_does_not_nudge_general_will_statement(tmp_path, text):
+    agent, provider, tool, result = _run_agent(
+        tmp_path,
+        [_text_response(text)],
+        yield_on_text=False,
+        premature_stop_nudges=True,
+    )
+
+    assert result == text
+    assert len(provider.calls) == 1
+    assert tool.calls == []
+    assert agent.stop_reason == "finished"
+    assert not any(message.get("_internal") for message in agent.messages)
+
+
 def test_autonomous_agent_config_defaults_are_unchanged(tmp_path):
     provider = _ScriptedProvider([
         _tool_response(text="Inspecting the target."),

@@ -287,6 +287,8 @@ class IdeaTree:
         if node is None:
             raise ValueError(f"Node {node_id!r} not found")
 
+        pruned_ids: list[str] = []
+
         def _prune(nid: str) -> None:
             n = self._nodes.get(nid)
             if n is None:
@@ -294,13 +296,16 @@ class IdeaTree:
             n.status = "pruned"
             if reason and nid == node_id:
                 n.insight = (n.insight + f"\n[Pruned: {reason}]").strip()
+            pruned_ids.append(nid)
             for child_id in n.children_ids:
                 _prune(child_id)
 
         _prune(node_id)
         self.save()
         from ..events.types import IDEA_PRUNED
-        self.bus.emit(IDEA_PRUNED, {"node_id": node_id, "reason": reason})
+        # One event per pruned node: every idea.* consumer keys off a single node_id.
+        for nid in pruned_ids:
+            self.bus.emit(IDEA_PRUNED, {"node_id": nid, "reason": reason})
 
     # ── Async-safe mutations (for parallel executor scenarios) ───────
 

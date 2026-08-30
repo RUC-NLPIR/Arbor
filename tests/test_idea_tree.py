@@ -186,6 +186,51 @@ def test_prune_node_recurses_into_subtree() -> None:
     assert "dead end" not in t.get_node("1.1").insight
 
 
+# ── prune cascade -> event contract (#62) ──────────────────────────────
+
+def test_prune_node_emits_one_event_per_pruned_node() -> None:
+    from arbor.events.bus import EventBus
+
+    bus = EventBus()
+    t = IdeaTree(Node(id="ROOT", parent_id=None, depth=0), bus=bus)
+    _child(t, "ROOT")          # "1"
+    _child(t, "1")             # "1.1"
+    _child(t, "1.1")           # "1.1.1"
+    _child(t, "ROOT")          # "2", untouched sibling, must not fire
+
+    received: list[str] = []
+    bus.on("idea.pruned", lambda e: received.append(e.data["node_id"]))
+
+    t.prune_node("1", reason="dead end")
+
+    assert sorted(received) == ["1", "1.1", "1.1.1"]
+
+
+def test_prune_cascade_updates_stats_and_dashboard_for_every_descendant() -> None:
+    from arbor.cli.run_state import RunState
+    from arbor.events import types as ev
+    from arbor.events.bus import EventBus
+    from arbor.events.subscribers.stats_collector import StatsCollector
+
+    bus = EventBus()
+    stats = StatsCollector()
+    stats.attach(bus)
+    run_state = RunState()
+    bus.on(ev.IDEA_PROPOSED, run_state.on_idea_proposed)
+    bus.on(ev.IDEA_PRUNED, run_state.on_idea_pruned)
+
+    t = IdeaTree(Node(id="ROOT", parent_id=None, depth=0), bus=bus)
+    _child(t, "ROOT")          # "1"
+    _child(t, "1")             # "1.1"
+    _child(t, "1.1")           # "1.1.1"
+
+    t.prune_node("1", reason="dead end")
+
+    assert stats.stats.ideas_pruned == 3
+    assert {run_state.ideas[nid].status for nid in ("1", "1.1", "1.1.1")} == {"pruned"}
+    assert run_state.ideas_pruned == 3
+
+
 # ── next_child_id ────────────────────────────────────────────────────
 
 def test_next_child_id_sequence_and_nesting() -> None:

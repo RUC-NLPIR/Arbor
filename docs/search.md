@@ -91,6 +91,7 @@ the same paper from two backends merges to one).
 | `jina` | no (optional `JINA_API_KEY` raises limits) | general web (s.jina.ai) |
 | `serper` | `SERPER_API_KEY` | Google results (serper.dev) |
 | `serpbase` | `SERPBASE_API_KEY` | Google SERP (serpbase.dev, POST + X-API-Key) |
+| `serply` | `SERPLY_API_KEY` | Google Scholar papers ([serply.io](https://serply.io), GET + X-Api-Key) |
 | `exa` | `EXA_API_KEY` | neural web search (exa.ai REST) |
 | `exa-mcp` | no (optional `EXA_API_KEY` raises limits) | Exa via its hosted MCP server |
 | `endpoint` | optional | self-hosted `web_search_endpoint` (BrowseComp-style) |
@@ -100,9 +101,19 @@ A backend whose key is missing is **silently skipped**, so a list like
 `SERPER_API_KEY` is set. The fully keyless default is
 **`backends: [alphaxiv, jina]`** — papers + general web, zero setup.
 
-Keys go in the config file (`serper_api_key` / `serpbase_api_key` / `exa_api_key`
-/ `jina_api_key`) or the matching env vars (`SERPER_API_KEY`,
-`SERPBASE_API_KEY`, `EXA_API_KEY`, `JINA_API_KEY`).
+Keys go in the config file (`serper_api_key` / `serpbase_api_key` /
+`serply_api_key` / `exa_api_key` / `jina_api_key`) or the matching env vars
+(`SERPER_API_KEY`, `SERPBASE_API_KEY`, `SERPLY_API_KEY`, `EXA_API_KEY`,
+`JINA_API_KEY`).
+
+!!! note "Two papers backends"
+    `alphaxiv` and `serply` both cover papers but not the same corpus:
+    alphaXiv is arXiv preprints, while Serply queries Google Scholar, which
+    also indexes venue proceedings and journals (ACL Anthology, AAAI,
+    NeurIPS) that never appear on arXiv. Listing both —
+    `backends: [alphaxiv, serply]` — merges and de-duplicates them, which
+    widens prior-art coverage for the novelty audit. Note that Scholar's
+    `description` is the byline ("Authors - Venue, Year"), not an abstract.
 
 !!! note "Exa via MCP"
     The `exa-mcp` backend calls Exa's hosted MCP server

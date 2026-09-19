@@ -78,6 +78,7 @@ arbor idea-check "一句话描述你的假设"
 | `alphaxiv` | 否 | arXiv / alphaXiv 论文（Python ≥ 3.12） |
 | `jina` | 否（可选 `JINA_API_KEY` 提配额） | 通用网页（s.jina.ai） |
 | `serper` | `SERPER_API_KEY` | Google 结果（serper.dev） |
+| `serply` | `SERPLY_API_KEY` | Google Scholar 论文（[serply.io](https://serply.io)，GET + X-Api-Key） |
 | `exa` | `EXA_API_KEY` | 神经网络检索（exa.ai REST） |
 | `exa-mcp` | 否（可选 `EXA_API_KEY` 提配额） | 经 Exa 托管 MCP 服务器接入 |
 | `endpoint` | 可选 | 自托管 `web_search_endpoint`（BrowseComp 风格） |
@@ -85,8 +86,15 @@ arbor idea-check "一句话描述你的假设"
 缺少 key 的后端会被**静默跳过**——因此像 `[alphaxiv, jina, serper]` 这样的列表在没有 `SERPER_API_KEY`
 时会优雅退化为免 key 的两个。完全免 key 的默认是 **`backends: [alphaxiv, jina]`**——论文 + 通用网页，零配置。
 
-key 写在配置文件里（`serper_api_key` / `exa_api_key` / `jina_api_key`），或用对应的同名环境变量
-（`SERPER_API_KEY`、`EXA_API_KEY`、`JINA_API_KEY`）。
+key 写在配置文件里（`serper_api_key` / `serply_api_key` / `exa_api_key` / `jina_api_key`），或用对应的同名环境变量
+（`SERPER_API_KEY`、`SERPLY_API_KEY`、`EXA_API_KEY`、`JINA_API_KEY`）。
+
+!!! note "两个论文后端"
+    `alphaxiv` 与 `serply` 都覆盖论文，但语料并不相同：alphaXiv 是 arXiv 预印本，
+    而 Serply 走 Google Scholar，后者还收录了大量从不出现在 arXiv 上的会议与期刊论文
+    （ACL Anthology、AAAI、NeurIPS 等）。同时列出两者——`backends: [alphaxiv, serply]`
+    ——会把结果合并去重，从而扩大新颖性审查的先行工作覆盖面。注意 Scholar 的
+    `description` 是署名行（“作者 - 会议/期刊, 年份”），并非摘要。
 
 !!! note "Exa via MCP"
     `exa-mcp` 后端连接 Exa 托管的 MCP 服务器（`https://mcp.exa.ai/mcp`，可用 `exa_mcp_url` 覆盖 URL）。

@@ -17,6 +17,7 @@ from arbor.core.tools.web.backends import (
     JinaSearchBackend,
     SerpBaseBackend,
     SerperBackend,
+    SerplyBackend,
     build_search_backends,
     resolve_backend_names,
 )
@@ -59,15 +60,22 @@ def test_resolve_drops_keyless_missing_creds(monkeypatch):
     monkeypatch.delenv("SERPER_API_KEY", raising=False)
     monkeypatch.delenv("EXA_API_KEY", raising=False)
     monkeypatch.delenv("SERPBASE_API_KEY", raising=False)
-    sc = SearchConfig(backends=["serper", "serpbase", "exa", "jina"])
-    # serper/serpbase/exa dropped (no key), jina kept (keyless)
+    monkeypatch.delenv("SERPLY_API_KEY", raising=False)
+    sc = SearchConfig(backends=["serper", "serpbase", "serply", "exa", "jina"])
+    # serper/serpbase/serply/exa dropped (no key), jina kept (keyless)
     assert resolve_backend_names(sc) == ["jina"]
 
 
 def test_resolve_keeps_keyed_when_key_present():
-    sc = SearchConfig(backends=["serper", "serpbase", "exa"],
-                      serper_api_key="s", serpbase_api_key="b", exa_api_key="e")
-    assert resolve_backend_names(sc) == ["serper", "serpbase", "exa"]
+    sc = SearchConfig(backends=["serper", "serpbase", "serply", "exa"],
+                      serper_api_key="s", serpbase_api_key="b",
+                      serply_api_key="p", exa_api_key="e")
+    assert resolve_backend_names(sc) == ["serper", "serpbase", "serply", "exa"]
+
+
+def test_resolve_serply_from_env(monkeypatch):
+    monkeypatch.setenv("SERPLY_API_KEY", "from-env")
+    assert resolve_backend_names(SearchConfig(backends=["serply"])) == ["serply"]
 
 
 def test_resolve_dedup_and_unknown_dropped():
@@ -155,6 +163,88 @@ def test_serpbase_backend_uses_post_x_api_key(monkeypatch):
     assert captured["headers"]["X-API-Key"] == "secret"
 
 
+# ── Serply adapter ───────────────────────────────────────────────────────────
+
+def test_serply_backend_parses_articles(monkeypatch):
+    payload = {"articles": [
+        {"title": "Active Retrieval Augmented Generation",
+         "link": "https://doi.org/10.18653/v1/2023.emnlp-main.495",
+         "description": "Z Jiang, F Xu, L Gao - EMNLP, 2023 - aclanthology.org"},
+        {"title": "RAG for Knowledge-Intensive NLP Tasks",
+         "link": "https://proceedings.neurips.cc/paper/2020/hash/6b493230.html",
+         "description": "P Lewis, E Perez - NeurIPS, 2020 - proceedings.neurips.cc"},
+    ], "results": []}
+    monkeypatch.setattr(B.requests, "get", lambda *a, **k: _Resp(payload))
+    items = asyncio.run(SerplyBackend(api_key="k").search("q", 5))
+    assert items == [
+        {"url": "https://doi.org/10.18653/v1/2023.emnlp-main.495",
+         "title": "Active Retrieval Augmented Generation",
+         "snippets": "Z Jiang, F Xu, L Gao - EMNLP, 2023 - aclanthology.org"},
+        {"url": "https://proceedings.neurips.cc/paper/2020/hash/6b493230.html",
+         "title": "RAG for Knowledge-Intensive NLP Tasks",
+         "snippets": "P Lewis, E Perez - NeurIPS, 2020 - proceedings.neurips.cc"},
+    ]
+
+
+def test_serply_backend_reads_articles_not_results(monkeypatch):
+    # The Scholar envelope also carries an always-empty "results" list; reading
+    # that one instead of "articles" would silently return nothing.
+    payload = {"results": [], "articles": [
+        {"title": "A", "link": "https://a.org", "description": "d"},
+    ]}
+    monkeypatch.setattr(B.requests, "get", lambda *a, **k: _Resp(payload))
+    items = asyncio.run(SerplyBackend(api_key="k").search("q", 5))
+    assert items == [{"url": "https://a.org", "title": "A", "snippets": "d"}]
+
+
+def test_serply_backend_truncates_to_max_results(monkeypatch):
+    payload = {"articles": [
+        {"title": f"X{i}", "link": f"https://x{i}.org", "description": ""}
+        for i in range(1, 26)
+    ]}
+    monkeypatch.setattr(B.requests, "get", lambda *a, **k: _Resp(payload))
+    items = asyncio.run(SerplyBackend(api_key="k").search("q", 10))
+    assert len(items) == 10
+
+
+def test_serply_backend_missing_title_falls_back(monkeypatch):
+    payload = {"articles": [{"link": "https://a.org", "description": "d"}]}
+    monkeypatch.setattr(B.requests, "get", lambda *a, **k: _Resp(payload))
+    items = asyncio.run(SerplyBackend(api_key="k").search("q", 5))
+    assert items[0]["title"] == "No Title"
+
+
+def test_serply_backend_uses_get_x_api_key(monkeypatch):
+    captured = {}
+
+    def _fake_get(url, **kwargs):
+        captured["url"] = url
+        captured["params"] = kwargs.get("params")
+        captured["headers"] = kwargs.get("headers")
+        return _Resp({"articles": []})
+
+    monkeypatch.setattr(B.requests, "get", _fake_get)
+    asyncio.run(SerplyBackend(api_key="secret").search("hello", 5))
+    assert captured["url"] == "https://api.serply.io/v1/scholar"
+    assert captured["params"] == {"q": "hello", "num": 5}
+    assert captured["headers"]["X-Api-Key"] == "secret"
+
+
+def test_serply_backend_http_error_raises(monkeypatch):
+    # A bad key is a plain HTTP 401 ({"detail": "Invalid API key"}), so the
+    # error surfaces through raise_for_status rather than an envelope check.
+    monkeypatch.setattr(
+        B.requests, "get",
+        lambda *a, **k: _Resp({"detail": "Invalid API key"}, status=401),
+    )
+    try:
+        asyncio.run(SerplyBackend(api_key="bad").search("q", 5))
+    except RuntimeError as exc:
+        assert "401" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError for HTTP 401")
+
+
 def test_jina_search_backend_parses(monkeypatch):
     payload = {"data": [
         {"url": "https://j.com", "title": "J", "description": "desc"},
@@ -167,11 +257,12 @@ def test_jina_search_backend_parses(monkeypatch):
 # ── build_search_backends ────────────────────────────────────────────────────
 
 def test_build_search_backends_types():
-    sc = SearchConfig(backends=["alphaxiv", "jina", "serper", "serpbase", "exa"],
-                      serper_api_key="s", serpbase_api_key="b", exa_api_key="e")
+    sc = SearchConfig(backends=["alphaxiv", "jina", "serper", "serpbase", "serply", "exa"],
+                      serper_api_key="s", serpbase_api_key="b",
+                      serply_api_key="p", exa_api_key="e")
     backends = build_search_backends(sc)
     names = [b.name for b in backends]
-    assert names == ["alphaxiv", "jina", "serper", "serpbase", "exa"]
+    assert names == ["alphaxiv", "jina", "serper", "serpbase", "serply", "exa"]
 
 
 # ── WebSearchTool multi-backend fan-out + merge ──────────────────────────────

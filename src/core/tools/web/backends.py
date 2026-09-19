@@ -10,6 +10,7 @@ Backends:
 - ``jina``     — Jina search ``s.jina.ai`` (keyless general web; ``JINA_API_KEY`` optional).
 - ``serper``   — Serper Google API (needs ``SERPER_API_KEY``).
 - ``serpbase`` — SerpBase Google SERP API (needs ``SERPBASE_API_KEY``).
+- ``serply``   — Serply Google Scholar API (papers; needs ``SERPLY_API_KEY``).
 - ``exa``      — Exa REST API (needs ``EXA_API_KEY``).
 - ``endpoint`` — the legacy self-hosted BrowseComp-style HTTP endpoint.
 
@@ -29,7 +30,7 @@ from urllib.parse import quote
 import requests
 
 _HTTP_TIMEOUT = (5, 30)
-_KNOWN = ("alphaxiv", "jina", "serper", "serpbase", "exa", "exa-mcp", "endpoint")
+_KNOWN = ("alphaxiv", "jina", "serper", "serpbase", "serply", "exa", "exa-mcp", "endpoint")
 
 
 class SearchBackend(ABC):
@@ -156,6 +157,50 @@ class SerpBaseBackend(_SyncBackend):
                 "url": o.get("link", ""),
                 "title": o.get("title", ""),
                 "snippets": o.get("snippet", ""),
+            })
+        return items[:max_results]
+
+
+class SerplyBackend(_SyncBackend):
+    """Serply Google Scholar API (https://serply.io) — needs an API key.
+
+    The papers counterpart to ``alphaxiv``: Scholar indexes the published
+    record (ACL Anthology, AAAI / NeurIPS proceedings, journals) that an
+    arXiv-only backend cannot return, so the two merge into broader prior-art
+    coverage for the novelty audit.
+
+    ``GET /v1/scholar`` with the key in an ``X-Api-Key`` header. Results live
+    in ``articles`` (``title`` / ``link`` / ``description``); the envelope also
+    carries an always-empty ``results`` list, so the array name is passed
+    explicitly rather than guessed — keying the wrong one yields zero hits
+    silently. ``description`` is the Scholar byline ("Authors - Venue, Year"),
+    not an abstract.
+    """
+
+    name = "serply"
+
+    def __init__(self, *, api_key: str,
+                 endpoint: str = "https://api.serply.io/v1/scholar",
+                 timeout: tuple[int, int] = _HTTP_TIMEOUT):
+        self._api_key = api_key
+        self._url = endpoint
+        self._timeout = timeout
+
+    def _sync(self, query: str, max_results: int) -> list[dict]:
+        params: dict[str, str | int] = {"q": query, "num": max_results}
+        resp = requests.get(
+            self._url,
+            params=params,
+            headers={"X-Api-Key": self._api_key, "User-Agent": "Arbor"},
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        items: list[dict] = []
+        for a in resp.json().get("articles", []) or []:
+            items.append({
+                "url": a.get("link", ""),
+                "title": a.get("title", "") or "No Title",
+                "snippets": a.get("description", ""),
             })
         return items[:max_results]
 
@@ -403,6 +448,10 @@ def _serpbase_key(sc: Any) -> str | None:
     return getattr(sc, "serpbase_api_key", None) or os.environ.get("SERPBASE_API_KEY")
 
 
+def _serply_key(sc: Any) -> str | None:
+    return getattr(sc, "serply_api_key", None) or os.environ.get("SERPLY_API_KEY")
+
+
 def resolve_backend_names(sc: Any) -> list[str]:
     """Ordered, de-duplicated list of usable backend names for ``sc``.
 
@@ -427,6 +476,8 @@ def resolve_backend_names(sc: Any) -> list[str]:
             continue
         if n == "serpbase" and not _serpbase_key(sc):
             continue
+        if n == "serply" and not _serply_key(sc):
+            continue
         if n == "exa" and not _exa_key(sc):
             continue
         # exa-mcp is keyless (the hosted server works without a key); an
@@ -449,6 +500,10 @@ def build_search_backends(sc: Any) -> list[SearchBackend]:
             key = _serpbase_key(sc)
             if key is not None:  # pragma: no cover - resolve_backend_names guards
                 out.append(SerpBaseBackend(api_key=key))
+        elif n == "serply":
+            key = _serply_key(sc)
+            if key is not None:  # pragma: no cover - resolve_backend_names guards
+                out.append(SerplyBackend(api_key=key))
         elif n == "exa":
             out.append(ExaBackend(api_key=_exa_key(sc)))
         elif n == "exa-mcp":

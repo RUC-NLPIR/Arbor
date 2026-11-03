@@ -204,13 +204,14 @@ search:
     Arbor 能在两条互相独立、默认关闭的 lane 中使用文献与开放网络——**接地 ideation**
     （ideation *期间*检索 → `node.grounding`）与**新颖性审查**（实验*之后*核查先行工作 →
     `node.related_work`）。`search.backends` 是一个有序、合并的来源列表；免 key 默认是
-    `[alphaxiv, jina]`（论文 + 通用网页，零配置），`serper` / `exa` 需各自 API key、`exa-mcp`
-    免 key。读取页面同样免 key（`visit_backend: auto`，经 Jina reader，支持 PDF）。完整后端表格、
+    `[alphaxiv, jina]`（论文 + 通用网页，零配置），`serper` / `serply` / `exa` 需各自 API key、`exa-mcp`
+    免 key（`serply` 补上 Google Scholar，即 alphaXiv 的 arXiv 索引覆盖不到的论文 lane）。
+    读取页面同样免 key（`visit_backend: auto`，经 Jina reader，支持 PDF）。完整后端表格、
     intent、key 与示例见 **[检索与外部知识](search.zh.md)** 指南。
 
     关键字段：`backends`、`grounded_ideation`、`auto_search_on_add`、`visit_backend`、
     `visit_max_content_tokens` / `research_visit_tokens`、
-    `serper_api_key` / `exa_api_key` / `jina_api_key`、`exa_mcp_url`。旧的
+    `serper_api_key` / `serply_api_key` / `exa_api_key` / `jina_api_key`、`exa_mcp_url`。旧的
     `builtin_backend` / `web_search_endpoint` 仍可用。
 
 

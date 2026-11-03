@@ -239,16 +239,18 @@ search:
     and the **novelty audit** (prior-art check *after* an experiment →
     `node.related_work`). `search.backends` is an ordered, merged list of
     sources; the keyless default is `[alphaxiv, jina]` (papers + general web,
-    no setup), with `serper` / `serpbase` / `exa` available behind API keys
-    and `exa-mcp` keyless. Page reading is keyless too (`visit_backend: auto`,
+    no setup), with `serper` / `serpbase` / `serply` / `exa` available behind
+    API keys and `exa-mcp` keyless (`serply` adds Google Scholar, the papers
+    lane alphaXiv's arXiv-only index cannot reach).
+    Page reading is keyless too (`visit_backend: auto`,
     via the Jina reader, with PDF support). See the **[Search & External
     Knowledge](search.md)** guide for the full backend table, intents, keys,
     and examples.
 
     Key fields: `backends`, `grounded_ideation`, `auto_search_on_add`,
     `visit_backend`, `visit_max_content_tokens` / `research_visit_tokens`,
-    `serper_api_key` / `serpbase_api_key` / `exa_api_key` / `jina_api_key`,
-    `exa_mcp_url`. Legacy
+    `serper_api_key` / `serpbase_api_key` / `serply_api_key` / `exa_api_key`
+    / `jina_api_key`, `exa_mcp_url`. Legacy
     `builtin_backend` / `web_search_endpoint` still work.
 
 

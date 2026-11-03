@@ -262,6 +262,7 @@ class _WebSearchEnv(BaseSettings):
     web_browse_api_key: str | None = None  # falls back to web_search_api_key
     serper_api_key: str | None = None  # SERPER_API_KEY
     serpbase_api_key: str | None = None  # SERPBASE_API_KEY
+    serply_api_key: str | None = None  # SERPLY_API_KEY
     exa_api_key: str | None = None     # EXA_API_KEY
     jina_api_key: str | None = None    # JINA_API_KEY
 
@@ -343,13 +344,15 @@ class SearchConfig(BaseModel):
     # ── Pluggable search backends ──────────────────────────────────────────
     # Ordered list of search backends to fan out across and merge. Names:
     #   "alphaxiv" (keyless papers) | "jina" (keyless web) | "serper" (key) |
-    #   "serpbase" (key) | "exa" (key) | "endpoint" (self-hosted web_search_endpoint).
+    #   "serpbase" (key) | "serply" (key, Scholar papers) | "exa" (key) |
+    #   "endpoint" (self-hosted web_search_endpoint).
     # When empty, the legacy fields below are mapped automatically:
     #   builtin_backend="alphaxiv" → ["alphaxiv"]; web_search_endpoint set →
     #   append "endpoint". Backends missing credentials are dropped.
     backends: list[str] = PydField(default_factory=list)
     serper_api_key: str | None = None  # SERPER_API_KEY
     serpbase_api_key: str | None = None  # SERPBASE_API_KEY
+    serply_api_key: str | None = None  # SERPLY_API_KEY
     exa_api_key: str | None = None     # EXA_API_KEY (used by both "exa" REST and "exa-mcp")
     jina_api_key: str | None = None    # JINA_API_KEY (optional; raises Jina rate limits)
     # Override the Exa MCP server URL for the "exa-mcp" backend (default
@@ -383,6 +386,8 @@ class SearchConfig(BaseModel):
             self.serper_api_key = env.serper_api_key or None
         if self.serpbase_api_key is None:
             self.serpbase_api_key = env.serpbase_api_key or None
+        if self.serply_api_key is None:
+            self.serply_api_key = env.serply_api_key or None
         if self.exa_api_key is None:
             self.exa_api_key = env.exa_api_key or None
         if self.jina_api_key is None:

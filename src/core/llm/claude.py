@@ -244,7 +244,12 @@ class ClaudeProvider(LLMProvider):
         out = [
             {key: value for key, value in m.items() if not key.startswith("_")}
             for m in messages
+            # Older saved histories may contain empty end_turn replies. Drop
+            # only empty assistant content, preserving tool/thinking blocks.
+            if not (m.get("role") == "assistant" and not m.get("content"))
         ]
+        if not out:
+            return out
         last = out[-1]
         content = last.get("content")
         if isinstance(content, str):

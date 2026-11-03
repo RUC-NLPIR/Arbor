@@ -364,8 +364,11 @@ class Agent:
                     model=self.provider.model,
                 )
 
-            # 3. Append assistant message
-            self.messages.append({"role": "assistant", "content": response.raw_content})
+            # 3. Keep only non-empty assistant turns. Claude can legitimately
+            # return content=[] with end_turn after tool results; replaying it
+            # before a later user turn would make the next request invalid.
+            if response.raw_content:
+                self.messages.append({"role": "assistant", "content": response.raw_content})
 
             # Stream the model's reasoning to observers (contract 2). The loop
             # is non-streaming, so each thinking block is emitted whole.

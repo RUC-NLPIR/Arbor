@@ -231,6 +231,41 @@ def _drop_redundant_reads(
 # Layer 4: LLM-powered summarization
 # ---------------------------------------------------------------------------
 
+def _tool_safe_cut(messages: list[dict[str, Any]], cut: int) -> int:
+    """Move a proposed cut back to the last completed tool exchange.
+
+    A cut is safe only when every tool call before it has received a result.
+    Tracking IDs also covers parallel calls, results spread over multiple
+    messages, and user/background notes inserted in the middle of an exchange.
+    Both normalized tool_use blocks and native Responses function calls occur
+    in saved histories. Messages and their content blocks are left intact.
+    """
+    pending: set[str] = set()
+    safe_cut = 0
+    for i in range(max(0, min(cut, len(messages)))):
+        content = messages[i].get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type == "tool_use":
+                    call_id = block.get("id")
+                elif block_type == "function_call":
+                    call_id = block.get("call_id") or block.get("id")
+                else:
+                    call_id = None
+                if isinstance(call_id, str) and call_id:
+                    pending.add(call_id)
+                if block_type in {"tool_result", "function_call_output"}:
+                    result_id = block.get("tool_use_id") or block.get("call_id")
+                    if isinstance(result_id, str):
+                        pending.discard(result_id)
+        if not pending:
+            safe_cut = i + 1
+    return safe_cut
+
+
 def _format_messages_for_summary(messages: list[dict[str, Any]]) -> str:
     """Format messages into a human-readable transcript for the summarizer."""
     parts: list[str] = []
@@ -347,8 +382,17 @@ class ContextManager:
         # If STILL over threshold after summarization, do emergency truncation
         if _current_tokens() >= threshold:
             log.warning("Still over threshold after Layer 4. Emergency truncation.")
-            # Keep only the summary + most recent messages
-            messages = messages[:2] + messages[-(self.keep_recent // 2):]
+            # Keep a real summary prefix, if present, plus complete recent
+            # exchanges. A failed/skipped summary may leave ordinary history;
+            # retaining its first two messages could duplicate or split calls.
+            prefix_end = (
+                _tool_safe_cut(messages, 2)
+                if messages and messages[0].get("_internal") == "context_summary"
+                else 0
+            )
+            cut = _tool_safe_cut(messages, len(messages) - max(1, self.keep_recent // 2))
+            if cut > prefix_end:
+                messages = messages[:prefix_end] + messages[cut:]
 
         return messages
 
@@ -357,11 +401,12 @@ class ContextManager:
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Use the LLM to summarize the oldest messages, keeping recent ones."""
-        if len(messages) <= self.keep_recent:
+        cut = _tool_safe_cut(messages, len(messages) - max(1, self.keep_recent))
+        if cut == 0:
             return messages
 
-        to_summarize = messages[:-self.keep_recent]
-        keep = messages[-self.keep_recent:]
+        to_summarize = messages[:cut]
+        keep = messages[cut:]
 
         transcript = _format_messages_for_summary(to_summarize)
 
@@ -397,8 +442,9 @@ class ContextManager:
                 pass
         except Exception as e:
             log.error("Compaction LLM call failed: %s. Falling back to hard truncation.", e)
-            # Fallback: drop the oldest half of messages
-            return messages[len(messages) // 2:]
+            # Drop the oldest half only at a completed tool-exchange boundary.
+            cut = _tool_safe_cut(messages, len(messages) // 2)
+            return messages[cut:]
 
         # Replace old messages with summary
         return [
